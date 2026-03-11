@@ -2,6 +2,10 @@
 
 ## Completed
 
+- Updated `AGENTS.md` to align Fantasma's agent workflow with the installed `superpowers` skills, including expectations for planning, debugging, verification, subagent execution, and review.
+- Implemented the first iOS SDK prototype as a Swift Package with explicit `configure`, `track`, `identify`, `flush`, and `clear` APIs, a durable SQLite-backed event queue, and asynchronous uploads to `POST /v1/events`.
+- Added Swift tests covering event serialization, queue persistence, queue replay after failures, batch deletion rules, and identity rotation semantics.
+- Added a demo iOS app that exercises the SDK against the local development ingest service with explicit `app_open`, `screen_view`, and `button_pressed` events.
 - Implemented vertical slice 1: `POST /v1/events` now validates batches, resolves project-scoped ingest keys from Postgres, and inserts raw events into `events_raw`.
 - Added startup Postgres bootstrap for `projects`, `api_keys`, and `events_raw`, including raw-event indexes for project/time, install, event name, platform, and received time.
 - Added `GET /v1/metrics/events/count` with bearer admin auth and direct counting from `events_raw`.
@@ -19,6 +23,8 @@
 
 ## Next
 
+- Use the documented superpowers workflow on the next multi-step backend slice so plan files and verification discipline become part of the normal repository cadence.
+- Run the end-to-end iOS Simulator smoke test against the local Docker Compose stack and confirm the demo app drives the raw-event count endpoint as expected.
 - Run the end-to-end smoke test in a healthy local environment with Docker or a working local Postgres install.
 - Add a dedicated migration workflow to replace startup bootstrap SQL once the raw schema stabilizes.
 - Start the next slice after ingestion stabilizes: worker-owned session inference and aggregate generation.
@@ -29,4 +35,5 @@
 - Which migration tool should own schema evolution after the bootstrap phase.
 - Exact retention aggregation window strategy for reprocessing late-arriving events.
 - First dashboard scope beyond API contract validation.
+- Whether the next iOS SDK step should add richer property value types or keep string-only properties until the API surface expands deliberately.
 - Android SDK implementation schedule after the iOS SDK milestone.

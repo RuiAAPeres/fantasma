@@ -88,3 +88,26 @@ Query the count:
 curl "http://localhost:8082/v1/metrics/events/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
   -H "Authorization: Bearer fg_pat_dev"
 ```
+
+## iOS Demo App
+
+Start the local backend first:
+
+```bash
+docker compose -f infra/docker/compose.yaml up --build
+```
+
+Then open the demo app in Xcode:
+
+```bash
+open apps/demo-ios/FantasmaDemo.xcodeproj
+```
+
+Run the app in the iOS Simulator. The demo configures the SDK for `http://localhost:8081` with `fg_ing_test`, sends `app_open`, sends `screen_view` for the home screen, and lets you enqueue `button_pressed` events from the main button.
+
+Use the existing metrics endpoint to confirm ingestion after interacting with the app:
+
+```bash
+curl "http://localhost:8082/v1/metrics/events/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z" \
+  -H "Authorization: Bearer fg_pat_dev"
+```

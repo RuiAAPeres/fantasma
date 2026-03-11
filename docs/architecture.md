@@ -104,3 +104,23 @@ Durability requirement:
 - use local SQLite for the queue
 - delete only acknowledged rows
 - preserve queued events across `clear()`
+
+Current iOS SDK shape:
+
+- expose a single static `Fantasma` facade backed by one shared client
+- store `install_id`, `user_id`, and current `session_id` in local defaults
+- serialize each tracked event to JSON and store it as an immutable SQLite row
+- upload queued events asynchronously to `POST /v1/events` using the existing batch contract
+
+Current upload triggers:
+
+- every 10 seconds
+- when the local queue reaches 50 events
+- when `flush()` is called
+- when the app enters background
+
+Current identity rules:
+
+- `install_id` is generated on first use and reused until `clear()`
+- `identify(userId)` applies only to future events
+- `clear()` rotates `install_id`, clears `user_id`, rotates `session_id`, and leaves already queued rows untouched
