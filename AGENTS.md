@@ -73,6 +73,18 @@ Keep a running record of what changed and what is next.
 - Record open decisions, active work, and next steps.
 - Use commit history for fine-grained change history and `docs/STATUS.md` for current project memory.
 
+## Agent Workflow
+
+Fantasma now expects Codex agents to use the installed `superpowers` skills when they apply. Repository rules in this file still win over any skill defaults.
+
+- Use `writing-plans` before starting multi-step feature or refactor work. Save plans under `docs/superpowers/plans/` unless the task clearly does not need one.
+- Use `subagent-driven-development` when executing a plan with separable tasks in the current session.
+- Use `systematic-debugging` for defects, flaky tests, or unexpected runtime behavior instead of guessing at fixes.
+- Use `verification-before-completion` before claiming work is done, fixed, or passing. Do not report success without fresh command output.
+- Use `requesting-code-review` or `receiving-code-review` when preparing or responding to substantive review cycles.
+- Use `finishing-a-development-branch` before final handoff when the task includes branch cleanup, verification, and merge-readiness work.
+- Keep superpowers usage pragmatic: choose the smallest applicable workflow, but do not skip a clearly relevant skill.
+
 ## Build Order
 
 When starting from a thin repository, follow this order unless there is a clear reason not to:
