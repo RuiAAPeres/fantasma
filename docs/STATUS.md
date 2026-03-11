@@ -10,15 +10,13 @@
 - Added initial auth primitives and runnable ingest, API, and worker service binaries.
 - Added the first public OpenAPI contract and event schema files.
 - Added Docker-based local deployment scaffolding and a dashboard placeholder.
-
-## In Progress
-
-- Add GitHub Actions CI for workspace and deployment checks.
+- Added GitHub Actions CI for formatting, linting, tests, schema JSON validation, and Compose config checks.
 
 ## Next
 
-- Validate CI locally and commit it as a dedicated slice.
 - Start replacing bootstrap auth and response stubs with database-backed behavior.
+- Add initial Postgres schema and migrations for projects, keys, tokens, and raw events.
+- Replace stub metric responses with aggregate-backed query paths.
 
 ## Open Decisions
 

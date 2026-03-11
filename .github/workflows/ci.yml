@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify formatting
+        run: cargo fmt --all --check
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace --quiet
+
+  deployment:
+    name: Deployment Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose file
+        run: docker compose -f infra/docker/compose.yaml config
+
+      - name: Validate event schema JSON files
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          schema_dir = Path("schemas/events")
+          for path in schema_dir.glob("*.json"):
+              with path.open("r", encoding="utf-8") as handle:
+                  json.load(handle)
+          print(f"validated {len(list(schema_dir.glob('*.json')))} schema files")
+          PY
+
+      - name: Assert OpenAPI file exists
+        run: test -f schemas/openapi/fantasma.yaml
