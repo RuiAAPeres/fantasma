@@ -8,9 +8,7 @@
     "event",
     "timestamp",
     "install_id",
-    "session_id",
-    "platform",
-    "app_version"
+    "platform"
   ],
   "properties": {
     "event": {
@@ -23,7 +21,7 @@
     },
     "install_id": {
       "type": "string",
-      "format": "uuid"
+      "minLength": 1
     },
     "user_id": {
       "type": [
@@ -32,8 +30,11 @@
       ]
     },
     "session_id": {
-      "type": "string",
-      "format": "uuid"
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
     },
     "platform": {
       "type": "string",
@@ -43,7 +44,10 @@
       ]
     },
     "app_version": {
-      "type": "string",
+      "type": [
+        "string",
+        "null"
+      ],
       "minLength": 1
     },
     "properties": {

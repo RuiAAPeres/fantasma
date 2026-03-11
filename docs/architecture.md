@@ -12,13 +12,12 @@
 ## High-Level Flow
 
 ```text
-Mobile SDK
+curl / SDK
   -> POST /v1/events
   -> Rust ingest service
-  -> append-only Postgres events table
-  -> worker-driven aggregate tables
+  -> append-only Postgres events_raw table
+  -> GET /v1/metrics/events/count
   -> query API
-  -> dashboard or external clients
 ```
 
 ## Services
@@ -29,9 +28,8 @@ Responsibilities:
 
 - authenticate project-scoped ingest keys
 - validate incoming event batches
-- normalize SDK metadata
 - batch insert raw events into Postgres
-- acknowledge accepted and rejected events
+- acknowledge accepted events with `202 Accepted`
 
 Non-responsibilities:
 
@@ -62,7 +60,7 @@ Planned aggregates:
 Responsibilities:
 
 - expose project-scoped query endpoints
-- read precomputed aggregate tables
+- read raw events directly for the first vertical slice
 - provide a stable public API for first-party and third-party clients
 
 ## Data Model Direction
@@ -70,9 +68,8 @@ Responsibilities:
 Core persisted concepts:
 
 - `projects`
-- `ingest_keys`
-- `admin_tokens`
-- `events`
+- `api_keys`
+- `events_raw`
 - aggregate tables keyed by project, metric window, and dimensions
 
 Event requirements:
@@ -80,13 +77,13 @@ Event requirements:
 - `event`
 - `timestamp`
 - `install_id`
-- `session_id`
 - `platform`
-- `app_version`
 
 Optional event fields:
 
+- `session_id`
 - `user_id`
+- `app_version`
 - small `properties` JSON object
 
 ## SDK Direction

@@ -1,19 +1,11 @@
 use http::HeaderMap;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
-use uuid::Uuid;
 
-const INGEST_HEADER: &str = "x-fantasma-key";
 const AUTHORIZATION_HEADER: &str = "authorization";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectScope {
-    pub project_id: Uuid,
-}
-
 #[derive(Debug, Clone)]
-pub struct StaticKeyAuthorizer {
-    project_scope: ProjectScope,
-    ingest_key: String,
+pub struct StaticAdminAuthorizer {
     admin_token: String,
 }
 
@@ -25,34 +17,14 @@ pub enum AuthError {
     InvalidCredentials,
 }
 
-impl StaticKeyAuthorizer {
-    pub fn new(
-        project_id: Uuid,
-        ingest_key: impl Into<String>,
-        admin_token: impl Into<String>,
-    ) -> Self {
+impl StaticAdminAuthorizer {
+    pub fn new(admin_token: impl Into<String>) -> Self {
         Self {
-            project_scope: ProjectScope { project_id },
-            ingest_key: ingest_key.into(),
             admin_token: admin_token.into(),
         }
     }
 
-    pub fn authorize_ingest(&self, headers: &HeaderMap) -> Result<ProjectScope, AuthError> {
-        let key = headers
-            .get(INGEST_HEADER)
-            .ok_or(AuthError::MissingCredentials)?
-            .to_str()
-            .map_err(|_| AuthError::InvalidCredentials)?;
-
-        if key == self.ingest_key {
-            return Ok(self.project_scope.clone());
-        }
-
-        Err(AuthError::InvalidCredentials)
-    }
-
-    pub fn authorize_admin(&self, headers: &HeaderMap) -> Result<ProjectScope, AuthError> {
+    pub fn authorize(&self, headers: &HeaderMap) -> Result<(), AuthError> {
         let token = headers
             .get(AUTHORIZATION_HEADER)
             .ok_or(AuthError::MissingCredentials)?
@@ -61,23 +33,67 @@ impl StaticKeyAuthorizer {
 
         let expected = format!("Bearer {}", self.admin_token);
         if token == expected {
-            return Ok(self.project_scope.clone());
+            return Ok(());
         }
 
         Err(AuthError::InvalidCredentials)
     }
+}
 
-    pub fn project_id(&self) -> Uuid {
-        self.project_scope.project_id
+impl Default for StaticAdminAuthorizer {
+    fn default() -> Self {
+        Self::new("fg_pat_dev")
     }
 }
 
-impl Default for StaticKeyAuthorizer {
-    fn default() -> Self {
-        Self::new(
-            Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a),
-            "fg_ing_dev",
-            "fg_pat_dev",
-        )
+pub fn hash_ingest_key(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+pub fn derive_key_prefix(key: &str) -> String {
+    let mut underscore_positions = key.match_indices('_').map(|(index, _)| index);
+    if let Some(second_underscore) = underscore_positions.nth(1) {
+        return key[..=second_underscore].to_owned();
+    }
+
+    key.chars().take(8).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderValue;
+
+    #[test]
+    fn authorize_accepts_matching_bearer_token() {
+        let authorizer = StaticAdminAuthorizer::new("secret-token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION_HEADER,
+            HeaderValue::from_static("Bearer secret-token"),
+        );
+
+        let result = authorizer.authorize(&headers);
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn derive_key_prefix_returns_two_segment_prefix_when_available() {
+        let prefix = derive_key_prefix("fg_ing_test");
+
+        assert_eq!(prefix, "fg_ing_");
+    }
+
+    #[test]
+    fn hash_ingest_key_returns_stable_sha256_hex() {
+        let hash = hash_ingest_key("fg_ing_test");
+
+        assert_eq!(
+            hash,
+            "5a7bb2912be58212418d3ab018f57f55c00a5386b6d3bbf01b20e90e3943c376"
+        );
     }
 }

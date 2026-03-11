@@ -2,6 +2,7 @@ pub mod events;
 pub mod metrics;
 
 pub use events::{
-    EventBatchRequest, EventBatchResponse, EventPayload, EventValidationIssue, Platform,
+    EventAcceptedResponse, EventBatchRequest, EventPayload, EventValidationIssue,
+    EventValidationResponse, Platform,
 };
-pub use metrics::{MetricQuery, MetricResponse, MetricSeriesPoint};
+pub use metrics::{EventCountQuery, MetricQuery, MetricResponse, MetricSeriesPoint};

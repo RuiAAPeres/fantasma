@@ -1,5 +1,6 @@
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::events::Platform;
 
@@ -9,6 +10,13 @@ pub struct MetricQuery {
     pub end: NaiveDate,
     pub platform: Option<Platform>,
     pub app_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EventCountQuery {
+    pub project_id: Uuid,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

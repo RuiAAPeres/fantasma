@@ -7,14 +7,16 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use fantasma_auth::StaticKeyAuthorizer;
-use fantasma_core::{MetricQuery, MetricResponse};
+use fantasma_auth::StaticAdminAuthorizer;
+use fantasma_core::{EventCountQuery, MetricQuery, MetricResponse, MetricSeriesPoint};
+use fantasma_store::{BootstrapConfig, DatabaseConfig, PgPool, bootstrap, connect, count_events};
 use tracing::info;
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
-    authorizer: Arc<StaticKeyAuthorizer>,
+    authorizer: Arc<StaticAdminAuthorizer>,
+    pool: PgPool,
 }
 
 #[tokio::main]
@@ -23,12 +25,35 @@ async fn main() {
 
     let bind_address =
         env::var("FANTASMA_BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1:8082".to_owned());
+    let database_url = env::var("FANTASMA_DATABASE_URL").expect("FANTASMA_DATABASE_URL");
+    let project_id = env::var("FANTASMA_PROJECT_ID")
+        .ok()
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .unwrap_or_else(default_project_id);
+    let project_name = env::var("FANTASMA_PROJECT_NAME")
+        .unwrap_or_else(|_| "Local Development Project".to_owned());
+    let ingest_key = env::var("FANTASMA_INGEST_KEY").ok();
+    let pool = connect(&DatabaseConfig::new(database_url))
+        .await
+        .expect("connect database");
+    bootstrap(
+        &pool,
+        &BootstrapConfig {
+            project_id,
+            project_name,
+            ingest_key,
+        },
+    )
+    .await
+    .expect("bootstrap database");
     let state = AppState {
         authorizer: Arc::new(load_authorizer()),
+        pool,
     };
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/metrics/events/count", get(events_count))
         .route("/v1/metrics/active-users", get(active_users))
         .route("/v1/metrics/sessions", get(sessions))
         .route("/v1/metrics/retention", get(retention))
@@ -57,19 +82,65 @@ fn init_tracing() {
         .try_init();
 }
 
-fn load_authorizer() -> StaticKeyAuthorizer {
-    let project_id = env::var("FANTASMA_PROJECT_ID")
-        .ok()
-        .and_then(|value| Uuid::parse_str(&value).ok())
-        .unwrap_or_else(|| StaticKeyAuthorizer::default().project_id());
-    let ingest_key = env::var("FANTASMA_INGEST_KEY").unwrap_or_else(|_| "fg_ing_dev".to_owned());
+fn default_project_id() -> Uuid {
+    Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a)
+}
+
+fn load_authorizer() -> StaticAdminAuthorizer {
     let admin_token = env::var("FANTASMA_ADMIN_TOKEN").unwrap_or_else(|_| "fg_pat_dev".to_owned());
 
-    StaticKeyAuthorizer::new(project_id, ingest_key, admin_token)
+    StaticAdminAuthorizer::new(admin_token)
 }
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok", "service": "fantasma-api" }))
+}
+
+async fn events_count(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EventCountQuery>,
+) -> impl IntoResponse {
+    if state.authorizer.authorize(&headers).is_err() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response();
+    }
+
+    if query.start > query.end {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "invalid_time_range" })),
+        )
+            .into_response();
+    }
+
+    match count_events(&state.pool, &query).await {
+        Ok(count) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(MetricResponse {
+                    metric: "events_count".to_owned(),
+                    points: vec![MetricSeriesPoint {
+                        date: query.end.date_naive(),
+                        value: count,
+                    }],
+                })
+                .expect("serialize metric response"),
+            ),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(?error, "failed to count raw events");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal_server_error" })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn active_users(
@@ -126,7 +197,7 @@ fn metric_response(
     _query: MetricQuery,
     metric_name: &'static str,
 ) -> axum::response::Response {
-    if state.authorizer.authorize_admin(headers).is_err() {
+    if state.authorizer.authorize(headers).is_err() {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "unauthorized" })),

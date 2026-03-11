@@ -1,20 +1,27 @@
-use std::{env, sync::Arc};
+use std::env;
 
 use axum::{
     Json, Router,
-    extract::State,
+    body::to_bytes,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
-use fantasma_auth::StaticKeyAuthorizer;
-use fantasma_core::{EventBatchRequest, EventBatchResponse};
+use fantasma_core::{EventAcceptedResponse, EventBatchRequest, EventValidationResponse};
+use fantasma_store::{
+    BootstrapConfig, DatabaseConfig, PgPool, bootstrap, connect, insert_events,
+    resolve_project_id_for_ingest_key,
+};
 use tracing::info;
 use uuid::Uuid;
 
+const INGEST_HEADER: &str = "x-fantasma-key";
+const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
+
 #[derive(Clone)]
 struct AppState {
-    authorizer: Arc<StaticKeyAuthorizer>,
+    pool: PgPool,
 }
 
 #[tokio::main]
@@ -23,9 +30,28 @@ async fn main() {
 
     let bind_address =
         env::var("FANTASMA_BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1:8081".to_owned());
-    let state = AppState {
-        authorizer: Arc::new(load_authorizer()),
-    };
+    let database_url = env::var("FANTASMA_DATABASE_URL").expect("FANTASMA_DATABASE_URL");
+    let project_id = env::var("FANTASMA_PROJECT_ID")
+        .ok()
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .unwrap_or_else(default_project_id);
+    let project_name = env::var("FANTASMA_PROJECT_NAME")
+        .unwrap_or_else(|_| "Local Development Project".to_owned());
+    let ingest_key = env::var("FANTASMA_INGEST_KEY").ok();
+    let pool = connect(&DatabaseConfig::new(database_url))
+        .await
+        .expect("connect database");
+    bootstrap(
+        &pool,
+        &BootstrapConfig {
+            project_id,
+            project_name,
+            ingest_key,
+        },
+    )
+    .await
+    .expect("bootstrap database");
+    let state = AppState { pool };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -52,15 +78,8 @@ fn init_tracing() {
         .try_init();
 }
 
-fn load_authorizer() -> StaticKeyAuthorizer {
-    let project_id = env::var("FANTASMA_PROJECT_ID")
-        .ok()
-        .and_then(|value| Uuid::parse_str(&value).ok())
-        .unwrap_or_else(|| StaticKeyAuthorizer::default().project_id());
-    let ingest_key = env::var("FANTASMA_INGEST_KEY").unwrap_or_else(|_| "fg_ing_dev".to_owned());
-    let admin_token = env::var("FANTASMA_ADMIN_TOKEN").unwrap_or_else(|_| "fg_pat_dev".to_owned());
-
-    StaticKeyAuthorizer::new(project_id, ingest_key, admin_token)
+fn default_project_id() -> Uuid {
+    Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a)
 }
 
 async fn health() -> impl IntoResponse {
@@ -70,37 +89,86 @@ async fn health() -> impl IntoResponse {
 async fn ingest_events(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<EventBatchRequest>,
+    request: Request,
 ) -> impl IntoResponse {
-    if state.authorizer.authorize_ingest(&headers).is_err() {
+    let Some(ingest_key) = headers.get(INGEST_HEADER) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "unauthorized" })),
         )
             .into_response();
-    }
+    };
+    let Ok(ingest_key) = ingest_key.to_str() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response();
+    };
+    let project_id = match resolve_project_id_for_ingest_key(&state.pool, ingest_key).await {
+        Ok(Some(project_id)) => project_id,
+        Ok(None) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "unauthorized" })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(?error, "failed to resolve ingest key");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal_server_error" })),
+            )
+                .into_response();
+        }
+    };
+
+    let body = match to_bytes(request.into_body(), MAX_PAYLOAD_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "payload_too_large" })),
+            )
+                .into_response();
+        }
+    };
+    let payload: EventBatchRequest = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::debug!(?error, "failed to parse event batch request");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": "invalid_request" })),
+            )
+                .into_response();
+        }
+    };
 
     let issues = payload.validate();
     if !issues.is_empty() {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(
-                serde_json::to_value(EventBatchResponse {
-                    accepted: 0,
-                    rejected: issues.len(),
-                    errors: issues,
-                })
-                .expect("serialize validation response"),
+                serde_json::to_value(EventValidationResponse { errors: issues })
+                    .expect("serialize validation response"),
             ),
         )
             .into_response();
     }
 
-    let accepted = payload.events.len();
-    let body = EventBatchResponse {
-        accepted,
-        rejected: 0,
-        errors: Vec::new(),
+    if let Err(error) = insert_events(&state.pool, project_id, &payload.events).await {
+        tracing::error!(?error, "failed to insert accepted events");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "internal_server_error" })),
+        )
+            .into_response();
+    }
+
+    let body = EventAcceptedResponse {
+        accepted: payload.events.len(),
     };
 
     (
