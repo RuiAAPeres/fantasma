@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: fantasma
+      POSTGRES_USER: fantasma
+      POSTGRES_PASSWORD: fantasma
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  fantasma-ingest:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.ingest
+    depends_on:
+      - postgres
+    environment:
+      FANTASMA_BIND_ADDRESS: 0.0.0.0:8081
+      FANTASMA_DATABASE_URL: postgres://fantasma:fantasma@postgres:5432/fantasma
+      FANTASMA_INGEST_KEY: fg_ing_dev
+      FANTASMA_ADMIN_TOKEN: fg_pat_dev
+      FANTASMA_PROJECT_ID: 9bad8b88-5e7a-44ed-98ce-4cf9ddde713a
+    ports:
+      - "8081:8081"
+
+  fantasma-api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    depends_on:
+      - postgres
+    environment:
+      FANTASMA_BIND_ADDRESS: 0.0.0.0:8082
+      FANTASMA_DATABASE_URL: postgres://fantasma:fantasma@postgres:5432/fantasma
+      FANTASMA_INGEST_KEY: fg_ing_dev
+      FANTASMA_ADMIN_TOKEN: fg_pat_dev
+      FANTASMA_PROJECT_ID: 9bad8b88-5e7a-44ed-98ce-4cf9ddde713a
+    ports:
+      - "8082:8082"
+
+  fantasma-worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.worker
+    depends_on:
+      - postgres
+    environment:
+      FANTASMA_DATABASE_URL: postgres://fantasma:fantasma@postgres:5432/fantasma
+      FANTASMA_WORKER_POLL_INTERVAL_MS: 5000
+
+  dashboard:
+    image: nginx:1.29-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ../../apps/dashboard-web/public:/usr/share/nginx/html:ro
+    profiles:
+      - dashboard
+
+volumes:
+  postgres-data:

@@ -8,17 +8,17 @@
 - Bootstrapped the Cargo workspace and monorepo skeleton.
 - Added shared event and metric domain types in `fantasma-core`.
 - Added initial auth primitives and runnable ingest, API, and worker service binaries.
+- Added the first public OpenAPI contract and event schema files.
+- Added Docker-based local deployment scaffolding and a dashboard placeholder.
 
 ## In Progress
 
-- Define the first public event and HTTP API contracts.
-- Add Docker-based local deployment scaffolding.
+- Add GitHub Actions CI for workspace and deployment checks.
 
 ## Next
 
-- Introduce the initial OpenAPI contract for ingest and metric queries.
-- Add event schema files under `schemas/events`.
-- Add Docker Compose and service Dockerfiles for local bootstrapping.
+- Validate CI locally and commit it as a dedicated slice.
+- Start replacing bootstrap auth and response stubs with database-backed behavior.
 
 ## Open Decisions
 

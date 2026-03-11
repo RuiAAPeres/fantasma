@@ -5,7 +5,7 @@
 Fantasma should be runnable locally with:
 
 ```bash
-docker compose up
+docker compose -f infra/docker/compose.yaml up --build
 ```
 
 The initial Compose setup should include:
@@ -15,6 +15,11 @@ The initial Compose setup should include:
 - `fantasma-api`
 - `fantasma-worker`
 - optional `dashboard`
+
+Current repository files:
+
+- Compose file: `infra/docker/compose.yaml`
+- Service images: `infra/docker/Dockerfile.ingest`, `infra/docker/Dockerfile.api`, `infra/docker/Dockerfile.worker`
 
 ## Deployment Principles
 
@@ -30,6 +35,7 @@ Shared examples:
 - `FANTASMA_DATABASE_URL`
 - `FANTASMA_BIND_ADDRESS`
 - `FANTASMA_LOG_LEVEL`
+- `FANTASMA_PROJECT_ID`
 
 Service-specific examples:
 

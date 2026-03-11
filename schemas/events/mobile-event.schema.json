@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fantasma.dev/schemas/events/mobile-event.schema.json",
+  "title": "Fantasma Mobile Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event",
+    "timestamp",
+    "install_id",
+    "session_id",
+    "platform",
+    "app_version"
+  ],
+  "properties": {
+    "event": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "install_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "platform": {
+      "type": "string",
+      "enum": [
+        "ios",
+        "android"
+      ]
+    },
+    "app_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "properties": {
+      "type": "object",
+      "maxProperties": 32,
+      "additionalProperties": true
+    }
+  }
+}

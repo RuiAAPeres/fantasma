@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fantasma Dashboard Placeholder</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --background: #f6efe6;
+        --surface: #fff7ed;
+        --text: #1f2937;
+        --accent: #d97706;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at top left, rgba(217, 119, 6, 0.16), transparent 32%),
+          linear-gradient(180deg, var(--background), #fdfaf6);
+        color: var(--text);
+        font-family: Georgia, Cambria, "Times New Roman", Times, serif;
+      }
+
+      main {
+        width: min(42rem, calc(100vw - 3rem));
+        padding: 2.5rem;
+        border: 1px solid rgba(31, 41, 55, 0.08);
+        border-radius: 1.5rem;
+        background: rgba(255, 247, 237, 0.88);
+        box-shadow: 0 24px 80px rgba(31, 41, 55, 0.08);
+      }
+
+      h1 {
+        margin: 0 0 0.5rem;
+        font-size: clamp(2rem, 6vw, 3.5rem);
+      }
+
+      p {
+        margin: 0.75rem 0;
+        line-height: 1.6;
+      }
+
+      code {
+        color: var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Fantasma Dashboard</h1>
+      <p>
+        This placeholder keeps the Docker topology honest while the real dashboard is deferred.
+      </p>
+      <p>
+        The intended rule still applies: the dashboard must consume the same public
+        <code>/v1/metrics/*</code> API as external clients.
+      </p>
+    </main>
+  </body>
+</html>

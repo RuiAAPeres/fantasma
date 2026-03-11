@@ -1,0 +1,359 @@
+openapi: 3.1.0
+info:
+  title: Fantasma API
+  version: 0.1.0
+  description: |
+    Fantasma is a privacy-first, self-hosted mobile analytics platform.
+
+    This initial API contract covers event ingestion plus the first query endpoints
+    for simple mobile metrics. The dashboard must use the same API.
+servers:
+  - url: http://localhost:8081
+    description: Local ingest service
+  - url: http://localhost:8082
+    description: Local query API service
+tags:
+  - name: ingest
+  - name: metrics
+paths:
+  /v1/events:
+    post:
+      tags:
+        - ingest
+      summary: Ingest a batch of mobile events
+      operationId: ingestEvents
+      parameters:
+        - in: header
+          name: X-Fantasma-Key
+          required: true
+          schema:
+            type: string
+          description: Project-scoped ingest key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventBatchRequest'
+      responses:
+        '202':
+          description: Batch accepted for asynchronous processing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventBatchResponse'
+        '401':
+          description: Missing or invalid ingest key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation failure for one or more events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventBatchResponse'
+  /v1/metrics/active-users:
+    get:
+      tags:
+        - metrics
+      summary: Query active users over time
+      operationId: getActiveUsers
+      parameters:
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/Platform'
+        - $ref: '#/components/parameters/AppVersion'
+      responses:
+        '200':
+          description: Active users time series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricResponse'
+        '401':
+          description: Missing or invalid admin token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/sessions:
+    get:
+      tags:
+        - metrics
+      summary: Query sessions over time
+      operationId: getSessions
+      parameters:
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/Platform'
+        - $ref: '#/components/parameters/AppVersion'
+      responses:
+        '200':
+          description: Sessions time series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricResponse'
+        '401':
+          description: Missing or invalid admin token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/retention:
+    get:
+      tags:
+        - metrics
+      summary: Query retention
+      operationId: getRetention
+      parameters:
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/Platform'
+        - $ref: '#/components/parameters/AppVersion'
+      responses:
+        '200':
+          description: Retention metric response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricResponse'
+        '401':
+          description: Missing or invalid admin token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/screens:
+    get:
+      tags:
+        - metrics
+      summary: Query screen usage
+      operationId: getScreens
+      parameters:
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/Platform'
+        - $ref: '#/components/parameters/AppVersion'
+      responses:
+        '200':
+          description: Screen usage metric response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricResponse'
+        '401':
+          description: Missing or invalid admin token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/releases:
+    get:
+      tags:
+        - metrics
+      summary: Query release adoption
+      operationId: getReleaseAdoption
+      parameters:
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/Platform'
+        - $ref: '#/components/parameters/AppVersion'
+      responses:
+        '200':
+          description: Release adoption metric response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricResponse'
+        '401':
+          description: Missing or invalid admin token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/events:
+    get:
+      tags:
+        - metrics
+      summary: Query custom events over time
+      operationId: getCustomEvents
+      parameters:
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/Platform'
+        - $ref: '#/components/parameters/AppVersion'
+        - in: query
+          name: event
+          schema:
+            type: string
+          description: Optional custom event name filter.
+      responses:
+        '200':
+          description: Custom event metric response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricResponse'
+        '401':
+          description: Missing or invalid admin token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  parameters:
+    Authorization:
+      in: header
+      name: Authorization
+      required: true
+      schema:
+        type: string
+      description: Bearer admin token, for example `Bearer fg_pat_xxx`.
+    StartDate:
+      in: query
+      name: start
+      required: true
+      schema:
+        type: string
+        format: date
+    EndDate:
+      in: query
+      name: end
+      required: true
+      schema:
+        type: string
+        format: date
+    Platform:
+      in: query
+      name: platform
+      required: false
+      schema:
+        $ref: '#/components/schemas/Platform'
+    AppVersion:
+      in: query
+      name: app_version
+      required: false
+      schema:
+        type: string
+  schemas:
+    Platform:
+      type: string
+      enum:
+        - ios
+        - android
+    EventPayload:
+      type: object
+      additionalProperties: false
+      required:
+        - event
+        - timestamp
+        - install_id
+        - session_id
+        - platform
+        - app_version
+      properties:
+        event:
+          type: string
+          minLength: 1
+        timestamp:
+          type: string
+          format: date-time
+        install_id:
+          type: string
+          format: uuid
+        user_id:
+          type:
+            - string
+            - "null"
+        session_id:
+          type: string
+          format: uuid
+        platform:
+          $ref: '#/components/schemas/Platform'
+        app_version:
+          type: string
+          minLength: 1
+        properties:
+          type: object
+          maxProperties: 32
+          additionalProperties: true
+    EventBatchRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - events
+      properties:
+        events:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/EventPayload'
+    EventValidationIssue:
+      type: object
+      required:
+        - index
+        - message
+      properties:
+        index:
+          type: integer
+          minimum: 0
+        message:
+          type: string
+    EventBatchResponse:
+      type: object
+      required:
+        - accepted
+        - rejected
+        - errors
+      properties:
+        accepted:
+          type: integer
+          minimum: 0
+        rejected:
+          type: integer
+          minimum: 0
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventValidationIssue'
+    MetricSeriesPoint:
+      type: object
+      required:
+        - date
+        - value
+      properties:
+        date:
+          type: string
+          format: date
+        value:
+          type: integer
+          minimum: 0
+    MetricResponse:
+      type: object
+      required:
+        - metric
+        - points
+      properties:
+        metric:
+          type: string
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/MetricSeriesPoint'
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
