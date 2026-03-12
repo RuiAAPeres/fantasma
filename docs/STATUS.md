@@ -13,6 +13,10 @@
 
 ## Completed
 
+- Hardened the performance-proof slice after review: `fantasma-bench` now scopes Docker commands to the dedicated `fantasma-bench` Compose project, benchmark services moved to isolated host ports so local runs cannot tear down the default dev stack, startup cleanup now fails closed instead of benchmarking against dirty state, the worker catch-up regression now proves at least one grouped event-metrics request ran during concurrent catch-up, and the performance docs now point at the real worker test command.
+- Fixed a consistency bug in the event-metrics query path: grouped event-metrics reads now run inside one repeatable-read snapshot instead of stitching multiple cube selects across live worker commits, and a new DB-backed pipeline test locks that regression down by hammering `GET /v1/metrics/events/daily` while the event-metrics worker catches up one batch at a time.
+- Recalibrated the enforced CI benchmark budgets from retained GitHub `ubuntu-latest` artifacts on March 12, 2026. Retained medians came in at `12.35k` events/s and `523ms` ready for `hot-path`, `11.47k` / `13.00k` events/s with `347.5ms` / `342ms` readiness for `repair-path`, and `11.51k` events/s with `13.56s` readiness for `scale-path`; readiness/query ceilings now still use `20%` median slack, but they never tighten below the slowest retained runner sample.
+- Added performance proofing for Fantasma's bounded backend paths: PR CI now locks the worker fanout boundary and benchmark Compose config, the repository has a first-class `fantasma-bench` harness plus `infra/docker/compose.bench.yaml`, and a dedicated `performance.yml` workflow now runs numeric hot-path and repair-path stack benchmarks on `main` and manual dispatch.
 - Clarified the event-property cap across public docs: `README.md` now states only the high-level principle that Fantasma keeps event context narrow for predictable performance, while `docs/deployment.md` and the event schema carry the exact 3-key limit and its worker-aggregate rationale.
 - Refocused `README.md` into a product-facing entry point instead of a contract dump, and tightened `AGENTS.md` so future contributors keep detailed implementation semantics in deployment, architecture, SDK, and schema docs instead of pushing them back into the README.
 - Followed up on the docs-centralization pass by removing repeated `install_id` policy prose from deployment, architecture, and SDK docs. `README.md` stays the canonical explanation; derived docs now focus on local contract or behavior instead of re-explaining the same privacy boundary.
@@ -57,6 +61,7 @@
 
 ## Next
 
+- Let the calibrated `Performance` workflow run on `main` after merge so default-branch history starts with the tightened benchmark budgets instead of the branch-only calibration samples.
 - Run the end-to-end iOS Simulator smoke test against the local stack and confirm the demo app drives the new worker-derived event metrics alongside the existing session metrics.
 - Decide whether the next aggregate slice should extend event metrics to more product-facing use cases such as release adoption or screen-view dashboards, while preserving the same bounded incremental model.
 

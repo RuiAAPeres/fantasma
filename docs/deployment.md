@@ -102,6 +102,15 @@ Test taxonomy:
 - `./scripts/docker-test.sh` is the canonical path for Rust workspace tests that need Postgres
 - `./scripts/compose-smoke.sh` is for running-stack verification and should stay separate from workspace `cargo test`
 
+## Performance Verification
+
+Fantasma keeps numeric stack benchmarks separate from the normal smoke path:
+
+- benchmark Compose file: [`infra/docker/compose.bench.yaml`](/Users/ruiperes/Code/fantasma/infra/docker/compose.bench.yaml)
+- benchmark docs and commands: [`docs/performance.md`](/Users/ruiperes/Code/fantasma/docs/performance.md)
+
+The benchmark stack keeps the same services as local development, but it runs under its own Compose project (`fantasma-bench`), uses benchmark-only host ports (`18081` / `18082`), does not publish Postgres on the host, and lowers the worker poll interval so derive-lag measurements are meaningful instead of dominated by the default 5-second sleep.
+
 ## Local Smoke Test
 
 Run the preflighted smoke script:

@@ -13,6 +13,7 @@ fantasma-auth = { path = "../fantasma-auth" }
 fantasma-core = { path = "../fantasma-core" }
 fantasma-store = { path = "../fantasma-store" }
 serde_json.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

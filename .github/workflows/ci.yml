@@ -66,6 +66,9 @@ jobs:
       - name: Validate Docker test Compose file
         run: docker compose -f infra/docker/compose.test.yaml config
 
+      - name: Validate benchmark Compose file
+        run: docker compose -f infra/docker/compose.bench.yaml config
+
       - name: Validate event schema JSON files
         run: |
           python3 - <<'PY'

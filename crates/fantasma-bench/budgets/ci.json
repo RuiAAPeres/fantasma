@@ -1,0 +1,46 @@
+{
+  "hot-path": {
+    "min_phase_events_per_second": {
+      "ingest": 9877.74
+    },
+    "max_readiness_ms": {
+      "derived_metrics_ready": 628
+    },
+    "max_query_p95_ms": {
+      "events_aggregate_dim3": 3,
+      "events_daily_dim3": 4,
+      "sessions_count_daily": 1,
+      "sessions_duration_total_daily": 1
+    }
+  },
+  "repair-path": {
+    "min_phase_events_per_second": {
+      "seed_ingest": 9174.98,
+      "repair_ingest": 10399.72
+    },
+    "max_readiness_ms": {
+      "seed_ready": 457,
+      "repair_ready": 411
+    },
+    "max_query_p95_ms": {
+      "events_aggregate_dim3": 4,
+      "events_daily_dim3": 4,
+      "sessions_count_daily": 1,
+      "sessions_duration_total_daily": 1
+    }
+  },
+  "scale-path": {
+    "min_phase_events_per_second": {
+      "ingest": 9210.0
+    },
+    "max_readiness_ms": {
+      "derived_metrics_ready": 16276
+    },
+    "max_query_p95_ms": {
+      "events_aggregate_dim3": 9,
+      "events_daily_dim3": 10,
+      "sessions_count_daily": 1,
+      "sessions_duration_total_daily": 1
+    }
+  }
+}
