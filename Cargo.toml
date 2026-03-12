@@ -2,6 +2,7 @@
 members = [
   "crates/fantasma-api",
   "crates/fantasma-auth",
+  "crates/fantasma-bench",
   "crates/fantasma-core",
   "crates/fantasma-ingest",
   "crates/fantasma-store",

@@ -1,0 +1,153 @@
+name: Performance
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Scenario to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - hot-path
+          - repair-path
+          - scale-path
+      profile:
+        description: Benchmark profile
+        required: true
+        default: ci
+        type: choice
+        options:
+          - ci
+          - extended
+
+jobs:
+  hot-path:
+    name: Hot Path Benchmark
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.scenario == 'all' || github.event.inputs.scenario == 'hot-path'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate benchmark Compose file
+        run: docker compose -f infra/docker/compose.bench.yaml config
+
+      - name: Run hot-path benchmark
+        run: |
+          mkdir -p artifacts/performance
+          cargo run -p fantasma-bench -- \
+            stack \
+            --scenario hot-path \
+            --profile "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.profile || 'ci' }}" \
+            --output artifacts/performance/hot-path.json
+
+      - name: Publish hot-path summary
+        if: always()
+        run: |
+          if [ -f artifacts/performance/hot-path.md ]; then
+            cat artifacts/performance/hot-path.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload hot-path artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hot-path-benchmark
+          path: artifacts/performance/hot-path.*
+          if-no-files-found: ignore
+
+  repair-path:
+    name: Repair Path Benchmark
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.scenario == 'all' || github.event.inputs.scenario == 'repair-path'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate benchmark Compose file
+        run: docker compose -f infra/docker/compose.bench.yaml config
+
+      - name: Run repair-path benchmark
+        run: |
+          mkdir -p artifacts/performance
+          cargo run -p fantasma-bench -- \
+            stack \
+            --scenario repair-path \
+            --profile "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.profile || 'ci' }}" \
+            --output artifacts/performance/repair-path.json
+
+      - name: Publish repair-path summary
+        if: always()
+        run: |
+          if [ -f artifacts/performance/repair-path.md ]; then
+            cat artifacts/performance/repair-path.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload repair-path artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-path-benchmark
+          path: artifacts/performance/repair-path.*
+          if-no-files-found: ignore
+
+  scale-path:
+    name: Scale Path Benchmark
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.scenario == 'all' || github.event.inputs.scenario == 'scale-path'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate benchmark Compose file
+        run: docker compose -f infra/docker/compose.bench.yaml config
+
+      - name: Run scale-path benchmark
+        run: |
+          mkdir -p artifacts/performance
+          cargo run -p fantasma-bench -- \
+            stack \
+            --scenario scale-path \
+            --profile "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.profile || 'ci' }}" \
+            --output artifacts/performance/scale-path.json
+
+      - name: Publish scale-path summary
+        if: always()
+        run: |
+          if [ -f artifacts/performance/scale-path.md ]; then
+            cat artifacts/performance/scale-path.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload scale-path artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scale-path-benchmark
+          path: artifacts/performance/scale-path.*
+          if-no-files-found: ignore

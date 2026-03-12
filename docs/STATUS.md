@@ -13,6 +13,7 @@
 
 ## Completed
 
+- Added performance proofing for Fantasma's bounded backend paths: PR CI now locks the worker fanout boundary and benchmark Compose config, the repository has a first-class `fantasma-bench` harness plus `infra/docker/compose.bench.yaml`, and a dedicated `performance.yml` workflow now runs numeric hot-path and repair-path stack benchmarks on `main` and manual dispatch.
 - Clarified the event-property cap across public docs: `README.md` now states only the high-level principle that Fantasma keeps event context narrow for predictable performance, while `docs/deployment.md` and the event schema carry the exact 3-key limit and its worker-aggregate rationale.
 - Refocused `README.md` into a product-facing entry point instead of a contract dump, and tightened `AGENTS.md` so future contributors keep detailed implementation semantics in deployment, architecture, SDK, and schema docs instead of pushing them back into the README.
 - Followed up on the docs-centralization pass by removing repeated `install_id` policy prose from deployment, architecture, and SDK docs. `README.md` stays the canonical explanation; derived docs now focus on local contract or behavior instead of re-explaining the same privacy boundary.
@@ -57,6 +58,7 @@
 
 ## Next
 
+- Run the new GitHub Actions performance workflow on `main` once and tighten the initial `crates/fantasma-bench/budgets/ci.json` thresholds from the first uploaded artifacts if they are materially looser than the observed runner baseline.
 - Run the end-to-end iOS Simulator smoke test against the local stack and confirm the demo app drives the new worker-derived event metrics alongside the existing session metrics.
 - Decide whether the next aggregate slice should extend event metrics to more product-facing use cases such as release adoption or screen-view dashboards, while preserving the same bounded incremental model.
 

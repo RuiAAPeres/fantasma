@@ -1871,6 +1871,7 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
     use fantasma_core::EventPayload;
+    use serde_json::Value;
 
     fn project_id() -> Uuid {
         Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a)
@@ -1932,6 +1933,49 @@ mod tests {
                 .num_seconds() as i32,
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
+        }
+    }
+
+    fn explain_plan_root(plan: &Value) -> &Value {
+        &plan.as_array().expect("EXPLAIN JSON is an array")[0]["Plan"]
+    }
+
+    fn plan_contains_node_type(plan: &Value, node_type: &str) -> bool {
+        let Some(object) = plan.as_object() else {
+            return false;
+        };
+
+        if object
+            .get("Node Type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == node_type)
+        {
+            return true;
+        }
+
+        object
+            .get("Plans")
+            .and_then(Value::as_array)
+            .is_some_and(|plans| {
+                plans
+                    .iter()
+                    .any(|plan| plan_contains_node_type(plan, node_type))
+            })
+    }
+
+    fn collect_plan_index_names(plan: &Value, names: &mut Vec<String>) {
+        let Some(object) = plan.as_object() else {
+            return;
+        };
+
+        if let Some(index_name) = object.get("Index Name").and_then(Value::as_str) {
+            names.push(index_name.to_owned());
+        }
+
+        if let Some(plans) = object.get("Plans").and_then(Value::as_array) {
+            for child in plans {
+                collect_plan_index_names(child, names);
+            }
         }
     }
 
@@ -2144,6 +2188,188 @@ mod tests {
         .expect_err("out-of-order dimension keys should fail");
 
         assert!(matches!(error, sqlx::Error::Database(_)));
+    }
+
+    #[sqlx::test]
+    async fn event_metrics_dim2_reads_use_bounded_read_indexes(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        sqlx::query(
+            r#"
+            INSERT INTO event_count_daily_dim2 (
+                project_id,
+                day,
+                event_name,
+                dim1_key,
+                dim1_value,
+                dim2_key,
+                dim2_value,
+                event_count
+            )
+            SELECT
+                $1,
+                DATE '2026-01-01' + day_offset,
+                'app_open',
+                'app_version',
+                '1.' || version_offset || '.0',
+                'provider',
+                'provider-' || provider_offset,
+                1
+            FROM generate_series(0, 29) AS day_offset
+            CROSS JOIN generate_series(0, 5) AS version_offset
+            CROSS JOIN generate_series(0, 79) AS provider_offset
+            "#,
+        )
+        .bind(project_id())
+        .execute(&pool)
+        .await
+        .expect("insert dim2 rows");
+        sqlx::query("ANALYZE event_count_daily_dim2")
+            .execute(&pool)
+            .await
+            .expect("analyze dim2 table");
+
+        let row = sqlx::query(
+            r#"
+            EXPLAIN (FORMAT JSON)
+            SELECT day, dim1_key, dim1_value, dim2_key, dim2_value, event_count
+            FROM event_count_daily_dim2
+            WHERE project_id = $1
+              AND event_name = $2
+              AND day BETWEEN $3 AND $4
+              AND dim1_key = $5
+              AND dim2_key = $6
+              AND dim2_value = $7
+            ORDER BY day ASC, dim1_value ASC, dim2_value ASC
+            "#,
+        )
+        .bind(project_id())
+        .bind("app_open")
+        .bind(NaiveDate::from_ymd_opt(2026, 1, 10).expect("valid date"))
+        .bind(NaiveDate::from_ymd_opt(2026, 1, 20).expect("valid date"))
+        .bind("app_version")
+        .bind("provider")
+        .bind("provider-11")
+        .fetch_one(&pool)
+        .await
+        .expect("explain dim2 query");
+        let plan = row
+            .try_get::<Value, _>(0)
+            .expect("EXPLAIN returns json plan");
+        let root = explain_plan_root(&plan);
+        let mut index_names = Vec::new();
+        collect_plan_index_names(root, &mut index_names);
+
+        assert!(
+            !plan_contains_node_type(root, "Seq Scan"),
+            "dim2 read path should avoid sequential scans: {plan:#}"
+        );
+        assert!(
+            index_names.iter().any(|name| {
+                name == "idx_event_count_daily_dim2_project_event_keys_day"
+                    || name == "idx_event_count_daily_dim2_project_event_dim1_value_day"
+                    || name == "idx_event_count_daily_dim2_project_event_dim2_value_day"
+            }),
+            "dim2 read path should use a dedicated read index, got {index_names:?} from {plan:#}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn event_metrics_dim3_reads_use_bounded_read_indexes(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        sqlx::query(
+            r#"
+            INSERT INTO event_count_daily_dim3 (
+                project_id,
+                day,
+                event_name,
+                dim1_key,
+                dim1_value,
+                dim2_key,
+                dim2_value,
+                dim3_key,
+                dim3_value,
+                event_count
+            )
+            SELECT
+                $1,
+                DATE '2026-01-01' + day_offset,
+                'app_open',
+                'app_version',
+                '1.' || version_offset || '.0',
+                'provider',
+                'provider-' || provider_offset,
+                'region',
+                'region-' || region_offset,
+                1
+            FROM generate_series(0, 19) AS day_offset
+            CROSS JOIN generate_series(0, 4) AS version_offset
+            CROSS JOIN generate_series(0, 49) AS provider_offset
+            CROSS JOIN generate_series(0, 7) AS region_offset
+            "#,
+        )
+        .bind(project_id())
+        .execute(&pool)
+        .await
+        .expect("insert dim3 rows");
+        sqlx::query("ANALYZE event_count_daily_dim3")
+            .execute(&pool)
+            .await
+            .expect("analyze dim3 table");
+
+        let row = sqlx::query(
+            r#"
+            EXPLAIN (FORMAT JSON)
+            SELECT day, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count
+            FROM event_count_daily_dim3
+            WHERE project_id = $1
+              AND event_name = $2
+              AND day BETWEEN $3 AND $4
+              AND dim1_key = $5
+              AND dim2_key = $6
+              AND dim3_key = $7
+              AND dim3_value = $8
+            ORDER BY day ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC
+            "#,
+        )
+        .bind(project_id())
+        .bind("app_open")
+        .bind(NaiveDate::from_ymd_opt(2026, 1, 5).expect("valid date"))
+        .bind(NaiveDate::from_ymd_opt(2026, 1, 12).expect("valid date"))
+        .bind("app_version")
+        .bind("provider")
+        .bind("region")
+        .bind("region-3")
+        .fetch_one(&pool)
+        .await
+        .expect("explain dim3 query");
+        let plan = row
+            .try_get::<Value, _>(0)
+            .expect("EXPLAIN returns json plan");
+        let root = explain_plan_root(&plan);
+        let mut index_names = Vec::new();
+        collect_plan_index_names(root, &mut index_names);
+
+        assert!(
+            !plan_contains_node_type(root, "Seq Scan"),
+            "dim3 read path should avoid sequential scans: {plan:#}"
+        );
+        assert!(
+            index_names.iter().any(|name| {
+                name == "idx_event_count_daily_dim3_project_event_keys_day"
+                    || name == "idx_event_count_daily_dim3_project_event_dim1_value_day"
+                    || name == "idx_event_count_daily_dim3_project_event_dim2_value_day"
+                    || name == "idx_event_count_daily_dim3_project_event_dim3_value_day"
+            }),
+            "dim3 read path should use a dedicated read index, got {index_names:?} from {plan:#}"
+        );
     }
 
     #[test]

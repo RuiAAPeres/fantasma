@@ -654,9 +654,9 @@ mod tests {
     use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use fantasma_core::{EventPayload, Platform};
     use fantasma_store::{
-        BootstrapConfig, average_session_duration_seconds, count_active_installs, count_sessions,
-        fetch_latest_session_for_install, insert_events, load_install_session_state,
-        load_worker_offset,
+        BootstrapConfig, RawEventRecord, average_session_duration_seconds, count_active_installs,
+        count_sessions, fetch_latest_session_for_install, insert_events,
+        load_install_session_state, load_worker_offset,
     };
     use sqlx::Row;
 
@@ -687,6 +687,24 @@ mod tests {
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
             properties: BTreeMap::new(),
+        }
+    }
+
+    fn raw_event_with_max_dimensions() -> RawEventRecord {
+        RawEventRecord {
+            id: 1,
+            project_id: project_id(),
+            event_name: "app_open".to_owned(),
+            timestamp: timestamp(1, 0, 0),
+            install_id: "install-1".to_owned(),
+            platform: Platform::Ios,
+            app_version: Some("1.0.0".to_owned()),
+            os_version: Some("18.3".to_owned()),
+            properties: BTreeMap::from([
+                ("plan".to_owned(), "pro".to_owned()),
+                ("provider".to_owned(), "strava".to_owned()),
+                ("region".to_owned(), "eu".to_owned()),
+            ]),
         }
     }
 
@@ -745,6 +763,28 @@ mod tests {
                     .expect("updated_at"),
             )
         })
+    }
+
+    #[test]
+    fn max_dimension_event_metrics_fanout_stays_bounded() {
+        let rollups = build_event_metric_rollups(&[raw_event_with_max_dimensions()]);
+        let total_fanout = rollups.total_deltas.len()
+            + rollups.dim1_deltas.len()
+            + rollups.dim2_deltas.len()
+            + rollups.dim3_deltas.len();
+
+        assert_eq!(rollups.total_deltas.len(), 1);
+        assert_eq!(rollups.dim1_deltas.len(), 6);
+        assert_eq!(rollups.dim2_deltas.len(), 15);
+        assert_eq!(rollups.dim3_deltas.len(), 20);
+        assert_eq!(total_fanout, 42);
+        assert!(
+            rollups
+                .dim3_deltas
+                .iter()
+                .all(|delta| delta.event_count == 1),
+            "single events must increment each bounded cube exactly once"
+        );
     }
 
     #[sqlx::test]
