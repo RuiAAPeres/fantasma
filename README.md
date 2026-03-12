@@ -8,6 +8,9 @@ tech or profile building. Privacy is enforced in the product shape: no
 person-level identity, no hidden enrichment, and intentionally narrow event
 context.
 
+Fantasma is inspired by Fathom's opinionated, privacy-first approach, but
+built for mobile analytics.
+
 ## What Fantasma Is Not
 
 Fantasma is not trying to be a full product analytics suite. It does not target:
