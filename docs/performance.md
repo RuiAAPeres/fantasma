@@ -81,9 +81,9 @@ That keeps local benchmark runs from tearing down or colliding with the default 
 
 ## Budget Model
 
-- `ci` uses enforced thresholds from [`crates/fantasma-bench/budgets/ci.json`](/Users/ruiperes/Code/fantasma/crates/fantasma-bench/budgets/ci.json)
+- `ci` uses enforced thresholds from [`crates/fantasma-bench/budgets/ci.json`](../crates/fantasma-bench/budgets/ci.json)
 - `extended` runs the same scenarios but skips threshold enforcement and is intended for manual investigation
-- benchmark runs use [`infra/docker/compose.bench.yaml`](/Users/ruiperes/Code/fantasma/infra/docker/compose.bench.yaml), which keeps the normal stack topology but runs under the dedicated `fantasma-bench` Compose project, exposes only benchmark-only host ports, lowers the worker poll interval to `50ms`, and raises the worker batch size to `1000`
+- benchmark runs use [`infra/docker/compose.bench.yaml`](../infra/docker/compose.bench.yaml), which keeps the normal stack topology but runs under the dedicated `fantasma-bench` Compose project, exposes only benchmark-only host ports, lowers the worker poll interval to `50ms`, and raises the worker batch size to `1000`
 - budget tightening should use GitHub runner medians from repeated workflow runs, not a single local-machine benchmark
 - minimum throughput budgets use the retained GitHub runner median with `20%` slack below it
 - maximum readiness and query budgets use the retained GitHub runner median with `20%` slack above it, but never undershoot the slowest retained sample on the same runner class
@@ -93,5 +93,5 @@ That keeps local benchmark runs from tearing down or colliding with the default 
 
 GitHub Actions runs the numeric benchmark workflow on pushes to `main` and on `workflow_dispatch`:
 
-- workflow: [`performance.yml`](/Users/ruiperes/Code/fantasma/.github/workflows/performance.yml)
+- workflow: [`performance.yml`](../.github/workflows/performance.yml)
 - artifacts: per-scenario JSON and Markdown summaries uploaded from `artifacts/performance/`

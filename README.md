@@ -1,4 +1,4 @@
-# Fantasma
+# Fantasma 👻
 
 Fantasma is a self-hosted, privacy-first mobile analytics platform.
 
@@ -45,7 +45,7 @@ else.
 This README is the canonical public product statement. Keep it high-level.
 Technical and operational details belong in the docs below.
 
-- Deployment: [`docs/deployment.md`](/Users/ruiperes/Code/fantasma/docs/deployment.md)
-- Architecture: [`docs/architecture.md`](/Users/ruiperes/Code/fantasma/docs/architecture.md)
-- Project status: [`docs/STATUS.md`](/Users/ruiperes/Code/fantasma/docs/STATUS.md)
-- Contributor rules: [`AGENTS.md`](/Users/ruiperes/Code/fantasma/AGENTS.md)
+- Deployment: [`docs/deployment.md`](docs/deployment.md)
+- Architecture: [`docs/architecture.md`](docs/architecture.md)
+- Project status: [`docs/STATUS.md`](docs/STATUS.md)
+- Contributor rules: [`AGENTS.md`](AGENTS.md)

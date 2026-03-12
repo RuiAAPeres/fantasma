@@ -106,8 +106,8 @@ Test taxonomy:
 
 Fantasma keeps numeric stack benchmarks separate from the normal smoke path:
 
-- benchmark Compose file: [`infra/docker/compose.bench.yaml`](/Users/ruiperes/Code/fantasma/infra/docker/compose.bench.yaml)
-- benchmark docs and commands: [`docs/performance.md`](/Users/ruiperes/Code/fantasma/docs/performance.md)
+- benchmark Compose file: [`infra/docker/compose.bench.yaml`](../infra/docker/compose.bench.yaml)
+- benchmark docs and commands: [`docs/performance.md`](performance.md)
 
 The benchmark stack keeps the same services as local development, but it runs under its own Compose project (`fantasma-bench`), uses benchmark-only host ports (`18081` / `18082`), does not publish Postgres on the host, and lowers the worker poll interval so derive-lag measurements are meaningful instead of dominated by the default 5-second sleep.
 
