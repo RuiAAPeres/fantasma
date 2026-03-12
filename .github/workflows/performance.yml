@@ -26,6 +26,9 @@ on:
           - ci
           - extended
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   hot-path:
     name: Hot Path Benchmark
@@ -59,6 +62,43 @@ jobs:
         run: |
           if [ -f artifacts/performance/hot-path.md ]; then
             cat artifacts/performance/hot-path.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish hot-path annotations
+        if: always()
+        run: |
+          if [ -f artifacts/performance/hot-path.json ]; then
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          result = json.loads(Path("artifacts/performance/hot-path.json").read_text())
+
+          def emit(title: str, message: str) -> None:
+              escaped = (
+                  message.replace("%", "%25")
+                  .replace("\r", "%0D")
+                  .replace("\n", "%0A")
+              )
+              print(f"::notice title={title}::{escaped}")
+
+          phase_summary = ", ".join(
+              f"{phase['name']}={phase['events_per_second']:.2f} events/s"
+              for phase in result["phases"]
+          )
+          readiness_summary = ", ".join(
+              f"{readiness['name']}={readiness['elapsed_ms']}ms"
+              for readiness in result["readiness"]
+          )
+          query_summary = ", ".join(
+              f"{query['name']}={query['p95_ms']}ms p95"
+              for query in result["queries"]
+          )
+
+          emit("hot-path throughput", phase_summary)
+          emit("hot-path readiness", readiness_summary)
+          emit("hot-path query p95", query_summary)
+          PY
           fi
 
       - name: Upload hot-path artifacts
@@ -103,6 +143,43 @@ jobs:
             cat artifacts/performance/repair-path.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Publish repair-path annotations
+        if: always()
+        run: |
+          if [ -f artifacts/performance/repair-path.json ]; then
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          result = json.loads(Path("artifacts/performance/repair-path.json").read_text())
+
+          def emit(title: str, message: str) -> None:
+              escaped = (
+                  message.replace("%", "%25")
+                  .replace("\r", "%0D")
+                  .replace("\n", "%0A")
+              )
+              print(f"::notice title={title}::{escaped}")
+
+          phase_summary = ", ".join(
+              f"{phase['name']}={phase['events_per_second']:.2f} events/s"
+              for phase in result["phases"]
+          )
+          readiness_summary = ", ".join(
+              f"{readiness['name']}={readiness['elapsed_ms']}ms"
+              for readiness in result["readiness"]
+          )
+          query_summary = ", ".join(
+              f"{query['name']}={query['p95_ms']}ms p95"
+              for query in result["queries"]
+          )
+
+          emit("repair-path throughput", phase_summary)
+          emit("repair-path readiness", readiness_summary)
+          emit("repair-path query p95", query_summary)
+          PY
+          fi
+
       - name: Upload repair-path artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -143,6 +220,43 @@ jobs:
         run: |
           if [ -f artifacts/performance/scale-path.md ]; then
             cat artifacts/performance/scale-path.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish scale-path annotations
+        if: always()
+        run: |
+          if [ -f artifacts/performance/scale-path.json ]; then
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          result = json.loads(Path("artifacts/performance/scale-path.json").read_text())
+
+          def emit(title: str, message: str) -> None:
+              escaped = (
+                  message.replace("%", "%25")
+                  .replace("\r", "%0D")
+                  .replace("\n", "%0A")
+              )
+              print(f"::notice title={title}::{escaped}")
+
+          phase_summary = ", ".join(
+              f"{phase['name']}={phase['events_per_second']:.2f} events/s"
+              for phase in result["phases"]
+          )
+          readiness_summary = ", ".join(
+              f"{readiness['name']}={readiness['elapsed_ms']}ms"
+              for readiness in result["readiness"]
+          )
+          query_summary = ", ".join(
+              f"{query['name']}={query['p95_ms']}ms p95"
+              for query in result["queries"]
+          )
+
+          emit("scale-path throughput", phase_summary)
+          emit("scale-path readiness", readiness_summary)
+          emit("scale-path query p95", query_summary)
+          PY
           fi
 
       - name: Upload scale-path artifacts
