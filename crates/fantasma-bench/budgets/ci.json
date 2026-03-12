@@ -1,46 +1,46 @@
 {
   "hot-path": {
     "min_phase_events_per_second": {
-      "ingest": 1000.0
+      "ingest": 9829.28
     },
     "max_readiness_ms": {
-      "derived_metrics_ready": 2000
+      "derived_metrics_ready": 728
     },
     "max_query_p95_ms": {
-      "events_aggregate_dim3": 100,
-      "events_daily_dim3": 100,
-      "sessions_count_daily": 100,
-      "sessions_duration_total_daily": 100
+      "events_aggregate_dim3": 3,
+      "events_daily_dim3": 4,
+      "sessions_count_daily": 1,
+      "sessions_duration_total_daily": 1
     }
   },
   "repair-path": {
     "min_phase_events_per_second": {
-      "seed_ingest": 1000.0,
-      "repair_ingest": 500.0
+      "seed_ingest": 8844.07,
+      "repair_ingest": 10023.25
     },
     "max_readiness_ms": {
-      "seed_ready": 2000,
-      "repair_ready": 2000
+      "seed_ready": 407,
+      "repair_ready": 410
     },
     "max_query_p95_ms": {
-      "events_aggregate_dim3": 100,
-      "events_daily_dim3": 100,
-      "sessions_count_daily": 100,
-      "sessions_duration_total_daily": 100
+      "events_aggregate_dim3": 4,
+      "events_daily_dim3": 4,
+      "sessions_count_daily": 1,
+      "sessions_duration_total_daily": 1
     }
   },
   "scale-path": {
     "min_phase_events_per_second": {
-      "ingest": 1000.0
+      "ingest": 9439.63
     },
     "max_readiness_ms": {
-      "derived_metrics_ready": 15000
+      "derived_metrics_ready": 16276
     },
     "max_query_p95_ms": {
-      "events_aggregate_dim3": 400,
-      "events_daily_dim3": 400,
-      "sessions_count_daily": 200,
-      "sessions_duration_total_daily": 200
+      "events_aggregate_dim3": 9,
+      "events_daily_dim3": 10,
+      "sessions_count_daily": 1,
+      "sessions_duration_total_daily": 2
     }
   }
 }
