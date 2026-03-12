@@ -79,6 +79,9 @@ Fantasma now expects Codex agents to use the installed `superpowers` skills when
 
 - Use `writing-plans` before starting multi-step feature or refactor work. Save plans under `docs/superpowers/plans/` unless the task clearly does not need one.
 - Use `subagent-driven-development` when executing a plan with separable tasks in the current session.
+- When the user reports a bug, do not start by patching code. First write a test that reproduces the bug.
+- After the reproducing test exists, use subagents to investigate and attempt fixes when that can reduce iteration time.
+- Do not call a bug fixed unless the reproducing test passes after the change.
 - Use `systematic-debugging` for defects, flaky tests, or unexpected runtime behavior instead of guessing at fixes.
 - Use `verification-before-completion` before claiming work is done, fixed, or passing. Do not report success without fresh command output.
 - Use `requesting-code-review` or `receiving-code-review` when preparing or responding to substantive review cycles.
