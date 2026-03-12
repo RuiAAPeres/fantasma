@@ -81,7 +81,7 @@ Current aggregate ownership:
 - `sessions` stores immutable closed sessions plus one mutable tail session per install
 - `install_session_state` is the worker's steady-state decision surface for sessionization
 - `session_daily` stores UTC `DATE` buckets for `sessions_count`, `active_installs`, and `total_duration_seconds`
-- `session_daily_installs` stores per-day install membership and session counts so `active_installs_daily` stays incremental
+- `session_daily_installs` stores per-day install membership and session counts so internal daily active-install aggregates stay incremental without `COUNT(DISTINCT ...)` rebuilds
 
 Current public daily metric scope:
 

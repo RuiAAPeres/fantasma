@@ -105,7 +105,7 @@ Run the preflighted smoke script:
 ./scripts/compose-smoke.sh
 ```
 
-The smoke script uses a disposable Compose project, waits for the ingest and API `/health` endpoints before sending events, and validates only the currently supported public daily metrics.
+The smoke script uses a disposable Compose project name, waits for the ingest and API `/health` endpoints before sending events, and validates only the currently supported public daily metrics. It still binds the standard local ports on `localhost`.
 
 Manual flow:
 
