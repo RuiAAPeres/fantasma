@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, to_bytes},
@@ -453,12 +453,13 @@ async fn pipeline_keeps_grouped_event_metrics_daily_queries_200_during_worker_ca
             if processed == 0 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });
 
     let query = "/v1/metrics/events/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-04-01&end_date=2026-04-01&platform=ios&group_by=provider&group_by=region";
     let mut saw_internal_server_error = false;
+    let mut query_count = 0;
 
     while !worker.is_finished() {
         let response = api
@@ -471,6 +472,7 @@ async fn pipeline_keeps_grouped_event_metrics_daily_queries_200_during_worker_ca
             )
             .await
             .expect("daily query succeeds");
+        query_count += 1;
 
         if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
             saw_internal_server_error = true;
@@ -482,6 +484,10 @@ async fn pipeline_keeps_grouped_event_metrics_daily_queries_200_during_worker_ca
 
     worker.await.expect("worker task joins");
 
+    assert!(
+        query_count > 0,
+        "the regression must issue at least one grouped metrics request during worker catch-up"
+    );
     assert!(
         !saw_internal_server_error,
         "grouped daily event metrics queries should never return internal_server_error while the worker commits bounded batches"

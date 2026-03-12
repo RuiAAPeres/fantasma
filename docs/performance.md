@@ -24,7 +24,7 @@ The new planner checks live in the DB-backed Rust test path, so run them through
 ```
 
 ```bash
-cargo test -p fantasma-worker event_metrics_rollups_stay_bounded
+cargo test -p fantasma-worker max_dimension_event_metrics_fanout_stays_bounded
 ```
 
 ## Stack Benchmarks
@@ -52,6 +52,13 @@ Each run writes:
 - a JSON result file at the requested `--output` path
 - a sibling Markdown summary with the same basename and `.md` extension
 
+The benchmark harness runs the stack in its own Compose project (`fantasma-bench`) and uses benchmark-only host ports:
+
+- ingest: `http://127.0.0.1:18081`
+- API: `http://127.0.0.1:18082`
+
+That keeps local benchmark runs from tearing down or colliding with the default development stack on `8081` / `8082`.
+
 ## Workloads
 
 `hot-path`
@@ -76,7 +83,7 @@ Each run writes:
 
 - `ci` uses enforced thresholds from [`crates/fantasma-bench/budgets/ci.json`](/Users/ruiperes/Code/fantasma/crates/fantasma-bench/budgets/ci.json)
 - `extended` runs the same scenarios but skips threshold enforcement and is intended for manual investigation
-- benchmark runs use [`infra/docker/compose.bench.yaml`](/Users/ruiperes/Code/fantasma/infra/docker/compose.bench.yaml), which keeps the normal stack topology but lowers the worker poll interval to `50ms` and raises the worker batch size to `1000`
+- benchmark runs use [`infra/docker/compose.bench.yaml`](/Users/ruiperes/Code/fantasma/infra/docker/compose.bench.yaml), which keeps the normal stack topology but runs under the dedicated `fantasma-bench` Compose project, exposes only benchmark-only host ports, lowers the worker poll interval to `50ms`, and raises the worker batch size to `1000`
 - budget tightening should use GitHub runner medians from repeated workflow runs, not a single local-machine benchmark
 - minimum throughput budgets use the retained GitHub runner median with `20%` slack below it
 - maximum readiness and query budgets use the retained GitHub runner median with `20%` slack above it, but never undershoot the slowest retained sample on the same runner class

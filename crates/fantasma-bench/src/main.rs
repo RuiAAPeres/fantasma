@@ -16,8 +16,9 @@ use serde_json::Value;
 const PROJECT_ID: &str = "9bad8b88-5e7a-44ed-98ce-4cf9ddde713a";
 const INGEST_KEY: &str = "fg_ing_test";
 const ADMIN_TOKEN: &str = "fg_pat_dev";
-const INGEST_BASE_URL: &str = "http://127.0.0.1:8081";
-const API_BASE_URL: &str = "http://127.0.0.1:8082";
+const BENCHMARK_COMPOSE_PROJECT_NAME: &str = "fantasma-bench";
+const INGEST_BASE_URL: &str = "http://127.0.0.1:18081";
+const API_BASE_URL: &str = "http://127.0.0.1:18082";
 const POST_BATCH_SIZE: usize = 100;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -458,7 +459,7 @@ fn throughput(events_sent: usize, elapsed: Duration) -> f64 {
 async fn post_batches(client: &Client, batches: &[Vec<BenchEvent>]) -> Result<()> {
     for batch in batches {
         let response = client
-            .post(format!("{INGEST_BASE_URL}/v1/events"))
+            .post(format!("{}/v1/events", benchmark_ingest_base_url()))
             .header("x-fantasma-key", INGEST_KEY)
             .json(&EventBatch { events: batch })
             .send()
@@ -479,13 +480,13 @@ async fn wait_for_health(client: &Client) -> Result<()> {
     poll_until(
         || async {
             let ingest = client
-                .get(format!("{INGEST_BASE_URL}/health"))
+                .get(format!("{}/health", benchmark_ingest_base_url()))
                 .send()
                 .await
                 .ok()
                 .is_some_and(|response| response.status() == StatusCode::OK);
             let api = client
-                .get(format!("{API_BASE_URL}/health"))
+                .get(format!("{}/health", benchmark_api_base_url()))
                 .send()
                 .await
                 .ok()
@@ -914,25 +915,29 @@ fn hot_path_query_urls() -> HashMap<&'static str, String> {
         (
             "events_aggregate_dim3",
             format!(
-                "{API_BASE_URL}/v1/metrics/events/aggregate?project_id={PROJECT_ID}&event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider&group_by=region"
+                "{}/v1/metrics/events/aggregate?project_id={PROJECT_ID}&event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider&group_by=region",
+                benchmark_api_base_url()
             ),
         ),
         (
             "events_daily_dim3",
             format!(
-                "{API_BASE_URL}/v1/metrics/events/daily?project_id={PROJECT_ID}&event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider&group_by=region"
+                "{}/v1/metrics/events/daily?project_id={PROJECT_ID}&event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider&group_by=region",
+                benchmark_api_base_url()
             ),
         ),
         (
             "sessions_count_daily",
             format!(
-                "{API_BASE_URL}/v1/metrics/sessions/count/daily?project_id={PROJECT_ID}&start_date=2026-03-01&end_date=2026-03-01"
+                "{}/v1/metrics/sessions/count/daily?project_id={PROJECT_ID}&start_date=2026-03-01&end_date=2026-03-01",
+                benchmark_api_base_url()
             ),
         ),
         (
             "sessions_duration_total_daily",
             format!(
-                "{API_BASE_URL}/v1/metrics/sessions/duration/total/daily?project_id={PROJECT_ID}&start_date=2026-03-01&end_date=2026-03-01"
+                "{}/v1/metrics/sessions/duration/total/daily?project_id={PROJECT_ID}&start_date=2026-03-01&end_date=2026-03-01",
+                benchmark_api_base_url()
             ),
         ),
     ])
@@ -943,25 +948,29 @@ fn repair_path_query_urls() -> HashMap<&'static str, String> {
         (
             "events_aggregate_dim3",
             format!(
-                "{API_BASE_URL}/v1/metrics/events/aggregate?project_id={PROJECT_ID}&event=app_open&start_date=2026-01-01&end_date=2026-01-03&platform=ios&group_by=provider&group_by=region"
+                "{}/v1/metrics/events/aggregate?project_id={PROJECT_ID}&event=app_open&start_date=2026-01-01&end_date=2026-01-03&platform=ios&group_by=provider&group_by=region",
+                benchmark_api_base_url()
             ),
         ),
         (
             "events_daily_dim3",
             format!(
-                "{API_BASE_URL}/v1/metrics/events/daily?project_id={PROJECT_ID}&event=app_open&start_date=2026-01-01&end_date=2026-01-03&platform=ios&group_by=provider&group_by=region"
+                "{}/v1/metrics/events/daily?project_id={PROJECT_ID}&event=app_open&start_date=2026-01-01&end_date=2026-01-03&platform=ios&group_by=provider&group_by=region",
+                benchmark_api_base_url()
             ),
         ),
         (
             "sessions_count_daily",
             format!(
-                "{API_BASE_URL}/v1/metrics/sessions/count/daily?project_id={PROJECT_ID}&start_date=2026-01-01&end_date=2026-01-03"
+                "{}/v1/metrics/sessions/count/daily?project_id={PROJECT_ID}&start_date=2026-01-01&end_date=2026-01-03",
+                benchmark_api_base_url()
             ),
         ),
         (
             "sessions_duration_total_daily",
             format!(
-                "{API_BASE_URL}/v1/metrics/sessions/duration/total/daily?project_id={PROJECT_ID}&start_date=2026-01-01&end_date=2026-01-03"
+                "{}/v1/metrics/sessions/duration/total/daily?project_id={PROJECT_ID}&start_date=2026-01-01&end_date=2026-01-03",
+                benchmark_api_base_url()
             ),
         ),
     ])
@@ -975,25 +984,29 @@ fn scale_path_query_urls(
         (
             "events_aggregate_dim3",
             format!(
-                "{API_BASE_URL}/v1/metrics/events/aggregate?project_id={PROJECT_ID}&event=app_open&start_date={start_day}&end_date={end_day}&platform=ios&group_by=provider&group_by=region"
+                "{}/v1/metrics/events/aggregate?project_id={PROJECT_ID}&event=app_open&start_date={start_day}&end_date={end_day}&platform=ios&group_by=provider&group_by=region",
+                benchmark_api_base_url()
             ),
         ),
         (
             "events_daily_dim3",
             format!(
-                "{API_BASE_URL}/v1/metrics/events/daily?project_id={PROJECT_ID}&event=app_open&start_date={start_day}&end_date={end_day}&platform=ios&group_by=provider&group_by=region"
+                "{}/v1/metrics/events/daily?project_id={PROJECT_ID}&event=app_open&start_date={start_day}&end_date={end_day}&platform=ios&group_by=provider&group_by=region",
+                benchmark_api_base_url()
             ),
         ),
         (
             "sessions_count_daily",
             format!(
-                "{API_BASE_URL}/v1/metrics/sessions/count/daily?project_id={PROJECT_ID}&start_date={start_day}&end_date={end_day}"
+                "{}/v1/metrics/sessions/count/daily?project_id={PROJECT_ID}&start_date={start_day}&end_date={end_day}",
+                benchmark_api_base_url()
             ),
         ),
         (
             "sessions_duration_total_daily",
             format!(
-                "{API_BASE_URL}/v1/metrics/sessions/duration/total/daily?project_id={PROJECT_ID}&start_date={start_day}&end_date={end_day}"
+                "{}/v1/metrics/sessions/duration/total/daily?project_id={PROJECT_ID}&start_date={start_day}&end_date={end_day}",
+                benchmark_api_base_url()
             ),
         ),
     ])
@@ -1132,6 +1145,18 @@ fn compose_file_path() -> PathBuf {
     repo_root().join("infra/docker/compose.bench.yaml")
 }
 
+fn benchmark_compose_project_name() -> &'static str {
+    BENCHMARK_COMPOSE_PROJECT_NAME
+}
+
+fn benchmark_ingest_base_url() -> &'static str {
+    INGEST_BASE_URL
+}
+
+fn benchmark_api_base_url() -> &'static str {
+    API_BASE_URL
+}
+
 fn budget_file_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("budgets/ci.json")
 }
@@ -1158,19 +1183,7 @@ impl StackGuard {
     }
 
     fn start(&mut self) -> Result<()> {
-        run_command(Command::new("docker").arg("info"))?;
-        run_best_effort(
-            Command::new("docker")
-                .args(["compose", "-f"])
-                .arg(&self.compose_file)
-                .args(["down", "--volumes", "--remove-orphans"]),
-        );
-        run_command(
-            Command::new("docker")
-                .args(["compose", "-f"])
-                .arg(&self.compose_file)
-                .args(["up", "-d", "--build"]),
-        )?;
+        prepare_stack(&self.compose_file, run_command)?;
         self.started = true;
         Ok(())
     }
@@ -1179,14 +1192,43 @@ impl StackGuard {
 impl Drop for StackGuard {
     fn drop(&mut self) {
         if self.started {
-            run_best_effort(
-                Command::new("docker")
-                    .args(["compose", "-f"])
-                    .arg(&self.compose_file)
-                    .args(["down", "--volumes", "--remove-orphans"]),
-            );
+            run_best_effort(&mut docker_compose_command(
+                &self.compose_file,
+                ["down", "--volumes", "--remove-orphans"],
+            ));
         }
     }
+}
+
+fn prepare_stack<F>(compose_file: &Path, mut runner: F) -> Result<()>
+where
+    F: FnMut(&mut Command) -> Result<()>,
+{
+    runner(Command::new("docker").arg("info"))?;
+    runner(&mut docker_compose_command(
+        compose_file,
+        ["down", "--volumes", "--remove-orphans"],
+    ))?;
+    runner(&mut docker_compose_command(
+        compose_file,
+        ["up", "-d", "--build"],
+    ))?;
+    Ok(())
+}
+
+fn docker_compose_command(
+    compose_file: &Path,
+    args: impl IntoIterator<Item = &'static str>,
+) -> Command {
+    let mut command = Command::new("docker");
+    command
+        .arg("compose")
+        .arg("-p")
+        .arg(benchmark_compose_project_name())
+        .arg("-f")
+        .arg(compose_file);
+    command.args(args);
+    command
 }
 
 fn run_command(command: &mut Command) -> Result<()> {
@@ -1210,6 +1252,17 @@ fn run_best_effort(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
+
+    fn snapshot_command(command: &Command) -> Vec<String> {
+        std::iter::once(command.get_program().to_string_lossy().into_owned())
+            .chain(
+                command
+                    .get_args()
+                    .map(|argument| argument.to_string_lossy().into_owned()),
+            )
+            .collect()
+    }
 
     #[test]
     fn parse_stack_command_reads_scenario_profile_and_output() {
@@ -1309,5 +1362,88 @@ mod tests {
 
         assert_eq!(percentile(&samples, 0.50), 20);
         assert_eq!(percentile(&samples, 0.95), 40);
+    }
+
+    #[test]
+    fn prepare_stack_scopes_compose_commands_to_benchmark_project() {
+        let compose_file = PathBuf::from("/tmp/compose.bench.yaml");
+        let mut seen = Vec::<Vec<String>>::new();
+
+        prepare_stack(&compose_file, |command| {
+            seen.push(snapshot_command(command));
+            Ok(())
+        })
+        .expect("prepare stack succeeds");
+
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0], vec!["docker".to_owned(), "info".to_owned()]);
+        assert_eq!(
+            seen[1],
+            vec![
+                "docker".to_owned(),
+                "compose".to_owned(),
+                "-p".to_owned(),
+                benchmark_compose_project_name().to_owned(),
+                "-f".to_owned(),
+                compose_file.display().to_string(),
+                "down".to_owned(),
+                "--volumes".to_owned(),
+                "--remove-orphans".to_owned(),
+            ]
+        );
+        assert_eq!(
+            seen[2],
+            vec![
+                "docker".to_owned(),
+                "compose".to_owned(),
+                "-p".to_owned(),
+                benchmark_compose_project_name().to_owned(),
+                "-f".to_owned(),
+                compose_file.display().to_string(),
+                "up".to_owned(),
+                "-d".to_owned(),
+                "--build".to_owned(),
+            ]
+        );
+        assert_eq!(benchmark_ingest_base_url(), "http://127.0.0.1:18081");
+        assert_eq!(benchmark_api_base_url(), "http://127.0.0.1:18082");
+    }
+
+    #[test]
+    fn prepare_stack_stops_before_up_when_cleanup_fails() {
+        let compose_file = PathBuf::from("/tmp/compose.bench.yaml");
+        let mut seen = Vec::<Vec<String>>::new();
+
+        let error = prepare_stack(&compose_file, |command| {
+            let snapshot = snapshot_command(command);
+            let is_cleanup = snapshot.iter().any(|argument| argument == "down");
+            seen.push(snapshot);
+            if is_cleanup {
+                return Err(anyhow!("cleanup failed"));
+            }
+
+            Ok(())
+        })
+        .expect_err("cleanup failure should abort startup");
+
+        assert_eq!(seen.len(), 2, "startup must stop before docker compose up");
+        assert_eq!(
+            seen.last().expect("cleanup command recorded"),
+            &vec![
+                "docker".to_owned(),
+                "compose".to_owned(),
+                "-p".to_owned(),
+                benchmark_compose_project_name().to_owned(),
+                "-f".to_owned(),
+                compose_file.display().to_string(),
+                "down".to_owned(),
+                "--volumes".to_owned(),
+                "--remove-orphans".to_owned(),
+            ]
+        );
+        assert!(
+            error.to_string().contains("cleanup failed"),
+            "unexpected error: {error:#}"
+        );
     }
 }
