@@ -2,7 +2,7 @@
 
 ## Active
 
-- Local environment recovery: Docker Desktop content-store and Postgres data files are returning input/output errors in the current machine state, so the new Compose smoke script still needs one clean run after disk space and Docker health are restored.
+- No active implementation work is recorded in this snapshot.
 
 ## Engineering Ethos
 
@@ -22,7 +22,7 @@
 - Extracted reusable library entrypoints for ingest, API, and worker batch processing so in-process end-to-end tests can drive `POST /v1/events`, run one worker batch, and query daily metrics without spawning services.
 - Added a preflighted Compose smoke script that checks disk and Docker availability, ingests sample events, polls the daily metrics endpoint, and dumps logs on timeout.
 - Recorded the repository preference that DB-backed Rust tests should run fully in Docker, with workspace Postgres tests separated from stack-level smoke verification.
-- Added a dedicated Docker test workflow with `infra/docker/compose.test.yaml`, `infra/docker/Dockerfile.test`, and `./scripts/docker-test.sh` so DB-backed Rust tests can run fully inside Docker against containerized Postgres using `sqlx::test`.
+- Added a dedicated Docker test workflow with `infra/docker/compose.test.yaml`, `infra/docker/Dockerfile.test`, and `./scripts/docker-test.sh` so DB-backed Rust tests can run fully inside Docker against containerized Postgres using `sqlx::test`, without requiring host-user writes to the Cargo cache volumes.
 - Added DB-backed store and worker tests for tail state persistence, bounded out-of-order repair, exact-day daily rebuilds, checkpoint round-trips, incremental daily metric updates, and daily install-membership tracking.
 - Updated OpenAPI, architecture, deployment docs, and CI so the repository documents and tests the `events_raw -> worker -> sessions -> metrics API` slice.
 - Updated `AGENTS.md` to align Fantasma's agent workflow with the installed `superpowers` skills, including expectations for planning, debugging, verification, subagent execution, and review.
@@ -46,8 +46,6 @@
 
 ## Next
 
-- Restore local Docker/Postgres health, then rerun `./scripts/compose-smoke.sh` and the full ingest -> worker -> `session_daily` -> API verification in a healthy environment.
-- Rerun `./scripts/docker-test.sh` once the local Docker daemon is responsive enough to execute Compose commands end to end and record the first successful Docker-backed store/worker exact-day repair run.
 - Run the end-to-end iOS Simulator smoke test against the local stack and confirm the demo app drives both the raw-event and derived-session endpoints as expected.
 - Start the next aggregate slice only if it can follow the same explicit incremental-processing model, likely screen views or release adoption.
 

@@ -105,6 +105,8 @@ Run the preflighted smoke script:
 ./scripts/compose-smoke.sh
 ```
 
+The smoke script uses a disposable Compose project, waits for the ingest and API `/health` endpoints before sending events, and validates only the currently supported public daily metrics.
+
 Manual flow:
 
 ```bash
