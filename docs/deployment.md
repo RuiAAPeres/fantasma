@@ -19,7 +19,9 @@ The current vertical slice Compose setup includes:
 Current repository files:
 
 - Compose file: `infra/docker/compose.yaml`
+- Docker test Compose file: `infra/docker/compose.test.yaml`
 - Service images: `infra/docker/Dockerfile.ingest`, `infra/docker/Dockerfile.api`, `infra/docker/Dockerfile.worker`
+- Docker test image: `infra/docker/Dockerfile.test`
 
 ## Deployment Principles
 
@@ -27,6 +29,15 @@ Current repository files:
 - Avoid optional infrastructure in v1 unless required by a concrete bottleneck.
 - Make it easy to run locally and in a simple self-hosted environment.
 - Keep configuration explicit through environment variables.
+
+Operational guidance:
+
+- Fantasma prefers simple, explicit, high-performance data paths.
+- We avoid steady-state designs that rely on broad recomputation.
+- We narrow feature shape when necessary to preserve predictable performance and operational clarity.
+- Correctness still matters, but we should choose correctness models that compose with incremental processing.
+- DB-backed Rust tests are expected to run fully in Docker through the repository workflow.
+- Keep workspace tests on the Docker Postgres path limited to cases satisfied by Postgres alone; stack-dependent checks stay in dedicated smoke workflows.
 
 ## Planned Environment Variables
 
@@ -45,20 +56,56 @@ Service-specific examples:
 - `FANTASMA_WORKER_POLL_INTERVAL_MS`
 - `FANTASMA_WORKER_BATCH_SIZE`
 
-## Startup Bootstrap
+## Startup Schema Preparation
 
 On startup, `fantasma-ingest`, `fantasma-api`, and `fantasma-worker` all:
 
 - connect to Postgres using a pooled connection
-- create `projects`, `api_keys`, `events_raw`, `sessions`, and `worker_offsets` if they do not exist
-- create the initial raw-event and session indexes
-- seed the local development project plus ingest key from environment variables
+- run SQL migrations from `crates/fantasma-store/migrations/`
+- optionally seed the local development project plus ingest key when seed environment variables are present
 
-This keeps the first vertical slice self-contained without separate migration tooling.
+The schema is owned by `fantasma-store` through `sqlx::migrate!()`, while local project seeding stays explicit.
+
+## Local Preconditions
+
+Reliable local verification currently requires:
+
+- enough free disk for Cargo, Docker layers, and Postgres data
+- a healthy Docker daemon
+
+The current machine state that prompted this work had both Docker I/O failures and very low free space. Use the smoke script below as the first preflight check.
+
+## Local Docker Workspace Tests
+
+Run DB-backed Rust tests fully inside Docker:
+
+```bash
+./scripts/docker-test.sh
+```
+
+The Docker test workflow uses:
+
+- `infra/docker/compose.test.yaml`
+- a disposable Postgres container with health checks
+- `DATABASE_URL=postgres://fantasma:fantasma@postgres:5432/postgres`
+- the `fantasma` role as the `sqlx::test` bootstrap user, which must retain `CREATEDB`
+
+The Docker test runner mounts the current checkout and keeps Cargo caches outside the repository tree. By default it tears down containers on exit with `docker compose down --remove-orphans`. Set `FANTASMA_DOCKER_TEST_KEEP_CONTAINERS=1` to keep containers around for debugging after a failure.
+
+Test taxonomy:
+
+- `./scripts/docker-test.sh` is the canonical path for Rust workspace tests that need Postgres
+- `./scripts/compose-smoke.sh` is for running-stack verification and should stay separate from workspace `cargo test`
 
 ## Local Smoke Test
 
-Start the stack:
+Run the preflighted smoke script:
+
+```bash
+./scripts/compose-smoke.sh
+```
+
+Manual flow:
 
 ```bash
 docker compose -f infra/docker/compose.yaml up --build
@@ -90,7 +137,7 @@ curl "http://localhost:8082/v1/metrics/events/count?project_id=9bad8b88-5e7a-44e
   -H "Authorization: Bearer fg_pat_dev"
 ```
 
-Wait for one worker poll, then query the derived session metrics:
+Query the derived session metrics after the worker has processed the new raw events:
 
 ```bash
 curl "http://localhost:8082/v1/metrics/sessions/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
@@ -106,6 +153,19 @@ curl "http://localhost:8082/v1/metrics/sessions/duration?project_id=9bad8b88-5e7
 curl "http://localhost:8082/v1/metrics/active-installs?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
   -H "Authorization: Bearer fg_pat_dev"
 ```
+
+Poll the daily endpoint until the expected data appears or the timeout expires:
+
+```bash
+curl "http://localhost:8082/v1/metrics/sessions/count/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
+  -H "Authorization: Bearer fg_pat_dev"
+```
+
+The daily routes use inclusive UTC date bounds:
+
+- `/v1/metrics/sessions/count/daily`
+- `/v1/metrics/active-installs/daily`
+- `/v1/metrics/sessions/duration/total/daily`
 
 ## iOS Demo App
 

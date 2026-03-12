@@ -8,6 +8,10 @@
 - APIs are public by default.
 - SDK behavior must be explicit.
 - Deployment must stay simple.
+- Fantasma prefers simple, explicit, high-performance data paths.
+- We avoid steady-state designs that rely on broad recomputation.
+- We narrow feature shape when necessary to preserve predictable performance and operational clarity.
+- Correctness still matters, but we should choose correctness models that compose with incremental processing.
 
 ## High-Level Flow
 
@@ -17,8 +21,8 @@ curl / SDK
   -> Rust ingest service
   -> append-only Postgres events_raw table
   -> fantasma-worker
-  -> derived Postgres sessions table
-  -> GET /v1/metrics/sessions/*
+  -> derived Postgres sessions, session_daily, and session_daily_installs tables
+  -> GET /v1/metrics/sessions/* and /v1/metrics/*/daily
   -> query API
 ```
 
@@ -52,19 +56,33 @@ Responsibilities:
 Current derived metric:
 
 - sessions
+- session_daily
+- session_daily_installs
 
 Current worker behavior:
 
 - poll `events_raw` in batches ordered by raw event id
 - group events by `project_id` and `install_id`
+- load one persisted tail state row per `(project_id, install_id)` from `install_session_state`
+- sort each install batch by `(timestamp, id)` and process forward only
 - infer sessions from event timestamps with a 30-minute inactivity rule
-- upsert derived rows into `sessions`
+- keep at most one mutable tail session per install
+- extend the current tail session in place when a new event is newer than or equal to the tail end and inside the inactivity window
+- insert a new immutable session row and replace tail state when a new event exceeds the inactivity window
+- leave older-than-tail raw events in `events_raw` without rewriting historical `sessions`
+- update `session_daily` incrementally from session inserts and tail-session duration deltas
+- update `session_daily_installs` incrementally so daily active installs never depend on `COUNT(DISTINCT ...)` rebuilds
 - advance a `worker_offsets` checkpoint only after successful writes
-- perform bounded recompute for the latest eligible install tail session using timestamp windows
+
+Current aggregate ownership:
+
+- `sessions` stores immutable closed sessions plus one mutable tail session per install
+- `install_session_state` is the worker's steady-state decision surface for sessionization
+- `session_daily` stores UTC `DATE` buckets for `sessions_count`, `active_installs`, and `total_duration_seconds`
+- `session_daily_installs` stores per-day install membership and session counts so `active_installs_daily` stays incremental
 
 Planned aggregates:
 
-- daily active users
 - screen views by day
 - retention cohorts
 - version adoption
@@ -86,6 +104,7 @@ Core persisted concepts:
 - `api_keys`
 - `events_raw`
 - `sessions`
+- `session_daily`
 - `worker_offsets`
 - aggregate tables keyed by project, metric window, and dimensions
 

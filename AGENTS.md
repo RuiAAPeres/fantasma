@@ -43,6 +43,8 @@ Do not add scope beyond the product vision without an explicit decision:
 - Do not perform synchronous aggregation in the ingest path.
 - Do not add hidden enrichment or automatic identity stitching.
 - Scope all persisted data by `project_id`.
+- DB-backed Rust tests should run fully in Docker through the repository workflow rather than host Postgres or ad hoc host `DATABASE_URL` setup.
+- Keep `cargo test --workspace` on the Docker Postgres path limited to tests satisfied by containerized Postgres alone; stack-level checks belong in dedicated smoke workflows.
 
 ## SDK Rules
 
@@ -103,6 +105,10 @@ When starting from a thin repository, follow this order unless there is a clear 
 
 ## Engineering Rules
 
+- Fantasma prefers simple, explicit, high-performance data paths.
+- We avoid steady-state designs that rely on broad recomputation.
+- We narrow feature shape when necessary to preserve predictable performance and operational clarity.
+- Correctness still matters, but we should choose correctness models that compose with incremental processing.
 - Favor typed crate-level errors with `thiserror` in libraries.
 - Reserve `anyhow` for binaries.
 - Prefer simple interfaces over clever abstractions.

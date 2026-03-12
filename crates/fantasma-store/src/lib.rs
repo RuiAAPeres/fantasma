@@ -1,15 +1,16 @@
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use fantasma_auth::{derive_key_prefix, hash_ingest_key};
 use fantasma_core::{EventCountQuery, EventPayload, Platform};
 pub use sqlx::PgPool;
-use sqlx::{Postgres, QueryBuilder, Row, Transaction, postgres::PgPoolOptions};
+use sqlx::{Postgres, QueryBuilder, Row, Transaction, migrate::Migrator, postgres::PgPoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
@@ -39,8 +40,12 @@ pub struct BootstrapConfig {
 pub enum StoreError {
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("migration error: {0}")]
+    Migration(#[from] sqlx::migrate::MigrateError),
     #[error("invalid platform value: {0}")]
     InvalidPlatform(String),
+    #[error("invariant violation: {0}")]
+    InvariantViolation(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +73,27 @@ pub struct SessionRecord {
     pub app_version: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSessionStateRecord {
+    pub project_id: Uuid,
+    pub install_id: String,
+    pub tail_session_id: String,
+    pub tail_session_start: DateTime<Utc>,
+    pub tail_session_end: DateTime<Utc>,
+    pub tail_event_count: i32,
+    pub tail_duration_seconds: i32,
+    pub tail_day: NaiveDate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDailyRecord {
+    pub project_id: Uuid,
+    pub day: NaiveDate,
+    pub sessions_count: i64,
+    pub active_installs: i64,
+    pub total_duration_seconds: i64,
+}
+
 pub async fn connect(config: &DatabaseConfig) -> Result<PgPool, StoreError> {
     let pool = PgPoolOptions::new()
         .max_connections(config.max_connections)
@@ -78,104 +104,19 @@ pub async fn connect(config: &DatabaseConfig) -> Result<PgPool, StoreError> {
     Ok(pool)
 }
 
-pub async fn bootstrap(pool: &PgPool, config: &BootstrapConfig) -> Result<(), StoreError> {
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS projects (
-            id UUID PRIMARY KEY,
-            name TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
+pub async fn run_migrations(pool: &PgPool) -> Result<(), StoreError> {
+    MIGRATOR.run(pool).await?;
 
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS api_keys (
-            id UUID PRIMARY KEY,
-            project_id UUID NOT NULL REFERENCES projects(id),
-            key_prefix TEXT NOT NULL,
-            key_hash TEXT NOT NULL UNIQUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
+    Ok(())
+}
 
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS events_raw (
-            id BIGSERIAL PRIMARY KEY,
-            project_id UUID NOT NULL REFERENCES projects(id),
-            event_name TEXT NOT NULL,
-            timestamp TIMESTAMPTZ NOT NULL,
-            install_id TEXT NOT NULL,
-            user_id TEXT,
-            session_id TEXT,
-            platform TEXT NOT NULL,
-            app_version TEXT,
-            properties JSONB,
-            received_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    for statement in [
-        "CREATE INDEX IF NOT EXISTS idx_events_project_time ON events_raw(project_id, timestamp)",
-        "CREATE INDEX IF NOT EXISTS idx_events_install ON events_raw(install_id)",
-        "CREATE INDEX IF NOT EXISTS idx_events_project_install_timestamp ON events_raw(project_id, install_id, timestamp)",
-        "CREATE INDEX IF NOT EXISTS idx_events_event_name ON events_raw(event_name)",
-        "CREATE INDEX IF NOT EXISTS idx_events_received_at ON events_raw(received_at)",
-        "CREATE INDEX IF NOT EXISTS idx_events_platform ON events_raw(platform)",
-    ] {
-        sqlx::query(statement).execute(pool).await?;
-    }
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS sessions (
-            id BIGSERIAL PRIMARY KEY,
-            project_id UUID NOT NULL REFERENCES projects(id),
-            install_id TEXT NOT NULL,
-            user_id TEXT,
-            session_id TEXT NOT NULL,
-            session_start TIMESTAMPTZ NOT NULL,
-            session_end TIMESTAMPTZ NOT NULL,
-            event_count INTEGER NOT NULL,
-            duration_seconds INTEGER NOT NULL,
-            platform TEXT,
-            app_version TEXT,
-            UNIQUE (project_id, session_id)
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    for statement in [
-        "CREATE INDEX IF NOT EXISTS idx_sessions_project_time ON sessions(project_id, session_start)",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_project_install_start ON sessions(project_id, install_id, session_start)",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_project_install_end ON sessions(project_id, install_id, session_end)",
-    ] {
-        sqlx::query(statement).execute(pool).await?;
-    }
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS worker_offsets (
-            worker_name TEXT PRIMARY KEY,
-            last_processed_event_id BIGINT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
+pub async fn ensure_local_project(
+    pool: &PgPool,
+    config: Option<&BootstrapConfig>,
+) -> Result<(), StoreError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
 
     sqlx::query(
         r#"
@@ -209,6 +150,13 @@ pub async fn bootstrap(pool: &PgPool, config: &BootstrapConfig) -> Result<(), St
         .execute(pool)
         .await?;
     }
+
+    Ok(())
+}
+
+pub async fn bootstrap(pool: &PgPool, config: &BootstrapConfig) -> Result<(), StoreError> {
+    run_migrations(pool).await?;
+    ensure_local_project(pool, Some(config)).await?;
 
     Ok(())
 }
@@ -350,139 +298,341 @@ pub async fn fetch_latest_session_for_install(
     row.map(session_from_row).transpose()
 }
 
-pub async fn fetch_sessions_overlapping_window(
+pub async fn load_install_session_state(
     pool: &PgPool,
     project_id: Uuid,
     install_id: &str,
-    window_start: DateTime<Utc>,
-    window_end: DateTime<Utc>,
-) -> Result<Vec<SessionRecord>, StoreError> {
-    let rows = sqlx::query(
+) -> Result<Option<InstallSessionStateRecord>, StoreError> {
+    load_install_session_state_in_executor(pool, project_id, install_id).await
+}
+
+pub async fn load_install_session_state_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+) -> Result<Option<InstallSessionStateRecord>, StoreError> {
+    load_install_session_state_in_executor(&mut **tx, project_id, install_id).await
+}
+
+async fn load_install_session_state_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    install_id: &str,
+) -> Result<Option<InstallSessionStateRecord>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let row = sqlx::query(
         r#"
-        SELECT project_id, install_id, user_id, session_id, session_start, session_end,
-               event_count, duration_seconds, platform, app_version
-        FROM sessions
+        SELECT
+            project_id,
+            install_id,
+            tail_session_id,
+            tail_session_start,
+            tail_session_end,
+            tail_event_count,
+            tail_duration_seconds,
+            tail_day
+        FROM install_session_state
         WHERE project_id = $1
           AND install_id = $2
-          AND session_start <= $3
-          AND session_end >= $4
-        ORDER BY session_start ASC, id ASC
         "#,
     )
     .bind(project_id)
     .bind(install_id)
-    .bind(window_end)
-    .bind(window_start)
-    .fetch_all(pool)
+    .fetch_optional(executor)
     .await?;
 
-    rows.into_iter().map(session_from_row).collect()
+    row.map(install_session_state_from_row).transpose()
 }
 
-pub async fn upsert_sessions(pool: &PgPool, sessions: &[SessionRecord]) -> Result<u64, StoreError> {
-    upsert_sessions_in_executor(pool, sessions).await
-}
-
-pub async fn upsert_sessions_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    sessions: &[SessionRecord],
-) -> Result<u64, StoreError> {
-    upsert_sessions_in_executor(&mut **tx, sessions).await
-}
-
-async fn upsert_sessions_in_executor<'a, E>(
-    executor: E,
-    sessions: &[SessionRecord],
-) -> Result<u64, StoreError>
-where
-    E: sqlx::Executor<'a, Database = Postgres>,
-{
-    if sessions.is_empty() {
-        return Ok(0);
-    }
-
-    let mut builder = QueryBuilder::<sqlx::Postgres>::new(
-        "INSERT INTO sessions (project_id, install_id, user_id, session_id, session_start, session_end, event_count, duration_seconds, platform, app_version) ",
-    );
-
-    builder.push_values(sessions, |mut separated, session| {
-        separated.push_bind(session.project_id);
-        separated.push_bind(&session.install_id);
-        separated.push_bind(&session.user_id);
-        separated.push_bind(&session.session_id);
-        separated.push_bind(session.session_start);
-        separated.push_bind(session.session_end);
-        separated.push_bind(session.event_count);
-        separated.push_bind(session.duration_seconds);
-        separated.push_bind(platform_as_str(&session.platform));
-        separated.push_bind(&session.app_version);
-    });
-
-    builder.push(
-        r#"
-        ON CONFLICT (project_id, session_id) DO UPDATE SET
-            user_id = EXCLUDED.user_id,
-            session_start = EXCLUDED.session_start,
-            session_end = EXCLUDED.session_end,
-            event_count = EXCLUDED.event_count,
-            duration_seconds = EXCLUDED.duration_seconds,
-            platform = EXCLUDED.platform,
-            app_version = EXCLUDED.app_version
-        "#,
-    );
-
-    let result = builder.build().execute(executor).await?;
-
-    Ok(result.rows_affected())
-}
-
-pub async fn delete_sessions_for_install_between(
+pub async fn upsert_install_session_state(
     pool: &PgPool,
-    project_id: Uuid,
-    install_id: &str,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    state: &InstallSessionStateRecord,
 ) -> Result<u64, StoreError> {
-    delete_sessions_for_install_between_in_executor(pool, project_id, install_id, start, end).await
+    upsert_install_session_state_in_executor(pool, state).await
 }
 
-pub async fn delete_sessions_for_install_between_in_tx(
+pub async fn upsert_install_session_state_in_tx(
     tx: &mut Transaction<'_, Postgres>,
-    project_id: Uuid,
-    install_id: &str,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    state: &InstallSessionStateRecord,
 ) -> Result<u64, StoreError> {
-    delete_sessions_for_install_between_in_executor(&mut **tx, project_id, install_id, start, end)
-        .await
+    upsert_install_session_state_in_executor(&mut **tx, state).await
 }
 
-async fn delete_sessions_for_install_between_in_executor<'a, E>(
+async fn upsert_install_session_state_in_executor<'a, E>(
     executor: E,
-    project_id: Uuid,
-    install_id: &str,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    state: &InstallSessionStateRecord,
 ) -> Result<u64, StoreError>
 where
     E: sqlx::Executor<'a, Database = Postgres>,
 {
     let result = sqlx::query(
         r#"
-        DELETE FROM sessions
-        WHERE project_id = $1
-          AND install_id = $2
-          AND session_start BETWEEN $3 AND $4
+        INSERT INTO install_session_state (
+            project_id,
+            install_id,
+            tail_session_id,
+            tail_session_start,
+            tail_session_end,
+            tail_event_count,
+            tail_duration_seconds,
+            tail_day
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (project_id, install_id) DO UPDATE SET
+            tail_session_id = EXCLUDED.tail_session_id,
+            tail_session_start = EXCLUDED.tail_session_start,
+            tail_session_end = EXCLUDED.tail_session_end,
+            tail_event_count = EXCLUDED.tail_event_count,
+            tail_duration_seconds = EXCLUDED.tail_duration_seconds,
+            tail_day = EXCLUDED.tail_day,
+            updated_at = now()
         "#,
     )
-    .bind(project_id)
-    .bind(install_id)
-    .bind(start)
-    .bind(end)
+    .bind(state.project_id)
+    .bind(&state.install_id)
+    .bind(&state.tail_session_id)
+    .bind(state.tail_session_start)
+    .bind(state.tail_session_end)
+    .bind(state.tail_event_count)
+    .bind(state.tail_duration_seconds)
+    .bind(state.tail_day)
     .execute(executor)
     .await?;
 
     Ok(result.rows_affected())
+}
+
+pub async fn insert_session_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session: &SessionRecord,
+) -> Result<u64, StoreError> {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO sessions (
+            project_id,
+            install_id,
+            user_id,
+            session_id,
+            session_start,
+            session_end,
+            event_count,
+            duration_seconds,
+            platform,
+            app_version
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "#,
+    )
+    .bind(session.project_id)
+    .bind(&session.install_id)
+    .bind(&session.user_id)
+    .bind(&session.session_id)
+    .bind(session.session_start)
+    .bind(session.session_end)
+    .bind(session.event_count)
+    .bind(session.duration_seconds)
+    .bind(platform_as_str(&session.platform))
+    .bind(&session.app_version)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn update_session_tail_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    session_id: &str,
+    session_end: DateTime<Utc>,
+    event_count: i32,
+    duration_seconds: i32,
+    user_id: Option<&str>,
+    app_version: Option<&str>,
+) -> Result<u64, StoreError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE sessions
+        SET session_end = $3,
+            event_count = $4,
+            duration_seconds = $5,
+            user_id = COALESCE($6, user_id),
+            app_version = COALESCE($7, app_version)
+        WHERE project_id = $1
+          AND session_id = $2
+        "#,
+    )
+    .bind(project_id)
+    .bind(session_id)
+    .bind(session_end)
+    .bind(event_count)
+    .bind(duration_seconds)
+    .bind(user_id)
+    .bind(app_version)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn increment_session_daily_for_new_session(
+    pool: &PgPool,
+    project_id: Uuid,
+    day: NaiveDate,
+    install_id: &str,
+    duration_seconds: i64,
+) -> Result<u64, StoreError> {
+    increment_session_daily_for_new_session_in_executor(
+        pool,
+        project_id,
+        day,
+        install_id,
+        duration_seconds,
+    )
+    .await
+}
+
+pub async fn increment_session_daily_for_new_session_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    day: NaiveDate,
+    install_id: &str,
+    duration_seconds: i64,
+) -> Result<u64, StoreError> {
+    increment_session_daily_for_new_session_in_executor(
+        &mut **tx,
+        project_id,
+        day,
+        install_id,
+        duration_seconds,
+    )
+    .await
+}
+
+async fn increment_session_daily_for_new_session_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    day: NaiveDate,
+    install_id: &str,
+    duration_seconds: i64,
+) -> Result<u64, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let result = sqlx::query(
+        r#"
+        WITH membership AS (
+            INSERT INTO session_daily_installs (
+                project_id,
+                day,
+                install_id,
+                session_count
+            )
+            VALUES ($1, $2, $3, 1)
+            ON CONFLICT (project_id, day, install_id) DO UPDATE SET
+                session_count = session_daily_installs.session_count + 1,
+                updated_at = now()
+            RETURNING CASE WHEN session_count = 1 THEN 1 ELSE 0 END AS active_install_delta
+        )
+        INSERT INTO session_daily (
+            project_id,
+            day,
+            sessions_count,
+            active_installs,
+            total_duration_seconds
+        )
+        SELECT $1, $2, 1, active_install_delta, $4
+        FROM membership
+        ON CONFLICT (project_id, day) DO UPDATE SET
+            sessions_count = session_daily.sessions_count + 1,
+            active_installs = session_daily.active_installs + EXCLUDED.active_installs,
+            total_duration_seconds = session_daily.total_duration_seconds + EXCLUDED.total_duration_seconds,
+            updated_at = now()
+        "#,
+    )
+    .bind(project_id)
+    .bind(day)
+    .bind(install_id)
+    .bind(duration_seconds)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn add_session_daily_duration_delta(
+    pool: &PgPool,
+    project_id: Uuid,
+    day: NaiveDate,
+    duration_delta: i64,
+) -> Result<u64, StoreError> {
+    add_session_daily_duration_delta_in_executor(pool, project_id, day, duration_delta).await
+}
+
+pub async fn add_session_daily_duration_delta_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    day: NaiveDate,
+    duration_delta: i64,
+) -> Result<u64, StoreError> {
+    add_session_daily_duration_delta_in_executor(&mut **tx, project_id, day, duration_delta).await
+}
+
+async fn add_session_daily_duration_delta_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    day: NaiveDate,
+    duration_delta: i64,
+) -> Result<u64, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let result = sqlx::query(
+        r#"
+        UPDATE session_daily
+        SET total_duration_seconds = total_duration_seconds + $3,
+            updated_at = now()
+        WHERE project_id = $1
+          AND day = $2
+        "#,
+    )
+    .bind(project_id)
+    .bind(day)
+    .bind(duration_delta)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn fetch_session_daily_range(
+    pool: &PgPool,
+    project_id: Uuid,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Result<Vec<SessionDailyRecord>, StoreError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            project_id,
+            day,
+            sessions_count,
+            active_installs,
+            total_duration_seconds
+        FROM session_daily
+        WHERE project_id = $1
+          AND day BETWEEN $2 AND $3
+        ORDER BY day ASC
+        "#,
+    )
+    .bind(project_id)
+    .bind(start_date)
+    .bind(end_date)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(session_daily_from_row).collect()
 }
 
 pub async fn load_worker_offset(pool: &PgPool, worker_name: &str) -> Result<i64, StoreError> {
@@ -671,6 +821,31 @@ fn session_from_row(row: sqlx::postgres::PgRow) -> Result<SessionRecord, StoreEr
     })
 }
 
+fn install_session_state_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<InstallSessionStateRecord, StoreError> {
+    Ok(InstallSessionStateRecord {
+        project_id: row.try_get("project_id")?,
+        install_id: row.try_get("install_id")?,
+        tail_session_id: row.try_get("tail_session_id")?,
+        tail_session_start: row.try_get("tail_session_start")?,
+        tail_session_end: row.try_get("tail_session_end")?,
+        tail_event_count: row.try_get("tail_event_count")?,
+        tail_duration_seconds: row.try_get("tail_duration_seconds")?,
+        tail_day: row.try_get("tail_day")?,
+    })
+}
+
+fn session_daily_from_row(row: sqlx::postgres::PgRow) -> Result<SessionDailyRecord, StoreError> {
+    Ok(SessionDailyRecord {
+        project_id: row.try_get("project_id")?,
+        day: row.try_get("day")?,
+        sessions_count: row.try_get("sessions_count")?,
+        active_installs: row.try_get("active_installs")?,
+        total_duration_seconds: row.try_get("total_duration_seconds")?,
+    })
+}
+
 fn platform_as_str(platform: &Platform) -> &'static str {
     match platform {
         Platform::Ios => "ios",
@@ -689,7 +864,7 @@ fn platform_from_str(value: &str) -> Result<Platform, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, TimeZone};
+    use chrono::{Duration, NaiveDate, TimeZone};
     use fantasma_core::EventPayload;
     use serde_json::Map;
 
@@ -725,26 +900,22 @@ mod tests {
         }
     }
 
-    fn session(session_id: &str, end_minutes: i64, event_count: i32) -> SessionRecord {
-        SessionRecord {
+    fn tail_state(end_minutes: i64, event_count: i32) -> InstallSessionStateRecord {
+        InstallSessionStateRecord {
             project_id: project_id(),
             install_id: "install-1".to_owned(),
-            user_id: Some("user-1".to_owned()),
-            session_id: session_id.to_owned(),
-            session_start: timestamp(0),
-            session_end: timestamp(end_minutes),
-            event_count,
-            duration_seconds: end_minutes as i32 * 60,
-            platform: Platform::Ios,
-            app_version: Some("1.0.1".to_owned()),
+            tail_session_id: "install-1:2026-01-01T00:00:00+00:00".to_owned(),
+            tail_session_start: timestamp(0),
+            tail_session_end: timestamp(end_minutes),
+            tail_event_count: event_count,
+            tail_duration_seconds: (end_minutes as i32) * 60,
+            tail_day: NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
         }
     }
 
     #[sqlx::test]
-    async fn bootstrap_creates_session_tables_and_indexes(pool: PgPool) {
-        bootstrap(&pool, &bootstrap_config())
-            .await
-            .expect("bootstrap succeeds");
+    async fn run_migrations_creates_session_daily_table_and_indexes(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
 
         let event_index_names = sqlx::query_scalar::<_, String>(
             r#"
@@ -771,6 +942,18 @@ mod tests {
         .await
         .expect("fetch session index names");
 
+        let session_daily_index_names = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename = 'session_daily'
+              AND indexname = 'idx_session_daily_project_day'
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch session_daily index names");
+
         let session_table_exists = sqlx::query_scalar::<_, bool>(
             r#"
             SELECT EXISTS (
@@ -784,6 +967,19 @@ mod tests {
         .await
         .expect("fetch session table existence");
 
+        let session_daily_table_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_name = 'session_daily'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session_daily table existence");
+
         assert_eq!(
             event_index_names,
             vec!["idx_events_project_install_timestamp".to_owned()]
@@ -795,43 +991,219 @@ mod tests {
                 "idx_sessions_project_install_start".to_owned()
             ]
         );
+        assert_eq!(
+            session_daily_index_names,
+            vec!["idx_session_daily_project_day".to_owned()]
+        );
         assert!(session_table_exists);
+        assert!(session_daily_table_exists);
     }
 
     #[sqlx::test]
-    async fn upsert_sessions_updates_existing_rows(pool: PgPool) {
-        bootstrap(&pool, &bootstrap_config())
-            .await
-            .expect("bootstrap succeeds");
+    async fn ensure_local_project_seeds_project_and_ingest_key_when_config_present(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
 
-        upsert_sessions(
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let project_name =
+            sqlx::query_scalar::<_, String>("SELECT name FROM projects WHERE id = $1")
+                .bind(project_id())
+                .fetch_one(&pool)
+                .await
+                .expect("fetch project");
+
+        let key_count =
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM api_keys WHERE project_id = $1")
+                .bind(project_id())
+                .fetch_one(&pool)
+                .await
+                .expect("count api keys");
+
+        assert_eq!(project_name, "Test Project");
+        assert_eq!(key_count, 1);
+    }
+
+    #[sqlx::test]
+    async fn ensure_local_project_skips_seeding_when_config_absent(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        ensure_local_project(&pool, None)
+            .await
+            .expect("ensure local project succeeds");
+
+        let project_count = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM projects")
+            .fetch_one(&pool)
+            .await
+            .expect("count projects");
+
+        assert_eq!(project_count, 0);
+    }
+
+    #[sqlx::test]
+    async fn run_migrations_creates_install_session_state_table(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let table_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_name = 'install_session_state'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch tail state table existence");
+
+        assert!(table_exists);
+    }
+
+    #[sqlx::test]
+    async fn run_migrations_creates_session_daily_installs_table(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let table_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_name = 'session_daily_installs'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch membership table existence");
+
+        assert!(table_exists);
+    }
+
+    #[sqlx::test]
+    async fn install_session_state_round_trips(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        upsert_install_session_state(&pool, &tail_state(10, 2))
+            .await
+            .expect("save tail state");
+
+        let stored = load_install_session_state(&pool, project_id(), "install-1")
+            .await
+            .expect("load tail state")
+            .expect("tail state exists");
+
+        assert_eq!(stored.tail_session_end, timestamp(10));
+        assert_eq!(stored.tail_event_count, 2);
+        assert_eq!(stored.tail_duration_seconds, 600);
+    }
+
+    #[sqlx::test]
+    async fn session_daily_updates_incrementally_for_insert_and_extension(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        increment_session_daily_for_new_session(
             &pool,
-            &[session("install-1:2026-01-01T00:00:00+00:00", 10, 2)],
+            project_id(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+            "install-1",
+            600,
         )
         .await
-        .expect("insert session");
-        upsert_sessions(
+        .expect("track new session");
+        increment_session_daily_for_new_session(
             &pool,
-            &[session("install-1:2026-01-01T00:00:00+00:00", 25, 3)],
+            project_id(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+            "install-1",
+            0,
         )
         .await
-        .expect("update session");
+        .expect("track second session same install");
+        increment_session_daily_for_new_session(
+            &pool,
+            project_id(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+            "install-2",
+            120,
+        )
+        .await
+        .expect("track new install");
+        add_session_daily_duration_delta(
+            &pool,
+            project_id(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+            300,
+        )
+        .await
+        .expect("track extension");
 
-        let stored = fetch_latest_session_for_install(&pool, project_id(), "install-1")
-            .await
-            .expect("fetch latest session")
-            .expect("session exists");
+        let row = sqlx::query(
+            r#"
+            SELECT sessions_count, active_installs, total_duration_seconds
+            FROM session_daily
+            WHERE project_id = $1
+              AND day = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session_daily row");
 
-        assert_eq!(stored.session_end, timestamp(25));
-        assert_eq!(stored.event_count, 3);
-        assert_eq!(stored.duration_seconds, 25 * 60);
+        assert_eq!(row.try_get::<i64, _>("sessions_count").expect("count"), 3);
+        assert_eq!(
+            row.try_get::<i64, _>("active_installs")
+                .expect("active installs"),
+            2
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_duration_seconds")
+                .expect("duration"),
+            1020
+        );
+
+        let membership_counts = sqlx::query(
+            r#"
+            SELECT install_id, session_count
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = $2
+            ORDER BY install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .bind(NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"))
+        .fetch_all(&pool)
+        .await
+        .expect("fetch membership rows");
+
+        assert_eq!(membership_counts.len(), 2);
+        assert_eq!(
+            membership_counts[0]
+                .try_get::<String, _>("install_id")
+                .expect("install id"),
+            "install-1"
+        );
+        assert_eq!(
+            membership_counts[0]
+                .try_get::<i32, _>("session_count")
+                .expect("session count"),
+            2
+        );
     }
 
     #[sqlx::test]
     async fn worker_offsets_round_trip(pool: PgPool) {
-        bootstrap(&pool, &bootstrap_config())
-            .await
-            .expect("bootstrap succeeds");
+        run_migrations(&pool).await.expect("migrations succeed");
 
         assert_eq!(
             load_worker_offset(&pool, "sessions")
@@ -854,9 +1226,7 @@ mod tests {
 
     #[sqlx::test]
     async fn lock_worker_offset_serializes_worker_claims(pool: PgPool) {
-        bootstrap(&pool, &bootstrap_config())
-            .await
-            .expect("bootstrap succeeds");
+        run_migrations(&pool).await.expect("migrations succeed");
 
         let mut tx_one = pool.begin().await.expect("begin first transaction");
         let mut tx_two = pool.begin().await.expect("begin second transaction");
@@ -888,9 +1258,10 @@ mod tests {
 
     #[sqlx::test]
     async fn fetch_events_for_install_between_orders_by_timestamp_then_id(pool: PgPool) {
-        bootstrap(&pool, &bootstrap_config())
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
             .await
-            .expect("bootstrap succeeds");
+            .expect("ensure local project succeeds");
 
         insert_events(
             &pool,

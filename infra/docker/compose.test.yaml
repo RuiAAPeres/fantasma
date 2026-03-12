@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: fantasma
+      POSTGRES_PASSWORD: fantasma
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fantasma -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  workspace-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://fantasma:fantasma@postgres:5432/postgres
+      CARGO_TARGET_DIR: /cargo-target
+    working_dir: /workspace
+    init: true
+    user: "${LOCAL_UID:-0}:${LOCAL_GID:-0}"
+    volumes:
+      - ../..:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/cargo-target
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:

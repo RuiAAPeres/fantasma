@@ -16,6 +16,13 @@ pub struct SessionMetricQuery {
     pub end: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DailyMetricQuery {
+    pub project_id: Uuid,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MetricSeriesPoint {
     pub date: NaiveDate,
