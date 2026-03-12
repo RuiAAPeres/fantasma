@@ -142,20 +142,5 @@ async fn pipeline_exposes_daily_metrics_after_worker_batch(pool: PgPool) {
         .await
         .expect("api request succeeds");
 
-    assert_eq!(active_installs_response.status(), StatusCode::OK);
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(
-            &to_bytes(active_installs_response.into_body(), usize::MAX)
-                .await
-                .expect("read response body"),
-        )
-        .expect("decode response"),
-        serde_json::json!({
-            "metric": "active_installs_daily",
-            "points": [
-                { "date": "2026-01-01", "value": 1 },
-                { "date": "2026-01-02", "value": 0 }
-            ]
-        })
-    );
+    assert_eq!(active_installs_response.status(), StatusCode::NOT_FOUND);
 }

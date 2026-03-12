@@ -23,7 +23,6 @@ services:
       CARGO_TARGET_DIR: /cargo-target
     working_dir: /workspace
     init: true
-    user: "${LOCAL_UID:-0}:${LOCAL_GID:-0}"
     volumes:
       - ../..:/workspace
       - cargo-registry:/usr/local/cargo/registry

@@ -1,23 +1,34 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::Duration as ChronoDuration;
+use chrono::{Duration as ChronoDuration, NaiveDate};
 use fantasma_store::{
     InstallSessionStateRecord, PgPool, RawEventRecord, SessionRecord, SessionTailUpdate,
-    StoreError, add_session_daily_duration_delta_in_tx, fetch_events_after,
+    StoreError, add_session_daily_duration_delta_in_tx, delete_sessions_overlapping_window_in_tx,
+    fetch_events_after, fetch_events_for_install_between_in_tx,
+    fetch_latest_session_for_install_in_tx, fetch_sessions_overlapping_window_in_tx,
     increment_session_daily_for_new_session_in_tx, insert_session_in_tx,
-    load_install_session_state_in_tx, lock_worker_offset, save_worker_offset_in_tx,
-    update_session_tail_in_tx, upsert_install_session_state_in_tx,
+    load_install_session_state_in_tx, lock_worker_offset, rebuild_session_daily_days_in_tx,
+    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_install_session_state_in_tx,
 };
 use uuid::Uuid;
 
+use crate::sessionization;
+
 const SESSION_TIMEOUT_MINS: i64 = 30;
 const WORKER_NAME: &str = "sessions";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecomputeWindow {
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+}
 
 pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usize, StoreError> {
     let mut tx = pool.begin().await.map_err(StoreError::from)?;
     let last_processed_event_id = lock_worker_offset(&mut tx, WORKER_NAME).await?;
     let batch = fetch_events_after(pool, last_processed_event_id, batch_size).await?;
     let processed_events = batch.len();
+    let mut touched_days_by_project = BTreeMap::<Uuid, BTreeSet<NaiveDate>>::new();
 
     if batch.is_empty() {
         tx.commit().await.map_err(StoreError::from)?;
@@ -30,7 +41,19 @@ pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usi
         .expect("non-empty batch has last event");
 
     for ((project_id, install_id), events) in group_events(batch) {
-        process_install_batch(&mut tx, project_id, &install_id, events).await?;
+        let touched_days = process_install_batch(&mut tx, project_id, &install_id, events).await?;
+
+        if !touched_days.is_empty() {
+            touched_days_by_project
+                .entry(project_id)
+                .or_default()
+                .extend(touched_days);
+        }
+    }
+
+    for (project_id, touched_days) in touched_days_by_project {
+        let days = touched_days.into_iter().collect::<Vec<_>>();
+        rebuild_session_daily_days_in_tx(&mut tx, project_id, &days).await?;
     }
 
     save_worker_offset_in_tx(&mut tx, WORKER_NAME, next_offset).await?;
@@ -65,9 +88,38 @@ async fn process_install_batch(
     project_id: Uuid,
     install_id: &str,
     events: Vec<RawEventRecord>,
-) -> Result<(), StoreError> {
-    let mut tail_state = load_install_session_state_in_tx(tx, project_id, install_id).await?;
+) -> Result<BTreeSet<NaiveDate>, StoreError> {
+    let tail_state = load_install_session_state_in_tx(tx, project_id, install_id).await?;
 
+    if needs_exact_day_repair(tail_state.as_ref(), &events) {
+        return repair_install_batch(tx, project_id, install_id, events).await;
+    }
+
+    process_install_batch_incremental(tx, project_id, install_id, events, tail_state).await?;
+
+    Ok(BTreeSet::new())
+}
+
+fn needs_exact_day_repair(
+    tail_state: Option<&InstallSessionStateRecord>,
+    events: &[RawEventRecord],
+) -> bool {
+    let Some(tail_state) = tail_state else {
+        return false;
+    };
+
+    events
+        .iter()
+        .any(|event| event.timestamp < tail_state.tail_session_end)
+}
+
+async fn process_install_batch_incremental(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+    events: Vec<RawEventRecord>,
+    mut tail_state: Option<InstallSessionStateRecord>,
+) -> Result<(), StoreError> {
     for event in events {
         match tail_state.as_mut() {
             None => {
@@ -87,8 +139,9 @@ async fn process_install_batch(
                 tail_state = Some(state);
             }
             Some(state) if event.timestamp < state.tail_session_end => {
-                // Older-than-tail raw events remain stored in events_raw but do not mutate derived state.
-                continue;
+                return Err(StoreError::InvariantViolation(format!(
+                    "incremental path received older-than-tail event for project {project_id} install {install_id}"
+                )));
             }
             Some(state) => {
                 let gap = event
@@ -118,6 +171,146 @@ async fn process_install_batch(
     }
 
     Ok(())
+}
+
+async fn repair_install_batch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+    batch_events: Vec<RawEventRecord>,
+) -> Result<BTreeSet<NaiveDate>, StoreError> {
+    let batch_min_ts = batch_events
+        .first()
+        .map(|event| event.timestamp)
+        .expect("install batch contains at least one event");
+    let batch_max_ts = batch_events
+        .last()
+        .map(|event| event.timestamp)
+        .expect("install batch contains at least one event");
+
+    let recompute_window =
+        load_recompute_window_in_tx(tx, project_id, install_id, batch_min_ts, batch_max_ts).await?;
+    let raw_events = fetch_events_for_install_between_in_tx(
+        tx,
+        project_id,
+        install_id,
+        recompute_window.start,
+        recompute_window.end,
+    )
+    .await?;
+    let overlapping_sessions = fetch_sessions_overlapping_window_in_tx(
+        tx,
+        project_id,
+        install_id,
+        recompute_window.start,
+        recompute_window.end,
+    )
+    .await?;
+    let repaired_sessions = derive_sessions_for_window(&raw_events);
+    let touched_days = overlapping_sessions
+        .iter()
+        .map(session_daily_day)
+        .chain(repaired_sessions.iter().map(session_daily_day))
+        .collect::<BTreeSet<_>>();
+
+    delete_sessions_overlapping_window_in_tx(
+        tx,
+        project_id,
+        install_id,
+        recompute_window.start,
+        recompute_window.end,
+    )
+    .await?;
+
+    for session in &repaired_sessions {
+        insert_session_in_tx(tx, session).await?;
+    }
+
+    let latest_session = fetch_latest_session_for_install_in_tx(tx, project_id, install_id).await?;
+    let Some(latest_session) = latest_session else {
+        return Err(StoreError::InvariantViolation(format!(
+            "repaired install {install_id} for project {project_id} has no latest session"
+        )));
+    };
+
+    let next_state = install_state_from_session(&latest_session);
+    upsert_install_session_state_in_tx(tx, &next_state).await?;
+
+    Ok(touched_days)
+}
+
+async fn load_recompute_window_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+    batch_min_ts: chrono::DateTime<chrono::Utc>,
+    batch_max_ts: chrono::DateTime<chrono::Utc>,
+) -> Result<RecomputeWindow, StoreError> {
+    let mut search_start = batch_min_ts - ChronoDuration::minutes(SESSION_TIMEOUT_MINS);
+    let mut search_end = batch_max_ts + ChronoDuration::minutes(SESSION_TIMEOUT_MINS);
+
+    loop {
+        let sessions = fetch_sessions_overlapping_window_in_tx(
+            tx,
+            project_id,
+            install_id,
+            search_start,
+            search_end,
+        )
+        .await?;
+
+        if sessions.is_empty() {
+            return Ok(RecomputeWindow {
+                start: batch_min_ts,
+                end: batch_max_ts,
+            });
+        }
+
+        let next = recompute_window_from_sessions(&sessions, batch_max_ts);
+        let next_search_start = next.start - ChronoDuration::minutes(SESSION_TIMEOUT_MINS);
+        let next_search_end = next.end + ChronoDuration::minutes(SESSION_TIMEOUT_MINS);
+
+        if next_search_start == search_start && next_search_end == search_end {
+            return Ok(next);
+        }
+
+        search_start = next_search_start;
+        search_end = next_search_end;
+    }
+}
+
+fn recompute_window_from_sessions(
+    sessions: &[SessionRecord],
+    batch_max_ts: chrono::DateTime<chrono::Utc>,
+) -> RecomputeWindow {
+    let start = sessions
+        .first()
+        .map(|session| session.session_start)
+        .expect("sessions window is non-empty");
+    let end = sessions
+        .iter()
+        .map(|session| session.session_end)
+        .max()
+        .expect("sessions window is non-empty")
+        .max(batch_max_ts);
+
+    RecomputeWindow { start, end }
+}
+
+fn derive_sessions_for_window(raw_events: &[RawEventRecord]) -> Vec<SessionRecord> {
+    let session_events = raw_events
+        .iter()
+        .map(|event| sessionization::SessionEvent {
+            project_id: event.project_id,
+            timestamp: event.timestamp,
+            install_id: event.install_id.clone(),
+            user_id: event.user_id.clone(),
+            platform: event.platform.clone(),
+            app_version: event.app_version.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    sessionization::derive_sessions(&session_events)
 }
 
 async fn extend_tail_session(
@@ -186,6 +379,10 @@ fn ensure_single_row_update(rows_affected: u64, message: String) -> Result<(), S
     Err(StoreError::InvariantViolation(message))
 }
 
+fn session_daily_day(session: &SessionRecord) -> NaiveDate {
+    session.session_start.date_naive()
+}
+
 fn session_from_event(event: &RawEventRecord) -> SessionRecord {
     SessionRecord {
         project_id: event.project_id,
@@ -217,7 +414,7 @@ fn install_state_from_session(session: &SessionRecord) -> InstallSessionStateRec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{NaiveDate, TimeZone, Utc};
+    use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use fantasma_core::{EventPayload, Platform};
     use fantasma_store::{
         BootstrapConfig, average_session_duration_seconds, count_active_installs, count_sessions,
@@ -280,6 +477,37 @@ mod tests {
                     .expect("active installs"),
                 row.try_get::<i64, _>("total_duration_seconds")
                     .expect("duration"),
+            )
+        })
+    }
+
+    async fn session_daily_snapshot(
+        pool: &PgPool,
+        day: NaiveDate,
+    ) -> Option<(i64, i64, i64, DateTime<Utc>)> {
+        sqlx::query(
+            r#"
+            SELECT sessions_count, active_installs, total_duration_seconds, updated_at
+            FROM session_daily
+            WHERE project_id = $1
+              AND day = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(day)
+        .fetch_optional(pool)
+        .await
+        .expect("fetch session_daily snapshot")
+        .map(|row| {
+            (
+                row.try_get::<i64, _>("sessions_count")
+                    .expect("sessions count"),
+                row.try_get::<i64, _>("active_installs")
+                    .expect("active installs"),
+                row.try_get::<i64, _>("total_duration_seconds")
+                    .expect("duration"),
+                row.try_get::<DateTime<Utc>, _>("updated_at")
+                    .expect("updated_at"),
             )
         })
     }
@@ -424,7 +652,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn older_than_tail_event_does_not_modify_historical_sessions(pool: PgPool) {
+    async fn older_than_tail_event_repairs_historical_sessions(pool: PgPool) {
         fantasma_store::bootstrap(&pool, &bootstrap_config())
             .await
             .expect("bootstrap succeeds");
@@ -439,7 +667,7 @@ mod tests {
             .await
             .expect("process initial batch");
 
-        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 10)])
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 20)])
             .await
             .expect("insert older event");
         process_session_batch(&pool, 100)
@@ -455,41 +683,62 @@ mod tests {
             )
             .await
             .expect("count sessions"),
-            2
+            1
         );
-        let first_session = sqlx::query(
+        let repaired_session = sqlx::query(
             r#"
-            SELECT event_count, duration_seconds
+            SELECT session_start, session_end, event_count, duration_seconds
             FROM sessions
             WHERE project_id = $1
-              AND session_start = $2
+              AND install_id = $2
             "#,
         )
         .bind(project_id())
-        .bind(timestamp(1, 0, 0))
+        .bind("install-1")
         .fetch_one(&pool)
         .await
-        .expect("fetch first session");
-        assert_eq!(first_session.try_get::<i32, _>("event_count").unwrap(), 1);
+        .expect("fetch repaired session");
         assert_eq!(
-            first_session.try_get::<i32, _>("duration_seconds").unwrap(),
-            0
+            repaired_session
+                .try_get::<chrono::DateTime<Utc>, _>("session_start")
+                .unwrap(),
+            timestamp(1, 0, 0)
+        );
+        assert_eq!(
+            repaired_session
+                .try_get::<chrono::DateTime<Utc>, _>("session_end")
+                .unwrap(),
+            timestamp(1, 0, 45)
+        );
+        assert_eq!(
+            repaired_session.try_get::<i32, _>("event_count").unwrap(),
+            3
+        );
+        assert_eq!(
+            repaired_session
+                .try_get::<i32, _>("duration_seconds")
+                .unwrap(),
+            45 * 60
         );
         assert_eq!(
             session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
-            Some((2, 1, 0))
+            Some((1, 1, 45 * 60))
         );
     }
 
     #[sqlx::test]
-    async fn cross_midnight_extension_stays_bucketed_on_session_start_day(pool: PgPool) {
+    async fn cross_midnight_repair_stays_bucketed_on_session_start_day(pool: PgPool) {
         fantasma_store::bootstrap(&pool, &bootstrap_config())
             .await
             .expect("bootstrap succeeds");
         insert_events(
             &pool,
             project_id(),
-            &[event("install-1", 1, 23, 55), event("install-1", 2, 0, 10)],
+            &[
+                event("install-1", 1, 23, 55),
+                event("install-1", 2, 0, 20),
+                event("install-1", 2, 1, 0),
+            ],
         )
         .await
         .expect("insert events");
@@ -498,18 +747,82 @@ mod tests {
             .await
             .expect("process batch");
 
+        let jan_2_before =
+            session_daily_snapshot(&pool, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap())
+                .await
+                .expect("january 2 row exists");
+
+        insert_events(&pool, project_id(), &[event("install-1", 2, 0, 25)])
+            .await
+            .expect("insert late cross-midnight event");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process repair batch");
+
         let tail = load_install_session_state(&pool, project_id(), "install-1")
             .await
             .expect("load tail")
             .expect("tail exists");
-        assert_eq!(tail.tail_day, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        assert_eq!(tail.tail_day, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
         assert_eq!(
             session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
-            Some((1, 1, 900))
+            Some((1, 1, 30 * 60))
         );
         assert_eq!(
-            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()).await,
-            None
+            session_daily_snapshot(&pool, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()).await,
+            Some(jan_2_before)
+        );
+    }
+
+    #[sqlx::test]
+    async fn out_of_order_repairs_rebuild_only_touched_days(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[
+                event("install-a", 1, 0, 0),
+                event("install-a", 1, 0, 45),
+                event("install-b", 2, 12, 0),
+                event("install-c", 3, 0, 0),
+                event("install-c", 3, 0, 45),
+            ],
+        )
+        .await
+        .expect("insert seed events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process seed batch");
+
+        let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let untouched_middle_day = session_daily_snapshot(&pool, day_2)
+            .await
+            .expect("middle day row exists");
+
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-a", 1, 0, 20), event("install-c", 3, 0, 20)],
+        )
+        .await
+        .expect("insert late repair events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process repair batch");
+
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 45 * 60))
+        );
+        assert_eq!(
+            session_daily_snapshot(&pool, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()).await,
+            Some(untouched_middle_day)
+        );
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 3).unwrap()).await,
+            Some((1, 1, 45 * 60))
         );
     }
 

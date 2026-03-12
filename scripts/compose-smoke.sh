@@ -3,9 +3,14 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/infra/docker/compose.yaml"
+PROJECT_NAME="fantasma-smoke"
 MIN_FREE_KB=5000000
 TIMEOUT_SECONDS=60
 SLEEP_SECONDS=2
+
+compose() {
+  docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
+}
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -32,38 +37,58 @@ check_docker() {
 }
 
 print_logs() {
-  docker compose -f "$COMPOSE_FILE" logs --tail=200 || true
+  compose logs --tail=200 || true
+}
+
+cleanup() {
+  local exit_code=$?
+  trap - EXIT INT TERM
+  compose down --remove-orphans >/dev/null 2>&1 || true
+  exit "$exit_code"
+}
+
+wait_for_http() {
+  local deadline now
+  deadline=$((SECONDS + TIMEOUT_SECONDS))
+
+  while true; do
+    if curl -fsS "http://localhost:8081/health" >/dev/null 2>&1 &&
+      curl -fsS "http://localhost:8082/health" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    now=$SECONDS
+    if (( now >= deadline )); then
+      echo "timed out waiting for ingest and api health endpoints" >&2
+      print_logs >&2
+      exit 1
+    fi
+
+    sleep "$SLEEP_SECONDS"
+  done
 }
 
 poll_daily_metric() {
-  local deadline now count_response count_compact active_response active_compact duration_response duration_compact
+  local deadline now count_response count_compact duration_response duration_compact
   deadline=$((SECONDS + TIMEOUT_SECONDS))
 
   while true; do
     count_response="$(curl -fsS \
       "http://localhost:8082/v1/metrics/sessions/count/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
       -H "Authorization: Bearer fg_pat_dev" || true)"
-    active_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/active-installs/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
-      -H "Authorization: Bearer fg_pat_dev" || true)"
     duration_response="$(curl -fsS \
       "http://localhost:8082/v1/metrics/sessions/duration/total/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
       -H "Authorization: Bearer fg_pat_dev" || true)"
     count_compact="$(printf '%s' "$count_response" | tr -d '[:space:]')"
-    active_compact="$(printf '%s' "$active_response" | tr -d '[:space:]')"
     duration_compact="$(printf '%s' "$duration_response" | tr -d '[:space:]')"
 
     if [[ "$count_compact" == *'"metric":"sessions_count_daily"'* &&
           "$count_compact" == *'"date":"2026-01-01","value":1'* &&
           "$count_compact" == *'"date":"2026-01-02","value":0'* &&
-          "$active_compact" == *'"metric":"active_installs_daily"'* &&
-          "$active_compact" == *'"date":"2026-01-01","value":1'* &&
-          "$active_compact" == *'"date":"2026-01-02","value":0'* &&
           "$duration_compact" == *'"metric":"session_duration_total_daily"'* &&
           "$duration_compact" == *'"date":"2026-01-01","value":600'* &&
           "$duration_compact" == *'"date":"2026-01-02","value":0'* ]]; then
       printf '%s\n' "$count_response"
-      printf '%s\n' "$active_response"
       printf '%s\n' "$duration_response"
       return 0
     fi
@@ -85,7 +110,10 @@ main() {
   check_disk
   check_docker
 
-  docker compose -f "$COMPOSE_FILE" up -d --build
+  trap cleanup EXIT INT TERM
+
+  compose up -d --build
+  wait_for_http
 
   curl -fsS -X POST "http://localhost:8081/v1/events" \
     -H "Content-Type: application/json" \

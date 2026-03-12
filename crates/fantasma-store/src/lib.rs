@@ -265,6 +265,30 @@ pub async fn fetch_events_for_install_between(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<RawEventRecord>, StoreError> {
+    fetch_events_for_install_between_in_executor(pool, project_id, install_id, start, end).await
+}
+
+pub async fn fetch_events_for_install_between_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<RawEventRecord>, StoreError> {
+    fetch_events_for_install_between_in_executor(&mut **tx, project_id, install_id, start, end)
+        .await
+}
+
+async fn fetch_events_for_install_between_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    install_id: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<RawEventRecord>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let rows = sqlx::query(
         r#"
         SELECT id, project_id, timestamp, install_id, user_id, platform, app_version
@@ -279,7 +303,7 @@ pub async fn fetch_events_for_install_between(
     .bind(install_id)
     .bind(start)
     .bind(end)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
 
     rows.into_iter().map(raw_event_from_row).collect()
@@ -290,6 +314,25 @@ pub async fn fetch_latest_session_for_install(
     project_id: Uuid,
     install_id: &str,
 ) -> Result<Option<SessionRecord>, StoreError> {
+    fetch_latest_session_for_install_in_executor(pool, project_id, install_id).await
+}
+
+pub async fn fetch_latest_session_for_install_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+) -> Result<Option<SessionRecord>, StoreError> {
+    fetch_latest_session_for_install_in_executor(&mut **tx, project_id, install_id).await
+}
+
+async fn fetch_latest_session_for_install_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    install_id: &str,
+) -> Result<Option<SessionRecord>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let row = sqlx::query(
         r#"
         SELECT project_id, install_id, user_id, session_id, session_start, session_end,
@@ -303,10 +346,39 @@ pub async fn fetch_latest_session_for_install(
     )
     .bind(project_id)
     .bind(install_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     row.map(session_from_row).transpose()
+}
+
+pub async fn fetch_sessions_overlapping_window_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Result<Vec<SessionRecord>, StoreError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT project_id, install_id, user_id, session_id, session_start, session_end,
+               event_count, duration_seconds, platform, app_version
+        FROM sessions
+        WHERE project_id = $1
+          AND install_id = $2
+          AND session_start <= $4
+          AND session_end >= $3
+        ORDER BY session_start ASC, id ASC
+        "#,
+    )
+    .bind(project_id)
+    .bind(install_id)
+    .bind(window_start)
+    .bind(window_end)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    rows.into_iter().map(session_from_row).collect()
 }
 
 pub async fn load_install_session_state(
@@ -481,6 +553,32 @@ pub async fn update_session_tail_in_tx(
     Ok(result.rows_affected())
 }
 
+pub async fn delete_sessions_overlapping_window_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Result<u64, StoreError> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM sessions
+        WHERE project_id = $1
+          AND install_id = $2
+          AND session_start <= $4
+          AND session_end >= $3
+        "#,
+    )
+    .bind(project_id)
+    .bind(install_id)
+    .bind(window_start)
+    .bind(window_end)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 pub async fn increment_session_daily_for_new_session(
     pool: &PgPool,
     project_id: Uuid,
@@ -638,6 +736,130 @@ pub async fn fetch_session_daily_range(
     .await?;
 
     rows.into_iter().map(session_daily_from_row).collect()
+}
+
+pub async fn rebuild_session_daily_days_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    days: &[NaiveDate],
+) -> Result<(), StoreError> {
+    let days = days
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if days.is_empty() {
+        return Ok(());
+    }
+
+    rebuild_session_daily_installs_days_in_tx(tx, project_id, &days).await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM session_daily
+        WHERE project_id = $1
+          AND day = ANY($2)
+        "#,
+    )
+    .bind(project_id)
+    .bind(&days)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        WITH session_rollups AS (
+            SELECT
+                project_id,
+                DATE(session_start AT TIME ZONE 'UTC') AS day,
+                COUNT(*)::BIGINT AS sessions_count,
+                COALESCE(SUM(duration_seconds), 0)::BIGINT AS total_duration_seconds
+            FROM sessions
+            WHERE project_id = $1
+              AND DATE(session_start AT TIME ZONE 'UTC') = ANY($2)
+            GROUP BY project_id, DATE(session_start AT TIME ZONE 'UTC')
+        ),
+        install_rollups AS (
+            SELECT
+                project_id,
+                day,
+                COUNT(*)::BIGINT AS active_installs
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = ANY($2)
+            GROUP BY project_id, day
+        )
+        INSERT INTO session_daily (
+            project_id,
+            day,
+            sessions_count,
+            active_installs,
+            total_duration_seconds
+        )
+        SELECT
+            session_rollups.project_id,
+            session_rollups.day,
+            session_rollups.sessions_count,
+            COALESCE(install_rollups.active_installs, 0),
+            session_rollups.total_duration_seconds
+        FROM session_rollups
+        LEFT JOIN install_rollups
+          ON install_rollups.project_id = session_rollups.project_id
+         AND install_rollups.day = session_rollups.day
+        "#,
+    )
+    .bind(project_id)
+    .bind(&days)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+async fn rebuild_session_daily_installs_days_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    days: &[NaiveDate],
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        DELETE FROM session_daily_installs
+        WHERE project_id = $1
+          AND day = ANY($2)
+        "#,
+    )
+    .bind(project_id)
+    .bind(days)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO session_daily_installs (
+            project_id,
+            day,
+            install_id,
+            session_count
+        )
+        SELECT
+            project_id,
+            DATE(session_start AT TIME ZONE 'UTC') AS day,
+            install_id,
+            COUNT(*)::INTEGER AS session_count
+        FROM sessions
+        WHERE project_id = $1
+          AND DATE(session_start AT TIME ZONE 'UTC') = ANY($2)
+        GROUP BY project_id, DATE(session_start AT TIME ZONE 'UTC'), install_id
+        "#,
+    )
+    .bind(project_id)
+    .bind(days)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
 }
 
 pub async fn load_worker_offset(pool: &PgPool, worker_name: &str) -> Result<i64, StoreError> {
@@ -869,7 +1091,7 @@ fn platform_from_str(value: &str) -> Result<Platform, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, NaiveDate, TimeZone};
+    use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
     use fantasma_core::EventPayload;
     use serde_json::Map;
 
@@ -915,6 +1137,26 @@ mod tests {
             tail_event_count: event_count,
             tail_duration_seconds: (end_minutes as i32) * 60,
             tail_day: NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+        }
+    }
+
+    fn session(install_id: &str, start_minutes: i64, end_minutes: i64) -> SessionRecord {
+        let session_start = timestamp(start_minutes);
+        let session_end = timestamp(end_minutes);
+
+        SessionRecord {
+            project_id: project_id(),
+            install_id: install_id.to_owned(),
+            user_id: Some(format!("user-{install_id}")),
+            session_id: format!("{install_id}:{}", session_start.to_rfc3339()),
+            session_start,
+            session_end,
+            event_count: if end_minutes > start_minutes { 2 } else { 1 },
+            duration_seconds: session_end
+                .signed_duration_since(session_start)
+                .num_seconds() as i32,
+            platform: Platform::Ios,
+            app_version: Some("1.0.0".to_owned()),
         }
     }
 
@@ -1293,5 +1535,225 @@ mod tests {
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[0].timestamp, timestamp(0));
         assert_eq!(stored[1].timestamp, timestamp(10));
+    }
+
+    #[sqlx::test]
+    async fn fetch_sessions_overlapping_window_in_tx_returns_only_overlaps(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let mut tx = pool.begin().await.expect("begin transaction");
+        insert_session_in_tx(&mut tx, &session("install-1", 0, 10))
+            .await
+            .expect("insert first session");
+        insert_session_in_tx(&mut tx, &session("install-1", 45, 60))
+            .await
+            .expect("insert second session");
+        insert_session_in_tx(&mut tx, &session("install-2", 5, 15))
+            .await
+            .expect("insert other install session");
+
+        let overlapping = fetch_sessions_overlapping_window_in_tx(
+            &mut tx,
+            project_id(),
+            "install-1",
+            timestamp(5),
+            timestamp(50),
+        )
+        .await
+        .expect("fetch overlapping sessions");
+        let non_overlapping = fetch_sessions_overlapping_window_in_tx(
+            &mut tx,
+            project_id(),
+            "install-1",
+            timestamp(11),
+            timestamp(44),
+        )
+        .await
+        .expect("fetch non-overlapping sessions");
+
+        assert_eq!(overlapping.len(), 2);
+        assert_eq!(overlapping[0].session_start, timestamp(0));
+        assert_eq!(overlapping[1].session_start, timestamp(45));
+        assert!(non_overlapping.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn rebuild_session_daily_days_in_tx_leaves_untouched_days_alone(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
+        let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date");
+        let day_3 = NaiveDate::from_ymd_opt(2026, 1, 3).expect("valid date");
+
+        let mut seed_tx = pool.begin().await.expect("begin seed transaction");
+        insert_session_in_tx(&mut seed_tx, &session("install-1", 0, 10))
+            .await
+            .expect("insert day 1 session");
+        insert_session_in_tx(&mut seed_tx, &session("install-2", 24 * 60, 24 * 60))
+            .await
+            .expect("insert day 2 session");
+        insert_session_in_tx(&mut seed_tx, &session("install-3", 48 * 60, 48 * 60 + 10))
+            .await
+            .expect("insert day 3 session");
+        rebuild_session_daily_days_in_tx(&mut seed_tx, project_id(), &[day_1, day_2, day_3])
+            .await
+            .expect("seed session_daily rows");
+        seed_tx.commit().await.expect("commit seed transaction");
+
+        let middle_day_before = sqlx::query(
+            r#"
+            SELECT sessions_count, active_installs, total_duration_seconds, updated_at
+            FROM session_daily
+            WHERE project_id = $1
+              AND day = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_2)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch middle day row");
+
+        sqlx::query("SELECT pg_sleep(0.01)")
+            .execute(&pool)
+            .await
+            .expect("sleep for updated_at delta");
+
+        sqlx::query(
+            r#"
+            UPDATE sessions
+            SET session_end = $3,
+                duration_seconds = $4
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .bind(timestamp(45))
+        .bind(45 * 60)
+        .execute(&pool)
+        .await
+        .expect("update day 1 session");
+        sqlx::query(
+            r#"
+            UPDATE sessions
+            SET session_end = $3,
+                duration_seconds = $4
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-3")
+        .bind(timestamp(48 * 60 + 45))
+        .bind(45 * 60)
+        .execute(&pool)
+        .await
+        .expect("update day 3 session");
+
+        let mut rebuild_tx = pool.begin().await.expect("begin rebuild transaction");
+        rebuild_session_daily_days_in_tx(&mut rebuild_tx, project_id(), &[day_1, day_3])
+            .await
+            .expect("rebuild touched days");
+        rebuild_tx
+            .commit()
+            .await
+            .expect("commit rebuild transaction");
+
+        let day_1_row = sqlx::query(
+            r#"
+            SELECT sessions_count, active_installs, total_duration_seconds
+            FROM session_daily
+            WHERE project_id = $1
+              AND day = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_1)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch day 1 row");
+        let middle_day_after = sqlx::query(
+            r#"
+            SELECT sessions_count, active_installs, total_duration_seconds, updated_at
+            FROM session_daily
+            WHERE project_id = $1
+              AND day = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_2)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch middle day row after rebuild");
+        let day_3_row = sqlx::query(
+            r#"
+            SELECT sessions_count, active_installs, total_duration_seconds
+            FROM session_daily
+            WHERE project_id = $1
+              AND day = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_3)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch day 3 row");
+
+        assert_eq!(day_1_row.try_get::<i64, _>("sessions_count").unwrap(), 1);
+        assert_eq!(day_1_row.try_get::<i64, _>("active_installs").unwrap(), 1);
+        assert_eq!(
+            day_1_row
+                .try_get::<i64, _>("total_duration_seconds")
+                .unwrap(),
+            45 * 60
+        );
+        assert_eq!(
+            middle_day_after
+                .try_get::<i64, _>("sessions_count")
+                .unwrap(),
+            middle_day_before
+                .try_get::<i64, _>("sessions_count")
+                .unwrap()
+        );
+        assert_eq!(
+            middle_day_after
+                .try_get::<i64, _>("active_installs")
+                .unwrap(),
+            middle_day_before
+                .try_get::<i64, _>("active_installs")
+                .unwrap()
+        );
+        assert_eq!(
+            middle_day_after
+                .try_get::<i64, _>("total_duration_seconds")
+                .unwrap(),
+            middle_day_before
+                .try_get::<i64, _>("total_duration_seconds")
+                .unwrap()
+        );
+        assert_eq!(
+            middle_day_after
+                .try_get::<DateTime<Utc>, _>("updated_at")
+                .unwrap(),
+            middle_day_before
+                .try_get::<DateTime<Utc>, _>("updated_at")
+                .unwrap()
+        );
+        assert_eq!(day_3_row.try_get::<i64, _>("sessions_count").unwrap(), 1);
+        assert_eq!(day_3_row.try_get::<i64, _>("active_installs").unwrap(), 1);
+        assert_eq!(
+            day_3_row
+                .try_get::<i64, _>("total_duration_seconds")
+                .unwrap(),
+            45 * 60
+        );
     }
 }
