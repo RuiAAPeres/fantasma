@@ -2,6 +2,14 @@
 
 This repository is for building Fantasma, a privacy-first, self-hosted mobile analytics stack. Treat this file as the operating manual for coding agents and contributors.
 
+## Product Ethos
+
+- Fantasma is install-scoped analytics, not person-scoped analytics.
+- Simplicity is a product feature. Prefer fewer metrics, fewer dimensions, and fewer knobs.
+- The goal is actionable understanding for mobile apps, not exhaustive analytics coverage.
+- Privacy claims must be reflected in the data model. Do not add hidden identity or stitching primitives.
+- Properties are for event context, not for profile building. Do not use them to reconstruct person-level identity.
+
 ## Product Rules
 
 - Keep Fantasma simple, API-first, mobile-first, self-hosted, and privacy-first.
@@ -42,6 +50,9 @@ Do not add scope beyond the product vision without an explicit decision:
 - Workers own aggregate generation.
 - Do not perform synchronous aggregation in the ingest path.
 - Do not add hidden enrichment or automatic identity stitching.
+- Do not add person-level identity primitives to the MVP model.
+- Do not accept public session identifiers from clients; backend sessionization is internal.
+- Do not infer identity from `properties` or other client metadata.
 - Scope all persisted data by `project_id`.
 - DB-backed Rust tests should run fully in Docker through the repository workflow rather than host Postgres or ad hoc host `DATABASE_URL` setup.
 - Keep `cargo test --workspace` on the Docker Postgres path limited to tests satisfied by containerized Postgres alone; stack-level checks belong in dedicated smoke workflows.
@@ -53,6 +64,7 @@ Do not add scope beyond the product vision without an explicit decision:
 - No automatic screen tracking.
 - No hidden behavior.
 - Persist tracked events before upload.
+- Do not expose person-scoped identity APIs in the MVP.
 - `clear()` rotates local identity without deleting already-queued events.
 
 ## Documentation Rules

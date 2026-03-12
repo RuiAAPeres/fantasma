@@ -31,13 +31,6 @@ public enum Fantasma {
         }
     }
 
-    public static func identify(_ userId: String) {
-        wait {
-            let core = await runtime.currentCore()
-            await core.identify(userId)
-        }
-    }
-
     public static func flush() {
         Task {
             let core = await runtime.currentCore()

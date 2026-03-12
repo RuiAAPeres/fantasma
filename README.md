@@ -2,6 +2,8 @@
 
 Fantasma is a self-hosted, privacy-first mobile analytics platform.
 
+Fantasma is intentionally install-scoped. It measures installs, sessions, and event activity for mobile apps without introducing person-level identity or hidden stitching.
+
 The project is intentionally narrow:
 
 - event-based analytics for mobile apps
@@ -9,6 +11,8 @@ The project is intentionally narrow:
 - durable mobile SDKs
 - simple self-hosted deployment
 - an optional dashboard built on the same public API
+
+Fantasma favors a small, legible product surface over analytics completeness. The MVP keeps identity local to an install, treats backend sessionization as an internal concern, and expects event `properties` to carry product context rather than direct identifiers.
 
 Fantasma is not trying to be a full product analytics suite. It does not target feature flags, attribution, experimentation, session replay, or customer data platform workflows.
 

@@ -55,12 +55,25 @@ async fn main() {
                 info!("processed {processed} raw events into sessions");
             }
             Ok(_) => {
-                info!("worker tick: no new raw events");
+                info!("session worker tick: no new raw events");
             }
             Err(err) => {
                 error!(?err, "failed to process session batch");
             }
         }
+
+        match fantasma_worker::process_event_metrics_batch(&pool, batch_size).await {
+            Ok(processed) if processed > 0 => {
+                info!("processed {processed} raw events into event metrics");
+            }
+            Ok(_) => {
+                info!("event metrics worker tick: no new raw events");
+            }
+            Err(err) => {
+                error!(?err, "failed to process event metrics batch");
+            }
+        }
+
         tokio::time::sleep(Duration::from_millis(poll_interval)).await;
     }
 }

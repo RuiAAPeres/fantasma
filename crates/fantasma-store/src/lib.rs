@@ -1,8 +1,8 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use fantasma_auth::{derive_key_prefix, hash_ingest_key};
-use fantasma_core::{EventCountQuery, EventPayload, Platform};
+use fantasma_core::{EventPayload, Platform};
 pub use sqlx::PgPool;
 use sqlx::{Postgres, QueryBuilder, Row, Transaction, migrate::Migrator, postgres::PgPoolOptions};
 use thiserror::Error;
@@ -52,18 +52,19 @@ pub enum StoreError {
 pub struct RawEventRecord {
     pub id: i64,
     pub project_id: Uuid,
+    pub event_name: String,
     pub timestamp: DateTime<Utc>,
     pub install_id: String,
-    pub user_id: Option<String>,
     pub platform: Platform,
     pub app_version: Option<String>,
+    pub os_version: Option<String>,
+    pub properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
     pub project_id: Uuid,
     pub install_id: String,
-    pub user_id: Option<String>,
     pub session_id: String,
     pub session_start: DateTime<Utc>,
     pub session_end: DateTime<Utc>,
@@ -80,7 +81,6 @@ pub struct SessionTailUpdate<'a> {
     pub session_end: DateTime<Utc>,
     pub event_count: i32,
     pub duration_seconds: i32,
-    pub user_id: Option<&'a str>,
     pub app_version: Option<&'a str>,
 }
 
@@ -103,6 +103,63 @@ pub struct SessionDailyRecord {
     pub sessions_count: i64,
     pub active_installs: i64,
     pub total_duration_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCountDailyTotalDelta {
+    pub project_id: Uuid,
+    pub day: NaiveDate,
+    pub event_name: String,
+    pub event_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCountDailyDim1Delta {
+    pub project_id: Uuid,
+    pub day: NaiveDate,
+    pub event_name: String,
+    pub dim1_key: String,
+    pub dim1_value: String,
+    pub event_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCountDailyDim2Delta {
+    pub project_id: Uuid,
+    pub day: NaiveDate,
+    pub event_name: String,
+    pub dim1_key: String,
+    pub dim1_value: String,
+    pub dim2_key: String,
+    pub dim2_value: String,
+    pub event_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCountDailyDim3Delta {
+    pub project_id: Uuid,
+    pub day: NaiveDate,
+    pub event_name: String,
+    pub dim1_key: String,
+    pub dim1_value: String,
+    pub dim2_key: String,
+    pub dim2_value: String,
+    pub dim3_key: String,
+    pub dim3_value: String,
+    pub event_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventMetricsCubeRow {
+    pub day: NaiveDate,
+    pub dimensions: BTreeMap<String, String>,
+    pub event_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventMetricsAggregateCubeRow {
+    pub dimensions: BTreeMap<String, String>,
+    pub event_count: u64,
 }
 
 pub async fn connect(config: &DatabaseConfig) -> Result<PgPool, StoreError> {
@@ -192,7 +249,7 @@ pub async fn insert_events(
     events: &[EventPayload],
 ) -> Result<u64, StoreError> {
     let mut builder = QueryBuilder::<sqlx::Postgres>::new(
-        "INSERT INTO events_raw (project_id, event_name, timestamp, install_id, user_id, session_id, platform, app_version, properties) ",
+        "INSERT INTO events_raw (project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties) ",
     );
 
     builder.push_values(events, |mut separated, event| {
@@ -200,16 +257,15 @@ pub async fn insert_events(
         separated.push_bind(&event.event);
         separated.push_bind(event.timestamp);
         separated.push_bind(&event.install_id);
-        separated.push_bind(&event.user_id);
-        separated.push_bind(&event.session_id);
         separated.push_bind(match event.platform {
             fantasma_core::Platform::Ios => "ios",
             fantasma_core::Platform::Android => "android",
         });
         separated.push_bind(&event.app_version);
-        separated.push_bind(sqlx::types::Json(serde_json::Value::Object(
-            event.properties.clone(),
-        )));
+        separated.push_bind(&event.os_version);
+        separated.push_bind(sqlx::types::Json(
+            serde_json::to_value(&event.properties).expect("serialize event properties"),
+        ));
     });
 
     let result = builder.build().execute(pool).await?;
@@ -217,23 +273,240 @@ pub async fn insert_events(
     Ok(result.rows_affected())
 }
 
-pub async fn count_events(pool: &PgPool, query: &EventCountQuery) -> Result<u64, StoreError> {
-    let count = sqlx::query(
-        r#"
-        SELECT count(*) AS count
-        FROM events_raw
-        WHERE project_id = $1
-          AND timestamp BETWEEN $2 AND $3
-        "#,
-    )
-    .bind(query.project_id)
-    .bind(query.start)
-    .bind(query.end)
-    .fetch_one(pool)
-    .await?
-    .try_get::<i64, _>("count")? as u64;
+pub async fn upsert_event_count_daily_totals_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deltas: &[EventCountDailyTotalDelta],
+) -> Result<(), StoreError> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
 
-    Ok(count)
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "INSERT INTO event_count_daily_total (project_id, day, event_name, event_count) ",
+    );
+    builder.push_values(deltas, |mut separated, delta| {
+        separated.push_bind(delta.project_id);
+        separated.push_bind(delta.day);
+        separated.push_bind(&delta.event_name);
+        separated.push_bind(delta.event_count);
+    });
+    builder.push(
+        " ON CONFLICT (project_id, day, event_name) DO UPDATE SET \
+          event_count = event_count_daily_total.event_count + EXCLUDED.event_count, \
+          updated_at = now()",
+    );
+
+    builder.build().execute(&mut **tx).await?;
+
+    Ok(())
+}
+
+pub async fn upsert_event_count_daily_dim1_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deltas: &[EventCountDailyDim1Delta],
+) -> Result<(), StoreError> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "INSERT INTO event_count_daily_dim1 \
+         (project_id, day, event_name, dim1_key, dim1_value, event_count) ",
+    );
+    builder.push_values(deltas, |mut separated, delta| {
+        separated.push_bind(delta.project_id);
+        separated.push_bind(delta.day);
+        separated.push_bind(&delta.event_name);
+        separated.push_bind(&delta.dim1_key);
+        separated.push_bind(&delta.dim1_value);
+        separated.push_bind(delta.event_count);
+    });
+    builder.push(
+        " ON CONFLICT (project_id, day, event_name, dim1_key, dim1_value) DO UPDATE SET \
+          event_count = event_count_daily_dim1.event_count + EXCLUDED.event_count, \
+          updated_at = now()",
+    );
+
+    builder.build().execute(&mut **tx).await?;
+
+    Ok(())
+}
+
+pub async fn upsert_event_count_daily_dim2_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deltas: &[EventCountDailyDim2Delta],
+) -> Result<(), StoreError> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "INSERT INTO event_count_daily_dim2 \
+         (project_id, day, event_name, dim1_key, dim1_value, dim2_key, dim2_value, event_count) ",
+    );
+    builder.push_values(deltas, |mut separated, delta| {
+        separated.push_bind(delta.project_id);
+        separated.push_bind(delta.day);
+        separated.push_bind(&delta.event_name);
+        separated.push_bind(&delta.dim1_key);
+        separated.push_bind(&delta.dim1_value);
+        separated.push_bind(&delta.dim2_key);
+        separated.push_bind(&delta.dim2_value);
+        separated.push_bind(delta.event_count);
+    });
+    builder.push(
+        " ON CONFLICT \
+          (project_id, day, event_name, dim1_key, dim1_value, dim2_key, dim2_value) \
+          DO UPDATE SET \
+          event_count = event_count_daily_dim2.event_count + EXCLUDED.event_count, \
+          updated_at = now()",
+    );
+
+    builder.build().execute(&mut **tx).await?;
+
+    Ok(())
+}
+
+pub async fn upsert_event_count_daily_dim3_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deltas: &[EventCountDailyDim3Delta],
+) -> Result<(), StoreError> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "INSERT INTO event_count_daily_dim3 \
+         (project_id, day, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count) ",
+    );
+    builder.push_values(deltas, |mut separated, delta| {
+        separated.push_bind(delta.project_id);
+        separated.push_bind(delta.day);
+        separated.push_bind(&delta.event_name);
+        separated.push_bind(&delta.dim1_key);
+        separated.push_bind(&delta.dim1_value);
+        separated.push_bind(&delta.dim2_key);
+        separated.push_bind(&delta.dim2_value);
+        separated.push_bind(&delta.dim3_key);
+        separated.push_bind(&delta.dim3_value);
+        separated.push_bind(delta.event_count);
+    });
+    builder.push(
+        " ON CONFLICT \
+          (project_id, day, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value) \
+          DO UPDATE SET \
+          event_count = event_count_daily_dim3.event_count + EXCLUDED.event_count, \
+          updated_at = now()",
+    );
+
+    builder.build().execute(&mut **tx).await?;
+
+    Ok(())
+}
+
+pub async fn fetch_event_metrics_cube_rows(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+    ensure_canonical_cube_keys(cube_keys)?;
+    ensure_filters_belong_to_cube(cube_keys, filters)?;
+
+    match cube_keys.len() {
+        0 => {
+            fetch_event_metrics_total_rows(pool, project_id, event_name, start_date, end_date).await
+        }
+        1 => {
+            fetch_event_metrics_dim1_rows(
+                pool, project_id, event_name, start_date, end_date, cube_keys, filters,
+            )
+            .await
+        }
+        2 => {
+            fetch_event_metrics_dim2_rows(
+                pool, project_id, event_name, start_date, end_date, cube_keys, filters,
+            )
+            .await
+        }
+        3 => {
+            fetch_event_metrics_dim3_rows(
+                pool, project_id, event_name, start_date, end_date, cube_keys, filters,
+            )
+            .await
+        }
+        other => Err(StoreError::InvariantViolation(format!(
+            "event metrics cube arity must be between 0 and 3, got {other}"
+        ))),
+    }
+}
+
+pub async fn fetch_event_metrics_aggregate_cube_rows(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    window: (NaiveDate, NaiveDate),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+    let (start_date, end_date) = window;
+    ensure_canonical_cube_keys(cube_keys)?;
+    ensure_filters_belong_to_cube(cube_keys, filters)?;
+
+    match cube_keys.len() {
+        0 => {
+            fetch_event_metrics_total_aggregate_rows(
+                pool,
+                project_id,
+                event_name,
+                (start_date, end_date),
+            )
+            .await
+        }
+        1 => {
+            fetch_event_metrics_dim1_aggregate_rows(
+                pool,
+                project_id,
+                event_name,
+                (start_date, end_date),
+                cube_keys,
+                filters,
+                limit,
+            )
+            .await
+        }
+        2 => {
+            fetch_event_metrics_dim2_aggregate_rows(
+                pool,
+                project_id,
+                event_name,
+                (start_date, end_date),
+                cube_keys,
+                filters,
+                limit,
+            )
+            .await
+        }
+        3 => {
+            fetch_event_metrics_dim3_aggregate_rows(
+                pool,
+                project_id,
+                event_name,
+                (start_date, end_date),
+                cube_keys,
+                filters,
+                limit,
+            )
+            .await
+        }
+        other => Err(StoreError::InvariantViolation(format!(
+            "event metrics cube arity must be between 0 and 3, got {other}"
+        ))),
+    }
 }
 
 pub async fn fetch_events_after(
@@ -243,7 +516,7 @@ pub async fn fetch_events_after(
 ) -> Result<Vec<RawEventRecord>, StoreError> {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, timestamp, install_id, user_id, platform, app_version
+        SELECT id, project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties
         FROM events_raw
         WHERE id > $1
         ORDER BY id ASC
@@ -291,7 +564,7 @@ where
 {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, timestamp, install_id, user_id, platform, app_version
+        SELECT id, project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties
         FROM events_raw
         WHERE project_id = $1
           AND install_id = $2
@@ -335,7 +608,7 @@ where
 {
     let row = sqlx::query(
         r#"
-        SELECT project_id, install_id, user_id, session_id, session_start, session_end,
+        SELECT project_id, install_id, session_id, session_start, session_end,
                event_count, duration_seconds, platform, app_version
         FROM sessions
         WHERE project_id = $1
@@ -361,7 +634,7 @@ pub async fn fetch_sessions_overlapping_window_in_tx(
 ) -> Result<Vec<SessionRecord>, StoreError> {
     let rows = sqlx::query(
         r#"
-        SELECT project_id, install_id, user_id, session_id, session_start, session_end,
+        SELECT project_id, install_id, session_id, session_start, session_end,
                event_count, duration_seconds, platform, app_version
         FROM sessions
         WHERE project_id = $1
@@ -496,7 +769,6 @@ pub async fn insert_session_in_tx(
         INSERT INTO sessions (
             project_id,
             install_id,
-            user_id,
             session_id,
             session_start,
             session_end,
@@ -505,12 +777,11 @@ pub async fn insert_session_in_tx(
             platform,
             app_version
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         "#,
     )
     .bind(session.project_id)
     .bind(&session.install_id)
-    .bind(&session.user_id)
     .bind(&session.session_id)
     .bind(session.session_start)
     .bind(session.session_end)
@@ -534,8 +805,7 @@ pub async fn update_session_tail_in_tx(
         SET session_end = $3,
             event_count = $4,
             duration_seconds = $5,
-            user_id = COALESCE($6, user_id),
-            app_version = COALESCE($7, app_version)
+            app_version = COALESCE($6, app_version)
         WHERE project_id = $1
           AND session_id = $2
         "#,
@@ -545,7 +815,6 @@ pub async fn update_session_tail_in_tx(
     .bind(update.session_end)
     .bind(update.event_count)
     .bind(update.duration_seconds)
-    .bind(update.user_id)
     .bind(update.app_version)
     .execute(&mut **tx)
     .await?;
@@ -1021,15 +1290,525 @@ pub async fn count_active_installs(
     Ok(count as u64)
 }
 
+async fn fetch_event_metrics_total_rows(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT day, event_count
+        FROM event_count_daily_total
+        WHERE project_id = $1
+          AND event_name = $2
+          AND day BETWEEN $3 AND $4
+        ORDER BY day ASC
+        "#,
+    )
+    .bind(project_id)
+    .bind(event_name)
+    .bind(start_date)
+    .bind(end_date)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsCubeRow {
+            day: row.try_get("day").expect("day column exists"),
+            dimensions: BTreeMap::new(),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_event_metrics_total_aggregate_rows(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    window: (NaiveDate, NaiveDate),
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+    let (start_date, end_date) = window;
+    let row = sqlx::query(
+        r#"
+        SELECT SUM(event_count)::BIGINT AS event_count
+        FROM event_count_daily_total
+        WHERE project_id = $1
+          AND event_name = $2
+          AND day BETWEEN $3 AND $4
+        "#,
+    )
+    .bind(project_id)
+    .bind(event_name)
+    .bind(start_date)
+    .bind(end_date)
+    .fetch_one(pool)
+    .await?;
+
+    let event_count = row.try_get::<Option<i64>, _>("event_count")?;
+
+    Ok(event_count
+        .map(|event_count| {
+            vec![EventMetricsAggregateCubeRow {
+                dimensions: BTreeMap::new(),
+                event_count: event_count as u64,
+            }]
+        })
+        .unwrap_or_default())
+}
+
+async fn fetch_event_metrics_dim1_rows(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT day, dim1_key, dim1_value, event_count \
+         FROM event_count_daily_dim1 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND event_name = ");
+    builder.push_bind(event_name);
+    builder.push(" AND day BETWEEN ");
+    builder.push_bind(start_date);
+    builder.push(" AND ");
+    builder.push_bind(end_date);
+    builder.push(" AND dim1_key = ");
+    builder.push_bind(&cube_keys[0]);
+
+    if let Some(value) = filters.get(&cube_keys[0]) {
+        builder.push(" AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(" ORDER BY day ASC, dim1_value ASC");
+
+    let rows = builder.build().fetch_all(pool).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsCubeRow {
+            day: row.try_get("day").expect("day column exists"),
+            dimensions: BTreeMap::from([(
+                row.try_get::<String, _>("dim1_key")
+                    .expect("dim1_key column exists"),
+                row.try_get::<String, _>("dim1_value")
+                    .expect("dim1_value column exists"),
+            )]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_event_metrics_dim1_aggregate_rows(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    window: (NaiveDate, NaiveDate),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+    let (start_date, end_date) = window;
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT dim1_key, dim1_value, SUM(event_count)::BIGINT AS event_count \
+         FROM event_count_daily_dim1 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND event_name = ");
+    builder.push_bind(event_name);
+    builder.push(" AND day BETWEEN ");
+    builder.push_bind(start_date);
+    builder.push(" AND ");
+    builder.push_bind(end_date);
+    builder.push(" AND dim1_key = ");
+    builder.push_bind(&cube_keys[0]);
+
+    if let Some(value) = filters.get(&cube_keys[0]) {
+        builder.push(" AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(" GROUP BY dim1_key, dim1_value ORDER BY dim1_value ASC");
+
+    if let Some(limit) = limit {
+        builder.push(" LIMIT ");
+        builder.push_bind(limit as i64);
+    }
+
+    let rows = builder.build().fetch_all(pool).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsAggregateCubeRow {
+            dimensions: BTreeMap::from([(
+                row.try_get::<String, _>("dim1_key")
+                    .expect("dim1_key column exists"),
+                row.try_get::<String, _>("dim1_value")
+                    .expect("dim1_value column exists"),
+            )]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_event_metrics_dim2_rows(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT day, dim1_key, dim1_value, dim2_key, dim2_value, event_count \
+         FROM event_count_daily_dim2 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND event_name = ");
+    builder.push_bind(event_name);
+    builder.push(" AND day BETWEEN ");
+    builder.push_bind(start_date);
+    builder.push(" AND ");
+    builder.push_bind(end_date);
+    builder.push(" AND dim1_key = ");
+    builder.push_bind(&cube_keys[0]);
+    builder.push(" AND dim2_key = ");
+    builder.push_bind(&cube_keys[1]);
+
+    if let Some(value) = filters.get(&cube_keys[0]) {
+        builder.push(" AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    if let Some(value) = filters.get(&cube_keys[1]) {
+        builder.push(" AND dim2_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(" ORDER BY day ASC, dim1_value ASC, dim2_value ASC");
+
+    let rows = builder.build().fetch_all(pool).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsCubeRow {
+            day: row.try_get("day").expect("day column exists"),
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+            ]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_event_metrics_dim2_aggregate_rows(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    window: (NaiveDate, NaiveDate),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+    let (start_date, end_date) = window;
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT dim1_key, dim1_value, dim2_key, dim2_value, SUM(event_count)::BIGINT AS event_count \
+         FROM event_count_daily_dim2 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND event_name = ");
+    builder.push_bind(event_name);
+    builder.push(" AND day BETWEEN ");
+    builder.push_bind(start_date);
+    builder.push(" AND ");
+    builder.push_bind(end_date);
+    builder.push(" AND dim1_key = ");
+    builder.push_bind(&cube_keys[0]);
+    builder.push(" AND dim2_key = ");
+    builder.push_bind(&cube_keys[1]);
+
+    if let Some(value) = filters.get(&cube_keys[0]) {
+        builder.push(" AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    if let Some(value) = filters.get(&cube_keys[1]) {
+        builder.push(" AND dim2_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(
+        " GROUP BY dim1_key, dim1_value, dim2_key, dim2_value \
+          ORDER BY dim1_value ASC, dim2_value ASC",
+    );
+
+    if let Some(limit) = limit {
+        builder.push(" LIMIT ");
+        builder.push_bind(limit as i64);
+    }
+
+    let rows = builder.build().fetch_all(pool).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsAggregateCubeRow {
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+            ]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_event_metrics_dim3_rows(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT day, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count \
+         FROM event_count_daily_dim3 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND event_name = ");
+    builder.push_bind(event_name);
+    builder.push(" AND day BETWEEN ");
+    builder.push_bind(start_date);
+    builder.push(" AND ");
+    builder.push_bind(end_date);
+    builder.push(" AND dim1_key = ");
+    builder.push_bind(&cube_keys[0]);
+    builder.push(" AND dim2_key = ");
+    builder.push_bind(&cube_keys[1]);
+    builder.push(" AND dim3_key = ");
+    builder.push_bind(&cube_keys[2]);
+
+    if let Some(value) = filters.get(&cube_keys[0]) {
+        builder.push(" AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    if let Some(value) = filters.get(&cube_keys[1]) {
+        builder.push(" AND dim2_value = ");
+        builder.push_bind(value);
+    }
+
+    if let Some(value) = filters.get(&cube_keys[2]) {
+        builder.push(" AND dim3_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(" ORDER BY day ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC");
+
+    let rows = builder.build().fetch_all(pool).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsCubeRow {
+            day: row.try_get("day").expect("day column exists"),
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim3_key")
+                        .expect("dim3_key column exists"),
+                    row.try_get::<String, _>("dim3_value")
+                        .expect("dim3_value column exists"),
+                ),
+            ]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_event_metrics_dim3_aggregate_rows(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    window: (NaiveDate, NaiveDate),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+    let (start_date, end_date) = window;
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, \
+                SUM(event_count)::BIGINT AS event_count \
+         FROM event_count_daily_dim3 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND event_name = ");
+    builder.push_bind(event_name);
+    builder.push(" AND day BETWEEN ");
+    builder.push_bind(start_date);
+    builder.push(" AND ");
+    builder.push_bind(end_date);
+    builder.push(" AND dim1_key = ");
+    builder.push_bind(&cube_keys[0]);
+    builder.push(" AND dim2_key = ");
+    builder.push_bind(&cube_keys[1]);
+    builder.push(" AND dim3_key = ");
+    builder.push_bind(&cube_keys[2]);
+
+    if let Some(value) = filters.get(&cube_keys[0]) {
+        builder.push(" AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    if let Some(value) = filters.get(&cube_keys[1]) {
+        builder.push(" AND dim2_value = ");
+        builder.push_bind(value);
+    }
+
+    if let Some(value) = filters.get(&cube_keys[2]) {
+        builder.push(" AND dim3_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(
+        " GROUP BY dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value \
+          ORDER BY dim1_value ASC, dim2_value ASC, dim3_value ASC",
+    );
+
+    if let Some(limit) = limit {
+        builder.push(" LIMIT ");
+        builder.push_bind(limit as i64);
+    }
+
+    let rows = builder.build().fetch_all(pool).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsAggregateCubeRow {
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim3_key")
+                        .expect("dim3_key column exists"),
+                    row.try_get::<String, _>("dim3_value")
+                        .expect("dim3_value column exists"),
+                ),
+            ]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+fn ensure_canonical_cube_keys(cube_keys: &[String]) -> Result<(), StoreError> {
+    if cube_keys.windows(2).any(|window| window[0] >= window[1]) {
+        return Err(StoreError::InvariantViolation(
+            "event metrics cube keys must be strictly increasing".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_filters_belong_to_cube(
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<(), StoreError> {
+    if filters
+        .keys()
+        .all(|key| cube_keys.iter().any(|cube_key| cube_key == key))
+    {
+        return Ok(());
+    }
+
+    Err(StoreError::InvariantViolation(
+        "event metrics filters must be a subset of the requested cube".to_owned(),
+    ))
+}
+
 fn raw_event_from_row(row: sqlx::postgres::PgRow) -> Result<RawEventRecord, StoreError> {
     Ok(RawEventRecord {
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,
+        event_name: row.try_get("event_name")?,
         timestamp: row.try_get("timestamp")?,
         install_id: row.try_get("install_id")?,
-        user_id: row.try_get("user_id")?,
         platform: platform_from_str(&row.try_get::<String, _>("platform")?)?,
         app_version: row.try_get("app_version")?,
+        os_version: row.try_get("os_version")?,
+        properties: row
+            .try_get::<Option<sqlx::types::Json<BTreeMap<String, String>>>, _>("properties")?
+            .map(|json| json.0)
+            .unwrap_or_default(),
     })
 }
 
@@ -1037,7 +1816,6 @@ fn session_from_row(row: sqlx::postgres::PgRow) -> Result<SessionRecord, StoreEr
     Ok(SessionRecord {
         project_id: row.try_get("project_id")?,
         install_id: row.try_get("install_id")?,
-        user_id: row.try_get("user_id")?,
         session_id: row.try_get("session_id")?,
         session_start: row.try_get("session_start")?,
         session_end: row.try_get("session_end")?,
@@ -1093,7 +1871,6 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
     use fantasma_core::EventPayload;
-    use serde_json::Map;
 
     fn project_id() -> Uuid {
         Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a)
@@ -1119,11 +1896,10 @@ mod tests {
             event: "app_open".to_owned(),
             timestamp: timestamp(minutes),
             install_id: install_id.to_owned(),
-            user_id: None,
-            session_id: None,
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
-            properties: Map::new(),
+            os_version: Some("18.3".to_owned()),
+            properties: BTreeMap::new(),
         }
     }
 
@@ -1147,7 +1923,6 @@ mod tests {
         SessionRecord {
             project_id: project_id(),
             install_id: install_id.to_owned(),
-            user_id: Some(format!("user-{install_id}")),
             session_id: format!("{install_id}:{}", session_start.to_rfc3339()),
             session_start,
             session_end,
@@ -1201,6 +1976,34 @@ mod tests {
         .await
         .expect("fetch session_daily index names");
 
+        let event_metrics_index_names = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename IN (
+                'event_count_daily_total',
+                'event_count_daily_dim1',
+                'event_count_daily_dim2',
+                'event_count_daily_dim3'
+            )
+              AND indexname IN (
+                'idx_event_count_daily_total_project_event_day',
+                'idx_event_count_daily_dim1_project_event_dims_day',
+                'idx_event_count_daily_dim2_project_event_keys_day',
+                'idx_event_count_daily_dim2_project_event_dim1_value_day',
+                'idx_event_count_daily_dim2_project_event_dim2_value_day',
+                'idx_event_count_daily_dim3_project_event_keys_day',
+                'idx_event_count_daily_dim3_project_event_dim1_value_day',
+                'idx_event_count_daily_dim3_project_event_dim2_value_day',
+                'idx_event_count_daily_dim3_project_event_dim3_value_day'
+              )
+            ORDER BY indexname
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch event metric index names");
+
         let session_table_exists = sqlx::query_scalar::<_, bool>(
             r#"
             SELECT EXISTS (
@@ -1227,6 +2030,49 @@ mod tests {
         .await
         .expect("fetch session_daily table existence");
 
+        let event_metrics_table_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT count(*)
+            FROM information_schema.tables
+            WHERE table_name IN (
+                'event_count_daily_total',
+                'event_count_daily_dim1',
+                'event_count_daily_dim2',
+                'event_count_daily_dim3'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch event metrics table count");
+
+        let os_version_column_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'events_raw'
+                  AND column_name = 'os_version'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch os_version column existence");
+
+        let removed_identity_columns = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name IN ('events_raw', 'sessions')
+              AND column_name IN ('user_id', 'session_id')
+            ORDER BY table_name, column_name
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch removed identity columns");
+
         assert_eq!(
             event_index_names,
             vec!["idx_events_project_install_timestamp".to_owned()]
@@ -1242,8 +2088,117 @@ mod tests {
             session_daily_index_names,
             vec!["idx_session_daily_project_day".to_owned()]
         );
+        assert_eq!(
+            event_metrics_index_names,
+            vec![
+                "idx_event_count_daily_dim1_project_event_dims_day".to_owned(),
+                "idx_event_count_daily_dim2_project_event_dim1_value_day".to_owned(),
+                "idx_event_count_daily_dim2_project_event_dim2_value_day".to_owned(),
+                "idx_event_count_daily_dim2_project_event_keys_day".to_owned(),
+                "idx_event_count_daily_dim3_project_event_dim1_value_day".to_owned(),
+                "idx_event_count_daily_dim3_project_event_dim2_value_day".to_owned(),
+                "idx_event_count_daily_dim3_project_event_dim3_value_day".to_owned(),
+                "idx_event_count_daily_dim3_project_event_keys_day".to_owned(),
+                "idx_event_count_daily_total_project_event_day".to_owned(),
+            ]
+        );
         assert!(session_table_exists);
         assert!(session_daily_table_exists);
+        assert_eq!(event_metrics_table_count, 4);
+        assert!(os_version_column_exists);
+        assert_eq!(removed_identity_columns, vec!["session_id".to_owned()]);
+    }
+
+    #[sqlx::test]
+    async fn event_metrics_dim_tables_enforce_canonical_key_order(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let error = sqlx::query(
+            r#"
+            INSERT INTO event_count_daily_dim2 (
+                project_id,
+                day,
+                event_name,
+                dim1_key,
+                dim1_value,
+                dim2_key,
+                dim2_value,
+                event_count
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(project_id())
+        .bind(NaiveDate::from_ymd_opt(2026, 3, 1).expect("date"))
+        .bind("app_open")
+        .bind("provider")
+        .bind("strava")
+        .bind("app_version")
+        .bind("1.4.0")
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect_err("out-of-order dimension keys should fail");
+
+        assert!(matches!(error, sqlx::Error::Database(_)));
+    }
+
+    #[test]
+    fn baseline_migration_retains_legacy_identity_columns_until_forward_migrations_remove_them() {
+        let migration = include_str!("../migrations/0001_initial.sql");
+
+        assert!(
+            migration.contains("user_id TEXT"),
+            "0001_initial.sql must retain the original events_raw/sessions identity columns"
+        );
+        assert!(
+            migration.contains("session_id TEXT"),
+            "0001_initial.sql must retain the original raw session_id column"
+        );
+    }
+
+    #[test]
+    fn forward_migration_removes_legacy_identity_columns() {
+        let migration = include_str!("../migrations/0006_remove_legacy_identity_columns.sql");
+
+        assert!(
+            migration.contains("ALTER TABLE events_raw")
+                && migration.contains("DROP COLUMN IF EXISTS user_id")
+                && migration.contains("DROP COLUMN IF EXISTS session_id"),
+            "0006 must remove legacy identity columns from events_raw"
+        );
+        assert!(
+            migration.contains("ALTER TABLE sessions")
+                && migration.contains("DROP COLUMN IF EXISTS user_id"),
+            "0006 must remove legacy user_id from sessions"
+        );
+    }
+
+    #[test]
+    fn forward_migration_replaces_event_metrics_read_indexes() {
+        let migration = include_str!("../migrations/0007_event_metrics_read_indexes.sql");
+
+        assert!(
+            migration
+                .contains("DROP INDEX IF EXISTS idx_event_count_daily_dim2_project_event_dims_day")
+                && migration.contains(
+                    "DROP INDEX IF EXISTS idx_event_count_daily_dim3_project_event_dims_day"
+                ),
+            "0007 must remove the older slot-ordered dim2/dim3 read indexes"
+        );
+        assert!(
+            migration.contains("idx_event_count_daily_dim2_project_event_keys_day")
+                && migration.contains("idx_event_count_daily_dim2_project_event_dim1_value_day")
+                && migration.contains("idx_event_count_daily_dim2_project_event_dim2_value_day")
+                && migration.contains("idx_event_count_daily_dim3_project_event_keys_day")
+                && migration.contains("idx_event_count_daily_dim3_project_event_dim1_value_day")
+                && migration.contains("idx_event_count_daily_dim3_project_event_dim2_value_day")
+                && migration.contains("idx_event_count_daily_dim3_project_event_dim3_value_day"),
+            "0007 must add the expanded dim2/dim3 read-path indexes"
+        );
     }
 
     #[sqlx::test]

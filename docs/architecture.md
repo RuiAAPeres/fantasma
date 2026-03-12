@@ -8,6 +8,8 @@
 - APIs are public by default.
 - SDK behavior must be explicit.
 - Deployment must stay simple.
+- Fantasma is install-scoped, not person-scoped.
+- Privacy claims must be reflected in the data model.
 - Fantasma prefers simple, explicit, high-performance data paths.
 - We avoid steady-state designs that rely on broad recomputation.
 - We narrow feature shape when necessary to preserve predictable performance and operational clarity.
@@ -21,8 +23,8 @@ curl / SDK
   -> Rust ingest service
   -> append-only Postgres events_raw table
   -> fantasma-worker
-  -> derived Postgres sessions, session_daily, and session_daily_installs tables
-  -> GET /v1/metrics/sessions/* and /v1/metrics/*/daily
+  -> derived Postgres sessions, session_daily, session_daily_installs, event_count_daily_total, event_count_daily_dim1, event_count_daily_dim2, and event_count_daily_dim3 tables
+  -> GET /v1/metrics/sessions/*, /v1/metrics/sessions/count/daily, /v1/metrics/sessions/duration/total/daily, /v1/metrics/events/aggregate, and /v1/metrics/events/daily
   -> query API
 ```
 
@@ -58,6 +60,10 @@ Current derived metric:
 - sessions
 - session_daily
 - session_daily_installs
+- event_count_daily_total
+- event_count_daily_dim1
+- event_count_daily_dim2
+- event_count_daily_dim3
 
 Current worker behavior:
 
@@ -74,6 +80,8 @@ Current worker behavior:
 - rebuild only the exact touched UTC start days for `session_daily` and `session_daily_installs` after a repair
 - keep the normal append path incremental: `session_daily` still updates directly from new sessions and tail-session duration deltas
 - update `session_daily_installs` incrementally so daily active installs never depend on `COUNT(DISTINCT ...)` rebuilds
+- derive event-count cuboids incrementally from raw events into daily totals, single-dimension rollups, two-dimension rollups, and three-dimension rollups
+- keep event-metrics rollups keyed only by canonical string dimensions, never by the full property bag
 - advance a `worker_offsets` checkpoint only after successful writes
 
 Current aggregate ownership:
@@ -82,11 +90,18 @@ Current aggregate ownership:
 - `install_session_state` is the worker's steady-state decision surface for sessionization
 - `session_daily` stores UTC `DATE` buckets for `sessions_count`, `active_installs`, and `total_duration_seconds`
 - `session_daily_installs` stores per-day install membership and session counts so internal daily active-install aggregates stay incremental without `COUNT(DISTINCT ...)` rebuilds
+- `event_count_daily_total` stores per-project, per-event, per-day totals
+- `event_count_daily_dim1`, `event_count_daily_dim2`, and `event_count_daily_dim3` store bounded sparse cuboids keyed by canonical dimension slots
 
 Current public daily metric scope:
 
 - `sessions_count_daily`
 - `session_duration_total_daily`
+- `event_count_daily`
+
+Current public aggregate metric scope:
+
+- `event_count`
 
 Planned aggregates:
 
@@ -100,7 +115,8 @@ Planned aggregates:
 Responsibilities:
 
 - expose project-scoped query endpoints
-- read raw events directly for the first vertical slice
+- parse the explicit event-metrics query surface from raw query params
+- read only worker-derived aggregates for analytics queries
 - provide a stable public API for first-party and third-party clients
 
 ## Data Model Direction
@@ -124,10 +140,39 @@ Event requirements:
 
 Optional event fields:
 
-- `session_id`
-- `user_id`
 - `app_version`
-- small `properties` JSON object
+- `os_version`
+- at most 3 explicit string `properties`
+
+Identity model:
+
+- `install_id` is the public analytics unit for the MVP
+- Fantasma does not expose person-scoped identifiers in the public event contract
+- backend-derived session identifiers are internal implementation details, not public API
+- multi-device usage counts as multiple installs by design
+- `properties` are for event context and must not contain direct identifiers or sensitive personal data
+- built-in event dimensions stay minimal: `platform`, `app_version`, and `os_version`
+
+## Event Metrics Query Model
+
+Event metrics use exactly two endpoint shapes:
+
+- `GET /v1/metrics/events/aggregate`
+- `GET /v1/metrics/events/daily`
+
+Query semantics:
+
+- `project_id`, `event`, `start_date`, and `end_date` are required
+- built-in equality filters use normal query params: `platform`, `app_version`, `os_version`
+- any other non-reserved query key matching `^[a-z][a-z0-9_]{0,62}$` is an equality filter on an explicit string property
+- `group_by` may be repeated up to twice
+- the total number of distinct referenced dimensions across filters plus `group_by` is capped at 3
+- reads come only from the worker-built daily cuboids, so the surface is explicitly eventually consistent
+
+Missing-dimension behavior:
+
+- grouped event metrics synthesize explicit `null` buckets from lower-order cuboids so grouped totals add back up to the filtered total
+- the worker does not persist synthetic null rows
 
 ## SDK Direction
 
@@ -137,7 +182,6 @@ Required client behavior:
 
 - `configure(serverURL, writeKey)`
 - `track(eventName, properties?)`
-- `identify(userId)`
 - `flush()`
 - `clear()`
 
@@ -151,8 +195,9 @@ Durability requirement:
 Current iOS SDK shape:
 
 - expose a single static `Fantasma` facade backed by one shared client
-- store `install_id`, `user_id`, and current `session_id` in local defaults
+- store `install_id` in local defaults
 - serialize each tracked event to JSON and store it as an immutable SQLite row
+- auto-populate `platform`, `app_version`, and `os_version`
 - upload queued events asynchronously to `POST /v1/events` using the existing batch contract
 
 Current upload triggers:
@@ -165,5 +210,4 @@ Current upload triggers:
 Current identity rules:
 
 - `install_id` is generated on first use and reused until `clear()`
-- `identify(userId)` applies only to future events
-- `clear()` rotates `install_id`, clears `user_id`, rotates `session_id`, and leaves already queued rows untouched
+- `clear()` rotates `install_id` and leaves already queued rows untouched

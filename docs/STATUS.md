@@ -2,7 +2,7 @@
 
 ## Active
 
-- No active implementation work is recorded in this snapshot.
+- No active implementation work recorded. See `Completed` and `Next` for the latest shipped slice and follow-up work.
 
 ## Engineering Ethos
 
@@ -13,6 +13,13 @@
 
 ## Completed
 
+- Refined the event-metrics dim2/dim3 read path after review: forward migration `0007_event_metrics_read_indexes.sql` replaces the older slot-ordered indexes with key/value-aware index coverage so canonical later-slot filters still stay on a bounded indexed path, and store migration tests now lock that index set in place.
+- Tightened the worker-derived event-metrics slice after review: group-limit failures now run through bounded aggregate prechecks before the full daily synthesis path, migration history is forward-only again via `0006_remove_legacy_identity_columns.sql`, and the published OpenAPI now documents structural ingest `invalid_request` responses, event-metrics `500` envelopes, and the explicit-property filter namespace.
+- Replaced the raw event-count route with worker-derived event metrics: `GET /v1/metrics/events/aggregate` and `GET /v1/metrics/events/daily` now read from bounded daily Postgres rollups, support explicit filtering and grouping, synthesize null buckets, hard-fail on group overflows, and use inclusive UTC `start_date` / `end_date` semantics.
+- Added the event-metrics rollup storage slice in Postgres with forward migration `0005_event_metrics_rollups.sql`, `os_version` on `events_raw`, worker-owned `event_count_daily_total` plus 1/2/3-dimension cuboids, database-enforced canonical slot ordering, and end-to-end worker processing in both tests and the long-running worker service.
+- Narrowed the public event contract to explicit string-only properties capped at 3 keys, added built-in `os_version`, preserved indexed ingest validation through raw DTO normalization, updated JSON Schema/OpenAPI/deployment docs, and updated the iOS SDK docs/tests/examples so supported clients auto-populate `platform`, `app_version`, and `os_version`.
+- Removed public `user_id` and client-sent `session_id` from Fantasma's MVP contract, rewrote the undeployed SQL migration history to the install-scoped shape, kept backend session IDs internal-only, removed `identify(_:)` from the iOS SDK, and updated docs/examples/scripts to match.
+- Updated the Compose smoke flow to reset its disposable Postgres volume before and after each run so schema rewrites do not leave stale migration history behind.
 - Implemented Fantasma's first derived metric: `fantasma-worker` now derives sessions from `events_raw`, stores them in `sessions`, tracks progress in `worker_offsets`, and exposes `GET /v1/metrics/sessions/count`, `GET /v1/metrics/sessions/duration`, and `GET /v1/metrics/active-installs`.
 - Replaced startup bootstrap DDL with `sqlx` migrations in `crates/fantasma-store/migrations/` and split schema preparation into always-run migrations plus optional local project seeding.
 - Added bounded exact-day historical repair to the tail-state worker: out-of-order install batches now recompute only the overlapping derived sessions, keep the read/delete/write sequence inside one transaction, and rebuild only the affected UTC session-start days.
@@ -32,7 +39,7 @@
 - Implemented vertical slice 1: `POST /v1/events` now validates batches, resolves project-scoped ingest keys from Postgres, and inserts raw events into `events_raw`.
 - Added startup Postgres bootstrap for `projects`, `api_keys`, and `events_raw`, including raw-event indexes for project/time, install, event name, platform, and received time.
 - Added `GET /v1/metrics/events/count` with bearer admin auth and direct counting from `events_raw`.
-- Relaxed the initial event contract to support string `install_id`, optional `session_id`, optional `app_version`, smaller batch limits, and payload-size guardrails.
+- Relaxed the initial event contract to support string `install_id`, optional `app_version`, smaller batch limits, and payload-size guardrails.
 - Updated local deployment defaults, OpenAPI, JSON schemas, and architecture/deployment docs for the first end-to-end ingest slice.
 - Captured repository operating rules in `AGENTS.md`.
 - Defined documentation-first workflow and project memory rules.
@@ -46,13 +53,11 @@
 
 ## Next
 
-- Run the end-to-end iOS Simulator smoke test against the local stack and confirm the demo app drives both the raw-event and derived-session endpoints as expected.
-- Start the next aggregate slice only if it can follow the same explicit incremental-processing model, likely screen views or release adoption.
+- Run the end-to-end iOS Simulator smoke test against the local stack and confirm the demo app drives the new worker-derived event metrics alongside the existing session metrics.
+- Decide whether the next aggregate slice should extend event metrics to more product-facing use cases such as release adoption or screen-view dashboards, while preserving the same bounded incremental model.
 
 ## Open Decisions
 
-- When to replace the temporary direct raw-event count query with worker-built aggregate reads.
 - Whether future late-event handling should stay bounded to per-install exact-day repair or eventually add a separate explicitly scoped backfill workflow.
 - First dashboard scope beyond API contract validation.
-- Whether the next iOS SDK step should add richer property value types or keep string-only properties until the API surface expands deliberately.
 - Android SDK implementation schedule after the iOS SDK milestone.

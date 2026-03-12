@@ -13,20 +13,18 @@ struct EventEnvelope: Codable, Equatable, Sendable {
     let event: String
     let timestamp: String
     let installId: String
-    let userId: String?
-    let sessionId: String?
     let platform: String
     let appVersion: String?
+    let osVersion: String?
     let properties: [String: String]?
 
     enum CodingKeys: String, CodingKey {
         case event
         case timestamp
         case installId = "install_id"
-        case userId = "user_id"
-        case sessionId = "session_id"
         case platform
         case appVersion = "app_version"
+        case osVersion = "os_version"
         case properties
     }
 }
@@ -52,6 +50,7 @@ struct FantasmaDependencies: @unchecked Sendable {
     let transport: any FantasmaTransport
     let now: @Sendable () -> Date
     let appVersion: @Sendable () -> String?
+    let osVersion: @Sendable () -> String?
     let newIdentifier: @Sendable () -> String
     let timerInterval: TimeInterval
     let uploadBatchSize: Int
@@ -66,6 +65,13 @@ struct FantasmaDependencies: @unchecked Sendable {
                 let bundle = Bundle.main
                 return bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
                     ?? bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+            },
+            osVersion: {
+                let version = ProcessInfo.processInfo.operatingSystemVersion
+                if version.patchVersion > 0 {
+                    return "\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
+                }
+                return "\(version.majorVersion).\(version.minorVersion)"
             },
             newIdentifier: { UUID().uuidString.lowercased() },
             timerInterval: 10,
@@ -170,10 +176,9 @@ actor FantasmaCore {
             event: name,
             timestamp: FantasmaJSON.timestamp(from: now),
             installId: identity.installID,
-            userId: identity.userID,
-            sessionId: identity.sessionID,
             platform: "ios",
             appVersion: dependencies.appVersion(),
+            osVersion: dependencies.osVersion(),
             properties: properties?.isEmpty == false ? properties : nil
         )
 
@@ -187,10 +192,6 @@ actor FantasmaCore {
                 await flush()
             }
         }
-    }
-
-    func identify(_ userId: String) {
-        identity = identityStore.identify(userId)
     }
 
     func clear() {

@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use fantasma_core::{EventAcceptedResponse, EventBatchRequest, EventValidationResponse};
+use fantasma_core::{EventAcceptedResponse, EventValidationResponse, RawEventBatchRequest};
 use fantasma_store::{PgPool, insert_events, resolve_project_id_for_ingest_key};
 
 const INGEST_HEADER: &str = "x-fantasma-key";
@@ -76,7 +76,7 @@ async fn ingest_events(
                 .into_response();
         }
     };
-    let payload: EventBatchRequest = match serde_json::from_slice(&body) {
+    let payload: RawEventBatchRequest = match serde_json::from_slice(&body) {
         Ok(payload) => payload,
         Err(error) => {
             tracing::debug!(?error, "failed to parse event batch request");
@@ -88,17 +88,19 @@ async fn ingest_events(
         }
     };
 
-    let issues = payload.validate();
-    if !issues.is_empty() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(
-                serde_json::to_value(EventValidationResponse { errors: issues })
-                    .expect("serialize validation response"),
-            ),
-        )
-            .into_response();
-    }
+    let payload = match payload.normalize() {
+        Ok(payload) => payload,
+        Err(issues) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(
+                    serde_json::to_value(EventValidationResponse { errors: issues })
+                        .expect("serialize validation response"),
+                ),
+            )
+                .into_response();
+        }
+    };
 
     if let Err(error) = insert_events(&state.pool, project_id, &payload.events).await {
         tracing::error!(?error, "failed to insert accepted events");

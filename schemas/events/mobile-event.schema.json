@@ -23,19 +23,6 @@
       "type": "string",
       "minLength": 1
     },
-    "user_id": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "session_id": {
-      "type": [
-        "string",
-        "null"
-      ],
-      "minLength": 1
-    },
     "platform": {
       "type": "string",
       "enum": [
@@ -50,10 +37,45 @@
       ],
       "minLength": 1
     },
+    "os_version": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
     "properties": {
       "type": "object",
-      "maxProperties": 32,
-      "additionalProperties": true
+      "maxProperties": 3,
+      "propertyNames": {
+        "allOf": [
+          {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,62}$"
+          },
+          {
+            "not": {
+              "enum": [
+                "project_id",
+                "event",
+                "timestamp",
+                "install_id",
+                "properties",
+                "start_date",
+                "end_date",
+                "group_by",
+                "platform",
+                "app_version",
+                "os_version"
+              ]
+            }
+          }
+        ]
+      },
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Explicit string event properties. Reserved query and built-in keys are rejected."
     }
   }
 }

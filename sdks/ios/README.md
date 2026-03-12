@@ -6,7 +6,6 @@ Public API:
 
 - `configure(serverURL:writeKey:)`
 - `track(_:properties:)`
-- `identify(_:)`
 - `flush()`
 - `clear()`
 
@@ -22,15 +21,16 @@ Fantasma.configure(
 
 Fantasma.track("app_open")
 Fantasma.track("screen_view", properties: ["screen": "Home"])
-Fantasma.identify("user_123")
 Fantasma.flush()
 Fantasma.clear()
 ```
 
+Pass only explicit string properties to `track(_:properties:)`. The SDK auto-populates `platform`, `app_version`, and `os_version` for each event.
+
 Behavior notes:
 
 - Every tracked event is written to a local SQLite queue before upload.
-- The SDK adds `timestamp`, `install_id`, `platform = "ios"`, `app_version`, and the current `session_id`.
-- `identify(_:)` only affects future events.
-- `clear()` rotates `install_id`, clears `user_id`, rotates `session_id`, and preserves already queued events.
+- The SDK adds `timestamp`, `install_id`, `platform = "ios"`, `app_version`, and `os_version`.
+- Event properties remain explicit string-to-string values passed by the app.
+- `clear()` rotates `install_id` and preserves already queued events.
 - Upload attempts happen every 10 seconds, when the queue reaches 50 events, when `flush()` is called, and when the app enters background.

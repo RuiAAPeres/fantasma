@@ -51,7 +51,6 @@ struct FantasmaSDKBehaviorTests {
         try await harness.installSharedCore(transport: RecordingTransport())
 
         Fantasma.configure(serverURL: "http://localhost:8081", writeKey: "fg_ing_test")
-        Fantasma.identify("user-123")
         Fantasma.track("screen_view", properties: ["screen": "Home"])
 
         let queue = try harness.makeQueue()
@@ -60,10 +59,9 @@ struct FantasmaSDKBehaviorTests {
 
         #expect(event.event == "screen_view")
         #expect(event.installId == "install-a")
-        #expect(event.userId == "user-123")
-        #expect(event.sessionId == "session-a")
         #expect(event.platform == "ios")
         #expect(event.appVersion == "1.2.3")
+        #expect(event.osVersion == "18.3")
         #expect(event.properties == ["screen": "Home"])
     }
 
@@ -77,7 +75,6 @@ struct FantasmaSDKBehaviorTests {
         try await harness.installSharedCore(transport: transport)
 
         Fantasma.configure(serverURL: "http://localhost:8081", writeKey: "fg_ing_test")
-        Fantasma.identify("user-123")
         Fantasma.track("before_clear")
         Fantasma.clear()
         Fantasma.track("after_clear")
@@ -89,11 +86,7 @@ struct FantasmaSDKBehaviorTests {
 
         #expect(rows.count == 2)
         #expect(first.installId == "install-a")
-        #expect(first.userId == "user-123")
-        #expect(first.sessionId == "session-a")
         #expect(second.installId == "install-b")
-        #expect(second.userId == nil)
-        #expect(second.sessionId == "session-b")
     }
 
     @Test("flush removes queued rows after a 202 accepted response")
@@ -133,7 +126,6 @@ struct FantasmaSDKBehaviorTests {
         try await harness.installSharedCore(transport: liveTransport)
 
         Fantasma.configure(serverURL: serverURL.absoluteString, writeKey: "fg_ing_test")
-        Fantasma.identify("user-123")
         Fantasma.track("app_open", properties: ["screen": "Home"])
         Fantasma.flush()
 
@@ -148,8 +140,8 @@ struct FantasmaSDKBehaviorTests {
         #expect(body.events.count == 1)
         #expect(event.event == "app_open")
         #expect(event.installId == "install-a")
-        #expect(event.userId == "user-123")
         #expect(event.platform == "ios")
+        #expect(event.osVersion == "18.3")
         #expect(event.properties == ["screen": "Home"])
 
         let queue = try harness.makeQueue()
@@ -204,7 +196,7 @@ private struct TestHarness {
     let databaseURL: URL
     let defaultsName: String
     let fixedDate: Date
-    private let identifiers = IdentifierSequence(["install-a", "session-a", "install-b", "session-b", "install-c", "session-c"])
+    private let identifiers = IdentifierSequence(["install-a", "install-b", "install-c"])
 
     init() {
         rootDirectory = FileManager.default.temporaryDirectory
@@ -239,10 +231,9 @@ private struct TestHarness {
                 event: event,
                 timestamp: "2026-01-01T00:00:00.000Z",
                 installId: installId,
-                userId: nil,
-                sessionId: "session-a",
                 platform: "ios",
                 appVersion: "1.2.3",
+                osVersion: "18.3",
                 properties: nil
             )
         )
@@ -258,6 +249,7 @@ private struct TestHarness {
             transport: transport,
             now: { fixedDate },
             appVersion: { "1.2.3" },
+            osVersion: { "18.3" },
             newIdentifier: { identifiers.next() },
             timerInterval: 3_600,
             uploadBatchSize: 50

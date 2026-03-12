@@ -32,10 +32,15 @@ Current repository files:
 
 Operational guidance:
 
+- Fantasma is install-scoped analytics, not person-scoped analytics.
 - Fantasma prefers simple, explicit, high-performance data paths.
 - We avoid steady-state designs that rely on broad recomputation.
 - We narrow feature shape when necessary to preserve predictable performance and operational clarity.
 - Correctness still matters, but we should choose correctness models that compose with incremental processing.
+- Backend sessionization is internal; clients send event context, not session identity.
+- Event `properties` are for product context and must not contain direct identifiers or sensitive personal data.
+- Event `properties` are explicit string-to-string context, capped at 3 keys, with canonical keys matching `^[a-z][a-z0-9_]{0,62}$`.
+- First-party supported SDKs auto-populate `platform`, `app_version`, and `os_version`.
 - DB-backed Rust tests are expected to run fully in Docker through the repository workflow.
 - Keep workspace tests on the Docker Postgres path limited to cases satisfied by Postgres alone; stack-dependent checks stay in dedicated smoke workflows.
 
@@ -105,7 +110,7 @@ Run the preflighted smoke script:
 ./scripts/compose-smoke.sh
 ```
 
-The smoke script uses a disposable Compose project name, waits for the ingest and API `/health` endpoints before sending events, and validates only the currently supported public daily metrics. It still binds the standard local ports on `localhost`.
+The smoke script uses a per-run disposable Compose project name by default, waits for the ingest and API `/health` endpoints before sending events, and validates the supported worker-derived session and event metrics. It still binds the standard local ports on `localhost`. Set `FANTASMA_SMOKE_PROJECT_NAME` if you need a stable override for debugging.
 
 Manual flow:
 
@@ -126,16 +131,27 @@ curl -X POST http://localhost:8081/v1/events \
         "timestamp": "2026-01-01T00:00:00Z",
         "install_id": "abc",
         "platform": "ios",
-        "app_version": "1.0"
+        "app_version": "1.0",
+        "os_version": "18.3",
+        "properties": {
+          "provider": "strava"
+        }
       }
     ]
   }'
 ```
 
-Query the raw event count:
+Query the worker-derived event aggregate after the worker has processed the new raw events:
 
 ```bash
-curl "http://localhost:8082/v1/metrics/events/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
+curl "http://localhost:8082/v1/metrics/events/aggregate?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&platform=ios&group_by=provider" \
+  -H "Authorization: Bearer fg_pat_dev"
+```
+
+Query the worker-derived daily event series:
+
+```bash
+curl "http://localhost:8082/v1/metrics/events/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&group_by=provider" \
   -H "Authorization: Bearer fg_pat_dev"
 ```
 
@@ -165,8 +181,16 @@ curl "http://localhost:8082/v1/metrics/sessions/count/daily?project_id=9bad8b88-
 
 The daily routes use inclusive UTC date bounds:
 
+- `/v1/metrics/events/daily`
 - `/v1/metrics/sessions/count/daily`
 - `/v1/metrics/sessions/duration/total/daily`
+
+Event-metrics query rules:
+
+- built-in filters use normal query params: `platform`, `app_version`, `os_version`
+- any other non-reserved query key becomes an equality filter on an explicit string property
+- `group_by` may be repeated up to twice
+- event metrics are eventually consistent because reads come from worker-built daily rollups
 
 ## iOS Demo App
 
@@ -184,10 +208,12 @@ open apps/demo-ios/FantasmaDemo.xcodeproj
 
 Run the app in the iOS Simulator. The demo configures the SDK for `http://localhost:8081` with `fg_ing_test`, sends `app_open`, sends `screen_view` for the home screen, and lets you enqueue `button_pressed` events from the main button.
 
-Use the raw-event and derived-session endpoints to confirm the full pipeline after interacting with the app:
+The resulting metrics are install-based. If the same human uses the app on two devices, Fantasma counts those as two installs by design.
+
+Use the worker-derived event and session endpoints to confirm the full pipeline after interacting with the app:
 
 ```bash
-curl "http://localhost:8082/v1/metrics/events/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z" \
+curl "http://localhost:8082/v1/metrics/events/aggregate?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2027-01-01&group_by=provider" \
   -H "Authorization: Bearer fg_pat_dev"
 ```
 

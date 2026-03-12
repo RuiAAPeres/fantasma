@@ -5,8 +5,8 @@ info:
   description: |
     Fantasma is a privacy-first, self-hosted mobile analytics platform.
 
-    This contract documents the current end-to-end slice:
-    raw event ingestion into Postgres plus worker-derived session metrics.
+    The current public surface covers raw event ingestion plus worker-derived
+    session metrics and worker-derived event metrics.
 servers:
   - url: http://localhost:8081
     description: Local ingest service
@@ -55,29 +55,66 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
-          description: Validation failure for one or more events.
+          description: |
+            Unprocessable request. Structural request-shape failures return
+            `{ "error": "invalid_request" }`; semantic event validation
+            failures return indexed `EventValidationResponse.errors`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EventValidationResponse'
-  /v1/metrics/events/count:
+                oneOf:
+                  - $ref: '#/components/schemas/ErrorResponse'
+                  - $ref: '#/components/schemas/EventValidationResponse'
+        '500':
+          description: Internal server error while resolving auth or persisting accepted events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/events/aggregate:
     get:
       tags:
         - metrics
-      summary: Count raw events in a time range
-      operationId: getEventsCount
+      summary: Return worker-derived event counts aggregated over an inclusive UTC date range
+      operationId: getEventMetricsAggregate
+      description: |
+        Event metrics are eventually consistent because the API reads only from
+        worker-built daily rollups.
+
+        Use normal query params for equality filters:
+
+        - built-ins: `platform`, `app_version`, `os_version`
+        - explicit properties: any additional non-reserved query key matching
+          `^[a-z][a-z0-9_]{0,62}$`
+
+        `group_by` may be repeated up to twice. The total number of distinct
+        referenced dimensions across filters plus `group_by` is capped at 3.
+        Queries exceeding 100 final groups fail with `group_limit_exceeded`.
+      x-fantasma-explicit-property-filters:
+        type: object
+        description: |
+          Any additional non-reserved top-level query parameter whose key
+          matches `^[a-z][a-z0-9_]{0,62}$` is treated as an equality filter on
+          an explicit event property.
+        additionalProperties:
+          type: string
       parameters:
         - $ref: '#/components/parameters/Authorization'
         - $ref: '#/components/parameters/ProjectId'
-        - $ref: '#/components/parameters/StartDateTime'
-        - $ref: '#/components/parameters/EndDateTime'
+        - $ref: '#/components/parameters/EventName'
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/EventGroupBy'
+        - $ref: '#/components/parameters/PlatformFilter'
+        - $ref: '#/components/parameters/AppVersionFilter'
+        - $ref: '#/components/parameters/OsVersionFilter'
       responses:
         '200':
-          description: Raw event count encoded in the shared metric response shape.
+          description: Aggregate worker-derived event counts.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MetricResponse'
+                $ref: '#/components/schemas/EventMetricsAggregateResponse'
         '401':
           description: Missing or invalid admin token.
           content:
@@ -85,7 +122,101 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
-          description: Invalid query parameters.
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `invalid_project_id`
+            - `invalid_event`
+            - `invalid_date_range`
+            - `invalid_query_key`
+            - `duplicate_query_key`
+            - `invalid_group_by`
+            - `duplicate_group_by`
+            - `too_many_group_by_dimensions`
+            - `too_many_dimensions`
+            - `conflicting_dimension_usage`
+            - `group_limit_exceeded`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while loading worker-derived event metrics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/events/daily:
+    get:
+      tags:
+        - metrics
+      summary: Return worker-derived daily event-count series for an inclusive UTC date range
+      operationId: getEventMetricsDaily
+      description: |
+        Event metrics are eventually consistent because the API reads only from
+        worker-built daily rollups.
+
+        Use normal query params for equality filters:
+
+        - built-ins: `platform`, `app_version`, `os_version`
+        - explicit properties: any additional non-reserved query key matching
+          `^[a-z][a-z0-9_]{0,62}$`
+
+        `group_by` may be repeated up to twice. The total number of distinct
+        referenced dimensions across filters plus `group_by` is capped at 3.
+        Queries exceeding 100 final series fail with `group_limit_exceeded`.
+      x-fantasma-explicit-property-filters:
+        type: object
+        description: |
+          Any additional non-reserved top-level query parameter whose key
+          matches `^[a-z][a-z0-9_]{0,62}$` is treated as an equality filter on
+          an explicit event property.
+        additionalProperties:
+          type: string
+      parameters:
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/EventName'
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/EventGroupBy'
+        - $ref: '#/components/parameters/PlatformFilter'
+        - $ref: '#/components/parameters/AppVersionFilter'
+        - $ref: '#/components/parameters/OsVersionFilter'
+      responses:
+        '200':
+          description: Daily worker-derived event-count series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventMetricsDailyResponse'
+        '401':
+          description: Missing or invalid admin token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `invalid_project_id`
+            - `invalid_event`
+            - `invalid_date_range`
+            - `invalid_query_key`
+            - `duplicate_query_key`
+            - `invalid_group_by`
+            - `duplicate_group_by`
+            - `too_many_group_by_dimensions`
+            - `too_many_dimensions`
+            - `conflicting_dimension_usage`
+            - `group_limit_exceeded`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while loading worker-derived daily event metrics.
           content:
             application/json:
               schema:
@@ -133,7 +264,7 @@ paths:
         - $ref: '#/components/parameters/EndDate'
       responses:
         '200':
-          description: Daily session counts encoded in the shared metric response shape with metric name `sessions_count_daily`. The `start_date` and `end_date` bounds are both inclusive.
+          description: Daily session counts encoded in the shared metric response shape with metric name `sessions_count_daily`.
           content:
             application/json:
               schema:
@@ -193,7 +324,7 @@ paths:
         - $ref: '#/components/parameters/EndDate'
       responses:
         '200':
-          description: Daily total session duration encoded in the shared metric response shape with metric name `session_duration_total_daily`. The `start_date` and `end_date` bounds are both inclusive.
+          description: Daily total session duration encoded in the shared metric response shape with metric name `session_duration_total_daily`.
           content:
             application/json:
               schema:
@@ -256,6 +387,49 @@ components:
       schema:
         type: string
         format: uuid
+    EventName:
+      in: query
+      name: event
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    EventGroupBy:
+      in: query
+      name: group_by
+      required: false
+      explode: true
+      schema:
+        type: array
+        maxItems: 2
+        items:
+          type: string
+      description: |
+        Repeat up to twice. Built-ins use `platform`, `app_version`, or
+        `os_version`. Explicit properties use canonical keys that match
+        `^[a-z][a-z0-9_]{0,62}$`.
+    PlatformFilter:
+      in: query
+      name: platform
+      required: false
+      schema:
+        type: string
+      description: |
+        Built-in platform equality filter. Supported SDKs currently emit
+        `ios` and `android`; other strings are treated as literal filter
+        values and normally yield empty results.
+    AppVersionFilter:
+      in: query
+      name: app_version
+      required: false
+      schema:
+        type: string
+    OsVersionFilter:
+      in: query
+      name: os_version
+      required: false
+      schema:
+        type: string
     StartDateTime:
       in: query
       name: start
@@ -277,7 +451,7 @@ components:
       schema:
         type: string
         format: date
-      description: Inclusive UTC start date for daily series queries.
+      description: Inclusive UTC start date.
     EndDate:
       in: query
       name: end_date
@@ -285,13 +459,36 @@ components:
       schema:
         type: string
         format: date
-      description: Inclusive UTC end date for daily series queries.
+      description: Inclusive UTC end date.
   schemas:
     Platform:
       type: string
       enum:
         - ios
         - android
+    EventProperties:
+      type: object
+      maxProperties: 3
+      propertyNames:
+        allOf:
+          - type: string
+            pattern: '^[a-z][a-z0-9_]{0,62}$'
+          - not:
+              enum:
+                - project_id
+                - event
+                - timestamp
+                - install_id
+                - properties
+                - start_date
+                - end_date
+                - group_by
+                - platform
+                - app_version
+                - os_version
+      additionalProperties:
+        type: string
+      description: Explicit string event properties. Reserved keys are rejected.
     EventPayload:
       type: object
       additionalProperties: false
@@ -310,26 +507,20 @@ components:
         install_id:
           type: string
           minLength: 1
-        user_id:
-          type:
-            - string
-            - "null"
-        session_id:
-          type:
-            - string
-            - "null"
-          minLength: 1
         platform:
           $ref: '#/components/schemas/Platform'
         app_version:
           type:
             - string
-            - "null"
+            - 'null'
+          minLength: 1
+        os_version:
+          type:
+            - string
+            - 'null'
           minLength: 1
         properties:
-          type: object
-          maxProperties: 32
-          additionalProperties: true
+          $ref: '#/components/schemas/EventProperties'
     EventBatchRequest:
       type: object
       additionalProperties: false
@@ -394,6 +585,83 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/MetricSeriesPoint'
+    EventMetricsDimensions:
+      type: object
+      additionalProperties:
+        type:
+          - string
+          - 'null'
+    EventMetricsAggregateRow:
+      type: object
+      required:
+        - dimensions
+        - value
+      properties:
+        dimensions:
+          $ref: '#/components/schemas/EventMetricsDimensions'
+        value:
+          type: integer
+          minimum: 0
+    EventMetricsAggregateResponse:
+      type: object
+      required:
+        - metric
+        - group_by
+        - rows
+      properties:
+        metric:
+          type: string
+          const: event_count
+        group_by:
+          type: array
+          items:
+            type: string
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventMetricsAggregateRow'
+    EventMetricsPoint:
+      type: object
+      required:
+        - date
+        - value
+      properties:
+        date:
+          type: string
+          format: date
+        value:
+          type: integer
+          minimum: 0
+    EventMetricsDailySeries:
+      type: object
+      required:
+        - dimensions
+        - points
+      properties:
+        dimensions:
+          $ref: '#/components/schemas/EventMetricsDimensions'
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventMetricsPoint'
+    EventMetricsDailyResponse:
+      type: object
+      required:
+        - metric
+        - group_by
+        - series
+      properties:
+        metric:
+          type: string
+          const: event_count_daily
+        group_by:
+          type: array
+          items:
+            type: string
+        series:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventMetricsDailySeries'
     ErrorResponse:
       type: object
       required:

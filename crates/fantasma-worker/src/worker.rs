@@ -2,20 +2,25 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{Duration as ChronoDuration, NaiveDate};
 use fantasma_store::{
-    InstallSessionStateRecord, PgPool, RawEventRecord, SessionRecord, SessionTailUpdate,
-    StoreError, add_session_daily_duration_delta_in_tx, delete_sessions_overlapping_window_in_tx,
-    fetch_events_after, fetch_events_for_install_between_in_tx,
-    fetch_latest_session_for_install_in_tx, fetch_sessions_overlapping_window_in_tx,
-    increment_session_daily_for_new_session_in_tx, insert_session_in_tx,
-    load_install_session_state_in_tx, lock_worker_offset, rebuild_session_daily_days_in_tx,
-    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_install_session_state_in_tx,
+    EventCountDailyDim1Delta, EventCountDailyDim2Delta, EventCountDailyDim3Delta,
+    EventCountDailyTotalDelta, InstallSessionStateRecord, PgPool, RawEventRecord, SessionRecord,
+    SessionTailUpdate, StoreError, add_session_daily_duration_delta_in_tx,
+    delete_sessions_overlapping_window_in_tx, fetch_events_after,
+    fetch_events_for_install_between_in_tx, fetch_latest_session_for_install_in_tx,
+    fetch_sessions_overlapping_window_in_tx, increment_session_daily_for_new_session_in_tx,
+    insert_session_in_tx, load_install_session_state_in_tx, lock_worker_offset,
+    rebuild_session_daily_days_in_tx, save_worker_offset_in_tx, update_session_tail_in_tx,
+    upsert_event_count_daily_dim1_in_tx, upsert_event_count_daily_dim2_in_tx,
+    upsert_event_count_daily_dim3_in_tx, upsert_event_count_daily_totals_in_tx,
+    upsert_install_session_state_in_tx,
 };
 use uuid::Uuid;
 
 use crate::sessionization;
 
 const SESSION_TIMEOUT_MINS: i64 = 30;
-const WORKER_NAME: &str = "sessions";
+const SESSION_WORKER_NAME: &str = "sessions";
+const EVENT_METRICS_WORKER_NAME: &str = "event_metrics";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecomputeWindow {
@@ -25,7 +30,7 @@ struct RecomputeWindow {
 
 pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usize, StoreError> {
     let mut tx = pool.begin().await.map_err(StoreError::from)?;
-    let last_processed_event_id = lock_worker_offset(&mut tx, WORKER_NAME).await?;
+    let last_processed_event_id = lock_worker_offset(&mut tx, SESSION_WORKER_NAME).await?;
     let batch = fetch_events_after(pool, last_processed_event_id, batch_size).await?;
     let processed_events = batch.len();
     let mut touched_days_by_project = BTreeMap::<Uuid, BTreeSet<NaiveDate>>::new();
@@ -56,10 +61,243 @@ pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usi
         rebuild_session_daily_days_in_tx(&mut tx, project_id, &days).await?;
     }
 
-    save_worker_offset_in_tx(&mut tx, WORKER_NAME, next_offset).await?;
+    save_worker_offset_in_tx(&mut tx, SESSION_WORKER_NAME, next_offset).await?;
     tx.commit().await.map_err(StoreError::from)?;
 
     Ok(processed_events)
+}
+
+pub async fn process_event_metrics_batch(
+    pool: &PgPool,
+    batch_size: i64,
+) -> Result<usize, StoreError> {
+    let mut tx = pool.begin().await.map_err(StoreError::from)?;
+    let last_processed_event_id = lock_worker_offset(&mut tx, EVENT_METRICS_WORKER_NAME).await?;
+    let batch = fetch_events_after(pool, last_processed_event_id, batch_size).await?;
+    let processed_events = batch.len();
+
+    if batch.is_empty() {
+        tx.commit().await.map_err(StoreError::from)?;
+        return Ok(0);
+    }
+
+    let next_offset = batch
+        .last()
+        .map(|event| event.id)
+        .expect("non-empty batch has last event");
+    let rollups = build_event_metric_rollups(&batch);
+
+    upsert_event_count_daily_totals_in_tx(&mut tx, &rollups.total_deltas).await?;
+    upsert_event_count_daily_dim1_in_tx(&mut tx, &rollups.dim1_deltas).await?;
+    upsert_event_count_daily_dim2_in_tx(&mut tx, &rollups.dim2_deltas).await?;
+    upsert_event_count_daily_dim3_in_tx(&mut tx, &rollups.dim3_deltas).await?;
+    save_worker_offset_in_tx(&mut tx, EVENT_METRICS_WORKER_NAME, next_offset).await?;
+    tx.commit().await.map_err(StoreError::from)?;
+
+    Ok(processed_events)
+}
+
+#[derive(Debug, Default)]
+struct EventMetricRollups {
+    total_deltas: Vec<EventCountDailyTotalDelta>,
+    dim1_deltas: Vec<EventCountDailyDim1Delta>,
+    dim2_deltas: Vec<EventCountDailyDim2Delta>,
+    dim3_deltas: Vec<EventCountDailyDim3Delta>,
+}
+
+fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
+    let mut totals = BTreeMap::<(Uuid, NaiveDate, String), i64>::new();
+    let mut dim1 = BTreeMap::<(Uuid, NaiveDate, String, String, String), i64>::new();
+    let mut dim2 =
+        BTreeMap::<(Uuid, NaiveDate, String, String, String, String, String), i64>::new();
+    let mut dim3 = BTreeMap::<
+        (
+            Uuid,
+            NaiveDate,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ),
+        i64,
+    >::new();
+
+    for event in batch {
+        let day = event.timestamp.date_naive();
+        let event_name = event.event_name.clone();
+        *totals
+            .entry((event.project_id, day, event_name.clone()))
+            .or_default() += 1;
+
+        let dimensions = event_metric_dimensions(event);
+
+        for dimension in &dimensions {
+            *dim1
+                .entry((
+                    event.project_id,
+                    day,
+                    event_name.clone(),
+                    dimension.0.clone(),
+                    dimension.1.clone(),
+                ))
+                .or_default() += 1;
+        }
+
+        for left_index in 0..dimensions.len() {
+            for right_index in left_index + 1..dimensions.len() {
+                let left = &dimensions[left_index];
+                let right = &dimensions[right_index];
+                *dim2
+                    .entry((
+                        event.project_id,
+                        day,
+                        event_name.clone(),
+                        left.0.clone(),
+                        left.1.clone(),
+                        right.0.clone(),
+                        right.1.clone(),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+
+        for first_index in 0..dimensions.len() {
+            for second_index in first_index + 1..dimensions.len() {
+                for third_index in second_index + 1..dimensions.len() {
+                    let first = &dimensions[first_index];
+                    let second = &dimensions[second_index];
+                    let third = &dimensions[third_index];
+                    *dim3
+                        .entry((
+                            event.project_id,
+                            day,
+                            event_name.clone(),
+                            first.0.clone(),
+                            first.1.clone(),
+                            second.0.clone(),
+                            second.1.clone(),
+                            third.0.clone(),
+                            third.1.clone(),
+                        ))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+
+    EventMetricRollups {
+        total_deltas: totals
+            .into_iter()
+            .map(
+                |((project_id, day, event_name), event_count)| EventCountDailyTotalDelta {
+                    project_id,
+                    day,
+                    event_name,
+                    event_count,
+                },
+            )
+            .collect(),
+        dim1_deltas: dim1
+            .into_iter()
+            .map(
+                |((project_id, day, event_name, dim1_key, dim1_value), event_count)| {
+                    EventCountDailyDim1Delta {
+                        project_id,
+                        day,
+                        event_name,
+                        dim1_key,
+                        dim1_value,
+                        event_count,
+                    }
+                },
+            )
+            .collect(),
+        dim2_deltas: dim2
+            .into_iter()
+            .map(
+                |(
+                    (project_id, day, event_name, dim1_key, dim1_value, dim2_key, dim2_value),
+                    event_count,
+                )| EventCountDailyDim2Delta {
+                    project_id,
+                    day,
+                    event_name,
+                    dim1_key,
+                    dim1_value,
+                    dim2_key,
+                    dim2_value,
+                    event_count,
+                },
+            )
+            .collect(),
+        dim3_deltas: dim3
+            .into_iter()
+            .map(
+                |(
+                    (
+                        project_id,
+                        day,
+                        event_name,
+                        dim1_key,
+                        dim1_value,
+                        dim2_key,
+                        dim2_value,
+                        dim3_key,
+                        dim3_value,
+                    ),
+                    event_count,
+                )| EventCountDailyDim3Delta {
+                    project_id,
+                    day,
+                    event_name,
+                    dim1_key,
+                    dim1_value,
+                    dim2_key,
+                    dim2_value,
+                    dim3_key,
+                    dim3_value,
+                    event_count,
+                },
+            )
+            .collect(),
+    }
+}
+
+fn event_metric_dimensions(event: &RawEventRecord) -> Vec<(String, String)> {
+    let mut dimensions = Vec::with_capacity(3 + event.properties.len());
+
+    dimensions.push((
+        "platform".to_owned(),
+        platform_dimension_value(&event.platform),
+    ));
+
+    if let Some(app_version) = event.app_version.as_ref() {
+        dimensions.push(("app_version".to_owned(), app_version.clone()));
+    }
+
+    if let Some(os_version) = event.os_version.as_ref() {
+        dimensions.push(("os_version".to_owned(), os_version.clone()));
+    }
+
+    dimensions.extend(
+        event
+            .properties
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    dimensions.sort_by(|left, right| left.0.cmp(&right.0));
+
+    dimensions
+}
+
+fn platform_dimension_value(platform: &fantasma_core::Platform) -> String {
+    match platform {
+        fantasma_core::Platform::Ios => "ios".to_owned(),
+        fantasma_core::Platform::Android => "android".to_owned(),
+    }
 }
 
 fn group_events(batch: Vec<RawEventRecord>) -> BTreeMap<(Uuid, String), Vec<RawEventRecord>> {
@@ -304,7 +542,6 @@ fn derive_sessions_for_window(raw_events: &[RawEventRecord]) -> Vec<SessionRecor
             project_id: event.project_id,
             timestamp: event.timestamp,
             install_id: event.install_id.clone(),
-            user_id: event.user_id.clone(),
             platform: event.platform.clone(),
             app_version: event.app_version.clone(),
         })
@@ -333,7 +570,6 @@ async fn extend_tail_session(
             session_end: new_end,
             event_count: new_event_count,
             duration_seconds: new_duration,
-            user_id: event.user_id.as_deref(),
             app_version: event.app_version.as_deref(),
         },
     )
@@ -387,7 +623,6 @@ fn session_from_event(event: &RawEventRecord) -> SessionRecord {
     SessionRecord {
         project_id: event.project_id,
         install_id: event.install_id.clone(),
-        user_id: event.user_id.clone(),
         session_id: format!("{}:{}", event.install_id, event.timestamp.to_rfc3339()),
         session_start: event.timestamp,
         session_end: event.timestamp,
@@ -414,6 +649,8 @@ fn install_state_from_session(session: &SessionRecord) -> InstallSessionStateRec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use fantasma_core::{EventPayload, Platform};
     use fantasma_store::{
@@ -421,7 +658,6 @@ mod tests {
         fetch_latest_session_for_install, insert_events, load_install_session_state,
         load_worker_offset,
     };
-    use serde_json::Map;
     use sqlx::Row;
 
     fn project_id() -> Uuid {
@@ -447,11 +683,10 @@ mod tests {
             event: "app_open".to_owned(),
             timestamp: timestamp(day, hour, minute),
             install_id: install_id.to_owned(),
-            user_id: Some("user-1".to_owned()),
-            session_id: None,
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
-            properties: Map::new(),
+            os_version: Some("18.3".to_owned()),
+            properties: BTreeMap::new(),
         }
     }
 
@@ -987,7 +1222,7 @@ mod tests {
             0
         );
         assert_eq!(
-            load_worker_offset(&pool, WORKER_NAME)
+            load_worker_offset(&pool, SESSION_WORKER_NAME)
                 .await
                 .expect("load offset"),
             2

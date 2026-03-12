@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/infra/docker/compose.yaml"
-PROJECT_NAME="fantasma-smoke"
+PROJECT_NAME="${FANTASMA_SMOKE_PROJECT_NAME:-fantasma-smoke-$$}"
 MIN_FREE_KB=5000000
 TIMEOUT_SECONDS=60
 SLEEP_SECONDS=2
@@ -43,7 +43,7 @@ print_logs() {
 cleanup() {
   local exit_code=$?
   trap - EXIT INT TERM
-  compose down --remove-orphans >/dev/null 2>&1 || true
+  compose down --volumes --remove-orphans >/dev/null 2>&1 || true
   exit "$exit_code"
 }
 
@@ -68,8 +68,9 @@ wait_for_http() {
   done
 }
 
-poll_daily_metric() {
+poll_metrics() {
   local deadline now count_response count_compact duration_response duration_compact
+  local event_aggregate_response event_aggregate_compact event_daily_response event_daily_compact
   deadline=$((SECONDS + TIMEOUT_SECONDS))
 
   while true; do
@@ -79,23 +80,40 @@ poll_daily_metric() {
     duration_response="$(curl -fsS \
       "http://localhost:8082/v1/metrics/sessions/duration/total/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
       -H "Authorization: Bearer fg_pat_dev" || true)"
+    event_aggregate_response="$(curl -fsS \
+      "http://localhost:8082/v1/metrics/events/aggregate?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&platform=ios&group_by=provider" \
+      -H "Authorization: Bearer fg_pat_dev" || true)"
+    event_daily_response="$(curl -fsS \
+      "http://localhost:8082/v1/metrics/events/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&group_by=provider" \
+      -H "Authorization: Bearer fg_pat_dev" || true)"
     count_compact="$(printf '%s' "$count_response" | tr -d '[:space:]')"
     duration_compact="$(printf '%s' "$duration_response" | tr -d '[:space:]')"
+    event_aggregate_compact="$(printf '%s' "$event_aggregate_response" | tr -d '[:space:]')"
+    event_daily_compact="$(printf '%s' "$event_daily_response" | tr -d '[:space:]')"
 
     if [[ "$count_compact" == *'"metric":"sessions_count_daily"'* &&
           "$count_compact" == *'"date":"2026-01-01","value":1'* &&
           "$count_compact" == *'"date":"2026-01-02","value":0'* &&
           "$duration_compact" == *'"metric":"session_duration_total_daily"'* &&
           "$duration_compact" == *'"date":"2026-01-01","value":600'* &&
-          "$duration_compact" == *'"date":"2026-01-02","value":0'* ]]; then
+          "$duration_compact" == *'"date":"2026-01-02","value":0'* &&
+          "$event_aggregate_compact" == *'"metric":"event_count"'* &&
+          "$event_aggregate_compact" == *'"provider":"strava"'* &&
+          "$event_aggregate_compact" == *'"value":2'* &&
+          "$event_daily_compact" == *'"metric":"event_count_daily"'* &&
+          "$event_daily_compact" == *'"provider":"strava"'* &&
+          "$event_daily_compact" == *'"date":"2026-01-01","value":2'* &&
+          "$event_daily_compact" == *'"date":"2026-01-02","value":0'* ]]; then
       printf '%s\n' "$count_response"
       printf '%s\n' "$duration_response"
+      printf '%s\n' "$event_aggregate_response"
+      printf '%s\n' "$event_daily_response"
       return 0
     fi
 
     now=$SECONDS
     if (( now >= deadline )); then
-      echo "timed out waiting for daily metrics to appear" >&2
+      echo "timed out waiting for derived metrics to appear" >&2
       print_logs >&2
       exit 1
     fi
@@ -112,6 +130,7 @@ main() {
 
   trap cleanup EXIT INT TERM
 
+  compose down --volumes --remove-orphans >/dev/null 2>&1 || true
   compose up -d --build
   wait_for_http
 
@@ -125,19 +144,27 @@ main() {
           "timestamp": "2026-01-01T00:00:00Z",
           "install_id": "compose-install-1",
           "platform": "ios",
-          "app_version": "1.0.0"
+          "app_version": "1.0.0",
+          "os_version": "18.3",
+          "properties": {
+            "provider": "strava"
+          }
         },
         {
           "event": "app_open",
           "timestamp": "2026-01-01T00:10:00Z",
           "install_id": "compose-install-1",
           "platform": "ios",
-          "app_version": "1.0.0"
+          "app_version": "1.0.0",
+          "os_version": "18.3",
+          "properties": {
+            "provider": "strava"
+          }
         }
       ]
     }' >/dev/null
 
-  poll_daily_metric
+  poll_metrics
 }
 
 main "$@"
