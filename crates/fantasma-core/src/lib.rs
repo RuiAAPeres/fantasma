@@ -5,4 +5,4 @@ pub use events::{
     EventAcceptedResponse, EventBatchRequest, EventPayload, EventValidationIssue,
     EventValidationResponse, Platform,
 };
-pub use metrics::{EventCountQuery, MetricQuery, MetricResponse, MetricSeriesPoint};
+pub use metrics::{EventCountQuery, MetricResponse, MetricSeriesPoint, SessionMetricQuery};

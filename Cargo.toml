@@ -24,7 +24,7 @@ hex = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros", "migrate"] }
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1.41"

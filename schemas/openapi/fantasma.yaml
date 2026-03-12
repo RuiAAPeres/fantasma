@@ -5,8 +5,8 @@ info:
   description: |
     Fantasma is a privacy-first, self-hosted mobile analytics platform.
 
-    This contract documents the first end-to-end vertical slice:
-    raw event ingestion into Postgres and a direct raw-event count query.
+    This contract documents the current end-to-end slice:
+    raw event ingestion into Postgres plus worker-derived session metrics.
 servers:
   - url: http://localhost:8081
     description: Local ingest service
@@ -68,24 +68,9 @@ paths:
       operationId: getEventsCount
       parameters:
         - $ref: '#/components/parameters/Authorization'
-        - in: query
-          name: project_id
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - in: query
-          name: start
-          required: true
-          schema:
-            type: string
-            format: date-time
-        - in: query
-          name: end
-          required: true
-          schema:
-            type: string
-            format: date-time
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/StartDateTime'
+        - $ref: '#/components/parameters/EndDateTime'
       responses:
         '200':
           description: Raw event count encoded in the shared metric response shape.
@@ -105,21 +90,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/active-users:
+  /v1/metrics/sessions/count:
     get:
       tags:
         - metrics
-      summary: Query active users over time
-      operationId: getActiveUsers
+      summary: Count derived sessions in a time range
+      operationId: getSessionsCount
       parameters:
         - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
-        - $ref: '#/components/parameters/Platform'
-        - $ref: '#/components/parameters/AppVersion'
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/StartDateTime'
+        - $ref: '#/components/parameters/EndDateTime'
       responses:
         '200':
-          description: Active users time series.
+          description: Session count encoded in the shared metric response shape.
           content:
             application/json:
               schema:
@@ -130,21 +114,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/sessions:
+        '422':
+          description: Invalid query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/sessions/duration:
     get:
       tags:
         - metrics
-      summary: Query sessions over time
-      operationId: getSessions
+      summary: Average derived session duration in seconds for a time range
+      operationId: getSessionsDuration
       parameters:
         - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
-        - $ref: '#/components/parameters/Platform'
-        - $ref: '#/components/parameters/AppVersion'
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/StartDateTime'
+        - $ref: '#/components/parameters/EndDateTime'
       responses:
         '200':
-          description: Sessions time series.
+          description: Average session duration encoded in the shared metric response shape.
           content:
             application/json:
               schema:
@@ -155,21 +144,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/retention:
+        '422':
+          description: Invalid query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/active-installs:
     get:
       tags:
         - metrics
-      summary: Query retention
-      operationId: getRetention
+      summary: Count distinct installs with a derived session overlapping the time range
+      operationId: getActiveInstalls
       parameters:
         - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
-        - $ref: '#/components/parameters/Platform'
-        - $ref: '#/components/parameters/AppVersion'
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/StartDateTime'
+        - $ref: '#/components/parameters/EndDateTime'
       responses:
         '200':
-          description: Retention metric response.
+          description: Active install count encoded in the shared metric response shape.
           content:
             application/json:
               schema:
@@ -180,82 +174,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/screens:
-    get:
-      tags:
-        - metrics
-      summary: Query screen usage
-      operationId: getScreens
-      parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
-        - $ref: '#/components/parameters/Platform'
-        - $ref: '#/components/parameters/AppVersion'
-      responses:
-        '200':
-          description: Screen usage metric response.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricResponse'
-        '401':
-          description: Missing or invalid admin token.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/releases:
-    get:
-      tags:
-        - metrics
-      summary: Query release adoption
-      operationId: getReleaseAdoption
-      parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
-        - $ref: '#/components/parameters/Platform'
-        - $ref: '#/components/parameters/AppVersion'
-      responses:
-        '200':
-          description: Release adoption metric response.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricResponse'
-        '401':
-          description: Missing or invalid admin token.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/events:
-    get:
-      tags:
-        - metrics
-      summary: Query custom events over time
-      operationId: getCustomEvents
-      parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
-        - $ref: '#/components/parameters/Platform'
-        - $ref: '#/components/parameters/AppVersion'
-        - in: query
-          name: event
-          schema:
-            type: string
-          description: Optional custom event name filter.
-      responses:
-        '200':
-          description: Custom event metric response.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricResponse'
-        '401':
-          description: Missing or invalid admin token.
+        '422':
+          description: Invalid query parameters.
           content:
             application/json:
               schema:
@@ -269,32 +189,27 @@ components:
       schema:
         type: string
       description: Bearer admin token, for example `Bearer fg_pat_xxx`.
-    StartDate:
+    ProjectId:
+      in: query
+      name: project_id
+      required: true
+      schema:
+        type: string
+        format: uuid
+    StartDateTime:
       in: query
       name: start
       required: true
       schema:
         type: string
-        format: date
-    EndDate:
+        format: date-time
+    EndDateTime:
       in: query
       name: end
       required: true
       schema:
         type: string
-        format: date
-    Platform:
-      in: query
-      name: platform
-      required: false
-      schema:
-        $ref: '#/components/schemas/Platform'
-    AppVersion:
-      in: query
-      name: app_version
-      required: false
-      schema:
-        type: string
+        format: date-time
   schemas:
     Platform:
       type: string

@@ -1,7 +1,15 @@
 # Status
 
+## Active
+
+- Local environment recovery: Docker Desktop content-store and Postgres data files are returning input/output errors in the current machine state, so the Compose smoke test for the new session slice needs to be rerun after disk space and Docker health are restored.
+
 ## Completed
 
+- Implemented Fantasma's first derived metric: `fantasma-worker` now derives sessions from `events_raw`, stores them in `sessions`, tracks progress in `worker_offsets`, and exposes `GET /v1/metrics/sessions/count`, `GET /v1/metrics/sessions/duration`, and `GET /v1/metrics/active-installs`.
+- Added the `sessions` table, true session upserts, the `(project_id, install_id, timestamp)` raw-event index, and a pure worker-side sessionization module with tests for inactivity splitting, install separation, user propagation, and bounded tail recompute behavior.
+- Added DB-backed store and worker tests for session persistence, checkpoint round-trips, ordered install-window fetches, and tail-session updates.
+- Updated OpenAPI, architecture, deployment docs, and CI so the repository documents and tests the `events_raw -> worker -> sessions -> metrics API` slice.
 - Updated `AGENTS.md` to align Fantasma's agent workflow with the installed `superpowers` skills, including expectations for planning, debugging, verification, subagent execution, and review.
 - Implemented the first iOS SDK prototype as a Swift Package with explicit `configure`, `track`, `identify`, `flush`, and `clear` APIs, a durable SQLite-backed event queue, and asynchronous uploads to `POST /v1/events`.
 - Added Swift tests covering event serialization, queue persistence, queue replay after failures, batch deletion rules, and identity rotation semantics.
@@ -23,11 +31,10 @@
 
 ## Next
 
-- Use the documented superpowers workflow on the next multi-step backend slice so plan files and verification discipline become part of the normal repository cadence.
-- Run the end-to-end iOS Simulator smoke test against the local Docker Compose stack and confirm the demo app drives the raw-event count endpoint as expected.
-- Run the end-to-end smoke test in a healthy local environment with Docker or a working local Postgres install.
+- Restore local Docker/Postgres health, then rerun `docker compose -f infra/docker/compose.yaml up --build` and the full ingest -> worker -> sessions -> API smoke test in a healthy environment.
+- Run the end-to-end iOS Simulator smoke test against the local stack and confirm the demo app drives both the raw-event and derived-session endpoints as expected.
 - Add a dedicated migration workflow to replace startup bootstrap SQL once the raw schema stabilizes.
-- Start the next slice after ingestion stabilizes: worker-owned session inference and aggregate generation.
+- Start the next aggregate slice after sessions stabilizes, likely screen views or release adoption.
 
 ## Open Decisions
 

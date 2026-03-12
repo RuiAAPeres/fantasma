@@ -16,7 +16,9 @@ curl / SDK
   -> POST /v1/events
   -> Rust ingest service
   -> append-only Postgres events_raw table
-  -> GET /v1/metrics/events/count
+  -> fantasma-worker
+  -> derived Postgres sessions table
+  -> GET /v1/metrics/sessions/*
   -> query API
 ```
 
@@ -42,14 +44,27 @@ Non-responsibilities:
 Responsibilities:
 
 - process raw events asynchronously
+- derive session records from raw events
 - populate aggregate tables for product metrics
 - keep processing idempotent
 - support version-aware mobile analytics
 
+Current derived metric:
+
+- sessions
+
+Current worker behavior:
+
+- poll `events_raw` in batches ordered by raw event id
+- group events by `project_id` and `install_id`
+- infer sessions from event timestamps with a 30-minute inactivity rule
+- upsert derived rows into `sessions`
+- advance a `worker_offsets` checkpoint only after successful writes
+- perform bounded recompute for the latest eligible install tail session using timestamp windows
+
 Planned aggregates:
 
 - daily active users
-- sessions by day
 - screen views by day
 - retention cohorts
 - version adoption
@@ -70,6 +85,8 @@ Core persisted concepts:
 - `projects`
 - `api_keys`
 - `events_raw`
+- `sessions`
+- `worker_offsets`
 - aggregate tables keyed by project, metric window, and dimensions
 
 Event requirements:

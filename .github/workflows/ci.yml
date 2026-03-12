@@ -14,6 +14,22 @@ jobs:
   rust:
     name: Rust Checks
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: fantasma
+          POSTGRES_USER: fantasma
+          POSTGRES_PASSWORD: fantasma
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fantasma -d fantasma"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://fantasma:fantasma@127.0.0.1:5432/fantasma
 
     steps:
       - name: Check out repository

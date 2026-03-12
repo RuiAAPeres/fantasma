@@ -8,8 +8,11 @@ use axum::{
     routing::get,
 };
 use fantasma_auth::StaticAdminAuthorizer;
-use fantasma_core::{EventCountQuery, MetricQuery, MetricResponse, MetricSeriesPoint};
-use fantasma_store::{BootstrapConfig, DatabaseConfig, PgPool, bootstrap, connect, count_events};
+use fantasma_core::{EventCountQuery, MetricResponse, MetricSeriesPoint, SessionMetricQuery};
+use fantasma_store::{
+    BootstrapConfig, DatabaseConfig, PgPool, StoreError, average_session_duration_seconds,
+    bootstrap, connect, count_active_installs, count_events, count_sessions,
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -54,12 +57,9 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/metrics/events/count", get(events_count))
-        .route("/v1/metrics/active-users", get(active_users))
-        .route("/v1/metrics/sessions", get(sessions))
-        .route("/v1/metrics/retention", get(retention))
-        .route("/v1/metrics/screens", get(screens))
-        .route("/v1/metrics/releases", get(releases))
-        .route("/v1/metrics/events", get(custom_events))
+        .route("/v1/metrics/sessions/count", get(sessions_count))
+        .route("/v1/metrics/sessions/duration", get(sessions_duration))
+        .route("/v1/metrics/active-installs", get(active_installs))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_address)
@@ -143,61 +143,67 @@ async fn events_count(
     }
 }
 
-async fn active_users(
+async fn sessions_count(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<MetricQuery>,
+    Query(query): Query<SessionMetricQuery>,
 ) -> impl IntoResponse {
-    metric_response(&state, &headers, query, "active_users")
+    metric_value_response(
+        &state.authorizer,
+        &headers,
+        &query,
+        "sessions_count",
+        async { count_sessions(&state.pool, query.project_id, query.start, query.end).await },
+    )
+    .await
 }
 
-async fn sessions(
+async fn sessions_duration(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<MetricQuery>,
+    Query(query): Query<SessionMetricQuery>,
 ) -> impl IntoResponse {
-    metric_response(&state, &headers, query, "sessions")
+    metric_value_response(
+        &state.authorizer,
+        &headers,
+        &query,
+        "sessions_duration",
+        async {
+            average_session_duration_seconds(&state.pool, query.project_id, query.start, query.end)
+                .await
+        },
+    )
+    .await
 }
 
-async fn retention(
+async fn active_installs(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<MetricQuery>,
+    Query(query): Query<SessionMetricQuery>,
 ) -> impl IntoResponse {
-    metric_response(&state, &headers, query, "retention")
+    metric_value_response(
+        &state.authorizer,
+        &headers,
+        &query,
+        "active_installs",
+        async {
+            count_active_installs(&state.pool, query.project_id, query.start, query.end).await
+        },
+    )
+    .await
 }
 
-async fn screens(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<MetricQuery>,
-) -> impl IntoResponse {
-    metric_response(&state, &headers, query, "screens")
-}
-
-async fn releases(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<MetricQuery>,
-) -> impl IntoResponse {
-    metric_response(&state, &headers, query, "releases")
-}
-
-async fn custom_events(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<MetricQuery>,
-) -> impl IntoResponse {
-    metric_response(&state, &headers, query, "events")
-}
-
-fn metric_response(
-    state: &AppState,
+async fn metric_value_response<F>(
+    authorizer: &StaticAdminAuthorizer,
     headers: &HeaderMap,
-    _query: MetricQuery,
+    query: &SessionMetricQuery,
     metric_name: &'static str,
-) -> axum::response::Response {
-    if state.authorizer.authorize(headers).is_err() {
+    compute: F,
+) -> axum::response::Response
+where
+    F: std::future::Future<Output = Result<u64, StoreError>>,
+{
+    if authorizer.authorize(headers).is_err() {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "unauthorized" })),
@@ -205,15 +211,174 @@ fn metric_response(
             .into_response();
     }
 
-    (
-        StatusCode::OK,
-        Json(
-            serde_json::to_value(MetricResponse {
-                metric: metric_name.to_owned(),
-                points: Vec::new(),
+    if query.start > query.end {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "invalid_time_range" })),
+        )
+            .into_response();
+    }
+
+    match compute.await {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(MetricResponse {
+                    metric: metric_name.to_owned(),
+                    points: vec![MetricSeriesPoint {
+                        date: query.end.date_naive(),
+                        value,
+                    }],
+                })
+                .expect("serialize metric response"),
+            ),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(?error, "failed to compute derived metric");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal_server_error" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::response::Response;
+    use serde_json::Value;
+
+    fn query() -> SessionMetricQuery {
+        serde_json::from_value(serde_json::json!({
+            "project_id": "9bad8b88-5e7a-44ed-98ce-4cf9ddde713a",
+            "start": "2026-01-01T00:00:00Z",
+            "end": "2026-01-02T00:00:00Z"
+        }))
+        .expect("valid query")
+    }
+
+    fn authorizer() -> StaticAdminAuthorizer {
+        StaticAdminAuthorizer::new("fg_pat_dev")
+    }
+
+    fn authorized_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer fg_pat_dev".parse().expect("header"),
+        );
+        headers
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        serde_json::from_slice(&body).expect("deserialize response body")
+    }
+
+    #[tokio::test]
+    async fn metric_value_response_rejects_unauthorized_requests() {
+        let response = metric_value_response(
+            &authorizer(),
+            &HeaderMap::new(),
+            &query(),
+            "sessions_count",
+            async { Ok(7) },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn metric_value_response_rejects_invalid_time_ranges() {
+        let response = metric_value_response(
+            &authorizer(),
+            &authorized_headers(),
+            &SessionMetricQuery {
+                start: query().end,
+                end: query().start,
+                ..query()
+            },
+            "sessions_count",
+            async { Ok(7) },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn metric_value_response_returns_session_count_payload() {
+        let response = metric_value_response(
+            &authorizer(),
+            &authorized_headers(),
+            &query(),
+            "sessions_count",
+            async { Ok(7) },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "metric": "sessions_count",
+                "points": [
+                    { "date": "2026-01-02", "value": 7 }
+                ]
             })
-            .expect("serialize metric response"),
-        ),
-    )
-        .into_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn metric_value_response_returns_average_duration_payload() {
+        let response = metric_value_response(
+            &authorizer(),
+            &authorized_headers(),
+            &query(),
+            "sessions_duration",
+            async { Ok(1800) },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "metric": "sessions_duration",
+                "points": [
+                    { "date": "2026-01-02", "value": 1800 }
+                ]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn metric_value_response_returns_active_installs_payload() {
+        let response = metric_value_response(
+            &authorizer(),
+            &authorized_headers(),
+            &query(),
+            "active_installs",
+            async { Ok(3) },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "metric": "active_installs",
+                "points": [
+                    { "date": "2026-01-02", "value": 3 }
+                ]
+            })
+        );
+    }
 }

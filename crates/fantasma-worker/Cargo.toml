@@ -7,6 +7,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+chrono.workspace = true
+fantasma-core = { path = "../fantasma-core" }
+fantasma-store = { path = "../fantasma-store" }
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

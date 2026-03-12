@@ -43,14 +43,15 @@ Service-specific examples:
 - `FANTASMA_INGEST_KEY`
 - `FANTASMA_ADMIN_TOKEN`
 - `FANTASMA_WORKER_POLL_INTERVAL_MS`
+- `FANTASMA_WORKER_BATCH_SIZE`
 
 ## Startup Bootstrap
 
-On startup, `fantasma-ingest` and `fantasma-api` both:
+On startup, `fantasma-ingest`, `fantasma-api`, and `fantasma-worker` all:
 
 - connect to Postgres using a pooled connection
-- create `projects`, `api_keys`, and `events_raw` if they do not exist
-- create the initial raw-event indexes
+- create `projects`, `api_keys`, `events_raw`, `sessions`, and `worker_offsets` if they do not exist
+- create the initial raw-event and session indexes
 - seed the local development project plus ingest key from environment variables
 
 This keeps the first vertical slice self-contained without separate migration tooling.
@@ -82,10 +83,27 @@ curl -X POST http://localhost:8081/v1/events \
   }'
 ```
 
-Query the count:
+Query the raw event count:
 
 ```bash
 curl "http://localhost:8082/v1/metrics/events/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
+  -H "Authorization: Bearer fg_pat_dev"
+```
+
+Wait for one worker poll, then query the derived session metrics:
+
+```bash
+curl "http://localhost:8082/v1/metrics/sessions/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
+  -H "Authorization: Bearer fg_pat_dev"
+```
+
+```bash
+curl "http://localhost:8082/v1/metrics/sessions/duration?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
+  -H "Authorization: Bearer fg_pat_dev"
+```
+
+```bash
+curl "http://localhost:8082/v1/metrics/active-installs?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
   -H "Authorization: Bearer fg_pat_dev"
 ```
 
@@ -105,9 +123,14 @@ open apps/demo-ios/FantasmaDemo.xcodeproj
 
 Run the app in the iOS Simulator. The demo configures the SDK for `http://localhost:8081` with `fg_ing_test`, sends `app_open`, sends `screen_view` for the home screen, and lets you enqueue `button_pressed` events from the main button.
 
-Use the existing metrics endpoint to confirm ingestion after interacting with the app:
+Use the raw-event and derived-session endpoints to confirm the full pipeline after interacting with the app:
 
 ```bash
 curl "http://localhost:8082/v1/metrics/events/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z" \
+  -H "Authorization: Bearer fg_pat_dev"
+```
+
+```bash
+curl "http://localhost:8082/v1/metrics/sessions/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z" \
   -H "Authorization: Bearer fg_pat_dev"
 ```
