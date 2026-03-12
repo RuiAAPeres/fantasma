@@ -71,11 +71,22 @@ Do not add scope beyond the product vision without an explicit decision:
 
 Documentation is a first-class deliverable.
 
+- Keep the canonical public product/identity/privacy stance in `README.md`.
+- `README.md` is a product-facing entry point, not an implementation dump.
+- Do not spread the same product-direction explanation across multiple docs with different wording.
 - Any public API change must update `schemas/openapi`.
 - Any event contract change must update `schemas/events`.
 - Any architecture change must update `docs/architecture.md`.
 - Any deployment change must update `docs/deployment.md`.
 - Public-facing SDK behavior must include usage examples in docs.
+- Secondary docs should describe consequences of the canonical README stance:
+  - `docs/deployment.md` for operational behavior
+  - `docs/architecture.md` for technical design
+  - SDK docs for client behavior
+  - schemas/OpenAPI for contract text
+- Keep `README.md` concise and high-level; technical specifics belong in the derived docs above.
+- When public direction changes, update `README.md` first, then align the derived docs.
+- Avoid duplicating policy or ethos text across files unless a short local restatement is needed for clarity.
 - Work is not complete until documentation is updated.
 
 ## Project Memory

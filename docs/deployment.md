@@ -32,7 +32,6 @@ Current repository files:
 
 Operational guidance:
 
-- Fantasma is install-scoped analytics, not person-scoped analytics.
 - Fantasma prefers simple, explicit, high-performance data paths.
 - We avoid steady-state designs that rely on broad recomputation.
 - We narrow feature shape when necessary to preserve predictable performance and operational clarity.
@@ -40,6 +39,7 @@ Operational guidance:
 - Backend sessionization is internal; clients send event context, not session identity.
 - Event `properties` are for product context and must not contain direct identifiers or sensitive personal data.
 - Event `properties` are explicit string-to-string context, capped at 3 keys, with canonical keys matching `^[a-z][a-z0-9_]{0,62}$`.
+- The 3-key cap is a deliberate performance boundary: event metrics are backed by bounded worker-built aggregates, so keeping event context narrow preserves predictable write amplification, storage growth, and query behavior.
 - First-party supported SDKs auto-populate `platform`, `app_version`, and `os_version`.
 - DB-backed Rust tests are expected to run fully in Docker through the repository workflow.
 - Keep workspace tests on the Docker Postgres path limited to cases satisfied by Postgres alone; stack-dependent checks stay in dedicated smoke workflows.

@@ -3,10 +3,12 @@ info:
   title: Fantasma API
   version: 0.1.0
   description: |
-    Fantasma is a privacy-first, self-hosted mobile analytics platform.
+    Fantasma is a privacy-first, self-hosted, install-scoped mobile analytics
+    platform.
 
     The current public surface covers raw event ingestion plus worker-derived
-    session metrics and worker-derived event metrics.
+    session metrics and worker-derived event metrics. Event properties are
+    explicit string-to-string context with at most 3 keys.
 servers:
   - url: http://localhost:8081
     description: Local ingest service
@@ -86,6 +88,7 @@ paths:
         - built-ins: `platform`, `app_version`, `os_version`
         - explicit properties: any additional non-reserved query key matching
           `^[a-z][a-z0-9_]{0,62}$`
+        - `install_id` is intentionally outside the public metrics query surface
 
         `group_by` may be repeated up to twice. The total number of distinct
         referenced dimensions across filters plus `group_by` is capped at 3.
@@ -161,6 +164,7 @@ paths:
         - built-ins: `platform`, `app_version`, `os_version`
         - explicit properties: any additional non-reserved query key matching
           `^[a-z][a-z0-9_]{0,62}$`
+        - `install_id` is intentionally outside the public metrics query surface
 
         `group_by` may be repeated up to twice. The total number of distinct
         referenced dimensions across filters plus `group_by` is capped at 3.
@@ -488,9 +492,10 @@ components:
                 - os_version
       additionalProperties:
         type: string
-      description: Explicit string event properties. Reserved keys are rejected.
+      description: Explicit string event context, capped at 3 keys. Reserved keys are rejected, and properties must not be used to reconstruct person-level identity.
     EventPayload:
       type: object
+      description: Install-scoped mobile event payload for Fantasma.
       additionalProperties: false
       required:
         - event
@@ -507,6 +512,7 @@ components:
         install_id:
           type: string
           minLength: 1
+          description: Stable install-scoped client identity used by ingest and backend sessionization. It is not a person identifier and it is not a public metrics query dimension.
         platform:
           $ref: '#/components/schemas/Platform'
         app_version:
@@ -514,11 +520,13 @@ components:
             - string
             - 'null'
           minLength: 1
+          description: Optional built-in app version.
         os_version:
           type:
             - string
             - 'null'
           minLength: 1
+          description: Optional built-in OS version. First-party SDKs populate it when supported.
         properties:
           $ref: '#/components/schemas/EventProperties'
     EventBatchRequest:

@@ -146,7 +146,8 @@ Optional event fields:
 
 Identity model:
 
-- `install_id` is the public analytics unit for the MVP
+- `install_id` is the client-supplied install identity used by ingest, worker processing, and backend sessionization
+- Fantasma's public metrics API does not expose install-level filtering or grouping
 - Fantasma does not expose person-scoped identifiers in the public event contract
 - backend-derived session identifiers are internal implementation details, not public API
 - multi-device usage counts as multiple installs by design
@@ -195,7 +196,6 @@ Durability requirement:
 Current iOS SDK shape:
 
 - expose a single static `Fantasma` facade backed by one shared client
-- store `install_id` in local defaults
 - serialize each tracked event to JSON and store it as an immutable SQLite row
 - auto-populate `platform`, `app_version`, and `os_version`
 - upload queued events asynchronously to `POST /v1/events` using the existing batch contract
@@ -209,5 +209,4 @@ Current upload triggers:
 
 Current identity rules:
 
-- `install_id` is generated on first use and reused until `clear()`
-- `clear()` rotates `install_id` and leaves already queued rows untouched
+- the SDK generates one local install identity on first use, reuses it until `clear()`, and leaves already queued rows untouched when that identity rotates

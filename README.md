@@ -2,77 +2,50 @@
 
 Fantasma is a self-hosted, privacy-first mobile analytics platform.
 
-Fantasma is intentionally install-scoped. It measures installs, sessions, and event activity for mobile apps without introducing person-level identity or hidden stitching.
+Fantasma helps mobile teams understand app activity without turning analytics
+into identity infrastructure.
 
-The project is intentionally narrow:
+It is intentionally narrow:
 
-- event-based analytics for mobile apps
-- API-first access to metrics
+- mobile-first, not web analytics retrofitted onto apps
+- privacy-first, with install-scoped analytics instead of person-level tracking
+- API-first, so dashboards and integrations use the same public surface
+- self-hosted, with simple deployment and minimal moving parts
+
+Fantasma favors a small, legible product surface over analytics sprawl. It is
+for teams that want event, session, and usage insight without drifting into ad
+tech, hidden enrichment, or profile building. It keeps event context
+intentionally narrow so the analytics surface stays predictable and fast to run.
+
+## What Fantasma Is Not
+
+Fantasma is not trying to be a full product analytics suite. It does not target:
+
+- attribution
+- ad tracking
+- A/B testing
+- session replay
+- customer data platform behavior
+- fingerprinting
+
+## Current Shape
+
+Today Fantasma is centered on:
+
+- a Rust backend and public API
+- background aggregation workers
 - durable mobile SDKs
 - simple self-hosted deployment
-- an optional dashboard built on the same public API
 
-Fantasma favors a small, legible product surface over analytics completeness. The MVP keeps identity local to an install, treats backend sessionization as an internal concern, and expects event `properties` to carry product context rather than direct identifiers.
+The dashboard is secondary and should consume the same public API as everything
+else.
 
-Fantasma is not trying to be a full product analytics suite. It does not target feature flags, attribution, experimentation, session replay, or customer data platform workflows.
+## Learn More
 
-## MVP Shape
+This README is the canonical public product statement. Keep it high-level.
+Technical and operational details belong in the docs below.
 
-The current MVP target is:
-
-- Rust backend
-- Postgres-backed event storage and aggregates
-- public query API
-- durable iOS SDK
-- Docker Compose local deployment
-
-The dashboard is secondary and should consume the same API as external clients.
-
-## Repository Layout
-
-```text
-fantasma/
-  apps/
-    dashboard-web/
-    demo-ios/
-    demo-android/
-  crates/
-    fantasma-api/
-    fantasma-auth/
-    fantasma-core/
-    fantasma-ingest/
-    fantasma-worker/
-  docs/
-  infra/
-    docker/
-  schemas/
-    events/
-    openapi/
-  sdks/
-    ios/
-    android/
-```
-
-## Documentation
-
-Documentation is part of the product surface. Work is not complete unless the relevant docs move with it.
-
-- Repository rules: [`AGENTS.md`](/Users/ruiperes/Code/fantasma/AGENTS.md)
-- Project memory and progress log: [`docs/STATUS.md`](/Users/ruiperes/Code/fantasma/docs/STATUS.md)
-- Architecture notes: [`docs/architecture.md`](/Users/ruiperes/Code/fantasma/docs/architecture.md)
-- Deployment notes: [`docs/deployment.md`](/Users/ruiperes/Code/fantasma/docs/deployment.md)
-
-## Development
-
-This repository is being bootstrapped as a Cargo workspace. The first implementation slices focus on:
-
-1. shared schemas and core types
-2. auth and project/key modeling
-3. ingest service
-4. background aggregation worker
-5. query API
-6. durable iOS SDK
-
-## Commit Discipline
-
-Keep commits small and focused. Each commit should represent one coherent change and be reversible without collateral cleanup.
+- Deployment: [`docs/deployment.md`](/Users/ruiperes/Code/fantasma/docs/deployment.md)
+- Architecture: [`docs/architecture.md`](/Users/ruiperes/Code/fantasma/docs/architecture.md)
+- Project status: [`docs/STATUS.md`](/Users/ruiperes/Code/fantasma/docs/STATUS.md)
+- Contributor rules: [`AGENTS.md`](/Users/ruiperes/Code/fantasma/AGENTS.md)

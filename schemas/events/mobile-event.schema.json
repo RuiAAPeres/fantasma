@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://fantasma.dev/schemas/events/mobile-event.schema.json",
   "title": "Fantasma Mobile Event",
+  "description": "Install-scoped mobile event contract for Fantasma.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -21,7 +22,8 @@
     },
     "install_id": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "description": "Stable install-scoped client identity used by ingest and backend sessionization. It is not a person identifier and it is not a public metrics query dimension."
     },
     "platform": {
       "type": "string",
@@ -35,14 +37,16 @@
         "string",
         "null"
       ],
-      "minLength": 1
+      "minLength": 1,
+      "description": "Optional built-in app version."
     },
     "os_version": {
       "type": [
         "string",
         "null"
       ],
-      "minLength": 1
+      "minLength": 1,
+      "description": "Optional built-in OS version. First-party SDKs populate it when supported."
     },
     "properties": {
       "type": "object",
@@ -75,7 +79,7 @@
       "additionalProperties": {
         "type": "string"
       },
-      "description": "Explicit string event properties. Reserved query and built-in keys are rejected."
+      "description": "Explicit string event context, capped at 3 keys. The cap is a deliberate performance boundary for Fantasma's bounded worker-built aggregates. Reserved query and built-in keys are rejected, and properties must not be used to reconstruct person-level identity."
     }
   }
 }
