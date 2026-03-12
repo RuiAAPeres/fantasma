@@ -1,10 +1,10 @@
 {
   "hot-path": {
     "min_phase_events_per_second": {
-      "ingest": 9829.28
+      "ingest": 9877.74
     },
     "max_readiness_ms": {
-      "derived_metrics_ready": 728
+      "derived_metrics_ready": 628
     },
     "max_query_p95_ms": {
       "events_aggregate_dim3": 3,
@@ -15,12 +15,12 @@
   },
   "repair-path": {
     "min_phase_events_per_second": {
-      "seed_ingest": 8844.07,
-      "repair_ingest": 10023.25
+      "seed_ingest": 9174.98,
+      "repair_ingest": 10399.72
     },
     "max_readiness_ms": {
-      "seed_ready": 407,
-      "repair_ready": 410
+      "seed_ready": 457,
+      "repair_ready": 411
     },
     "max_query_p95_ms": {
       "events_aggregate_dim3": 4,
@@ -31,7 +31,7 @@
   },
   "scale-path": {
     "min_phase_events_per_second": {
-      "ingest": 9439.63
+      "ingest": 9210.0
     },
     "max_readiness_ms": {
       "derived_metrics_ready": 16276
@@ -40,7 +40,7 @@
       "events_aggregate_dim3": 9,
       "events_daily_dim3": 10,
       "sessions_count_daily": 1,
-      "sessions_duration_total_daily": 2
+      "sessions_duration_total_daily": 1
     }
   }
 }

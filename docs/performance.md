@@ -78,7 +78,9 @@ Each run writes:
 - `extended` runs the same scenarios but skips threshold enforcement and is intended for manual investigation
 - benchmark runs use [`infra/docker/compose.bench.yaml`](/Users/ruiperes/Code/fantasma/infra/docker/compose.bench.yaml), which keeps the normal stack topology but lowers the worker poll interval to `50ms` and raises the worker batch size to `1000`
 - budget tightening should use GitHub runner medians from repeated workflow runs, not a single local-machine benchmark
-- max query budgets clamp to at least `1ms` when the recorded p95 is `0ms`, because the harness stores integer-millisecond timings and a literal `0ms` budget would be artificially brittle
+- minimum throughput budgets use the retained GitHub runner median with `20%` slack below it
+- maximum readiness and query budgets use the retained GitHub runner median with `20%` slack above it, but never undershoot the slowest retained sample on the same runner class
+- max query budgets also clamp to at least `1ms` when the recorded p95 is `0ms`, because the harness stores integer-millisecond timings and a literal `0ms` budget would be artificially brittle
 
 ## Automation
 
