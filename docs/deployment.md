@@ -1,117 +1,111 @@
 # Deployment
 
-## Local Development Target
+Fantasma is documented for a single-host Docker Compose deployment. The
+repository's primary deployment definition lives in
+`infra/docker/compose.yaml`.
 
-Fantasma should be runnable locally with:
+## Supported Topology
 
-```bash
-docker compose -f infra/docker/compose.yaml up --build
-```
-
-The current vertical slice Compose setup includes:
+The default stack includes:
 
 - Postgres
 - `fantasma-ingest`
 - `fantasma-api`
 - `fantasma-worker`
-- optional `dashboard`
+- optional `dashboard` under the Compose `dashboard` profile
 
-Current repository files:
+Repository files:
 
-- Compose file: `infra/docker/compose.yaml`
-- Docker test Compose file: `infra/docker/compose.test.yaml`
-- Service images: `infra/docker/Dockerfile.ingest`, `infra/docker/Dockerfile.api`, `infra/docker/Dockerfile.worker`
-- Docker test image: `infra/docker/Dockerfile.test`
+- Compose stack: `infra/docker/compose.yaml`
+- service images: `infra/docker/Dockerfile.ingest`,
+  `infra/docker/Dockerfile.api`, `infra/docker/Dockerfile.worker`
+- benchmark stack: [`infra/docker/compose.bench.yaml`](../infra/docker/compose.bench.yaml)
 
-## Deployment Principles
+## Configuration
 
-- Prefer a small number of services.
-- Avoid optional infrastructure in v1 unless required by a concrete bottleneck.
-- Make it easy to run locally and in a simple self-hosted environment.
-- Keep configuration explicit through environment variables.
+Shared runtime variables:
 
-Operational guidance:
+- `FANTASMA_DATABASE_URL`: required by ingest, API, and worker
+- `FANTASMA_LOG_LEVEL`: optional tracing filter
+- `FANTASMA_PROJECT_ID`: optional local bootstrap override; binaries fall
+  back to the repository's default local project UUID when unset
+- `FANTASMA_PROJECT_NAME`: optional local bootstrap override; binaries fall
+  back to `Local Development Project`
+- `FANTASMA_INGEST_KEY`: optional local bootstrap ingest key
 
-- Fantasma prefers simple, explicit, high-performance data paths.
-- We avoid steady-state designs that rely on broad recomputation.
-- We narrow feature shape when necessary to preserve predictable performance and operational clarity.
-- Correctness still matters, but we should choose correctness models that compose with incremental processing.
-- Backend sessionization is internal; clients send event context, not session identity.
-- Event `properties` are for product context and must not contain direct identifiers or sensitive personal data.
-- Event `properties` are explicit string-to-string context, capped at 3 keys, with canonical keys matching `^[a-z][a-z0-9_]{0,62}$`.
-- The 3-key cap is a deliberate performance boundary: event metrics are backed by bounded worker-built aggregates, so keeping event context narrow preserves predictable write amplification, storage growth, and query behavior.
-- First-party supported SDKs auto-populate `platform`, `app_version`, and `os_version`.
-- DB-backed Rust tests are expected to run fully in Docker through the repository workflow.
-- Keep workspace tests on the Docker Postgres path limited to cases satisfied by Postgres alone; stack-dependent checks stay in dedicated smoke workflows.
+HTTP service variables:
 
-## Planned Environment Variables
+- `FANTASMA_BIND_ADDRESS`: bind address for `fantasma-ingest` and
+  `fantasma-api`
+- `FANTASMA_ADMIN_TOKEN`: bearer token consumed by `fantasma-api`; defaults
+  to `fg_pat_dev`
 
-Shared examples:
+Worker variables:
 
-- `FANTASMA_DATABASE_URL`
-- `FANTASMA_BIND_ADDRESS`
-- `FANTASMA_LOG_LEVEL`
-- `FANTASMA_PROJECT_ID`
-- `FANTASMA_PROJECT_NAME`
+- `FANTASMA_WORKER_POLL_INTERVAL_MS`: worker sleep interval in milliseconds;
+  defaults to `5000`
+- `FANTASMA_WORKER_BATCH_SIZE`: worker batch size; defaults to `500`
 
-Service-specific examples:
+Current Compose defaults:
 
-- `FANTASMA_INGEST_KEY`
-- `FANTASMA_ADMIN_TOKEN`
-- `FANTASMA_WORKER_POLL_INTERVAL_MS`
-- `FANTASMA_WORKER_BATCH_SIZE`
+- all three services get
+  `postgres://fantasma:fantasma@postgres:5432/fantasma`
+- `fantasma-ingest` gets `0.0.0.0:8081`, `fg_ing_test`,
+  `fg_pat_dev`, and explicit local project id/name values
+- `fantasma-api` gets `0.0.0.0:8082`, `fg_ing_test`,
+  `fg_pat_dev`, and explicit local project id/name values
+- `fantasma-worker` gets `FANTASMA_WORKER_POLL_INTERVAL_MS=5000` and uses
+  its built-in local project defaults because the Compose file does not pass
+  project id/name or ingest key to the worker
 
-## Startup Schema Preparation
+## Startup Behavior
 
 On startup, `fantasma-ingest`, `fantasma-api`, and `fantasma-worker` all:
 
 - connect to Postgres using a pooled connection
 - run SQL migrations from `crates/fantasma-store/migrations/`
-- optionally seed the local development project plus ingest key when seed environment variables are present
+- ensure the seeded local project exists using the configured project id,
+  project name, and any provided ingest key
 
-The schema is owned by `fantasma-store` through `sqlx::migrate!()`, while local project seeding stays explicit.
+There is no separate migration job in the default stack. The dashboard, when
+enabled, serves static files from `apps/dashboard-web/public` through Nginx.
 
-## Local Preconditions
+## Preconditions
 
-Reliable local verification currently requires:
+Before bringing the stack up, confirm:
 
-- enough free disk for Cargo, Docker layers, and Postgres data
+- enough free disk for Docker layers, Cargo build output, and Postgres data
 - a healthy Docker daemon
+- `docker` and `curl` are installed for the smoke path
 
-The current machine state that prompted this work had both Docker I/O failures and very low free space. Use the smoke script below as the first preflight check.
+## Bring Up
 
-## Local Docker Workspace Tests
-
-Run DB-backed Rust tests fully inside Docker:
+Start the default stack:
 
 ```bash
-./scripts/docker-test.sh
+docker compose -f infra/docker/compose.yaml up --build
 ```
 
-The Docker test workflow uses:
+Enable the dashboard profile:
 
-- `infra/docker/compose.test.yaml`
-- a disposable Postgres container with health checks
-- `DATABASE_URL=postgres://fantasma:fantasma@postgres:5432/postgres`
-- the `fantasma` role as the `sqlx::test` bootstrap user, which must retain `CREATEDB`
+```bash
+docker compose -f infra/docker/compose.yaml --profile dashboard up --build
+```
 
-The Docker test runner mounts the current checkout and keeps Cargo caches outside the repository tree. By default it tears down containers on exit with `docker compose down --remove-orphans`. Set `FANTASMA_DOCKER_TEST_KEEP_CONTAINERS=1` to keep containers around for debugging after a failure.
+Default host ports:
 
-Test taxonomy:
+- `5432`: Postgres
+- `8081`: ingest
+- `8082`: API
+- `8080`: dashboard when enabled
 
-- `./scripts/docker-test.sh` is the canonical path for Rust workspace tests that need Postgres
-- `./scripts/compose-smoke.sh` is for running-stack verification and should stay separate from workspace `cargo test`
+Stop the stack and remove volumes:
 
-## Performance Verification
+```bash
+docker compose -f infra/docker/compose.yaml down --volumes --remove-orphans
+```
 
-Fantasma keeps numeric stack benchmarks separate from the normal smoke path:
-
-- benchmark Compose file: [`infra/docker/compose.bench.yaml`](../infra/docker/compose.bench.yaml)
-- benchmark docs and commands: [`docs/performance.md`](performance.md)
-
-The benchmark stack keeps the same services as local development, but it runs under its own Compose project (`fantasma-bench`), uses benchmark-only host ports (`18081` / `18082`), does not publish Postgres on the host, and lowers the worker poll interval so derive-lag measurements are meaningful instead of dominated by the default 5-second sleep.
-
-## Local Smoke Test
+## Smoke Verification
 
 Run the preflighted smoke script:
 
@@ -119,18 +113,38 @@ Run the preflighted smoke script:
 ./scripts/compose-smoke.sh
 ```
 
-The smoke script uses a per-run disposable Compose project name by default, waits for the ingest and API `/health` endpoints before sending events, and validates the supported worker-derived session and event metrics. It still binds the standard local ports on `localhost`. Set `FANTASMA_SMOKE_PROJECT_NAME` if you need a stable override for debugging.
+The smoke path:
 
-Manual flow:
+- checks free disk and Docker availability
+- runs the stack in a disposable Compose project
+- waits for `http://localhost:8081/health` and
+  `http://localhost:8082/health`
+- ingests sample events
+- polls worker-derived metrics until the expected data appears
+- tears the stack down with volumes on exit
+
+Set `FANTASMA_SMOKE_PROJECT_NAME` if you need a stable Compose project name
+for debugging.
+
+Worker-built metrics are asynchronous. If you verify manually, expect a short
+delay between ingesting events and seeing derived metric reads update.
+
+## Manual Checks
+
+Use these commands when you need to inspect the running stack without the smoke
+script.
+
+Health endpoints:
 
 ```bash
-docker compose -f infra/docker/compose.yaml up --build
+curl -fsS http://localhost:8081/health
+curl -fsS http://localhost:8082/health
 ```
 
-Send one event:
+Ingest sample events:
 
 ```bash
-curl -X POST http://localhost:8081/v1/events \
+curl -fsS -X POST http://localhost:8081/v1/events \
   -H "Content-Type: application/json" \
   -H "X-Fantasma-Key: fg_ing_test" \
   -d '{
@@ -138,9 +152,20 @@ curl -X POST http://localhost:8081/v1/events \
       {
         "event": "app_open",
         "timestamp": "2026-01-01T00:00:00Z",
-        "install_id": "abc",
+        "install_id": "compose-install-1",
         "platform": "ios",
-        "app_version": "1.0",
+        "app_version": "1.0.0",
+        "os_version": "18.3",
+        "properties": {
+          "provider": "strava"
+        }
+      },
+      {
+        "event": "app_open",
+        "timestamp": "2026-01-01T00:10:00Z",
+        "install_id": "compose-install-1",
+        "platform": "ios",
+        "app_version": "1.0.0",
         "os_version": "18.3",
         "properties": {
           "provider": "strava"
@@ -150,83 +175,30 @@ curl -X POST http://localhost:8081/v1/events \
   }'
 ```
 
-Query the worker-derived event aggregate after the worker has processed the new raw events:
+Query derived metrics:
 
 ```bash
-curl "http://localhost:8082/v1/metrics/events/aggregate?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&platform=ios&group_by=provider" \
-  -H "Authorization: Bearer fg_pat_dev"
-```
-
-Query the worker-derived daily event series:
-
-```bash
-curl "http://localhost:8082/v1/metrics/events/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&group_by=provider" \
-  -H "Authorization: Bearer fg_pat_dev"
-```
-
-Query the derived session metrics after the worker has processed the new raw events:
-
-```bash
-curl "http://localhost:8082/v1/metrics/sessions/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions/count/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
   -H "Authorization: Bearer fg_pat_dev"
 ```
 
 ```bash
-curl "http://localhost:8082/v1/metrics/sessions/duration?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions/duration/total/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
   -H "Authorization: Bearer fg_pat_dev"
 ```
 
 ```bash
-curl "http://localhost:8082/v1/metrics/active-installs?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z" \
-  -H "Authorization: Bearer fg_pat_dev"
-```
-
-Poll the daily endpoint until the expected data appears or the timeout expires:
-
-```bash
-curl "http://localhost:8082/v1/metrics/sessions/count/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
-  -H "Authorization: Bearer fg_pat_dev"
-```
-
-The daily routes use inclusive UTC date bounds:
-
-- `/v1/metrics/events/daily`
-- `/v1/metrics/sessions/count/daily`
-- `/v1/metrics/sessions/duration/total/daily`
-
-Event-metrics query rules:
-
-- built-in filters use normal query params: `platform`, `app_version`, `os_version`
-- any other non-reserved query key becomes an equality filter on an explicit string property
-- `group_by` may be repeated up to twice
-- event metrics are eventually consistent because reads come from worker-built daily rollups
-
-## iOS Demo App
-
-Start the local backend first:
-
-```bash
-docker compose -f infra/docker/compose.yaml up --build
-```
-
-Then open the demo app in Xcode:
-
-```bash
-open apps/demo-ios/FantasmaDemo.xcodeproj
-```
-
-Run the app in the iOS Simulator. The demo configures the SDK for `http://localhost:8081` with `fg_ing_test`, sends `app_open`, sends `screen_view` for the home screen, and lets you enqueue `button_pressed` events from the main button.
-
-The resulting metrics are install-based. If the same human uses the app on two devices, Fantasma counts those as two installs by design.
-
-Use the worker-derived event and session endpoints to confirm the full pipeline after interacting with the app:
-
-```bash
-curl "http://localhost:8082/v1/metrics/events/aggregate?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2027-01-01&group_by=provider" \
+curl -fsS "http://localhost:8082/v1/metrics/events/aggregate?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&platform=ios&group_by=provider" \
   -H "Authorization: Bearer fg_pat_dev"
 ```
 
 ```bash
-curl "http://localhost:8082/v1/metrics/sessions/count?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z" \
+curl -fsS "http://localhost:8082/v1/metrics/events/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&group_by=provider" \
   -H "Authorization: Bearer fg_pat_dev"
 ```
+
+## Related Docs
+
+- architecture and data flow: [`docs/architecture.md`](architecture.md)
+- benchmark-specific commands: [`docs/performance.md`](performance.md)
+- iOS demo walkthrough: [`apps/demo-ios/README.md`](../apps/demo-ios/README.md)
