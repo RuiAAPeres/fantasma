@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - perf-proof-gh-data
   workflow_dispatch:
     inputs:
       scenario:
