@@ -21,9 +21,10 @@ use fantasma_core::{
 use fantasma_store::{
     EventMetricsAggregateCubeRow, EventMetricsCubeRow, PgPool, SessionDailyRecord, StoreError,
     average_session_duration_seconds, count_active_installs, count_sessions,
-    fetch_event_metrics_aggregate_cube_rows, fetch_event_metrics_cube_rows,
+    fetch_event_metrics_aggregate_cube_rows_in_tx, fetch_event_metrics_cube_rows_in_tx,
     fetch_session_daily_range,
 };
+use sqlx::{Postgres, Transaction};
 use url::form_urlencoded;
 use uuid::Uuid;
 
@@ -209,22 +210,7 @@ async fn events_aggregate(
         Err(error) => return query_error_response(error.error_code()),
     };
 
-    if let Err(error) = precheck_event_metrics_group_limit(&state.pool, &query).await {
-        return match error {
-            EventMetricsResponseError::GroupLimitExceeded => {
-                query_error_response("group_limit_exceeded")
-            }
-            EventMetricsResponseError::Store(error) => {
-                tracing::error!(
-                    ?error,
-                    "failed to precheck event metrics aggregate group limit"
-                );
-                query_error_response("internal_server_error")
-            }
-        };
-    }
-
-    match load_event_metrics_aggregate_response(&state.pool, &query).await {
+    match execute_event_metrics_aggregate_query(&state.pool, &query).await {
         Ok(response) => (
             StatusCode::OK,
             Json(serde_json::to_value(response).expect("serialize event metric response")),
@@ -258,19 +244,7 @@ async fn events_daily(
         Err(error) => return query_error_response(error.error_code()),
     };
 
-    if let Err(error) = precheck_event_metrics_group_limit(&state.pool, &query).await {
-        return match error {
-            EventMetricsResponseError::GroupLimitExceeded => {
-                query_error_response("group_limit_exceeded")
-            }
-            EventMetricsResponseError::Store(error) => {
-                tracing::error!(?error, "failed to precheck daily event metrics group limit");
-                query_error_response("internal_server_error")
-            }
-        };
-    }
-
-    match load_event_metrics_daily_response(&state.pool, &query).await {
+    match execute_event_metrics_daily_query(&state.pool, &query).await {
         Ok(response) => (
             StatusCode::OK,
             Json(serde_json::to_value(response).expect("serialize event metrics response")),
@@ -311,14 +285,47 @@ fn query_error_response(error: &'static str) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": error }))).into_response()
 }
 
-async fn precheck_event_metrics_group_limit(
+async fn execute_event_metrics_aggregate_query(
     pool: &PgPool,
+    query: &EventMetricsQuery,
+) -> Result<EventMetricsAggregateResponse, EventMetricsResponseError> {
+    let mut tx = begin_event_metrics_snapshot(pool).await?;
+    precheck_event_metrics_group_limit(&mut tx, query).await?;
+    let response = load_event_metrics_aggregate_response(&mut tx, query).await?;
+    tx.commit().await.map_err(StoreError::Database)?;
+    Ok(response)
+}
+
+async fn execute_event_metrics_daily_query(
+    pool: &PgPool,
+    query: &EventMetricsQuery,
+) -> Result<EventMetricsDailyResponse, EventMetricsResponseError> {
+    let mut tx = begin_event_metrics_snapshot(pool).await?;
+    precheck_event_metrics_group_limit(&mut tx, query).await?;
+    let response = load_event_metrics_daily_response(&mut tx, query).await?;
+    tx.commit().await.map_err(StoreError::Database)?;
+    Ok(response)
+}
+
+async fn begin_event_metrics_snapshot(
+    pool: &PgPool,
+) -> Result<Transaction<'_, Postgres>, EventMetricsResponseError> {
+    let mut tx = pool.begin().await.map_err(StoreError::Database)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::Database)?;
+    Ok(tx)
+}
+
+async fn precheck_event_metrics_group_limit(
+    tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<(), EventMetricsResponseError> {
     match query.group_by.len() {
         0 => Ok(()),
-        1 => precheck_single_group_limit(pool, query).await,
-        2 => precheck_two_group_limit(pool, query).await,
+        1 => precheck_single_group_limit(tx, query).await,
+        2 => precheck_two_group_limit(tx, query).await,
         other => Err(StoreError::InvariantViolation(format!(
             "event metrics group_by arity must be between 0 and 2, got {other}"
         ))
@@ -327,15 +334,15 @@ async fn precheck_event_metrics_group_limit(
 }
 
 async fn precheck_single_group_limit(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<(), EventMetricsResponseError> {
     let group_key = query
         .group_by
         .first()
         .expect("single-group query has one group key");
-    let primary_rows = fetch_event_metrics_aggregate_cube_rows(
-        pool,
+    let primary_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         (query.window.start_date, query.window.end_date),
@@ -349,8 +356,8 @@ async fn precheck_single_group_limit(
         return Err(EventMetricsResponseError::GroupLimitExceeded);
     }
 
-    let total_rows = fetch_event_metrics_aggregate_cube_rows(
-        pool,
+    let total_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         (query.window.start_date, query.window.end_date),
@@ -373,7 +380,7 @@ async fn precheck_single_group_limit(
 }
 
 async fn precheck_two_group_limit(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<(), EventMetricsResponseError> {
     let first_group = query
@@ -384,8 +391,8 @@ async fn precheck_two_group_limit(
         .group_by
         .get(1)
         .expect("two-group query has second group");
-    let pair_rows = fetch_event_metrics_aggregate_cube_rows(
-        pool,
+    let pair_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         (query.window.start_date, query.window.end_date),
@@ -399,8 +406,8 @@ async fn precheck_two_group_limit(
         return Err(EventMetricsResponseError::GroupLimitExceeded);
     }
 
-    let first_rows = fetch_event_metrics_aggregate_cube_rows(
-        pool,
+    let first_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         (query.window.start_date, query.window.end_date),
@@ -414,8 +421,8 @@ async fn precheck_two_group_limit(
         return Err(EventMetricsResponseError::GroupLimitExceeded);
     }
 
-    let second_rows = fetch_event_metrics_aggregate_cube_rows(
-        pool,
+    let second_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         (query.window.start_date, query.window.end_date),
@@ -429,8 +436,8 @@ async fn precheck_two_group_limit(
         return Err(EventMetricsResponseError::GroupLimitExceeded);
     }
 
-    let total_rows = fetch_event_metrics_aggregate_cube_rows(
-        pool,
+    let total_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         (query.window.start_date, query.window.end_date),
@@ -455,10 +462,10 @@ async fn precheck_two_group_limit(
 }
 
 async fn load_event_metrics_aggregate_response(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<EventMetricsAggregateResponse, EventMetricsResponseError> {
-    let counts_by_day = load_group_counts_by_day(pool, query).await?;
+    let counts_by_day = load_group_counts_by_day(tx, query).await?;
     let mut totals_by_group = BTreeMap::<GroupKey, u64>::new();
 
     for groups in counts_by_day.values() {
@@ -492,10 +499,10 @@ async fn load_event_metrics_aggregate_response(
 }
 
 async fn load_event_metrics_daily_response(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<EventMetricsDailyResponse, EventMetricsResponseError> {
-    let counts_by_day = load_group_counts_by_day(pool, query).await?;
+    let counts_by_day = load_group_counts_by_day(tx, query).await?;
     let mut series_by_group = BTreeMap::<GroupKey, BTreeMap<chrono::NaiveDate, u64>>::new();
 
     for (day, groups) in counts_by_day {
@@ -535,13 +542,13 @@ async fn load_event_metrics_daily_response(
 }
 
 async fn load_group_counts_by_day(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<BTreeMap<chrono::NaiveDate, BTreeMap<GroupKey, u64>>, EventMetricsResponseError> {
     match query.group_by.len() {
-        0 => load_ungrouped_counts_by_day(pool, query).await,
-        1 => load_single_group_counts_by_day(pool, query).await,
-        2 => load_two_group_counts_by_day(pool, query).await,
+        0 => load_ungrouped_counts_by_day(tx, query).await,
+        1 => load_single_group_counts_by_day(tx, query).await,
+        2 => load_two_group_counts_by_day(tx, query).await,
         other => Err(StoreError::InvariantViolation(format!(
             "event metrics group_by arity must be between 0 and 2, got {other}"
         ))
@@ -550,11 +557,11 @@ async fn load_group_counts_by_day(
 }
 
 async fn load_ungrouped_counts_by_day(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<BTreeMap<chrono::NaiveDate, BTreeMap<GroupKey, u64>>, EventMetricsResponseError> {
-    let total_rows = fetch_event_metrics_cube_rows(
-        pool,
+    let total_rows = fetch_event_metrics_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         query.window.start_date,
@@ -572,15 +579,15 @@ async fn load_ungrouped_counts_by_day(
 }
 
 async fn load_single_group_counts_by_day(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<BTreeMap<chrono::NaiveDate, BTreeMap<GroupKey, u64>>, EventMetricsResponseError> {
     let group_key = query
         .group_by
         .first()
         .expect("single-group query has one group key");
-    let primary_rows = fetch_event_metrics_cube_rows(
-        pool,
+    let primary_rows = fetch_event_metrics_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         query.window.start_date,
@@ -589,8 +596,8 @@ async fn load_single_group_counts_by_day(
         &query.filters,
     )
     .await?;
-    let total_rows = fetch_event_metrics_cube_rows(
-        pool,
+    let total_rows = fetch_event_metrics_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         query.window.start_date,
@@ -623,7 +630,7 @@ async fn load_single_group_counts_by_day(
 }
 
 async fn load_two_group_counts_by_day(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<BTreeMap<chrono::NaiveDate, BTreeMap<GroupKey, u64>>, EventMetricsResponseError> {
     let first_group = query
@@ -634,8 +641,8 @@ async fn load_two_group_counts_by_day(
         .group_by
         .get(1)
         .expect("two-group query has second group");
-    let primary_rows = fetch_event_metrics_cube_rows(
-        pool,
+    let primary_rows = fetch_event_metrics_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         query.window.start_date,
@@ -644,8 +651,8 @@ async fn load_two_group_counts_by_day(
         &query.filters,
     )
     .await?;
-    let first_rows = fetch_event_metrics_cube_rows(
-        pool,
+    let first_rows = fetch_event_metrics_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         query.window.start_date,
@@ -654,8 +661,8 @@ async fn load_two_group_counts_by_day(
         &query.filters,
     )
     .await?;
-    let second_rows = fetch_event_metrics_cube_rows(
-        pool,
+    let second_rows = fetch_event_metrics_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         query.window.start_date,
@@ -664,8 +671,8 @@ async fn load_two_group_counts_by_day(
         &query.filters,
     )
     .await?;
-    let total_rows = fetch_event_metrics_cube_rows(
-        pool,
+    let total_rows = fetch_event_metrics_cube_rows_in_tx(
+        tx,
         query.project_id,
         &query.event,
         query.window.start_date,

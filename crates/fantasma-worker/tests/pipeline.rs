@@ -22,6 +22,41 @@ fn bootstrap_config() -> BootstrapConfig {
     }
 }
 
+fn scale_like_events(day: &str, install_count: usize) -> Vec<serde_json::Value> {
+    let providers = ["strava", "garmin", "polar", "oura"];
+    let regions = ["eu", "us", "apac", "latam"];
+    let plans = ["free", "pro", "team"];
+    let app_versions = ["1.0.0", "1.1.0", "1.2.0"];
+    let os_versions = ["18.3", "18.4"];
+    let mut events = Vec::with_capacity(install_count * 3);
+
+    for install_index in 0..install_count {
+        let provider = providers[install_index % providers.len()];
+        let region = regions[(install_index / providers.len()) % regions.len()];
+        let plan = plans[install_index % plans.len()];
+        let app_version = app_versions[install_index % app_versions.len()];
+        let os_version = os_versions[install_index % os_versions.len()];
+
+        for timestamp in ["00:00:00Z", "00:10:00Z", "00:20:00Z"] {
+            events.push(serde_json::json!({
+                "event": "app_open",
+                "timestamp": format!("{day}T{timestamp}"),
+                "install_id": format!("scale-{day}-{install_index}"),
+                "platform": "ios",
+                "app_version": app_version,
+                "os_version": os_version,
+                "properties": {
+                    "plan": plan,
+                    "provider": provider,
+                    "region": region
+                }
+            }));
+        }
+    }
+
+    events
+}
+
 #[sqlx::test]
 async fn pipeline_exposes_daily_metrics_after_worker_batch(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
@@ -372,5 +407,81 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
         serde_json::json!({
             "error": "group_limit_exceeded"
         })
+    );
+}
+
+#[sqlx::test]
+async fn pipeline_keeps_grouped_event_metrics_daily_queries_200_during_worker_catchup(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    ensure_local_project(&pool, Some(&bootstrap_config()))
+        .await
+        .expect("seed local project");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+    );
+    let events = scale_like_events("2026-04-01", 120);
+
+    for batch in events.chunks(100) {
+        let ingest_response = ingest
+            .clone()
+            .oneshot(
+                Request::post("/v1/events")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("x-fantasma-key", "fg_ing_test")
+                    .body(Body::from(
+                        serde_json::json!({ "events": batch.to_vec() }).to_string(),
+                    ))
+                    .expect("valid ingest request"),
+            )
+            .await
+            .expect("ingest request succeeds");
+
+        assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+    }
+
+    let worker_pool = pool.clone();
+    let worker = tokio::spawn(async move {
+        loop {
+            let processed = fantasma_worker::process_event_metrics_batch(&worker_pool, 1)
+                .await
+                .expect("event metrics worker batch succeeds");
+            if processed == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let query = "/v1/metrics/events/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-04-01&end_date=2026-04-01&platform=ios&group_by=provider&group_by=region";
+    let mut saw_internal_server_error = false;
+
+    while !worker.is_finished() {
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(query)
+                    .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                    .body(Body::empty())
+                    .expect("valid api request"),
+            )
+            .await
+            .expect("daily query succeeds");
+
+        if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
+            saw_internal_server_error = true;
+            break;
+        }
+
+        tokio::task::yield_now().await;
+    }
+
+    worker.await.expect("worker task joins");
+
+    assert!(
+        !saw_internal_server_error,
+        "grouped daily event metrics queries should never return internal_server_error while the worker commits bounded batches"
     );
 }

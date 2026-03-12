@@ -413,28 +413,66 @@ pub async fn fetch_event_metrics_cube_rows(
     cube_keys: &[String],
     filters: &BTreeMap<String, String>,
 ) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+    fetch_event_metrics_cube_rows_in_executor(
+        pool, project_id, event_name, start_date, end_date, cube_keys, filters,
+    )
+    .await
+}
+
+pub async fn fetch_event_metrics_cube_rows_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    event_name: &str,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+    fetch_event_metrics_cube_rows_in_executor(
+        &mut **tx,
+        project_id,
+        event_name,
+        start_date,
+        end_date,
+        cube_keys,
+        filters,
+    )
+    .await
+}
+
+async fn fetch_event_metrics_cube_rows_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    event_name: &str,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     ensure_canonical_cube_keys(cube_keys)?;
     ensure_filters_belong_to_cube(cube_keys, filters)?;
 
     match cube_keys.len() {
-        0 => {
-            fetch_event_metrics_total_rows(pool, project_id, event_name, start_date, end_date).await
-        }
+        0 => fetch_event_metrics_total_rows(executor, project_id, event_name, start_date, end_date)
+            .await,
         1 => {
             fetch_event_metrics_dim1_rows(
-                pool, project_id, event_name, start_date, end_date, cube_keys, filters,
+                executor, project_id, event_name, start_date, end_date, cube_keys, filters,
             )
             .await
         }
         2 => {
             fetch_event_metrics_dim2_rows(
-                pool, project_id, event_name, start_date, end_date, cube_keys, filters,
+                executor, project_id, event_name, start_date, end_date, cube_keys, filters,
             )
             .await
         }
         3 => {
             fetch_event_metrics_dim3_rows(
-                pool, project_id, event_name, start_date, end_date, cube_keys, filters,
+                executor, project_id, event_name, start_date, end_date, cube_keys, filters,
             )
             .await
         }
@@ -453,6 +491,45 @@ pub async fn fetch_event_metrics_aggregate_cube_rows(
     filters: &BTreeMap<String, String>,
     limit: Option<usize>,
 ) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+    fetch_event_metrics_aggregate_cube_rows_in_executor(
+        pool, project_id, event_name, window, cube_keys, filters, limit,
+    )
+    .await
+}
+
+pub async fn fetch_event_metrics_aggregate_cube_rows_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    event_name: &str,
+    window: (NaiveDate, NaiveDate),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+    fetch_event_metrics_aggregate_cube_rows_in_executor(
+        &mut **tx,
+        project_id,
+        event_name,
+        window,
+        cube_keys,
+        filters,
+        limit,
+    )
+    .await
+}
+
+async fn fetch_event_metrics_aggregate_cube_rows_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    event_name: &str,
+    window: (NaiveDate, NaiveDate),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let (start_date, end_date) = window;
     ensure_canonical_cube_keys(cube_keys)?;
     ensure_filters_belong_to_cube(cube_keys, filters)?;
@@ -460,7 +537,7 @@ pub async fn fetch_event_metrics_aggregate_cube_rows(
     match cube_keys.len() {
         0 => {
             fetch_event_metrics_total_aggregate_rows(
-                pool,
+                executor,
                 project_id,
                 event_name,
                 (start_date, end_date),
@@ -469,7 +546,7 @@ pub async fn fetch_event_metrics_aggregate_cube_rows(
         }
         1 => {
             fetch_event_metrics_dim1_aggregate_rows(
-                pool,
+                executor,
                 project_id,
                 event_name,
                 (start_date, end_date),
@@ -481,7 +558,7 @@ pub async fn fetch_event_metrics_aggregate_cube_rows(
         }
         2 => {
             fetch_event_metrics_dim2_aggregate_rows(
-                pool,
+                executor,
                 project_id,
                 event_name,
                 (start_date, end_date),
@@ -493,7 +570,7 @@ pub async fn fetch_event_metrics_aggregate_cube_rows(
         }
         3 => {
             fetch_event_metrics_dim3_aggregate_rows(
-                pool,
+                executor,
                 project_id,
                 event_name,
                 (start_date, end_date),
@@ -1290,13 +1367,16 @@ pub async fn count_active_installs(
     Ok(count as u64)
 }
 
-async fn fetch_event_metrics_total_rows(
-    pool: &PgPool,
+async fn fetch_event_metrics_total_rows<'a, E>(
+    executor: E,
     project_id: Uuid,
     event_name: &str,
     start_date: NaiveDate,
     end_date: NaiveDate,
-) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let rows = sqlx::query(
         r#"
         SELECT day, event_count
@@ -1311,7 +1391,7 @@ async fn fetch_event_metrics_total_rows(
     .bind(event_name)
     .bind(start_date)
     .bind(end_date)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
 
     Ok(rows
@@ -1326,12 +1406,15 @@ async fn fetch_event_metrics_total_rows(
         .collect())
 }
 
-async fn fetch_event_metrics_total_aggregate_rows(
-    pool: &PgPool,
+async fn fetch_event_metrics_total_aggregate_rows<'a, E>(
+    executor: E,
     project_id: Uuid,
     event_name: &str,
     window: (NaiveDate, NaiveDate),
-) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let (start_date, end_date) = window;
     let row = sqlx::query(
         r#"
@@ -1346,7 +1429,7 @@ async fn fetch_event_metrics_total_aggregate_rows(
     .bind(event_name)
     .bind(start_date)
     .bind(end_date)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     let event_count = row.try_get::<Option<i64>, _>("event_count")?;
@@ -1361,15 +1444,18 @@ async fn fetch_event_metrics_total_aggregate_rows(
         .unwrap_or_default())
 }
 
-async fn fetch_event_metrics_dim1_rows(
-    pool: &PgPool,
+async fn fetch_event_metrics_dim1_rows<'a, E>(
+    executor: E,
     project_id: Uuid,
     event_name: &str,
     start_date: NaiveDate,
     end_date: NaiveDate,
     cube_keys: &[String],
     filters: &BTreeMap<String, String>,
-) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let mut builder = QueryBuilder::<Postgres>::new(
         "SELECT day, dim1_key, dim1_value, event_count \
          FROM event_count_daily_dim1 \
@@ -1392,7 +1478,7 @@ async fn fetch_event_metrics_dim1_rows(
 
     builder.push(" ORDER BY day ASC, dim1_value ASC");
 
-    let rows = builder.build().fetch_all(pool).await?;
+    let rows = builder.build().fetch_all(executor).await?;
 
     Ok(rows
         .into_iter()
@@ -1411,15 +1497,18 @@ async fn fetch_event_metrics_dim1_rows(
         .collect())
 }
 
-async fn fetch_event_metrics_dim1_aggregate_rows(
-    pool: &PgPool,
+async fn fetch_event_metrics_dim1_aggregate_rows<'a, E>(
+    executor: E,
     project_id: Uuid,
     event_name: &str,
     window: (NaiveDate, NaiveDate),
     cube_keys: &[String],
     filters: &BTreeMap<String, String>,
     limit: Option<usize>,
-) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let (start_date, end_date) = window;
     let mut builder = QueryBuilder::<Postgres>::new(
         "SELECT dim1_key, dim1_value, SUM(event_count)::BIGINT AS event_count \
@@ -1448,7 +1537,7 @@ async fn fetch_event_metrics_dim1_aggregate_rows(
         builder.push_bind(limit as i64);
     }
 
-    let rows = builder.build().fetch_all(pool).await?;
+    let rows = builder.build().fetch_all(executor).await?;
 
     Ok(rows
         .into_iter()
@@ -1466,15 +1555,18 @@ async fn fetch_event_metrics_dim1_aggregate_rows(
         .collect())
 }
 
-async fn fetch_event_metrics_dim2_rows(
-    pool: &PgPool,
+async fn fetch_event_metrics_dim2_rows<'a, E>(
+    executor: E,
     project_id: Uuid,
     event_name: &str,
     start_date: NaiveDate,
     end_date: NaiveDate,
     cube_keys: &[String],
     filters: &BTreeMap<String, String>,
-) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let mut builder = QueryBuilder::<Postgres>::new(
         "SELECT day, dim1_key, dim1_value, dim2_key, dim2_value, event_count \
          FROM event_count_daily_dim2 \
@@ -1504,7 +1596,7 @@ async fn fetch_event_metrics_dim2_rows(
 
     builder.push(" ORDER BY day ASC, dim1_value ASC, dim2_value ASC");
 
-    let rows = builder.build().fetch_all(pool).await?;
+    let rows = builder.build().fetch_all(executor).await?;
 
     Ok(rows
         .into_iter()
@@ -1531,15 +1623,18 @@ async fn fetch_event_metrics_dim2_rows(
         .collect())
 }
 
-async fn fetch_event_metrics_dim2_aggregate_rows(
-    pool: &PgPool,
+async fn fetch_event_metrics_dim2_aggregate_rows<'a, E>(
+    executor: E,
     project_id: Uuid,
     event_name: &str,
     window: (NaiveDate, NaiveDate),
     cube_keys: &[String],
     filters: &BTreeMap<String, String>,
     limit: Option<usize>,
-) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let (start_date, end_date) = window;
     let mut builder = QueryBuilder::<Postgres>::new(
         "SELECT dim1_key, dim1_value, dim2_key, dim2_value, SUM(event_count)::BIGINT AS event_count \
@@ -1578,7 +1673,7 @@ async fn fetch_event_metrics_dim2_aggregate_rows(
         builder.push_bind(limit as i64);
     }
 
-    let rows = builder.build().fetch_all(pool).await?;
+    let rows = builder.build().fetch_all(executor).await?;
 
     Ok(rows
         .into_iter()
@@ -1604,15 +1699,18 @@ async fn fetch_event_metrics_dim2_aggregate_rows(
         .collect())
 }
 
-async fn fetch_event_metrics_dim3_rows(
-    pool: &PgPool,
+async fn fetch_event_metrics_dim3_rows<'a, E>(
+    executor: E,
     project_id: Uuid,
     event_name: &str,
     start_date: NaiveDate,
     end_date: NaiveDate,
     cube_keys: &[String],
     filters: &BTreeMap<String, String>,
-) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let mut builder = QueryBuilder::<Postgres>::new(
         "SELECT day, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count \
          FROM event_count_daily_dim3 \
@@ -1649,7 +1747,7 @@ async fn fetch_event_metrics_dim3_rows(
 
     builder.push(" ORDER BY day ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC");
 
-    let rows = builder.build().fetch_all(pool).await?;
+    let rows = builder.build().fetch_all(executor).await?;
 
     Ok(rows
         .into_iter()
@@ -1682,15 +1780,18 @@ async fn fetch_event_metrics_dim3_rows(
         .collect())
 }
 
-async fn fetch_event_metrics_dim3_aggregate_rows(
-    pool: &PgPool,
+async fn fetch_event_metrics_dim3_aggregate_rows<'a, E>(
+    executor: E,
     project_id: Uuid,
     event_name: &str,
     window: (NaiveDate, NaiveDate),
     cube_keys: &[String],
     filters: &BTreeMap<String, String>,
     limit: Option<usize>,
-) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let (start_date, end_date) = window;
     let mut builder = QueryBuilder::<Postgres>::new(
         "SELECT dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, \
@@ -1737,7 +1838,7 @@ async fn fetch_event_metrics_dim3_aggregate_rows(
         builder.push_bind(limit as i64);
     }
 
-    let rows = builder.build().fetch_all(pool).await?;
+    let rows = builder.build().fetch_all(executor).await?;
 
     Ok(rows
         .into_iter()
