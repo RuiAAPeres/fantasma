@@ -4,16 +4,29 @@ struct IdentityState: Equatable, Sendable {
     let installID: String
 }
 
-final class IdentityStore: @unchecked Sendable {
+struct UserDefaultsProvider: Sendable {
+    let suiteName: String?
+
+    static let standard = UserDefaultsProvider(suiteName: nil)
+
+    func userDefaults() -> UserDefaults {
+        if let suiteName, let userDefaults = UserDefaults(suiteName: suiteName) {
+            return userDefaults
+        }
+        return .standard
+    }
+}
+
+actor IdentityStore {
     private enum Keys {
         static let installID = "dev.fantasma.sdk.install-id"
     }
 
-    private let userDefaults: UserDefaults
+    private let provider: UserDefaultsProvider
     private let newIdentifier: @Sendable () -> String
 
-    init(userDefaults: UserDefaults, newIdentifier: @escaping @Sendable () -> String) {
-        self.userDefaults = userDefaults
+    init(provider: UserDefaultsProvider, newIdentifier: @escaping @Sendable () -> String) {
+        self.provider = provider
         self.newIdentifier = newIdentifier
     }
 
@@ -24,11 +37,12 @@ final class IdentityStore: @unchecked Sendable {
 
     func clear() -> IdentityState {
         let installID = newIdentifier()
-        userDefaults.set(installID, forKey: Keys.installID)
+        provider.userDefaults().set(installID, forKey: Keys.installID)
         return IdentityState(installID: installID)
     }
 
     private func readOrCreate(key: String) -> String {
+        let userDefaults = provider.userDefaults()
         if let existing = normalized(userDefaults.string(forKey: key)) {
             return existing
         }

@@ -1,6 +1,6 @@
 import Foundation
 
-actor EventUploader {
+struct EventUploader: Sendable {
     private let queue: SQLiteEventQueue
     private let transport: any FantasmaTransport
 
@@ -9,8 +9,8 @@ actor EventUploader {
         self.transport = transport
     }
 
-    func makeBatch(limit: Int) throws -> UploadBatch? {
-        let rows = try queue.peek(limit: limit)
+    func makeBatch(limit: Int) async throws -> UploadBatch? {
+        let rows = try await queue.peek(limit: limit)
         guard !rows.isEmpty else {
             return nil
         }
@@ -28,30 +28,38 @@ actor EventUploader {
         return UploadBatch(rowIDs: ids, body: body, count: rows.count)
     }
 
-    func upload(_ batch: UploadBatch, configuration: FantasmaConfiguration) async -> Bool {
+    func upload(_ batch: UploadBatch, configuration: FantasmaConfiguration) async throws {
         var request = URLRequest(url: configuration.serverURL.appendingPathComponent("v1/events"))
         request.httpMethod = "POST"
         request.httpBody = batch.body
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(configuration.writeKey, forHTTPHeaderField: "X-Fantasma-Key")
 
+        let data: Data
+        let response: HTTPURLResponse
+
         do {
-            let (data, response) = try await transport.send(request: request)
-            guard response.statusCode == 202 else {
-                return false
+            (data, response) = try await transport.send(request: request)
+        } catch let error as FantasmaError {
+            if error == .invalidResponse {
+                throw error
             }
-
-            guard
-                let accepted = try? JSONDecoder().decode(AcceptedResponse.self, from: data),
-                accepted.accepted == batch.count
-            else {
-                return false
-            }
-
-            try queue.delete(ids: batch.rowIDs)
-            return true
+            throw FantasmaError.uploadFailed
         } catch {
-            return false
+            throw FantasmaError.uploadFailed
         }
+
+        guard response.statusCode == 202 else {
+            throw FantasmaError.uploadFailed
+        }
+
+        guard
+            let accepted = try? JSONDecoder().decode(AcceptedResponse.self, from: data),
+            accepted.accepted == batch.count
+        else {
+            throw FantasmaError.uploadFailed
+        }
+
+        try await queue.delete(ids: batch.rowIDs)
     }
 }

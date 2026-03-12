@@ -3,42 +3,65 @@ import Foundation
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+private final class SQLiteDatabaseHandle {
+    let pointer: OpaquePointer?
+
+    init(pointer: OpaquePointer?) {
+        self.pointer = pointer
+    }
+
+    deinit {
+        sqlite3_close(pointer)
+    }
+}
+
 internal struct QueuedEventRow: Equatable, Sendable {
     let id: Int64
     let payload: Data
     let createdAt: Int64
 }
 
-internal final class SQLiteEventQueue: @unchecked Sendable {
-    private var database: OpaquePointer?
+internal actor SQLiteEventQueue {
+    private let database: SQLiteDatabaseHandle
 
     init(databaseURL: URL) throws {
-        try FileManager.default.createDirectory(
-            at: databaseURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        do {
+            try FileManager.default.createDirectory(
+                at: databaseURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        } catch {
+            throw FantasmaError.storageFailure(error.localizedDescription)
+        }
 
         let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
         var database: OpaquePointer?
         if sqlite3_open_v2(databaseURL.path, &database, flags, nil) != SQLITE_OK {
             let message = database.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown sqlite error"
             sqlite3_close(database)
-            throw FantasmaSDKError.sqlite(message)
+            throw FantasmaError.storageFailure(message)
         }
 
-        self.database = database
+        self.database = SQLiteDatabaseHandle(pointer: database)
 
-        try execute("""
+        var errorMessage: UnsafeMutablePointer<Int8>?
+        if sqlite3_exec(
+            self.database.pointer,
+            """
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 payload BLOB NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            """)
-    }
-
-    deinit {
-        sqlite3_close(database)
+            """,
+            nil,
+            nil,
+            &errorMessage
+        ) != SQLITE_OK {
+            let message = errorMessage.map { String(cString: $0) } ?? "unknown sqlite error"
+            sqlite3_free(errorMessage)
+            throw FantasmaError.storageFailure(message)
+        }
     }
 
     func enqueue(payload: Data, createdAt: Int64) throws {
@@ -85,7 +108,7 @@ internal final class SQLiteEventQueue: @unchecked Sendable {
         defer { sqlite3_finalize(statement) }
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
-            throw FantasmaSDKError.sqlite("failed to count queued events")
+            throw FantasmaError.storageFailure("failed to count queued events")
         }
 
         return Int(sqlite3_column_int64(statement, 0))
@@ -109,17 +132,17 @@ internal final class SQLiteEventQueue: @unchecked Sendable {
 
     private func execute(_ sql: String) throws {
         var errorMessage: UnsafeMutablePointer<Int8>?
-        if sqlite3_exec(database, sql, nil, nil, &errorMessage) != SQLITE_OK {
+        if sqlite3_exec(database.pointer, sql, nil, nil, &errorMessage) != SQLITE_OK {
             let message = errorMessage.map { String(cString: $0) } ?? "unknown sqlite error"
             sqlite3_free(errorMessage)
-            throw FantasmaSDKError.sqlite(message)
+            throw FantasmaError.storageFailure(message)
         }
     }
 
     private func prepare(_ sql: String) throws -> OpaquePointer? {
         var statement: OpaquePointer?
-        if sqlite3_prepare_v2(database, sql, -1, &statement, nil) != SQLITE_OK {
-            throw FantasmaSDKError.sqlite(lastErrorMessage())
+        if sqlite3_prepare_v2(database.pointer, sql, -1, &statement, nil) != SQLITE_OK {
+            throw FantasmaError.storageFailure(lastErrorMessage())
         }
         return statement
     }
@@ -129,25 +152,25 @@ internal final class SQLiteEventQueue: @unchecked Sendable {
             sqlite3_bind_blob(statement, index, buffer.baseAddress, Int32(value.count), sqliteTransient)
         }
         guard result == SQLITE_OK else {
-            throw FantasmaSDKError.sqlite(lastErrorMessage())
+            throw FantasmaError.storageFailure(lastErrorMessage())
         }
     }
 
     private func bind(_ value: Int64, to statement: OpaquePointer?, at index: Int32) throws {
         guard sqlite3_bind_int64(statement, index, value) == SQLITE_OK else {
-            throw FantasmaSDKError.sqlite(lastErrorMessage())
+            throw FantasmaError.storageFailure(lastErrorMessage())
         }
     }
 
     private func step(_ statement: OpaquePointer?) throws {
         let result = sqlite3_step(statement)
         guard result == SQLITE_DONE else {
-            throw FantasmaSDKError.sqlite(lastErrorMessage())
+            throw FantasmaError.storageFailure(lastErrorMessage())
         }
     }
 
     private func lastErrorMessage() -> String {
-        guard let database else {
+        guard let database = database.pointer else {
             return "database is not open"
         }
         return String(cString: sqlite3_errmsg(database))

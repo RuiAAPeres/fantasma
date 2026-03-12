@@ -5,15 +5,15 @@ import Testing
 @Suite("Fantasma SDK Internal Tests")
 struct FantasmaSDKInternalTests {
     @Test("queue persists rows across reopen")
-    func queuePersistence() throws {
+    func queuePersistence() async throws {
         let harness = TestHarness()
         defer { harness.cleanup() }
 
         let queue = try harness.makeQueue()
-        try queue.enqueue(payload: try harness.payload(event: "app_open", installId: "install-a"), createdAt: 1)
+        try await queue.enqueue(payload: try harness.payload(event: "app_open", installId: "install-a"), createdAt: 1)
 
         let reopenedQueue = try harness.makeQueue()
-        let rows = try reopenedQueue.peek(limit: 10)
+        let rows = try await reopenedQueue.peek(limit: 10)
 
         #expect(rows.count == 1)
         #expect(rows.first?.createdAt == 1)
@@ -26,7 +26,7 @@ struct FantasmaSDKInternalTests {
 
         let queue = try harness.makeQueue()
         for index in 0..<55 {
-            try queue.enqueue(
+            try await queue.enqueue(
                 payload: try harness.payload(event: "button_pressed_\(index)", installId: "install-a"),
                 createdAt: Int64(index)
             )
@@ -36,12 +36,25 @@ struct FantasmaSDKInternalTests {
         let batch = try #require(await uploader.makeBatch(limit: 50))
 
         #expect(batch.rowIDs.count == 50)
-        #expect(try queue.count() == 55)
+        #expect(try await queue.count() == 55)
     }
 }
 
 @Suite("Fantasma SDK Behavior Tests", .serialized)
 struct FantasmaSDKBehaviorTests {
+    @Test("public API exposes async throwing static entrypoints")
+    func publicAPISignatures() {
+        let configure: (URL, String) async throws -> Void = Fantasma.configure
+        let track: (String, [String: String]?) async throws -> Void = Fantasma.track
+        let flush: () async throws -> Void = Fantasma.flush
+        let clear: () async -> Void = Fantasma.clear
+
+        _ = configure
+        _ = track
+        _ = flush
+        _ = clear
+    }
+
     @Test("public API persists queued event snapshots with generated identity")
     func publicAPIQueuesSnapshot() async throws {
         let harness = TestHarness()
@@ -50,11 +63,11 @@ struct FantasmaSDKBehaviorTests {
         await Fantasma.resetSharedCoreForTesting()
         try await harness.installSharedCore(transport: RecordingTransport())
 
-        Fantasma.configure(serverURL: "http://localhost:8081", writeKey: "fg_ing_test")
-        Fantasma.track("screen_view", properties: ["screen": "Home"])
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("screen_view", properties: ["screen": "Home"])
 
         let queue = try harness.makeQueue()
-        let row = try #require(queue.peek(limit: 1).first)
+        let row = try #require(await queue.peek(limit: 1).first)
         let event = try JSONDecoder().decode(EventEnvelope.self, from: row.payload)
 
         #expect(event.event == "screen_view")
@@ -74,19 +87,86 @@ struct FantasmaSDKBehaviorTests {
         await Fantasma.resetSharedCoreForTesting()
         try await harness.installSharedCore(transport: transport)
 
-        Fantasma.configure(serverURL: "http://localhost:8081", writeKey: "fg_ing_test")
-        Fantasma.track("before_clear")
-        Fantasma.clear()
-        Fantasma.track("after_clear")
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("before_clear")
+        await Fantasma.clear()
+        try await Fantasma.track("after_clear")
 
         let queue = try harness.makeQueue()
-        let rows = try queue.peek(limit: 10)
+        let rows = try await queue.peek(limit: 10)
         let first = try JSONDecoder().decode(EventEnvelope.self, from: try #require(rows.first?.payload))
         let second = try JSONDecoder().decode(EventEnvelope.self, from: try #require(rows.last?.payload))
 
         #expect(rows.count == 2)
         #expect(first.installId == "install-a")
         #expect(second.installId == "install-b")
+    }
+
+    @Test("track throws when configure has not run")
+    func trackBeforeConfigureThrows() async throws {
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: RecordingTransport())
+
+        do {
+            try await Fantasma.track("screen_view")
+            Issue.record("expected notConfigured error")
+        } catch let error as FantasmaError {
+            #expect(error == .notConfigured)
+        }
+    }
+
+    @Test("flush throws when configure has not run")
+    func flushBeforeConfigureThrows() async throws {
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: RecordingTransport())
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected notConfigured error")
+        } catch let error as FantasmaError {
+            #expect(error == .notConfigured)
+        }
+    }
+
+    @Test("configure rejects an empty write key")
+    func configureRejectsEmptyWriteKey() async throws {
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: RecordingTransport())
+
+        do {
+            try await Fantasma.configure(serverURL: localhostURL(), writeKey: "   ")
+            Issue.record("expected invalidWriteKey error")
+        } catch let error as FantasmaError {
+            #expect(error == .invalidWriteKey)
+        }
+    }
+
+    @Test("configure rejects unsupported server URLs")
+    func configureRejectsUnsupportedServerURL() async throws {
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: RecordingTransport())
+
+        do {
+            try await Fantasma.configure(
+                serverURL: URL(fileURLWithPath: "/tmp/fantasma"),
+                writeKey: "fg_ing_test"
+            )
+            Issue.record("expected unsupportedServerURL error")
+        } catch let error as FantasmaError {
+            #expect(error == .unsupportedServerURL)
+        }
     }
 
     @Test("flush removes queued rows after a 202 accepted response")
@@ -99,9 +179,9 @@ struct FantasmaSDKBehaviorTests {
         await transport.enqueue(response: .success(successResponse(accepted: 1)))
         try await harness.installSharedCore(transport: transport)
 
-        Fantasma.configure(serverURL: "http://localhost:8081", writeKey: "fg_ing_test")
-        Fantasma.track("app_open")
-        Fantasma.flush()
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+        try await Fantasma.flush()
 
         try await waitUntil {
             await transport.requests().count == 1
@@ -109,9 +189,149 @@ struct FantasmaSDKBehaviorTests {
 
         let queue = try harness.makeQueue()
         try await waitUntil {
-            (try? queue.count()) == 0
+            (try? await queue.count()) == 0
         }
     }
+
+    @Test("flush throws when upload fails and keeps rows queued")
+    func flushThrowsOnUploadFailure() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .failure(TestError.noPlannedResponse))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected uploadFailed error")
+        } catch let error as FantasmaError {
+            #expect(error == .uploadFailed)
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+    }
+
+    @Test("threshold auto flush keeps queued rows when upload fails")
+    func autoFlushFailureRetainsRows() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .failure(TestError.noPlannedResponse))
+        try await harness.installSharedCore(transport: transport, uploadBatchSize: 1)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        try await waitUntil {
+            await transport.requests().count == 1
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+    }
+
+    @Test("explicit flush waits for a threshold-triggered auto flush already in flight")
+    func explicitFlushWaitsForThresholdAutoFlush() async throws {
+        let transport = SuspendedTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: transport, uploadBatchSize: 1)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+        try await transport.waitUntilSendStarts()
+
+        let probe = CompletionProbe()
+        let explicitFlush = Task {
+            defer { Task { await probe.markCompleted() } }
+            try await Fantasma.flush()
+        }
+
+        await transport.release()
+
+        try await waitUntil(timeoutNanoseconds: 250_000_000) {
+            await probe.completed
+        }
+
+        try await explicitFlush.value
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+    }
+
+    @Test("explicit flush waits for an in-flight upload to finish")
+    func explicitFlushWaitsForInFlightUpload() async throws {
+        let transport = SuspendedTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        let firstFlush = Task {
+            try await Fantasma.flush()
+        }
+        try await transport.waitUntilSendStarts()
+
+        let probe = CompletionProbe()
+        let secondFlush = Task {
+            defer { Task { await probe.markCompleted() } }
+            try await Fantasma.flush()
+        }
+
+        try await waitUntil(timeoutNanoseconds: 250_000_000) {
+            await transport.requests().count == 1
+        }
+        #expect(await probe.completed == false)
+
+        await transport.release()
+        try await firstFlush.value
+        try await secondFlush.value
+
+        #expect(await transport.requests().count == 1)
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+    }
+
+    @Test("clear rotates identity even when live core creation fails")
+    func clearRotatesIdentityWhenLiveCoreCreationFails() async throws {
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await Fantasma.installRuntimeEnvironmentForTesting(
+            makeCore: { throw FantasmaError.storageFailure("simulated live-core failure") },
+            clearIdentity: {
+                let store = IdentityStore(
+                    provider: UserDefaultsProvider(suiteName: harness.defaultsName),
+                    newIdentifier: { "install-z" }
+                )
+                _ = await store.clear()
+            }
+        )
+
+        await Fantasma.clear()
+
+        let userDefaults = try #require(UserDefaults(suiteName: harness.defaultsName))
+        #expect(userDefaults.string(forKey: "dev.fantasma.sdk.install-id") == "install-z")
+
+        await Fantasma.resetRuntimeEnvironmentForTesting()
+    }
+
     @Test("public API sends the Fantasma ingest contract to a local HTTP server")
     func ingestContractRoundTrip() async throws {
         let server = try LocalEventServer()
@@ -125,9 +345,9 @@ struct FantasmaSDKBehaviorTests {
         let liveTransport = URLSessionTransport(session: .shared)
         try await harness.installSharedCore(transport: liveTransport)
 
-        Fantasma.configure(serverURL: serverURL.absoluteString, writeKey: "fg_ing_test")
-        Fantasma.track("app_open", properties: ["screen": "Home"])
-        Fantasma.flush()
+        try await Fantasma.configure(serverURL: serverURL, writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open", properties: ["screen": "Home"])
+        try await Fantasma.flush()
 
         let request = try await server.waitForRequest()
         let body = try JSONDecoder().decode(EventBatch.self, from: request.body)
@@ -146,13 +366,27 @@ struct FantasmaSDKBehaviorTests {
 
         let queue = try harness.makeQueue()
         try await waitUntil {
-            (try? queue.count()) == 0
+            (try? await queue.count()) == 0
         }
     }
 }
 
 private struct EventBatch: Decodable {
     let events: [EventEnvelope]
+}
+
+@Suite("Fantasma SDK Test Helper Tests")
+struct FantasmaSDKTestHelperTests {
+    @Test("local event server launches python via env")
+    func localEventServerUsesPortablePythonLauncher() throws {
+        let server = try LocalEventServer()
+        defer { server.stop() }
+
+        let command = server.launchCommand
+        #expect(command.executableURL.path == "/usr/bin/env")
+        #expect(command.arguments.first == "python3")
+        #expect(command.arguments.dropFirst().count == 3)
+    }
 }
 
 private actor RecordingTransport: FantasmaTransport {
@@ -173,6 +407,53 @@ private actor RecordingTransport: FantasmaTransport {
             throw TestError.noPlannedResponse
         }
         return try responses.removeFirst().get()
+    }
+}
+
+private actor CompletionProbe {
+    private(set) var completed = false
+
+    func markCompleted() {
+        completed = true
+    }
+}
+
+private actor SuspendedTransport: FantasmaTransport {
+    private var capturedRequests: [URLRequest] = []
+    private var didStartSend = false
+    private var sendStartedContinuation: CheckedContinuation<Void, Error>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func requests() -> [URLRequest] {
+        capturedRequests
+    }
+
+    func waitUntilSendStarts() async throws {
+        if didStartSend {
+            return
+        }
+
+        try await withCheckedThrowingContinuation { continuation in
+            sendStartedContinuation = continuation
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+
+    func send(request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        capturedRequests.append(request)
+        didStartSend = true
+        sendStartedContinuation?.resume()
+        sendStartedContinuation = nil
+
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+
+        return successResponse(accepted: 1)
     }
 }
 
@@ -218,10 +499,16 @@ private struct TestHarness {
         try SQLiteEventQueue(databaseURL: databaseURL)
     }
 
-    func installSharedCore(transport: any FantasmaTransport) async throws {
+    func installSharedCore(
+        transport: any FantasmaTransport,
+        uploadBatchSize: Int = 50
+    ) async throws {
         let userDefaults = try #require(UserDefaults(suiteName: defaultsName))
         userDefaults.removePersistentDomain(forName: defaultsName)
-        let core = makeCore(userDefaults: userDefaults, transport: transport)
+        let core = try makeCore(
+            transport: transport,
+            uploadBatchSize: uploadBatchSize
+        )
         await Fantasma.replaceSharedCoreForTesting(core)
     }
 
@@ -240,25 +527,24 @@ private struct TestHarness {
     }
 
     private func makeCore(
-        userDefaults: UserDefaults,
-        transport: any FantasmaTransport
-    ) -> FantasmaCore {
+        transport: any FantasmaTransport,
+        uploadBatchSize: Int
+    ) throws -> FantasmaCore {
         let dependencies = FantasmaDependencies(
-            userDefaults: userDefaults,
             databaseURL: databaseURL,
             transport: transport,
             now: { fixedDate },
             appVersion: { "1.2.3" },
             osVersion: { "18.3" },
             newIdentifier: { identifiers.next() },
-            timerInterval: 3_600,
-            uploadBatchSize: 50
+            timerInterval: .seconds(3_600),
+            uploadBatchSize: uploadBatchSize
         )
         let identityStore = IdentityStore(
-            userDefaults: userDefaults,
+            provider: UserDefaultsProvider(suiteName: defaultsName),
             newIdentifier: { identifiers.next() }
         )
-        let queue = try! SQLiteEventQueue(databaseURL: databaseURL)
+        let queue = try SQLiteEventQueue(databaseURL: databaseURL)
         let uploader = EventUploader(queue: queue, transport: transport)
         return FantasmaCore(
             dependencies: dependencies,
@@ -274,6 +560,11 @@ private struct CapturedRequest: Sendable {
     let path: String
     let headers: [String: String]
     let body: Data
+}
+
+private struct LocalServerLaunchCommand: Sendable {
+    let executableURL: URL
+    let arguments: [String]
 }
 
 private final class LocalEventServer: @unchecked Sendable {
@@ -334,9 +625,17 @@ server.handle_request()
 """.write(to: scriptURL, atomically: true, encoding: .utf8)
     }
 
+    var launchCommand: LocalServerLaunchCommand {
+        LocalServerLaunchCommand(
+            executableURL: URL(fileURLWithPath: "/usr/bin/env"),
+            arguments: ["python3", scriptURL.path, captureURL.path, readyURL.path]
+        )
+    }
+
     func start() async throws -> URL {
-        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/python3")
-        process.arguments = [scriptURL.path, captureURL.path, readyURL.path]
+        let command = launchCommand
+        process.executableURL = command.executableURL
+        process.arguments = command.arguments
         try process.run()
 
         try await waitUntil(timeoutNanoseconds: 2_000_000_000) {
@@ -396,6 +695,10 @@ private func makeFixedDate() -> Date {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     return formatter.date(from: "2026-01-01T00:00:00.000Z")!
+}
+
+private func localhostURL() -> URL {
+    URL(string: "http://localhost:8081")!
 }
 
 private func waitUntil(

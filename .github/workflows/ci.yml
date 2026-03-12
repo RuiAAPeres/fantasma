@@ -52,6 +52,18 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --quiet
 
+  swift-sdk:
+    name: Swift SDK Checks
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run Swift SDK tests with complete concurrency checking
+        working-directory: sdks/ios/FantasmaSDK
+        run: swift test -Xswiftc -strict-concurrency=complete
+
   deployment:
     name: Deployment Checks
     runs-on: ubuntu-latest
