@@ -4,7 +4,7 @@
       "ingest": 9877.74
     },
     "max_readiness_ms": {
-      "derived_metrics_ready": 628
+      "derived_metrics_ready": 1324
     },
     "max_query_p95_ms": {
       "events_aggregate_dim3": 3,
@@ -16,10 +16,10 @@
   "repair-path": {
     "min_phase_events_per_second": {
       "seed_ingest": 9174.98,
-      "repair_ingest": 10399.72
+      "repair_ingest": 10348.46
     },
     "max_readiness_ms": {
-      "seed_ready": 457,
+      "seed_ready": 458,
       "repair_ready": 411
     },
     "max_query_p95_ms": {

@@ -31,20 +31,23 @@ const OS_VERSIONS: [&str; 2] = ["18.3", "18.4"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum Scenario {
+    #[serde(rename = "hot-path")]
     #[value(name = "hot-path")]
-    HotPath,
+    Hot,
+    #[serde(rename = "repair-path")]
     #[value(name = "repair-path")]
-    RepairPath,
+    Repair,
+    #[serde(rename = "scale-path")]
     #[value(name = "scale-path")]
-    ScalePath,
+    Scale,
 }
 
 impl Scenario {
     fn key(self) -> &'static str {
         match self {
-            Scenario::HotPath => "hot-path",
-            Scenario::RepairPath => "repair-path",
-            Scenario::ScalePath => "scale-path",
+            Scenario::Hot => "hot-path",
+            Scenario::Repair => "repair-path",
+            Scenario::Scale => "scale-path",
         }
     }
 }
@@ -255,9 +258,9 @@ async fn run_stack(args: StackArgs) -> Result<()> {
     wait_for_health(&client).await?;
 
     let mut result = match args.scenario {
-        Scenario::HotPath => run_hot_path(&client, args.profile, profile_config).await?,
-        Scenario::RepairPath => run_repair_path(&client, args.profile, profile_config).await?,
-        Scenario::ScalePath => run_scale_path(&client, args.profile, profile_config).await?,
+        Scenario::Hot => run_hot_path(&client, args.profile, profile_config).await?,
+        Scenario::Repair => run_repair_path(&client, args.profile, profile_config).await?,
+        Scenario::Scale => run_scale_path(&client, args.profile, profile_config).await?,
     };
     result.budget = budget
         .as_ref()
@@ -311,7 +314,7 @@ async fn run_hot_path(
     .await?;
 
     Ok(ScenarioResult {
-        scenario: Scenario::HotPath,
+        scenario: Scenario::Hot,
         profile,
         phases: vec![PhaseMeasurement {
             name: "ingest".to_owned(),
@@ -371,7 +374,7 @@ async fn run_repair_path(
     .await?;
 
     Ok(ScenarioResult {
-        scenario: Scenario::RepairPath,
+        scenario: Scenario::Repair,
         profile,
         phases: vec![
             PhaseMeasurement {
@@ -431,7 +434,7 @@ async fn run_scale_path(
     .await?;
 
     Ok(ScenarioResult {
-        scenario: Scenario::ScalePath,
+        scenario: Scenario::Scale,
         profile,
         phases: vec![PhaseMeasurement {
             name: "ingest".to_owned(),
@@ -1021,9 +1024,9 @@ fn load_budget(scenario: Scenario, profile: Profile) -> Result<Option<ScenarioBu
     let budgets: BudgetFile = serde_json::from_str(&budget_file).context("parse CI budget file")?;
 
     Ok(Some(match scenario {
-        Scenario::HotPath => budgets.hot_path,
-        Scenario::RepairPath => budgets.repair_path,
-        Scenario::ScalePath => budgets.scale_path,
+        Scenario::Hot => budgets.hot_path,
+        Scenario::Repair => budgets.repair_path,
+        Scenario::Scale => budgets.scale_path,
     }))
 }
 
@@ -1253,6 +1256,7 @@ fn run_best_effort(command: &mut Command) {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use std::fs;
 
     fn snapshot_command(command: &Command) -> Vec<String> {
         std::iter::once(command.get_program().to_string_lossy().into_owned())
@@ -1262,6 +1266,128 @@ mod tests {
                     .map(|argument| argument.to_string_lossy().into_owned()),
             )
             .collect()
+    }
+
+    fn query_measurements(
+        event_aggregate_dim3_p95_ms: u64,
+        events_daily_dim3_p95_ms: u64,
+        sessions_count_daily_p95_ms: u64,
+        sessions_duration_total_daily_p95_ms: u64,
+    ) -> Vec<QueryMeasurement> {
+        vec![
+            QueryMeasurement {
+                name: "events_aggregate_dim3".to_owned(),
+                iterations: 15,
+                min_ms: event_aggregate_dim3_p95_ms,
+                p50_ms: event_aggregate_dim3_p95_ms,
+                p95_ms: event_aggregate_dim3_p95_ms,
+                max_ms: event_aggregate_dim3_p95_ms,
+            },
+            QueryMeasurement {
+                name: "events_daily_dim3".to_owned(),
+                iterations: 15,
+                min_ms: events_daily_dim3_p95_ms,
+                p50_ms: events_daily_dim3_p95_ms,
+                p95_ms: events_daily_dim3_p95_ms,
+                max_ms: events_daily_dim3_p95_ms,
+            },
+            QueryMeasurement {
+                name: "sessions_count_daily".to_owned(),
+                iterations: 15,
+                min_ms: sessions_count_daily_p95_ms,
+                p50_ms: sessions_count_daily_p95_ms,
+                p95_ms: sessions_count_daily_p95_ms,
+                max_ms: sessions_count_daily_p95_ms,
+            },
+            QueryMeasurement {
+                name: "sessions_duration_total_daily".to_owned(),
+                iterations: 15,
+                min_ms: sessions_duration_total_daily_p95_ms,
+                p50_ms: sessions_duration_total_daily_p95_ms,
+                p95_ms: sessions_duration_total_daily_p95_ms,
+                max_ms: sessions_duration_total_daily_p95_ms,
+            },
+        ]
+    }
+
+    fn recent_main_runner_samples() -> Vec<(ScenarioBudget, ScenarioResult)> {
+        let budget_file = fs::read_to_string(budget_file_path()).expect("read committed CI budget");
+        let budgets: BudgetFile =
+            serde_json::from_str(&budget_file).expect("parse committed CI budget");
+
+        vec![
+            (
+                budgets.hot_path,
+                ScenarioResult {
+                    scenario: Scenario::Hot,
+                    profile: Profile::Ci,
+                    phases: vec![PhaseMeasurement {
+                        name: "ingest".to_owned(),
+                        events_sent: 600,
+                        elapsed_ms: 46,
+                        events_per_second: 13039.003898336192,
+                    }],
+                    readiness: vec![ReadinessMeasurement {
+                        name: "derived_metrics_ready".to_owned(),
+                        elapsed_ms: 1_324,
+                    }],
+                    queries: query_measurements(2, 2, 1, 0),
+                    budget: None,
+                },
+            ),
+            (
+                budgets.repair_path,
+                ScenarioResult {
+                    scenario: Scenario::Repair,
+                    profile: Profile::Ci,
+                    phases: vec![
+                        PhaseMeasurement {
+                            name: "seed_ingest".to_owned(),
+                            events_sent: 250,
+                            elapsed_ms: 24,
+                            events_per_second: 10313.51135581544,
+                        },
+                        PhaseMeasurement {
+                            name: "repair_ingest".to_owned(),
+                            events_sent: 100,
+                            elapsed_ms: 9,
+                            events_per_second: 10348.465964102414,
+                        },
+                    ],
+                    readiness: vec![
+                        ReadinessMeasurement {
+                            name: "seed_ready".to_owned(),
+                            elapsed_ms: 458,
+                        },
+                        ReadinessMeasurement {
+                            name: "repair_ready".to_owned(),
+                            elapsed_ms: 344,
+                        },
+                    ],
+                    queries: query_measurements(3, 2, 0, 0),
+                    budget: None,
+                },
+            ),
+            (
+                budgets.scale_path,
+                ScenarioResult {
+                    scenario: Scenario::Scale,
+                    profile: Profile::Ci,
+                    phases: vec![PhaseMeasurement {
+                        name: "ingest".to_owned(),
+                        events_sent: 3_600,
+                        elapsed_ms: 343,
+                        events_per_second: 10503.72034597112,
+                    }],
+                    readiness: vec![ReadinessMeasurement {
+                        name: "derived_metrics_ready".to_owned(),
+                        elapsed_ms: 14_015,
+                    }],
+                    queries: query_measurements(6, 7, 1, 0),
+                    budget: None,
+                },
+            ),
+        ]
     }
 
     #[test]
@@ -1281,7 +1407,7 @@ mod tests {
         assert_eq!(
             command,
             BenchCommand::Stack(StackArgs {
-                scenario: Scenario::HotPath,
+                scenario: Scenario::Hot,
                 profile: Profile::Ci,
                 output: PathBuf::from("artifacts/hot-path.json"),
             })
@@ -1305,10 +1431,39 @@ mod tests {
         assert_eq!(
             command,
             BenchCommand::Stack(StackArgs {
-                scenario: Scenario::ScalePath,
+                scenario: Scenario::Scale,
                 profile: Profile::Extended,
                 output: PathBuf::from("artifacts/scale-path.json"),
             })
+        );
+    }
+
+    #[test]
+    fn scenario_serde_keeps_public_path_names() {
+        assert_eq!(
+            serde_json::to_string(&Scenario::Hot).expect("serialize hot scenario"),
+            "\"hot-path\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Scenario::Repair).expect("serialize repair scenario"),
+            "\"repair-path\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Scenario::Scale).expect("serialize scale scenario"),
+            "\"scale-path\""
+        );
+
+        assert_eq!(
+            serde_json::from_str::<Scenario>("\"hot-path\"").expect("deserialize hot-path"),
+            Scenario::Hot
+        );
+        assert_eq!(
+            serde_json::from_str::<Scenario>("\"repair-path\"").expect("deserialize repair-path"),
+            Scenario::Repair
+        );
+        assert_eq!(
+            serde_json::from_str::<Scenario>("\"scale-path\"").expect("deserialize scale-path"),
+            Scenario::Scale
         );
     }
 
@@ -1320,7 +1475,7 @@ mod tests {
             max_query_p95_ms: BTreeMap::from([("events_aggregate_dim3".to_owned(), 200)]),
         };
         let result = ScenarioResult {
-            scenario: Scenario::HotPath,
+            scenario: Scenario::Hot,
             profile: Profile::Ci,
             phases: vec![PhaseMeasurement {
                 name: "ingest".to_owned(),
@@ -1354,6 +1509,19 @@ mod tests {
                 "events_aggregate_dim3 p95 250ms exceeded budget 200ms".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn retained_ci_runner_samples_fit_committed_budgets() {
+        for (budget, sample) in recent_main_runner_samples() {
+            let evaluation = evaluate_budget(&budget, &sample);
+            assert!(
+                evaluation.passed,
+                "committed CI budget rejected retained runner sample for {}: {:?}",
+                sample.scenario.key(),
+                evaluation.failures
+            );
+        }
     }
 
     #[test]
