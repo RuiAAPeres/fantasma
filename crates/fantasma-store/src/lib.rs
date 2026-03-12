@@ -73,6 +73,17 @@ pub struct SessionRecord {
     pub app_version: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SessionTailUpdate<'a> {
+    pub project_id: Uuid,
+    pub session_id: &'a str,
+    pub session_end: DateTime<Utc>,
+    pub event_count: i32,
+    pub duration_seconds: i32,
+    pub user_id: Option<&'a str>,
+    pub app_version: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallSessionStateRecord {
     pub project_id: Uuid,
@@ -443,13 +454,7 @@ pub async fn insert_session_in_tx(
 
 pub async fn update_session_tail_in_tx(
     tx: &mut Transaction<'_, Postgres>,
-    project_id: Uuid,
-    session_id: &str,
-    session_end: DateTime<Utc>,
-    event_count: i32,
-    duration_seconds: i32,
-    user_id: Option<&str>,
-    app_version: Option<&str>,
+    update: SessionTailUpdate<'_>,
 ) -> Result<u64, StoreError> {
     let result = sqlx::query(
         r#"
@@ -463,13 +468,13 @@ pub async fn update_session_tail_in_tx(
           AND session_id = $2
         "#,
     )
-    .bind(project_id)
-    .bind(session_id)
-    .bind(session_end)
-    .bind(event_count)
-    .bind(duration_seconds)
-    .bind(user_id)
-    .bind(app_version)
+    .bind(update.project_id)
+    .bind(update.session_id)
+    .bind(update.session_end)
+    .bind(update.event_count)
+    .bind(update.duration_seconds)
+    .bind(update.user_id)
+    .bind(update.app_version)
     .execute(&mut **tx)
     .await?;
 

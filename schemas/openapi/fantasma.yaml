@@ -240,36 +240,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/active-installs/daily:
-    get:
-      tags:
-        - metrics
-      summary: Return daily active install counts for an inclusive UTC date range
-      operationId: getActiveInstallsDaily
-      parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/ProjectId'
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
-      responses:
-        '200':
-          description: Daily active install counts encoded in the shared metric response shape with metric name `active_installs_daily`. The `start_date` and `end_date` bounds are both inclusive.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricResponse'
-        '401':
-          description: Missing or invalid admin token.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '422':
-          description: Invalid inclusive date range.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
 components:
   parameters:
     Authorization:

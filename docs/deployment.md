@@ -164,7 +164,6 @@ curl "http://localhost:8082/v1/metrics/sessions/count/daily?project_id=9bad8b88-
 The daily routes use inclusive UTC date bounds:
 
 - `/v1/metrics/sessions/count/daily`
-- `/v1/metrics/active-installs/daily`
 - `/v1/metrics/sessions/duration/total/daily`
 
 ## iOS Demo App

@@ -18,7 +18,7 @@
 - Added `install_session_state` and redesigned the worker around a tail-only per-install model: one mutable tail session per `(project_id, install_id)`, immutable historical sessions, forward-only processing, and no historical repair path for older-than-tail raw events.
 - Added `session_daily_installs` so daily active installs are maintained from explicit membership state instead of `COUNT(DISTINCT ...)` rebuilds.
 - Kept daily metrics incremental and Postgres-only: `session_daily` now stores UTC `DATE` buckets for `sessions_count`, `active_installs`, and `total_duration_seconds`, maintained from session inserts and tail-duration deltas instead of day rebuilds.
-- Exposed explicit daily-series endpoints for `GET /v1/metrics/sessions/count/daily`, `GET /v1/metrics/active-installs/daily`, and `GET /v1/metrics/sessions/duration/total/daily` with inclusive `start_date` / `end_date` query semantics and zero-filled UTC series responses.
+- Exposed explicit daily-series endpoints for `GET /v1/metrics/sessions/count/daily` and `GET /v1/metrics/sessions/duration/total/daily` with inclusive `start_date` / `end_date` query semantics and zero-filled UTC series responses.
 - Extracted reusable library entrypoints for ingest, API, and worker batch processing so in-process end-to-end tests can drive `POST /v1/events`, run one worker batch, and query daily metrics without spawning services.
 - Added a preflighted Compose smoke script that checks disk and Docker availability, ingests sample events, polls the daily metrics endpoint, and dumps logs on timeout.
 - Recorded the repository preference that DB-backed Rust tests should run fully in Docker, with workspace Postgres tests separated from stack-level smoke verification.

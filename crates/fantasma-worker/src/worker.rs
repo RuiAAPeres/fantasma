@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use chrono::Duration as ChronoDuration;
 use fantasma_store::{
-    InstallSessionStateRecord, PgPool, RawEventRecord, SessionRecord, StoreError,
-    add_session_daily_duration_delta_in_tx, fetch_events_after,
+    InstallSessionStateRecord, PgPool, RawEventRecord, SessionRecord, SessionTailUpdate,
+    StoreError, add_session_daily_duration_delta_in_tx, fetch_events_after,
     increment_session_daily_for_new_session_in_tx, insert_session_in_tx,
     load_install_session_state_in_tx, lock_worker_offset, save_worker_offset_in_tx,
     update_session_tail_in_tx, upsert_install_session_state_in_tx,
@@ -134,13 +134,15 @@ async fn extend_tail_session(
 
     let updated_session_rows = update_session_tail_in_tx(
         tx,
-        state.project_id,
-        &state.tail_session_id,
-        new_end,
-        new_event_count,
-        new_duration,
-        event.user_id.as_deref(),
-        event.app_version.as_deref(),
+        SessionTailUpdate {
+            project_id: state.project_id,
+            session_id: &state.tail_session_id,
+            session_end: new_end,
+            event_count: new_event_count,
+            duration_seconds: new_duration,
+            user_id: event.user_id.as_deref(),
+            app_version: event.app_version.as_deref(),
+        },
     )
     .await?;
     ensure_single_row_update(

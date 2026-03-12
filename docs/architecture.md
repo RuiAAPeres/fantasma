@@ -81,6 +81,11 @@ Current aggregate ownership:
 - `session_daily` stores UTC `DATE` buckets for `sessions_count`, `active_installs`, and `total_duration_seconds`
 - `session_daily_installs` stores per-day install membership and session counts so `active_installs_daily` stays incremental
 
+Current public daily metric scope:
+
+- `sessions_count_daily`
+- `session_duration_total_daily`
+
 Planned aggregates:
 
 - screen views by day

@@ -37,10 +37,6 @@ pub fn app(pool: PgPool, authorizer: Arc<StaticAdminAuthorizer>) -> Router {
             get(session_duration_total_daily),
         )
         .route("/v1/metrics/active-installs", get(active_installs))
-        .route(
-            "/v1/metrics/active-installs/daily",
-            get(active_installs_daily),
-        )
         .with_state(AppState { authorizer, pool })
 }
 
@@ -178,24 +174,6 @@ async fn active_installs(
         "active_installs",
         async {
             count_active_installs(&state.pool, query.project_id, query.start, query.end).await
-        },
-    )
-    .await
-}
-
-async fn active_installs_daily(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<DailyMetricQuery>,
-) -> impl IntoResponse {
-    daily_metric_response(
-        &state.authorizer,
-        &headers,
-        &query,
-        "active_installs_daily",
-        async {
-            load_daily_metric_series(&state.pool, &query, |record| record.active_installs as u64)
-                .await
         },
     )
     .await
@@ -350,8 +328,10 @@ fn zero_fill_daily_points(
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use axum::http::{Request, StatusCode};
     use axum::response::Response;
     use serde_json::Value;
+    use tower::ServiceExt;
 
     fn query() -> SessionMetricQuery {
         serde_json::from_value(serde_json::json!({
@@ -549,32 +529,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daily_metric_response_returns_active_installs_daily_payload() {
-        let response = daily_metric_response(
-            &authorizer(),
-            &authorized_headers(),
-            &daily_query(),
-            "active_installs_daily",
-            async {
-                Ok(vec![MetricSeriesPoint {
-                    date: serde_json::from_value(serde_json::json!("2026-01-01")).expect("date"),
-                    value: 3,
-                }])
-            },
-        )
-        .await;
+    async fn app_exposes_only_supported_daily_metric_routes() {
+        let pool = PgPool::connect_lazy("postgres://localhost/fantasma").expect("lazy pool");
+        let app = super::app(pool, Arc::new(authorizer()));
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(response).await,
-            serde_json::json!({
-                "metric": "active_installs_daily",
-                "points": [
-                    { "date": "2026-01-01", "value": 3 },
-                    { "date": "2026-01-02", "value": 0 },
-                    { "date": "2026-01-03", "value": 0 }
-                ]
-            })
-        );
+        let sessions_count_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics/sessions/count/daily")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("sessions count route response");
+        let duration_total_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics/sessions/duration/total/daily")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("duration total route response");
+        let active_installs_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics/active-installs/daily")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("active installs route response");
+
+        assert_ne!(sessions_count_response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(duration_total_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(active_installs_response.status(), StatusCode::NOT_FOUND);
     }
 }
