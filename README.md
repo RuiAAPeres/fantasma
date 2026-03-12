@@ -1,21 +1,12 @@
 # Fantasma 👻
 
-Fantasma is a self-hosted, privacy-first mobile analytics platform.
-
-Fantasma helps mobile teams understand app activity without turning analytics
-into identity infrastructure.
-
-It is intentionally narrow:
-
-- mobile-first, not web analytics retrofitted onto apps
-- privacy-first, with install-scoped analytics instead of person-level tracking
-- API-first, so dashboards and integrations use the same public surface
-- self-hosted, with simple deployment and minimal moving parts
+Fantasma is a self-hosted, privacy-first, high-performance mobile analytics platform.
 
 Fantasma favors a small, legible product surface over analytics sprawl. It is
 for teams that want event, session, and usage insight without drifting into ad
-tech, hidden enrichment, or profile building. It keeps event context
-intentionally narrow so the analytics surface stays predictable and fast to run.
+tech or profile building. Privacy is enforced in the product shape: no
+person-level identity, no hidden enrichment, and intentionally narrow event
+context.
 
 ## What Fantasma Is Not
 
