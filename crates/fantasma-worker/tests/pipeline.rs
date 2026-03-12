@@ -411,7 +411,9 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
 }
 
 #[sqlx::test]
-async fn pipeline_keeps_grouped_event_metrics_daily_queries_200_during_worker_catchup(pool: PgPool) {
+async fn pipeline_keeps_grouped_event_metrics_daily_queries_200_during_worker_catchup(
+    pool: PgPool,
+) {
     run_migrations(&pool).await.expect("migrations succeed");
     ensure_local_project(&pool, Some(&bootstrap_config()))
         .await

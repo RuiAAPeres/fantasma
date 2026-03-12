@@ -429,13 +429,7 @@ pub async fn fetch_event_metrics_cube_rows_in_tx(
     filters: &BTreeMap<String, String>,
 ) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
     fetch_event_metrics_cube_rows_in_executor(
-        &mut **tx,
-        project_id,
-        event_name,
-        start_date,
-        end_date,
-        cube_keys,
-        filters,
+        &mut **tx, project_id, event_name, start_date, end_date, cube_keys, filters,
     )
     .await
 }
@@ -456,8 +450,10 @@ where
     ensure_filters_belong_to_cube(cube_keys, filters)?;
 
     match cube_keys.len() {
-        0 => fetch_event_metrics_total_rows(executor, project_id, event_name, start_date, end_date)
-            .await,
+        0 => {
+            fetch_event_metrics_total_rows(executor, project_id, event_name, start_date, end_date)
+                .await
+        }
         1 => {
             fetch_event_metrics_dim1_rows(
                 executor, project_id, event_name, start_date, end_date, cube_keys, filters,
@@ -507,13 +503,7 @@ pub async fn fetch_event_metrics_aggregate_cube_rows_in_tx(
     limit: Option<usize>,
 ) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
     fetch_event_metrics_aggregate_cube_rows_in_executor(
-        &mut **tx,
-        project_id,
-        event_name,
-        window,
-        cube_keys,
-        filters,
-        limit,
+        &mut **tx, project_id, event_name, window, cube_keys, filters, limit,
     )
     .await
 }
