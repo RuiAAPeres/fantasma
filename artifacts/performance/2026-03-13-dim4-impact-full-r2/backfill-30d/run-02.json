@@ -1,0 +1,30 @@
+{
+  "scenario": "backfill-30d",
+  "phases": [
+    {
+      "name": "ingest",
+      "events_sent": 900000,
+      "elapsed_ms": 32010,
+      "events_per_second": 28116.012211487003
+    }
+  ],
+  "readiness": [
+    {
+      "name": "event_metrics_ready_ms",
+      "elapsed_ms": 233
+    },
+    {
+      "name": "session_metrics_ready_ms",
+      "elapsed_ms": 53903
+    },
+    {
+      "name": "derived_metrics_ready_ms",
+      "elapsed_ms": 53903
+    }
+  ],
+  "queries": [],
+  "budget": {
+    "passed": true,
+    "failures": []
+  }
+}

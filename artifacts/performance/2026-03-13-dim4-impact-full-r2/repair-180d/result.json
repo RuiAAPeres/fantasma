@@ -1,0 +1,36 @@
+{
+  "scenario": "repair-180d",
+  "phases": [
+    {
+      "name": "seed_ingest",
+      "events_sent": 5400000,
+      "elapsed_ms": 200099,
+      "events_per_second": 26986.5875592511
+    },
+    {
+      "name": "repair_ingest",
+      "events_sent": 18000,
+      "elapsed_ms": 759,
+      "events_per_second": 23707.386305677494
+    }
+  ],
+  "readiness": [
+    {
+      "name": "event_metrics_ready_ms",
+      "elapsed_ms": 4876
+    },
+    {
+      "name": "session_metrics_ready_ms",
+      "elapsed_ms": 11993
+    },
+    {
+      "name": "derived_metrics_ready_ms",
+      "elapsed_ms": 11993
+    }
+  ],
+  "queries": [],
+  "budget": {
+    "passed": true,
+    "failures": []
+  }
+}
