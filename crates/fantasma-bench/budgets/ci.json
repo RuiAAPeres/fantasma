@@ -7,10 +7,10 @@
       "derived_metrics_ready": 1324
     },
     "max_query_p95_ms": {
-      "events_aggregate_dim3": 3,
-      "events_daily_dim3": 4,
-      "sessions_count_daily": 1,
-      "sessions_duration_total_daily": 1
+      "events_day_dim2": 3,
+      "events_hour_dim2": 4,
+      "sessions_count_day": 1,
+      "sessions_duration_total_day": 1
     }
   },
   "repair-path": {
@@ -23,10 +23,10 @@
       "repair_ready": 411
     },
     "max_query_p95_ms": {
-      "events_aggregate_dim3": 4,
-      "events_daily_dim3": 4,
-      "sessions_count_daily": 1,
-      "sessions_duration_total_daily": 1
+      "events_day_dim2": 4,
+      "events_hour_dim2": 4,
+      "sessions_count_day": 1,
+      "sessions_duration_total_day": 1
     }
   },
   "scale-path": {
@@ -37,10 +37,10 @@
       "derived_metrics_ready": 16276
     },
     "max_query_p95_ms": {
-      "events_aggregate_dim3": 9,
-      "events_daily_dim3": 10,
-      "sessions_count_daily": 1,
-      "sessions_duration_total_daily": 1
+      "events_day_dim2": 9,
+      "events_hour_dim2": 10,
+      "sessions_count_day": 1,
+      "sessions_duration_total_day": 1
     }
   }
 }

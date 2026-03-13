@@ -28,8 +28,8 @@ curl / SDK
   -> Rust ingest service
   -> append-only Postgres events_raw table
   -> fantasma-worker
-  -> derived Postgres sessions, session_daily, session_daily_installs, event_count_daily_total, event_count_daily_dim1, event_count_daily_dim2, and event_count_daily_dim3 tables
-  -> GET /v1/metrics/sessions/*, /v1/metrics/sessions/count/daily, /v1/metrics/sessions/duration/total/daily, /v1/metrics/events/aggregate, and /v1/metrics/events/daily
+  -> derived Postgres sessions, session_daily, session_daily_installs, event bucket rollups, session bucket rollups, and install first-seen state
+  -> GET /v1/metrics/events and /v1/metrics/sessions
   -> query API
 ```
 
@@ -65,10 +65,9 @@ Current derived metric:
 - sessions
 - session_daily
 - session_daily_installs
-- event_count_daily_total
-- event_count_daily_dim1
-- event_count_daily_dim2
-- event_count_daily_dim3
+- worker-derived hourly and daily event metric cuboids
+- worker-derived hourly and daily session metric rollups
+- install first-seen state for `new_installs`
 
 Current worker behavior:
 
@@ -83,9 +82,12 @@ Current worker behavior:
 - switch an install into a bounded repair path when a batch contains older-than-tail events
 - derive replacement sessions from raw events inside the overlapping repair window and rewrite only those derived rows
 - rebuild only the exact touched UTC start days for `session_daily` and `session_daily_installs` after a repair
+- rebuild only the exact touched hourly and daily session metric buckets after session changes
+- preserve grouped session dimensions from the pre-repair session assignment so late events do not rebucket `platform` or `app_version`
 - keep the normal append path incremental: `session_daily` still updates directly from new sessions and tail-session duration deltas
 - update `session_daily_installs` incrementally so daily active installs never depend on `COUNT(DISTINCT ...)` rebuilds
-- derive event-count cuboids incrementally from raw events into daily totals, single-dimension rollups, two-dimension rollups, and three-dimension rollups
+- derive event-count cuboids incrementally from raw events into bounded hourly and daily totals, single-dimension rollups, two-dimension rollups, and three-dimension rollups
+- derive session metric rollups incrementally for `count`, `duration_total`, and `new_installs`
 - keep event-metrics rollups keyed only by canonical string dimensions, never by the full property bag
 - advance a `worker_offsets` checkpoint only after successful writes
 
@@ -93,20 +95,11 @@ Current aggregate ownership:
 
 - `sessions` stores immutable closed sessions plus one mutable tail session per install
 - `install_session_state` is the worker's steady-state decision surface for sessionization
-- `session_daily` stores UTC `DATE` buckets for `sessions_count`, `active_installs`, and `total_duration_seconds`
-- `session_daily_installs` stores per-day install membership and session counts so internal daily active-install aggregates stay incremental without `COUNT(DISTINCT ...)` rebuilds
-- `event_count_daily_total` stores per-project, per-event, per-day totals
-- `event_count_daily_dim1`, `event_count_daily_dim2`, and `event_count_daily_dim3` store bounded sparse cuboids keyed by canonical dimension slots
-
-Current public daily metric scope:
-
-- `sessions_count_daily`
-- `session_duration_total_daily`
-- `event_count_daily`
-
-Current public aggregate metric scope:
-
-- `event_count`
+- `session_daily` stores UTC `DATE` buckets used by bounded session repair and incremental session-count / duration maintenance
+- `session_daily_installs` stores per-day install membership so internal install bookkeeping stays incremental without `COUNT(DISTINCT ...)` rebuilds
+- bounded event metric cuboids store worker-derived hourly and daily series for event counts
+- bounded session metric rollups store worker-derived hourly and daily series for `count`, `duration_total`, and `new_installs`
+- `install_first_seen` fixes each install to the bucket of its first accepted event and never rebuckets late arrivals
 
 Planned aggregates:
 
@@ -175,27 +168,39 @@ Identity model:
 - `properties` are for event context and must not contain direct identifiers or sensitive personal data
 - built-in event dimensions stay minimal: `platform`, `app_version`, and `os_version`
 
-## Event Metrics Query Model
+## Metrics Query Model
 
-Event metrics use exactly two endpoint shapes:
+Public metrics use exactly two endpoint shapes:
 
-- `GET /v1/metrics/events/aggregate`
-- `GET /v1/metrics/events/daily`
+- `GET /v1/metrics/events`
+- `GET /v1/metrics/sessions`
 
-Query semantics:
+Shared query semantics:
 
 - authenticated project scope comes from the caller's `read` key
-- `event`, `start_date`, and `end_date` are required
-- built-in equality filters use normal query params: `platform`, `app_version`, `os_version`
+- `metric`, `granularity`, `start`, and `end` are required
+- `granularity=day` uses inclusive UTC `YYYY-MM-DD` buckets
+- `granularity=hour` uses inclusive UTC RFC3339 hour-start buckets
+- responses are series-only and always include `metric`, `granularity`, `group_by`, and `series`
+- ungrouped responses always use `group_by: []` and one series item with `dimensions: {}`
+
+Event metrics:
+
+- only `metric=count` is public
+- `event` is required
+- built-in equality filters use `platform`, `app_version`, and `os_version`
 - any other non-reserved query key matching `^[a-z][a-z0-9_]{0,62}$` is an equality filter on an explicit string property
 - `group_by` may be repeated up to twice
 - the total number of distinct referenced dimensions across filters plus `group_by` is capped at 3
-- reads come only from the worker-built daily cuboids, so the surface is explicitly eventually consistent
-
-Missing-dimension behavior:
-
 - grouped event metrics synthesize explicit `null` buckets from lower-order cuboids so grouped totals add back up to the filtered total
-- the worker does not persist synthetic null rows
+
+Session metrics:
+
+- supported public metrics are `count`, `duration_total`, and `new_installs`
+- `group_by` and equality filters are limited to `platform` and `app_version`
+- session grouped dimensions are fixed from the session's first event
+- `duration_total` is assigned to the bucket where the session starts
+- `new_installs` is assigned once from the install's first accepted event and is never retroactively moved by late arrivals
 
 ## SDK Direction
 

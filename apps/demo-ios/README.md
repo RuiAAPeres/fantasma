@@ -54,21 +54,21 @@ again, or background the app to trigger an upload sooner.
 Confirm that `screen_view` grouped by `screen` includes `Home`:
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/events/aggregate?event=screen_view&start_date=<UTC-start-date>&end_date=<UTC-end-date>&group_by=screen" \
+curl -fsS "http://localhost:8082/v1/metrics/events?event=screen_view&metric=count&granularity=day&start=<UTC-start-date>&end=<UTC-end-date>&group_by=screen" \
   -H "X-Fantasma-Key: <read-key-from-provision-project-output>"
 ```
 
 Confirm that `button_pressed` events were counted:
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/events/aggregate?event=button_pressed&start_date=<UTC-start-date>&end_date=<UTC-end-date>" \
+curl -fsS "http://localhost:8082/v1/metrics/events?event=button_pressed&metric=count&granularity=day&start=<UTC-start-date>&end=<UTC-end-date>" \
   -H "X-Fantasma-Key: <read-key-from-provision-project-output>"
 ```
 
 Confirm that the simulator session appears in the daily session series:
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/sessions/count/daily?start_date=<UTC-start-date>&end_date=<UTC-end-date>" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=count&granularity=day&start=<UTC-start-date>&end=<UTC-end-date>" \
   -H "X-Fantasma-Key: <read-key-from-provision-project-output>"
 ```
 

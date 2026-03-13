@@ -64,10 +64,6 @@ fn apply_event(session: &mut fantasma_store::SessionRecord, event: &SessionEvent
         .signed_duration_since(session.session_start)
         .num_seconds()
         .max(0) as i32;
-
-    if let Some(app_version) = &event.app_version {
-        session.app_version = Some(app_version.clone());
-    }
 }
 
 fn session_id(install_id: &str, session_start: DateTime<Utc>) -> String {
@@ -118,7 +114,7 @@ mod tests {
         assert_eq!(sessions[0].session_end, timestamp(1, 0, 29));
         assert_eq!(sessions[0].event_count, 3);
         assert_eq!(sessions[0].duration_seconds, 29 * 60);
-        assert_eq!(sessions[0].app_version.as_deref(), Some("1.0.1"));
+        assert_eq!(sessions[0].app_version.as_deref(), Some("1.0.0"));
     }
 
     #[test]
@@ -144,6 +140,6 @@ mod tests {
         assert_eq!(sessions[0].session_start, timestamp(1, 23, 55));
         assert_eq!(sessions[0].session_end, timestamp(2, 0, 20));
         assert_eq!(sessions[0].duration_seconds, 25 * 60);
-        assert_eq!(sessions[0].app_version.as_deref(), Some("1.0.1"));
+        assert_eq!(sessions[0].app_version.as_deref(), Some("1.0.0"));
     }
 }

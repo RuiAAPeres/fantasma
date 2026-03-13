@@ -203,22 +203,27 @@ curl -fsS -X POST http://localhost:8081/v1/events \
 Query derived metrics:
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-02" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-02" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/sessions/duration/total/daily?start_date=2026-01-01&end_date=2026-01-02" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=duration_total&granularity=day&start=2026-01-01&end=2026-01-02" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/events/aggregate?event=app_open&start_date=2026-01-01&end_date=2026-01-02&platform=ios&group_by=provider" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=new_installs&granularity=day&start=2026-01-01&end=2026-01-02" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/events/daily?event=app_open&start_date=2026-01-01&end_date=2026-01-02&group_by=provider" \
+curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02&platform=ios&group_by=provider" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
+```
+
+```bash
+curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z&group_by=provider" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 

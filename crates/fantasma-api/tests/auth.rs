@@ -181,7 +181,7 @@ async fn ingest_and_metrics_routes_enforce_project_key_kinds(pool: PgPool) {
         .clone()
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-01",
+                "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-01",
             )
             .header("x-fantasma-key", &ingest_key)
             .body(Body::empty())
@@ -195,7 +195,7 @@ async fn ingest_and_metrics_routes_enforce_project_key_kinds(pool: PgPool) {
         .clone()
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-01",
+                "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-01",
             )
             .header(AUTHORIZATION, "Bearer fg_pat_dev")
             .body(Body::empty())
@@ -211,7 +211,7 @@ async fn ingest_and_metrics_routes_enforce_project_key_kinds(pool: PgPool) {
     let metrics_with_read_key = api
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-01",
+                "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-01",
             )
             .header("x-fantasma-key", &read_key)
             .body(Body::empty())
@@ -232,7 +232,7 @@ async fn event_metrics_reject_public_project_id_query_params(pool: PgPool) {
     let response = api
         .oneshot(
             Request::get(format!(
-                "/v1/metrics/events/aggregate?project_id={project_id}&event=app_open&start_date=2026-01-01&end_date=2026-01-01"
+                "/v1/metrics/events?project_id={project_id}&event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-01"
             ))
             .header("x-fantasma-key", &read_key)
             .body(Body::empty())
@@ -350,7 +350,7 @@ async fn session_metrics_reject_public_project_id_query_params(pool: PgPool) {
     let response = api
         .oneshot(
             Request::get(format!(
-                "/v1/metrics/sessions/count/daily?project_id={project_id}&start_date=2026-01-01&end_date=2026-01-01"
+                "/v1/metrics/sessions?project_id={project_id}&metric=count&granularity=day&start=2026-01-01&end=2026-01-01"
             ))
             .header("x-fantasma-key", &read_key)
             .body(Body::empty())

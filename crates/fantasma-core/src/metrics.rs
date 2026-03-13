@@ -1,80 +1,101 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SessionMetricQuery {
-    pub project_id: Uuid,
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricGranularity {
+    Hour,
+    Day,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DailyMetricQuery {
-    pub project_id: Uuid,
-    pub start_date: NaiveDate,
-    pub end_date: NaiveDate,
+impl MetricGranularity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hour => "hour",
+            Self::Day => "day",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventMetric {
+    Count,
+}
+
+impl EventMetric {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMetric {
+    Count,
+    DurationTotal,
+    NewInstalls,
+}
+
+impl SessionMetric {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::DurationTotal => "duration_total",
+            Self::NewInstalls => "new_installs",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct EventMetricsDateWindow {
-    pub start_date: NaiveDate,
-    pub end_date: NaiveDate,
+pub struct MetricsBucketWindow {
+    pub granularity: MetricGranularity,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EventMetricsQuery {
     pub project_id: Uuid,
+    pub metric: EventMetric,
     pub event: String,
-    pub window: EventMetricsDateWindow,
+    pub window: MetricsBucketWindow,
     pub filters: BTreeMap<String, String>,
     pub group_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct MetricSeriesPoint {
-    pub date: NaiveDate,
-    pub value: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct MetricResponse {
-    pub metric: String,
-    pub points: Vec<MetricSeriesPoint>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct EventMetricsAggregateRow {
-    pub dimensions: BTreeMap<String, Option<String>>,
-    pub value: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct EventMetricsAggregateResponse {
-    pub metric: String,
+pub struct SessionMetricsQuery {
+    pub project_id: Uuid,
+    pub metric: SessionMetric,
+    pub window: MetricsBucketWindow,
+    pub filters: BTreeMap<String, String>,
     pub group_by: Vec<String>,
-    pub rows: Vec<EventMetricsAggregateRow>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct EventMetricsPoint {
-    pub date: NaiveDate,
+pub struct MetricsPoint {
+    pub bucket: String,
     pub value: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct EventMetricsDailySeries {
+pub struct MetricsSeries {
     pub dimensions: BTreeMap<String, Option<String>>,
-    pub points: Vec<EventMetricsPoint>,
+    pub points: Vec<MetricsPoint>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct EventMetricsDailyResponse {
+pub struct MetricsResponse {
     pub metric: String,
+    pub granularity: MetricGranularity,
     pub group_by: Vec<String>,
-    pub series: Vec<EventMetricsDailySeries>,
+    pub series: Vec<MetricsSeries>,
 }
 
 #[cfg(test)]
@@ -82,44 +103,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_metrics_aggregate_response_serializes_with_rows() {
-        let response = EventMetricsAggregateResponse {
-            metric: "event_count".to_owned(),
-            group_by: vec!["provider".to_owned()],
-            rows: vec![EventMetricsAggregateRow {
-                dimensions: BTreeMap::from([("provider".to_owned(), Some("strava".to_owned()))]),
-                value: 7,
-            }],
-        };
-
-        let json = serde_json::to_value(response).expect("serialize response");
-
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "metric": "event_count",
-                "group_by": ["provider"],
-                "rows": [
-                    {
-                        "dimensions": {
-                            "provider": "strava"
-                        },
-                        "value": 7
-                    }
-                ]
-            })
-        );
-    }
-
-    #[test]
-    fn event_metrics_daily_response_serializes_with_series() {
-        let response = EventMetricsDailyResponse {
-            metric: "event_count_daily".to_owned(),
-            group_by: vec!["provider".to_owned()],
-            series: vec![EventMetricsDailySeries {
-                dimensions: BTreeMap::from([("provider".to_owned(), Some("strava".to_owned()))]),
-                points: vec![EventMetricsPoint {
-                    date: serde_json::from_value(serde_json::json!("2026-03-01")).expect("date"),
+    fn metrics_response_serializes_ungrouped_series_shape() {
+        let response = MetricsResponse {
+            metric: "count".to_owned(),
+            granularity: MetricGranularity::Day,
+            group_by: Vec::new(),
+            series: vec![MetricsSeries {
+                dimensions: BTreeMap::new(),
+                points: vec![MetricsPoint {
+                    bucket: "2026-03-01".to_owned(),
                     value: 10,
                 }],
             }],
@@ -130,15 +122,51 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "metric": "event_count_daily",
-                "group_by": ["provider"],
+                "metric": "count",
+                "granularity": "day",
+                "group_by": [],
+                "series": [
+                    {
+                        "dimensions": {},
+                        "points": [
+                            { "bucket": "2026-03-01", "value": 10 }
+                        ]
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn metrics_response_serializes_grouped_hourly_series_shape() {
+        let response = MetricsResponse {
+            metric: "count".to_owned(),
+            granularity: MetricGranularity::Hour,
+            group_by: vec!["platform".to_owned()],
+            series: vec![MetricsSeries {
+                dimensions: BTreeMap::from([("platform".to_owned(), Some("ios".to_owned()))]),
+                points: vec![MetricsPoint {
+                    bucket: "2026-03-01T10:00:00Z".to_owned(),
+                    value: 80,
+                }],
+            }],
+        };
+
+        let json = serde_json::to_value(response).expect("serialize response");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "metric": "count",
+                "granularity": "hour",
+                "group_by": ["platform"],
                 "series": [
                     {
                         "dimensions": {
-                            "provider": "strava"
+                            "platform": "ios"
                         },
                         "points": [
-                            { "date": "2026-03-01", "value": 10 }
+                            { "bucket": "2026-03-01T10:00:00Z", "value": 80 }
                         ]
                     }
                 ]

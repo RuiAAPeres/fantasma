@@ -73,44 +73,55 @@ wait_for_http() {
 
 poll_metrics() {
   local deadline now count_response count_compact duration_response duration_compact
-  local event_aggregate_response event_aggregate_compact event_daily_response event_daily_compact
+  local installs_response installs_compact event_response event_compact
+  local hourly_count_response hourly_count_compact
   deadline=$((SECONDS + TIMEOUT_SECONDS))
 
   while true; do
     count_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-02" \
+      "http://localhost:8082/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-02" \
       -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     duration_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/sessions/duration/total/daily?start_date=2026-01-01&end_date=2026-01-02" \
+      "http://localhost:8082/v1/metrics/sessions?metric=duration_total&granularity=day&start=2026-01-01&end=2026-01-02" \
       -H "X-Fantasma-Key: ${READ_KEY}" || true)"
-    event_aggregate_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/events/aggregate?event=app_open&start_date=2026-01-01&end_date=2026-01-02&platform=ios&group_by=provider" \
+    installs_response="$(curl -fsS \
+      "http://localhost:8082/v1/metrics/sessions?metric=new_installs&granularity=day&start=2026-01-01&end=2026-01-02" \
       -H "X-Fantasma-Key: ${READ_KEY}" || true)"
-    event_daily_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/events/daily?event=app_open&start_date=2026-01-01&end_date=2026-01-02&group_by=provider" \
+    hourly_count_response="$(curl -fsS \
+      "http://localhost:8082/v1/metrics/sessions?metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z" \
+      -H "X-Fantasma-Key: ${READ_KEY}" || true)"
+    event_response="$(curl -fsS \
+      "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02&platform=ios&group_by=provider" \
       -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     count_compact="$(printf '%s' "$count_response" | tr -d '[:space:]')"
     duration_compact="$(printf '%s' "$duration_response" | tr -d '[:space:]')"
-    event_aggregate_compact="$(printf '%s' "$event_aggregate_response" | tr -d '[:space:]')"
-    event_daily_compact="$(printf '%s' "$event_daily_response" | tr -d '[:space:]')"
+    installs_compact="$(printf '%s' "$installs_response" | tr -d '[:space:]')"
+    hourly_count_compact="$(printf '%s' "$hourly_count_response" | tr -d '[:space:]')"
+    event_compact="$(printf '%s' "$event_response" | tr -d '[:space:]')"
 
-    if [[ "$count_compact" == *'"metric":"sessions_count_daily"'* &&
-          "$count_compact" == *'"date":"2026-01-01","value":1'* &&
-          "$count_compact" == *'"date":"2026-01-02","value":0'* &&
-          "$duration_compact" == *'"metric":"session_duration_total_daily"'* &&
-          "$duration_compact" == *'"date":"2026-01-01","value":600'* &&
-          "$duration_compact" == *'"date":"2026-01-02","value":0'* &&
-          "$event_aggregate_compact" == *'"metric":"event_count"'* &&
-          "$event_aggregate_compact" == *'"provider":"strava"'* &&
-          "$event_aggregate_compact" == *'"value":2'* &&
-          "$event_daily_compact" == *'"metric":"event_count_daily"'* &&
-          "$event_daily_compact" == *'"provider":"strava"'* &&
-          "$event_daily_compact" == *'"date":"2026-01-01","value":2'* &&
-          "$event_daily_compact" == *'"date":"2026-01-02","value":0'* ]]; then
+    if [[ "$count_compact" == *'"metric":"count"'* &&
+          "$count_compact" == *'"granularity":"day"'* &&
+          "$count_compact" == *'"bucket":"2026-01-01","value":1'* &&
+          "$count_compact" == *'"bucket":"2026-01-02","value":0'* &&
+          "$duration_compact" == *'"metric":"duration_total"'* &&
+          "$duration_compact" == *'"bucket":"2026-01-01","value":600'* &&
+          "$duration_compact" == *'"bucket":"2026-01-02","value":0'* &&
+          "$installs_compact" == *'"metric":"new_installs"'* &&
+          "$installs_compact" == *'"bucket":"2026-01-01","value":1'* &&
+          "$installs_compact" == *'"bucket":"2026-01-02","value":0'* &&
+          "$hourly_count_compact" == *'"metric":"count"'* &&
+          "$hourly_count_compact" == *'"granularity":"hour"'* &&
+          "$hourly_count_compact" == *'"bucket":"2026-01-01T00:00:00Z","value":1'* &&
+          "$hourly_count_compact" == *'"bucket":"2026-01-01T01:00:00Z","value":0'* &&
+          "$event_compact" == *'"metric":"count"'* &&
+          "$event_compact" == *'"provider":"strava"'* &&
+          "$event_compact" == *'"bucket":"2026-01-01","value":2'* &&
+          "$event_compact" == *'"bucket":"2026-01-02","value":0'* ]]; then
       printf '%s\n' "$count_response"
       printf '%s\n' "$duration_response"
-      printf '%s\n' "$event_aggregate_response"
-      printf '%s\n' "$event_daily_response"
+      printf '%s\n' "$installs_response"
+      printf '%s\n' "$hourly_count_response"
+      printf '%s\n' "$event_response"
       return 0
     fi
 

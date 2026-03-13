@@ -249,24 +249,27 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/events/aggregate:
+  /v1/metrics/events:
     get:
       tags:
         - metrics
-      summary: Return worker-derived event counts aggregated over an inclusive UTC date range
-      operationId: getEventMetricsAggregate
+      summary: Return worker-derived bucketed event-count series
+      operationId: getEventMetrics
       security:
         - ProjectKeyHeader: []
       description: |
         Event metrics are eventually consistent because the API reads only from
-        worker-built daily rollups.
+        worker-built hourly and daily rollups.
+
+        `metric=count` is the only public event metric in v1.
 
         Use normal query params for equality filters:
 
         - built-ins: `platform`, `app_version`, `os_version`
         - explicit properties: any additional non-reserved query key matching
           `^[a-z][a-z0-9_]{0,62}$`
-        - `install_id` is intentionally outside the public metrics query surface
+        - legacy public params such as `project_id`, `start_date`, and
+          `end_date` fail fast and are never reinterpreted as property filters
 
         `group_by` may be repeated up to twice. The total number of distinct
         referenced dimensions across filters plus `group_by` is capped at 3.
@@ -281,19 +284,21 @@ paths:
           type: string
       parameters:
         - $ref: '#/components/parameters/EventName'
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/EventMetric'
+        - $ref: '#/components/parameters/MetricGranularity'
+        - $ref: '#/components/parameters/MetricStart'
+        - $ref: '#/components/parameters/MetricEnd'
         - $ref: '#/components/parameters/EventGroupBy'
         - $ref: '#/components/parameters/PlatformFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
       responses:
         '200':
-          description: Aggregate worker-derived event counts.
+          description: Bucketed event-count series using the uniform metrics family response shape.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EventMetricsAggregateResponse'
+                $ref: '#/components/schemas/MetricsResponse'
         '401':
           description: Missing, invalid, revoked, or wrong-kind project read key.
           content:
@@ -305,7 +310,9 @@ paths:
             Invalid query. Error envelope is `{ "error": "..." }` with one of:
 
             - `invalid_event`
-            - `invalid_date_range`
+            - `invalid_metric`
+            - `invalid_granularity`
+            - `invalid_time_range`
             - `invalid_query_key`
             - `duplicate_query_key`
             - `invalid_group_by`
@@ -324,51 +331,43 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/events/daily:
+  /v1/metrics/sessions:
     get:
       tags:
         - metrics
-      summary: Return worker-derived daily event-count series for an inclusive UTC date range
-      operationId: getEventMetricsDaily
+      summary: Return worker-derived bucketed session metrics
+      operationId: getSessionMetrics
       security:
         - ProjectKeyHeader: []
       description: |
-        Event metrics are eventually consistent because the API reads only from
-        worker-built daily rollups.
+        Session metrics are eventually consistent because the API reads only
+        from worker-built hourly and daily rollups.
 
-        Use normal query params for equality filters:
+        Supported public metrics are:
 
-        - built-ins: `platform`, `app_version`, `os_version`
-        - explicit properties: any additional non-reserved query key matching
-          `^[a-z][a-z0-9_]{0,62}$`
-        - `install_id` is intentionally outside the public metrics query surface
+        - `count`
+        - `duration_total`
+        - `new_installs`
 
-        `group_by` may be repeated up to twice. The total number of distinct
-        referenced dimensions across filters plus `group_by` is capped at 3.
-        Queries exceeding 100 final series fail with `group_limit_exceeded`.
-      x-fantasma-explicit-property-filters:
-        type: object
-        description: |
-          Any additional non-reserved top-level query parameter whose key
-          matches `^[a-z][a-z0-9_]{0,62}$` is treated as an equality filter on
-          an explicit event property.
-        additionalProperties:
-          type: string
+        `group_by` may be repeated up to twice and supports only `platform`
+        and `app_version`. Equality filters are limited to the same
+        dimensions. Legacy public params such as `project_id`, `start_date`,
+        and `end_date` fail fast with `422`.
       parameters:
-        - $ref: '#/components/parameters/EventName'
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
-        - $ref: '#/components/parameters/EventGroupBy'
+        - $ref: '#/components/parameters/SessionMetric'
+        - $ref: '#/components/parameters/MetricGranularity'
+        - $ref: '#/components/parameters/MetricStart'
+        - $ref: '#/components/parameters/MetricEnd'
+        - $ref: '#/components/parameters/SessionGroupBy'
         - $ref: '#/components/parameters/PlatformFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
-        - $ref: '#/components/parameters/OsVersionFilter'
       responses:
         '200':
-          description: Daily worker-derived event-count series.
+          description: Bucketed session metric series using the uniform metrics family response shape.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EventMetricsDailyResponse'
+                $ref: '#/components/schemas/MetricsResponse'
         '401':
           description: Missing, invalid, revoked, or wrong-kind project read key.
           content:
@@ -379,212 +378,14 @@ paths:
           description: |
             Invalid query. Error envelope is `{ "error": "..." }` with one of:
 
-            - `invalid_event`
-            - `invalid_date_range`
-            - `invalid_query_key`
-            - `duplicate_query_key`
-            - `invalid_group_by`
-            - `duplicate_group_by`
-            - `too_many_group_by_dimensions`
-            - `too_many_dimensions`
-            - `conflicting_dimension_usage`
+            - `invalid_request`
             - `group_limit_exceeded`
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '500':
-          description: Internal server error while loading worker-derived daily event metrics.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/sessions/count:
-    get:
-      tags:
-        - metrics
-      summary: Count derived sessions in a time range
-      operationId: getSessionsCount
-      security:
-        - ProjectKeyHeader: []
-      description: |
-        Project scope is derived from the authenticated `read` key. Public
-        query parameters are limited to `start` and `end`; unknown parameters,
-        including `project_id`, are rejected.
-      parameters:
-        - $ref: '#/components/parameters/StartDateTime'
-        - $ref: '#/components/parameters/EndDateTime'
-      responses:
-        '200':
-          description: Session count encoded in the shared metric response shape.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricResponse'
-        '401':
-          description: Missing, invalid, revoked, or wrong-kind project read key.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '422':
-          description: |
-            Invalid query. Error envelope is `{ "error": "..." }` with one of:
-
-            - `invalid_request`
-            - `invalid_time_range`
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/sessions/count/daily:
-    get:
-      tags:
-        - metrics
-      summary: Return daily derived session counts for an inclusive UTC date range
-      operationId: getSessionsCountDaily
-      security:
-        - ProjectKeyHeader: []
-      description: |
-        Project scope is derived from the authenticated `read` key. Public
-        query parameters are limited to `start_date` and `end_date`; unknown
-        parameters, including `project_id`, are rejected.
-      parameters:
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
-      responses:
-        '200':
-          description: Daily session counts encoded in the shared metric response shape with metric name `sessions_count_daily`.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricResponse'
-        '401':
-          description: Missing, invalid, revoked, or wrong-kind project read key.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '422':
-          description: |
-            Invalid query. Error envelope is `{ "error": "..." }` with one of:
-
-            - `invalid_request`
-            - `invalid_date_range`
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/sessions/duration:
-    get:
-      tags:
-        - metrics
-      summary: Average derived session duration in seconds for a time range
-      operationId: getSessionsDuration
-      security:
-        - ProjectKeyHeader: []
-      description: |
-        Project scope is derived from the authenticated `read` key. Public
-        query parameters are limited to `start` and `end`; unknown parameters,
-        including `project_id`, are rejected.
-      parameters:
-        - $ref: '#/components/parameters/StartDateTime'
-        - $ref: '#/components/parameters/EndDateTime'
-      responses:
-        '200':
-          description: Average session duration encoded in the shared metric response shape.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricResponse'
-        '401':
-          description: Missing, invalid, revoked, or wrong-kind project read key.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '422':
-          description: |
-            Invalid query. Error envelope is `{ "error": "..." }` with one of:
-
-            - `invalid_request`
-            - `invalid_time_range`
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/sessions/duration/total/daily:
-    get:
-      tags:
-        - metrics
-      summary: Return total derived session duration per UTC day for an inclusive UTC date range
-      operationId: getSessionDurationTotalDaily
-      security:
-        - ProjectKeyHeader: []
-      description: |
-        Project scope is derived from the authenticated `read` key. Public
-        query parameters are limited to `start_date` and `end_date`; unknown
-        parameters, including `project_id`, are rejected.
-      parameters:
-        - $ref: '#/components/parameters/StartDate'
-        - $ref: '#/components/parameters/EndDate'
-      responses:
-        '200':
-          description: Daily total session duration encoded in the shared metric response shape with metric name `session_duration_total_daily`.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricResponse'
-        '401':
-          description: Missing, invalid, revoked, or wrong-kind project read key.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '422':
-          description: |
-            Invalid query. Error envelope is `{ "error": "..." }` with one of:
-
-            - `invalid_request`
-            - `invalid_date_range`
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/active-installs:
-    get:
-      tags:
-        - metrics
-      summary: Count distinct installs with a derived session overlapping the time range
-      operationId: getActiveInstalls
-      security:
-        - ProjectKeyHeader: []
-      description: |
-        Project scope is derived from the authenticated `read` key. Public
-        query parameters are limited to `start` and `end`; unknown parameters,
-        including `project_id`, are rejected.
-      parameters:
-        - $ref: '#/components/parameters/StartDateTime'
-        - $ref: '#/components/parameters/EndDateTime'
-      responses:
-        '200':
-          description: Active install count encoded in the shared metric response shape.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricResponse'
-        '401':
-          description: Missing, invalid, revoked, or wrong-kind project read key.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '422':
-          description: |
-            Invalid query. Error envelope is `{ "error": "..." }` with one of:
-
-            - `invalid_request`
-            - `invalid_time_range`
+          description: Internal server error while loading worker-derived session metrics.
           content:
             application/json:
               schema:
@@ -636,6 +437,50 @@ components:
         Repeat up to twice. Built-ins use `platform`, `app_version`, or
         `os_version`. Explicit properties use canonical keys that match
         `^[a-z][a-z0-9_]{0,62}$`.
+    SessionGroupBy:
+      in: query
+      name: group_by
+      required: false
+      explode: true
+      schema:
+        type: array
+        maxItems: 2
+        items:
+          type: string
+          enum:
+            - platform
+            - app_version
+      description: Repeat up to twice. Only `platform` and `app_version` are supported for session metrics.
+    EventMetric:
+      in: query
+      name: metric
+      required: true
+      schema:
+        type: string
+        enum:
+          - count
+    SessionMetric:
+      in: query
+      name: metric
+      required: true
+      schema:
+        type: string
+        enum:
+          - count
+          - duration_total
+          - new_installs
+    MetricGranularity:
+      in: query
+      name: granularity
+      required: true
+      schema:
+        type: string
+        enum:
+          - hour
+          - day
+      description: |
+        Bucket granularity. `hour` uses UTC RFC3339 hour-start timestamps for
+        `start` and `end`; `day` uses inclusive UTC `YYYY-MM-DD` bucket dates.
     PlatformFilter:
       in: query
       name: platform
@@ -658,36 +503,24 @@ components:
       required: false
       schema:
         type: string
-    StartDateTime:
+    MetricStart:
       in: query
       name: start
       required: true
       schema:
         type: string
-        format: date-time
-    EndDateTime:
+      description: |
+        Inclusive UTC bucket start. Use `YYYY-MM-DD` when `granularity=day`
+        and RFC3339 `...:00:00Z` hour starts when `granularity=hour`.
+    MetricEnd:
       in: query
       name: end
       required: true
       schema:
         type: string
-        format: date-time
-    StartDate:
-      in: query
-      name: start_date
-      required: true
-      schema:
-        type: string
-        format: date
-      description: Inclusive UTC start date.
-    EndDate:
-      in: query
-      name: end_date
-      required: true
-      schema:
-        type: string
-        format: date
-      description: Inclusive UTC end date.
+      description: |
+        Inclusive UTC bucket end. Use `YYYY-MM-DD` when `granularity=day`
+        and RFC3339 `...:00:00Z` hour starts when `granularity=hour`.
   schemas:
     Project:
       type: object
@@ -853,6 +686,10 @@ components:
                 - timestamp
                 - install_id
                 - properties
+                - metric
+                - granularity
+                - start
+                - end
                 - start_date
                 - end_date
                 - group_by
@@ -938,99 +775,53 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/EventValidationIssue'
-    MetricSeriesPoint:
+    MetricGranularityValue:
+      type: string
+      enum:
+        - hour
+        - day
+    MetricsPoint:
       type: object
       required:
-        - date
+        - bucket
         - value
       properties:
-        date:
+        bucket:
           type: string
-          format: date
+          description: UTC bucket identifier. Days use `YYYY-MM-DD`; hours use RFC3339 hour starts.
         value:
           type: integer
           minimum: 0
-    MetricResponse:
-      type: object
-      required:
-        - metric
-        - points
-      properties:
-        metric:
-          type: string
-        points:
-          type: array
-          items:
-            $ref: '#/components/schemas/MetricSeriesPoint'
-    EventMetricsDimensions:
+    MetricsDimensions:
       type: object
       additionalProperties:
         type:
           - string
           - 'null'
-    EventMetricsAggregateRow:
-      type: object
-      required:
-        - dimensions
-        - value
-      properties:
-        dimensions:
-          $ref: '#/components/schemas/EventMetricsDimensions'
-        value:
-          type: integer
-          minimum: 0
-    EventMetricsAggregateResponse:
-      type: object
-      required:
-        - metric
-        - group_by
-        - rows
-      properties:
-        metric:
-          type: string
-          const: event_count
-        group_by:
-          type: array
-          items:
-            type: string
-        rows:
-          type: array
-          items:
-            $ref: '#/components/schemas/EventMetricsAggregateRow'
-    EventMetricsPoint:
-      type: object
-      required:
-        - date
-        - value
-      properties:
-        date:
-          type: string
-          format: date
-        value:
-          type: integer
-          minimum: 0
-    EventMetricsDailySeries:
+    MetricsSeries:
       type: object
       required:
         - dimensions
         - points
       properties:
         dimensions:
-          $ref: '#/components/schemas/EventMetricsDimensions'
+          $ref: '#/components/schemas/MetricsDimensions'
         points:
           type: array
           items:
-            $ref: '#/components/schemas/EventMetricsPoint'
-    EventMetricsDailyResponse:
+            $ref: '#/components/schemas/MetricsPoint'
+    MetricsResponse:
       type: object
       required:
         - metric
+        - granularity
         - group_by
         - series
       properties:
         metric:
           type: string
-          const: event_count_daily
+        granularity:
+          $ref: '#/components/schemas/MetricGranularityValue'
         group_by:
           type: array
           items:
@@ -1038,7 +829,7 @@ components:
         series:
           type: array
           items:
-            $ref: '#/components/schemas/EventMetricsDailySeries'
+            $ref: '#/components/schemas/MetricsSeries'
     ErrorResponse:
       type: object
       required:

@@ -1,19 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{Duration as ChronoDuration, NaiveDate};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Timelike, Utc};
+use fantasma_core::MetricGranularity;
 use fantasma_store::{
     EventCountDailyDim1Delta, EventCountDailyDim2Delta, EventCountDailyDim3Delta,
-    EventCountDailyTotalDelta, InstallSessionStateRecord, PgPool, RawEventRecord, SessionRecord,
-    SessionTailUpdate, StoreError, add_session_daily_duration_delta_in_tx,
+    EventCountDailyTotalDelta, InstallFirstSeenRecord, InstallSessionStateRecord, PgPool,
+    RawEventRecord, SessionMetricDim1Delta, SessionMetricDim2Delta, SessionMetricTotalDelta,
+    SessionRecord, SessionTailUpdate, StoreError, add_session_daily_duration_delta_in_tx,
     delete_sessions_overlapping_window_in_tx, fetch_events_after,
     fetch_events_for_install_between_in_tx, fetch_latest_session_for_install_in_tx,
     fetch_sessions_overlapping_window_in_tx, increment_session_daily_for_new_session_in_tx,
-    insert_session_in_tx, load_install_session_state_in_tx, lock_worker_offset,
-    rebuild_session_daily_days_in_tx, save_worker_offset_in_tx, update_session_tail_in_tx,
-    upsert_event_count_daily_dim1_in_tx, upsert_event_count_daily_dim2_in_tx,
-    upsert_event_count_daily_dim3_in_tx, upsert_event_count_daily_totals_in_tx,
-    upsert_install_session_state_in_tx,
+    insert_install_first_seen_in_tx, insert_session_in_tx, load_install_first_seen_in_tx,
+    load_install_session_state_in_tx, lock_worker_offset, rebuild_session_daily_days_in_tx,
+    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_event_count_daily_dim1_in_tx,
+    upsert_event_count_daily_dim2_in_tx, upsert_event_count_daily_dim3_in_tx,
+    upsert_event_count_daily_totals_in_tx, upsert_install_session_state_in_tx,
+    upsert_session_metric_dim1_in_tx, upsert_session_metric_dim2_in_tx,
+    upsert_session_metric_totals_in_tx,
 };
+use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::sessionization;
@@ -28,12 +33,41 @@ struct RecomputeWindow {
     end: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Default)]
+struct SessionRepairBuckets {
+    days: BTreeSet<NaiveDate>,
+    hours: BTreeSet<DateTime<Utc>>,
+}
+
+impl SessionRepairBuckets {
+    fn extend(&mut self, other: Self) {
+        self.days.extend(other.days);
+        self.hours.extend(other.hours);
+    }
+
+    fn insert_timestamp(&mut self, timestamp: DateTime<Utc>) {
+        self.days.insert(timestamp.date_naive());
+        self.hours.insert(bucket_start_for_granularity(
+            timestamp,
+            MetricGranularity::Hour,
+        ));
+    }
+
+    fn insert_session(&mut self, session: &SessionRecord) {
+        self.insert_timestamp(session.session_start);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.days.is_empty() && self.hours.is_empty()
+    }
+}
+
 pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usize, StoreError> {
     let mut tx = pool.begin().await.map_err(StoreError::from)?;
     let last_processed_event_id = lock_worker_offset(&mut tx, SESSION_WORKER_NAME).await?;
     let batch = fetch_events_after(pool, last_processed_event_id, batch_size).await?;
     let processed_events = batch.len();
-    let mut touched_days_by_project = BTreeMap::<Uuid, BTreeSet<NaiveDate>>::new();
+    let mut touched_buckets_by_project = BTreeMap::<Uuid, SessionRepairBuckets>::new();
 
     if batch.is_empty() {
         tx.commit().await.map_err(StoreError::from)?;
@@ -46,19 +80,43 @@ pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usi
         .expect("non-empty batch has last event");
 
     for ((project_id, install_id), events) in group_events(batch) {
-        let touched_days = process_install_batch(&mut tx, project_id, &install_id, events).await?;
+        let touched_buckets =
+            process_install_batch(&mut tx, project_id, &install_id, events).await?;
 
-        if !touched_days.is_empty() {
-            touched_days_by_project
+        if !touched_buckets.is_empty() {
+            touched_buckets_by_project
                 .entry(project_id)
                 .or_default()
-                .extend(touched_days);
+                .extend(touched_buckets);
         }
     }
 
-    for (project_id, touched_days) in touched_days_by_project {
-        let days = touched_days.into_iter().collect::<Vec<_>>();
-        rebuild_session_daily_days_in_tx(&mut tx, project_id, &days).await?;
+    for (project_id, touched_buckets) in touched_buckets_by_project {
+        let days = touched_buckets.days.iter().copied().collect::<Vec<_>>();
+        if !days.is_empty() {
+            rebuild_session_daily_days_in_tx(&mut tx, project_id, &days).await?;
+            rebuild_session_metric_buckets_in_tx(
+                &mut tx,
+                project_id,
+                MetricGranularity::Day,
+                &days
+                    .iter()
+                    .map(|day| bucket_start_for_day(*day))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        }
+
+        let hours = touched_buckets.hours.into_iter().collect::<Vec<_>>();
+        if !hours.is_empty() {
+            rebuild_session_metric_buckets_in_tx(
+                &mut tx,
+                project_id,
+                MetricGranularity::Hour,
+                &hours,
+            )
+            .await?;
+        }
     }
 
     save_worker_offset_in_tx(&mut tx, SESSION_WORKER_NAME, next_offset).await?;
@@ -106,14 +164,36 @@ struct EventMetricRollups {
 }
 
 fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
-    let mut totals = BTreeMap::<(Uuid, NaiveDate, String), i64>::new();
-    let mut dim1 = BTreeMap::<(Uuid, NaiveDate, String, String, String), i64>::new();
-    let mut dim2 =
-        BTreeMap::<(Uuid, NaiveDate, String, String, String, String, String), i64>::new();
+    let mut totals = BTreeMap::<(Uuid, MetricGranularity, DateTime<Utc>, String), i64>::new();
+    let mut dim1 = BTreeMap::<
+        (
+            Uuid,
+            MetricGranularity,
+            DateTime<Utc>,
+            String,
+            String,
+            String,
+        ),
+        i64,
+    >::new();
+    let mut dim2 = BTreeMap::<
+        (
+            Uuid,
+            MetricGranularity,
+            DateTime<Utc>,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ),
+        i64,
+    >::new();
     let mut dim3 = BTreeMap::<
         (
             Uuid,
-            NaiveDate,
+            MetricGranularity,
+            DateTime<Utc>,
             String,
             String,
             String,
@@ -126,63 +206,73 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
     >::new();
 
     for event in batch {
-        let day = event.timestamp.date_naive();
         let event_name = event.event_name.clone();
-        *totals
-            .entry((event.project_id, day, event_name.clone()))
-            .or_default() += 1;
-
         let dimensions = event_metric_dimensions(event);
+        for granularity in [MetricGranularity::Day, MetricGranularity::Hour] {
+            let bucket_start = bucket_start_for_granularity(event.timestamp, granularity);
 
-        for dimension in &dimensions {
-            *dim1
+            *totals
                 .entry((
                     event.project_id,
-                    day,
+                    granularity,
+                    bucket_start,
                     event_name.clone(),
-                    dimension.0.clone(),
-                    dimension.1.clone(),
                 ))
                 .or_default() += 1;
-        }
 
-        for left_index in 0..dimensions.len() {
-            for right_index in left_index + 1..dimensions.len() {
-                let left = &dimensions[left_index];
-                let right = &dimensions[right_index];
-                *dim2
+            for dimension in &dimensions {
+                *dim1
                     .entry((
                         event.project_id,
-                        day,
+                        granularity,
+                        bucket_start,
                         event_name.clone(),
-                        left.0.clone(),
-                        left.1.clone(),
-                        right.0.clone(),
-                        right.1.clone(),
+                        dimension.0.clone(),
+                        dimension.1.clone(),
                     ))
                     .or_default() += 1;
             }
-        }
 
-        for first_index in 0..dimensions.len() {
-            for second_index in first_index + 1..dimensions.len() {
-                for third_index in second_index + 1..dimensions.len() {
-                    let first = &dimensions[first_index];
-                    let second = &dimensions[second_index];
-                    let third = &dimensions[third_index];
-                    *dim3
+            for left_index in 0..dimensions.len() {
+                for right_index in left_index + 1..dimensions.len() {
+                    let left = &dimensions[left_index];
+                    let right = &dimensions[right_index];
+                    *dim2
                         .entry((
                             event.project_id,
-                            day,
+                            granularity,
+                            bucket_start,
                             event_name.clone(),
-                            first.0.clone(),
-                            first.1.clone(),
-                            second.0.clone(),
-                            second.1.clone(),
-                            third.0.clone(),
-                            third.1.clone(),
+                            left.0.clone(),
+                            left.1.clone(),
+                            right.0.clone(),
+                            right.1.clone(),
                         ))
                         .or_default() += 1;
+                }
+            }
+
+            for first_index in 0..dimensions.len() {
+                for second_index in first_index + 1..dimensions.len() {
+                    for third_index in second_index + 1..dimensions.len() {
+                        let first = &dimensions[first_index];
+                        let second = &dimensions[second_index];
+                        let third = &dimensions[third_index];
+                        *dim3
+                            .entry((
+                                event.project_id,
+                                granularity,
+                                bucket_start,
+                                event_name.clone(),
+                                first.0.clone(),
+                                first.1.clone(),
+                                second.0.clone(),
+                                second.1.clone(),
+                                third.0.clone(),
+                                third.1.clone(),
+                            ))
+                            .or_default() += 1;
+                    }
                 }
             }
         }
@@ -192,21 +282,28 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
         total_deltas: totals
             .into_iter()
             .map(
-                |((project_id, day, event_name), event_count)| EventCountDailyTotalDelta {
-                    project_id,
-                    day,
-                    event_name,
-                    event_count,
+                |((project_id, granularity, bucket_start, event_name), event_count)| {
+                    EventCountDailyTotalDelta {
+                        project_id,
+                        granularity,
+                        bucket_start,
+                        event_name,
+                        event_count,
+                    }
                 },
             )
             .collect(),
         dim1_deltas: dim1
             .into_iter()
             .map(
-                |((project_id, day, event_name, dim1_key, dim1_value), event_count)| {
+                |(
+                    (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value),
+                    event_count,
+                )| {
                     EventCountDailyDim1Delta {
                         project_id,
-                        day,
+                        granularity,
+                        bucket_start,
                         event_name,
                         dim1_key,
                         dim1_value,
@@ -219,11 +316,21 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
             .into_iter()
             .map(
                 |(
-                    (project_id, day, event_name, dim1_key, dim1_value, dim2_key, dim2_value),
+                    (
+                        project_id,
+                        granularity,
+                        bucket_start,
+                        event_name,
+                        dim1_key,
+                        dim1_value,
+                        dim2_key,
+                        dim2_value,
+                    ),
                     event_count,
                 )| EventCountDailyDim2Delta {
                     project_id,
-                    day,
+                    granularity,
+                    bucket_start,
                     event_name,
                     dim1_key,
                     dim1_value,
@@ -239,7 +346,8 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                 |(
                     (
                         project_id,
-                        day,
+                        granularity,
+                        bucket_start,
                         event_name,
                         dim1_key,
                         dim1_value,
@@ -251,7 +359,8 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                     event_count,
                 )| EventCountDailyDim3Delta {
                     project_id,
-                    day,
+                    granularity,
+                    bucket_start,
                     event_name,
                     dim1_key,
                     dim1_value,
@@ -326,16 +435,14 @@ async fn process_install_batch(
     project_id: Uuid,
     install_id: &str,
     events: Vec<RawEventRecord>,
-) -> Result<BTreeSet<NaiveDate>, StoreError> {
+) -> Result<SessionRepairBuckets, StoreError> {
     let tail_state = load_install_session_state_in_tx(tx, project_id, install_id).await?;
 
     if needs_exact_day_repair(tail_state.as_ref(), &events) {
         return repair_install_batch(tx, project_id, install_id, events).await;
     }
 
-    process_install_batch_incremental(tx, project_id, install_id, events, tail_state).await?;
-
-    Ok(BTreeSet::new())
+    process_install_batch_incremental(tx, project_id, install_id, events, tail_state).await
 }
 
 fn needs_exact_day_repair(
@@ -357,7 +464,25 @@ async fn process_install_batch_incremental(
     install_id: &str,
     events: Vec<RawEventRecord>,
     mut tail_state: Option<InstallSessionStateRecord>,
-) -> Result<(), StoreError> {
+) -> Result<SessionRepairBuckets, StoreError> {
+    let mut touched_buckets = SessionRepairBuckets::default();
+    let existing_first_seen = load_install_first_seen_in_tx(tx, project_id, install_id).await?;
+    if existing_first_seen.is_none() {
+        if let Some(first_accepted_event) = events.iter().min_by_key(|event| event.id) {
+            let first_seen = InstallFirstSeenRecord {
+                project_id,
+                install_id: install_id.to_owned(),
+                first_seen_event_id: first_accepted_event.id,
+                first_seen_at: first_accepted_event.timestamp,
+                platform: first_accepted_event.platform.clone(),
+                app_version: first_accepted_event.app_version.clone(),
+            };
+            if insert_install_first_seen_in_tx(tx, &first_seen).await? {
+                touched_buckets.insert_timestamp(first_seen.first_seen_at);
+            }
+        }
+    }
+
     for event in events {
         match tail_state.as_mut() {
             None => {
@@ -375,6 +500,7 @@ async fn process_install_batch_incremental(
                 let state = install_state_from_session(&session);
                 upsert_install_session_state_in_tx(tx, &state).await?;
                 tail_state = Some(state);
+                touched_buckets.insert_session(&session);
             }
             Some(state) if event.timestamp < state.tail_session_end => {
                 return Err(StoreError::InvariantViolation(format!(
@@ -387,6 +513,7 @@ async fn process_install_batch_incremental(
                     .signed_duration_since(state.tail_session_end);
 
                 if gap <= ChronoDuration::minutes(SESSION_TIMEOUT_MINS) {
+                    touched_buckets.insert_timestamp(state.tail_session_start);
                     extend_tail_session(tx, state, &event).await?;
                 } else {
                     let session = session_from_event(&event);
@@ -403,12 +530,13 @@ async fn process_install_batch_incremental(
                     let next_state = install_state_from_session(&session);
                     upsert_install_session_state_in_tx(tx, &next_state).await?;
                     *state = next_state;
+                    touched_buckets.insert_session(&session);
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(touched_buckets)
 }
 
 async fn repair_install_batch(
@@ -416,7 +544,7 @@ async fn repair_install_batch(
     project_id: Uuid,
     install_id: &str,
     batch_events: Vec<RawEventRecord>,
-) -> Result<BTreeSet<NaiveDate>, StoreError> {
+) -> Result<SessionRepairBuckets, StoreError> {
     let batch_min_ts = batch_events
         .first()
         .map(|event| event.timestamp)
@@ -444,12 +572,12 @@ async fn repair_install_batch(
         recompute_window.end,
     )
     .await?;
-    let repaired_sessions = derive_sessions_for_window(&raw_events);
-    let touched_days = overlapping_sessions
-        .iter()
-        .map(session_daily_day)
-        .chain(repaired_sessions.iter().map(session_daily_day))
-        .collect::<BTreeSet<_>>();
+    let mut repaired_sessions = derive_sessions_for_window(&raw_events);
+    preserve_repaired_session_dimensions(&mut repaired_sessions, &overlapping_sessions);
+    let mut touched_buckets = SessionRepairBuckets::default();
+    for session in overlapping_sessions.iter().chain(repaired_sessions.iter()) {
+        touched_buckets.insert_session(session);
+    }
 
     delete_sessions_overlapping_window_in_tx(
         tx,
@@ -474,7 +602,7 @@ async fn repair_install_batch(
     let next_state = install_state_from_session(&latest_session);
     upsert_install_session_state_in_tx(tx, &next_state).await?;
 
-    Ok(touched_days)
+    Ok(touched_buckets)
 }
 
 async fn load_recompute_window_in_tx(
@@ -504,7 +632,7 @@ async fn load_recompute_window_in_tx(
             });
         }
 
-        let next = recompute_window_from_sessions(&sessions, batch_max_ts);
+        let next = recompute_window_from_sessions(&sessions, batch_min_ts, batch_max_ts);
         let next_search_start = next.start - ChronoDuration::minutes(SESSION_TIMEOUT_MINS);
         let next_search_end = next.end + ChronoDuration::minutes(SESSION_TIMEOUT_MINS);
 
@@ -519,12 +647,14 @@ async fn load_recompute_window_in_tx(
 
 fn recompute_window_from_sessions(
     sessions: &[SessionRecord],
+    batch_min_ts: chrono::DateTime<chrono::Utc>,
     batch_max_ts: chrono::DateTime<chrono::Utc>,
 ) -> RecomputeWindow {
     let start = sessions
         .first()
         .map(|session| session.session_start)
         .expect("sessions window is non-empty");
+    let start = start.min(batch_min_ts);
     let end = sessions
         .iter()
         .map(|session| session.session_end)
@@ -550,6 +680,31 @@ fn derive_sessions_for_window(raw_events: &[RawEventRecord]) -> Vec<SessionRecor
     sessionization::derive_sessions(&session_events)
 }
 
+fn preserve_repaired_session_dimensions(
+    repaired_sessions: &mut [SessionRecord],
+    existing_sessions: &[SessionRecord],
+) {
+    let mut existing_index = 0;
+
+    for repaired_session in repaired_sessions {
+        while existing_index < existing_sessions.len()
+            && existing_sessions[existing_index].session_end < repaired_session.session_start
+        {
+            existing_index += 1;
+        }
+
+        if let Some(existing_session) = existing_sessions[existing_index..].iter().find(|session| {
+            session.session_start <= repaired_session.session_end
+                && session.session_end >= repaired_session.session_start
+        }) {
+            // Preserve grouped session dimensions from the earliest pre-repair session that
+            // overlaps this rebuilt session so late events cannot rebucket existing rollups.
+            repaired_session.platform = existing_session.platform.clone();
+            repaired_session.app_version = existing_session.app_version.clone();
+        }
+    }
+}
+
 async fn extend_tail_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     state: &mut InstallSessionStateRecord,
@@ -570,7 +725,6 @@ async fn extend_tail_session(
             session_end: new_end,
             event_count: new_event_count,
             duration_seconds: new_duration,
-            app_version: event.app_version.as_deref(),
         },
     )
     .await?;
@@ -615,10 +769,6 @@ fn ensure_single_row_update(rows_affected: u64, message: String) -> Result<(), S
     Err(StoreError::InvariantViolation(message))
 }
 
-fn session_daily_day(session: &SessionRecord) -> NaiveDate {
-    session.session_start.date_naive()
-}
-
 fn session_from_event(event: &RawEventRecord) -> SessionRecord {
     SessionRecord {
         project_id: event.project_id,
@@ -644,6 +794,364 @@ fn install_state_from_session(session: &SessionRecord) -> InstallSessionStateRec
         tail_duration_seconds: session.duration_seconds,
         tail_day: session.session_start.date_naive(),
     }
+}
+
+fn bucket_start_for_granularity(
+    timestamp: DateTime<Utc>,
+    granularity: MetricGranularity,
+) -> DateTime<Utc> {
+    match granularity {
+        MetricGranularity::Day => bucket_start_for_day(timestamp.date_naive()),
+        MetricGranularity::Hour => DateTime::from_naive_utc_and_offset(
+            timestamp
+                .date_naive()
+                .and_hms_opt(timestamp.hour(), 0, 0)
+                .expect("top-of-hour is a valid UTC datetime"),
+            Utc,
+        ),
+    }
+}
+
+fn bucket_start_for_day(day: NaiveDate) -> DateTime<Utc> {
+    DateTime::from_naive_utc_and_offset(
+        day.and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid UTC datetime"),
+        Utc,
+    )
+}
+
+fn bucket_sql(granularity: MetricGranularity, column: &str) -> String {
+    let precision = match granularity {
+        MetricGranularity::Hour => "hour",
+        MetricGranularity::Day => "day",
+    };
+
+    format!("date_trunc('{precision}', {column} AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'")
+}
+
+async fn rebuild_session_metric_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    bucket_starts: &[DateTime<Utc>],
+) -> Result<(), StoreError> {
+    let bucket_starts = bucket_starts
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if bucket_starts.is_empty() {
+        return Ok(());
+    }
+
+    let bucket_expr = bucket_sql(granularity, "session_start");
+    let first_seen_bucket_expr = bucket_sql(granularity, "first_seen_at");
+
+    for table in [
+        "session_metric_buckets_total",
+        "session_metric_buckets_dim1",
+        "session_metric_buckets_dim2",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE project_id = $1 AND granularity = $2 AND bucket_start = ANY($3)"
+        ))
+        .bind(project_id)
+        .bind(granularity.as_str())
+        .bind(&bucket_starts)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    let session_total_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            {bucket_expr} AS bucket_start,
+            COUNT(*)::BIGINT AS session_count,
+            COALESCE(SUM(duration_seconds), 0)::BIGINT AS duration_total_seconds
+        FROM sessions
+        WHERE project_id = $1
+          AND {bucket_expr} = ANY($2)
+        GROUP BY bucket_start
+        ORDER BY bucket_start ASC
+        "#
+    ))
+    .bind(project_id)
+    .bind(&bucket_starts)
+    .fetch_all(&mut **tx)
+    .await?;
+    let session_total_deltas = session_total_rows
+        .into_iter()
+        .map(|row| SessionMetricTotalDelta {
+            project_id,
+            granularity,
+            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
+            session_count: row.try_get("session_count").expect("session_count"),
+            duration_total_seconds: row
+                .try_get("duration_total_seconds")
+                .expect("duration_total_seconds"),
+            new_installs: 0,
+        })
+        .collect::<Vec<_>>();
+    upsert_session_metric_totals_in_tx(tx, &session_total_deltas).await?;
+
+    let session_platform_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            {bucket_expr} AS bucket_start,
+            platform,
+            COUNT(*)::BIGINT AS session_count,
+            COALESCE(SUM(duration_seconds), 0)::BIGINT AS duration_total_seconds
+        FROM sessions
+        WHERE project_id = $1
+          AND {bucket_expr} = ANY($2)
+        GROUP BY bucket_start, platform
+        ORDER BY bucket_start ASC, platform ASC
+        "#
+    ))
+    .bind(project_id)
+    .bind(&bucket_starts)
+    .fetch_all(&mut **tx)
+    .await?;
+    let session_platform_deltas = session_platform_rows
+        .into_iter()
+        .map(|row| SessionMetricDim1Delta {
+            project_id,
+            granularity,
+            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
+            dim1_key: "platform".to_owned(),
+            dim1_value: row.try_get("platform").expect("platform"),
+            session_count: row.try_get("session_count").expect("session_count"),
+            duration_total_seconds: row
+                .try_get("duration_total_seconds")
+                .expect("duration_total_seconds"),
+            new_installs: 0,
+        })
+        .collect::<Vec<_>>();
+    upsert_session_metric_dim1_in_tx(tx, &session_platform_deltas).await?;
+
+    let session_app_version_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            {bucket_expr} AS bucket_start,
+            app_version,
+            COUNT(*)::BIGINT AS session_count,
+            COALESCE(SUM(duration_seconds), 0)::BIGINT AS duration_total_seconds
+        FROM sessions
+        WHERE project_id = $1
+          AND {bucket_expr} = ANY($2)
+          AND app_version IS NOT NULL
+        GROUP BY bucket_start, app_version
+        ORDER BY bucket_start ASC, app_version ASC
+        "#
+    ))
+    .bind(project_id)
+    .bind(&bucket_starts)
+    .fetch_all(&mut **tx)
+    .await?;
+    let session_app_version_deltas = session_app_version_rows
+        .into_iter()
+        .map(|row| SessionMetricDim1Delta {
+            project_id,
+            granularity,
+            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
+            dim1_key: "app_version".to_owned(),
+            dim1_value: row.try_get("app_version").expect("app_version"),
+            session_count: row.try_get("session_count").expect("session_count"),
+            duration_total_seconds: row
+                .try_get("duration_total_seconds")
+                .expect("duration_total_seconds"),
+            new_installs: 0,
+        })
+        .collect::<Vec<_>>();
+    upsert_session_metric_dim1_in_tx(tx, &session_app_version_deltas).await?;
+
+    let session_dim2_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            {bucket_expr} AS bucket_start,
+            platform,
+            app_version,
+            COUNT(*)::BIGINT AS session_count,
+            COALESCE(SUM(duration_seconds), 0)::BIGINT AS duration_total_seconds
+        FROM sessions
+        WHERE project_id = $1
+          AND {bucket_expr} = ANY($2)
+          AND app_version IS NOT NULL
+        GROUP BY bucket_start, platform, app_version
+        ORDER BY bucket_start ASC, platform ASC, app_version ASC
+        "#
+    ))
+    .bind(project_id)
+    .bind(&bucket_starts)
+    .fetch_all(&mut **tx)
+    .await?;
+    let session_dim2_deltas = session_dim2_rows
+        .into_iter()
+        .map(|row| SessionMetricDim2Delta {
+            project_id,
+            granularity,
+            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
+            dim1_key: "app_version".min("platform").to_owned(),
+            dim1_value: if "app_version" < "platform" {
+                row.try_get("app_version").expect("app_version")
+            } else {
+                row.try_get("platform").expect("platform")
+            },
+            dim2_key: "app_version".max("platform").to_owned(),
+            dim2_value: if "app_version" < "platform" {
+                row.try_get("platform").expect("platform")
+            } else {
+                row.try_get("app_version").expect("app_version")
+            },
+            session_count: row.try_get("session_count").expect("session_count"),
+            duration_total_seconds: row
+                .try_get("duration_total_seconds")
+                .expect("duration_total_seconds"),
+            new_installs: 0,
+        })
+        .collect::<Vec<_>>();
+    upsert_session_metric_dim2_in_tx(tx, &session_dim2_deltas).await?;
+
+    let first_seen_total_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            {first_seen_bucket_expr} AS bucket_start,
+            COUNT(*)::BIGINT AS new_installs
+        FROM install_first_seen
+        WHERE project_id = $1
+          AND {first_seen_bucket_expr} = ANY($2)
+        GROUP BY bucket_start
+        ORDER BY bucket_start ASC
+        "#
+    ))
+    .bind(project_id)
+    .bind(&bucket_starts)
+    .fetch_all(&mut **tx)
+    .await?;
+    let first_seen_total_deltas = first_seen_total_rows
+        .into_iter()
+        .map(|row| SessionMetricTotalDelta {
+            project_id,
+            granularity,
+            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
+            session_count: 0,
+            duration_total_seconds: 0,
+            new_installs: row.try_get("new_installs").expect("new_installs"),
+        })
+        .collect::<Vec<_>>();
+    upsert_session_metric_totals_in_tx(tx, &first_seen_total_deltas).await?;
+
+    let first_seen_platform_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            {first_seen_bucket_expr} AS bucket_start,
+            platform,
+            COUNT(*)::BIGINT AS new_installs
+        FROM install_first_seen
+        WHERE project_id = $1
+          AND {first_seen_bucket_expr} = ANY($2)
+        GROUP BY bucket_start, platform
+        ORDER BY bucket_start ASC, platform ASC
+        "#
+    ))
+    .bind(project_id)
+    .bind(&bucket_starts)
+    .fetch_all(&mut **tx)
+    .await?;
+    let first_seen_platform_deltas = first_seen_platform_rows
+        .into_iter()
+        .map(|row| SessionMetricDim1Delta {
+            project_id,
+            granularity,
+            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
+            dim1_key: "platform".to_owned(),
+            dim1_value: row.try_get("platform").expect("platform"),
+            session_count: 0,
+            duration_total_seconds: 0,
+            new_installs: row.try_get("new_installs").expect("new_installs"),
+        })
+        .collect::<Vec<_>>();
+    upsert_session_metric_dim1_in_tx(tx, &first_seen_platform_deltas).await?;
+
+    let first_seen_app_version_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            {first_seen_bucket_expr} AS bucket_start,
+            app_version,
+            COUNT(*)::BIGINT AS new_installs
+        FROM install_first_seen
+        WHERE project_id = $1
+          AND {first_seen_bucket_expr} = ANY($2)
+          AND app_version IS NOT NULL
+        GROUP BY bucket_start, app_version
+        ORDER BY bucket_start ASC, app_version ASC
+        "#
+    ))
+    .bind(project_id)
+    .bind(&bucket_starts)
+    .fetch_all(&mut **tx)
+    .await?;
+    let first_seen_app_version_deltas = first_seen_app_version_rows
+        .into_iter()
+        .map(|row| SessionMetricDim1Delta {
+            project_id,
+            granularity,
+            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
+            dim1_key: "app_version".to_owned(),
+            dim1_value: row.try_get("app_version").expect("app_version"),
+            session_count: 0,
+            duration_total_seconds: 0,
+            new_installs: row.try_get("new_installs").expect("new_installs"),
+        })
+        .collect::<Vec<_>>();
+    upsert_session_metric_dim1_in_tx(tx, &first_seen_app_version_deltas).await?;
+
+    let first_seen_dim2_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            {first_seen_bucket_expr} AS bucket_start,
+            platform,
+            app_version,
+            COUNT(*)::BIGINT AS new_installs
+        FROM install_first_seen
+        WHERE project_id = $1
+          AND {first_seen_bucket_expr} = ANY($2)
+          AND app_version IS NOT NULL
+        GROUP BY bucket_start, platform, app_version
+        ORDER BY bucket_start ASC, platform ASC, app_version ASC
+        "#
+    ))
+    .bind(project_id)
+    .bind(&bucket_starts)
+    .fetch_all(&mut **tx)
+    .await?;
+    let first_seen_dim2_deltas = first_seen_dim2_rows
+        .into_iter()
+        .map(|row| SessionMetricDim2Delta {
+            project_id,
+            granularity,
+            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
+            dim1_key: "app_version".min("platform").to_owned(),
+            dim1_value: if "app_version" < "platform" {
+                row.try_get("app_version").expect("app_version")
+            } else {
+                row.try_get("platform").expect("platform")
+            },
+            dim2_key: "app_version".max("platform").to_owned(),
+            dim2_value: if "app_version" < "platform" {
+                row.try_get("platform").expect("platform")
+            } else {
+                row.try_get("app_version").expect("app_version")
+            },
+            session_count: 0,
+            duration_total_seconds: 0,
+            new_installs: row.try_get("new_installs").expect("new_installs"),
+        })
+        .collect::<Vec<_>>();
+    upsert_session_metric_dim2_in_tx(tx, &first_seen_dim2_deltas).await?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -679,12 +1187,22 @@ mod tests {
     }
 
     fn event(install_id: &str, day: u32, hour: u32, minute: u32) -> EventPayload {
+        event_with_app_version(install_id, day, hour, minute, Some("1.0.0"))
+    }
+
+    fn event_with_app_version(
+        install_id: &str,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        app_version: Option<&str>,
+    ) -> EventPayload {
         EventPayload {
             event: "app_open".to_owned(),
             timestamp: timestamp(day, hour, minute),
             install_id: install_id.to_owned(),
             platform: Platform::Ios,
-            app_version: Some("1.0.0".to_owned()),
+            app_version: app_version.map(str::to_owned),
             os_version: Some("18.3".to_owned()),
             properties: BTreeMap::new(),
         }
@@ -773,11 +1291,11 @@ mod tests {
             + rollups.dim2_deltas.len()
             + rollups.dim3_deltas.len();
 
-        assert_eq!(rollups.total_deltas.len(), 1);
-        assert_eq!(rollups.dim1_deltas.len(), 6);
-        assert_eq!(rollups.dim2_deltas.len(), 15);
-        assert_eq!(rollups.dim3_deltas.len(), 20);
-        assert_eq!(total_fanout, 42);
+        assert_eq!(rollups.total_deltas.len(), 2);
+        assert_eq!(rollups.dim1_deltas.len(), 12);
+        assert_eq!(rollups.dim2_deltas.len(), 30);
+        assert_eq!(rollups.dim3_deltas.len(), 40);
+        assert_eq!(total_fanout, 84);
         assert!(
             rollups
                 .dim3_deltas
@@ -999,6 +1517,47 @@ mod tests {
             session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
             Some((1, 1, 45 * 60))
         );
+    }
+
+    #[sqlx::test]
+    async fn late_repair_keeps_existing_session_app_version_assignment(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[
+                event_with_app_version("install-1", 1, 1, 0, None),
+                event_with_app_version("install-1", 1, 1, 10, Some("1.0.0")),
+            ],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(
+            &pool,
+            project_id(),
+            &[event_with_app_version("install-1", 1, 0, 50, Some("0.9.0"))],
+        )
+        .await
+        .expect("insert late event");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process late batch");
+
+        let repaired_session = fetch_latest_session_for_install(&pool, project_id(), "install-1")
+            .await
+            .expect("fetch repaired session")
+            .expect("session exists");
+
+        assert_eq!(repaired_session.session_start, timestamp(1, 0, 50));
+        assert_eq!(repaired_session.session_end, timestamp(1, 1, 10));
+        assert_eq!(repaired_session.duration_seconds, 20 * 60);
+        assert_eq!(repaired_session.app_version, None);
     }
 
     #[sqlx::test]
@@ -1266,6 +1825,161 @@ mod tests {
                 .await
                 .expect("load offset"),
             2
+        );
+    }
+
+    #[sqlx::test]
+    async fn event_worker_writes_hour_and_day_rollups(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(&pool, project_id(), &[event("install-1", 1, 1, 15)])
+            .await
+            .expect("insert event");
+
+        process_event_metrics_batch(&pool, 100)
+            .await
+            .expect("process batch");
+
+        let bucket_rows = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM event_metric_buckets_total
+            WHERE project_id = $1
+              AND event_name = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("app_open")
+        .fetch_one(&pool)
+        .await
+        .expect("count event bucket rows");
+
+        assert_eq!(bucket_rows, 2);
+    }
+
+    #[sqlx::test]
+    async fn session_worker_keeps_duration_total_on_session_start_bucket(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 0, 50), event("install-1", 1, 1, 10)],
+        )
+        .await
+        .expect("insert events");
+
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process batch");
+
+        let start_bucket_duration = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT duration_total_seconds
+            FROM session_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = 'hour'
+              AND bucket_start = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(1, 0, 0))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch start bucket duration");
+
+        let later_bucket_duration = sqlx::query_scalar::<_, Option<i64>>(
+            r#"
+            SELECT duration_total_seconds
+            FROM session_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = 'hour'
+              AND bucket_start = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(1, 1, 0))
+        .fetch_optional(&pool)
+        .await
+        .expect("fetch later bucket duration")
+        .flatten();
+
+        assert_eq!(start_bucket_duration, 20 * 60);
+        assert_eq!(later_bucket_duration.unwrap_or_default(), 0);
+    }
+
+    #[sqlx::test]
+    async fn session_worker_keeps_first_seen_install_assignment_fixed(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(&pool, project_id(), &[event("install-1", 1, 1, 0)])
+            .await
+            .expect("insert first event");
+
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process first batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 0)])
+            .await
+            .expect("insert late event");
+
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process late batch");
+
+        let first_seen_bucket = sqlx::query_scalar::<_, DateTime<Utc>>(
+            r#"
+            SELECT first_seen_at
+            FROM install_first_seen
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch first seen row");
+
+        let bucket_values = sqlx::query(
+            r#"
+            SELECT bucket_start, new_installs
+            FROM session_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = 'hour'
+            ORDER BY bucket_start ASC
+            "#,
+        )
+        .bind(project_id())
+        .fetch_all(&pool)
+        .await
+        .expect("fetch hourly new-install buckets");
+
+        assert_eq!(first_seen_bucket, timestamp(1, 1, 0));
+        assert_eq!(bucket_values.len(), 2);
+        assert_eq!(
+            bucket_values[0]
+                .try_get::<DateTime<Utc>, _>("bucket_start")
+                .unwrap(),
+            timestamp(1, 0, 0)
+        );
+        assert_eq!(
+            bucket_values[0].try_get::<i64, _>("new_installs").unwrap(),
+            0
+        );
+        assert_eq!(
+            bucket_values[1]
+                .try_get::<DateTime<Utc>, _>("bucket_start")
+                .unwrap(),
+            timestamp(1, 1, 0)
+        );
+        assert_eq!(
+            bucket_values[1].try_get::<i64, _>("new_installs").unwrap(),
+            1
         );
     }
 }

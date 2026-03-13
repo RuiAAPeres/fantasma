@@ -12,19 +12,19 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get},
 };
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, SecondsFormat, Timelike, Utc};
 use fantasma_auth::StaticAdminAuthorizer;
 use fantasma_core::{
-    DailyMetricQuery, EventMetricsAggregateResponse, EventMetricsAggregateRow,
-    EventMetricsDailyResponse, EventMetricsDailySeries, EventMetricsDateWindow, EventMetricsPoint,
-    EventMetricsQuery, MetricResponse, MetricSeriesPoint, SessionMetricQuery,
+    EventMetric, EventMetricsQuery, MetricGranularity, MetricsBucketWindow, MetricsPoint,
+    MetricsResponse, MetricsSeries, SessionMetric, SessionMetricsQuery,
     is_reserved_event_property_key, is_valid_event_property_key,
 };
 use fantasma_store::{
     ApiKeyKind, EventMetricsAggregateCubeRow, EventMetricsCubeRow, PgPool, ProjectRecord,
-    ResolvedApiKey, SessionDailyRecord, StoreError, average_session_duration_seconds,
-    count_active_installs, count_sessions, create_api_key, create_project_with_api_key,
-    fetch_event_metrics_aggregate_cube_rows_in_tx, fetch_event_metrics_cube_rows_in_tx,
-    fetch_session_daily_range, generate_api_key_secret, list_api_keys, list_projects,
+    ResolvedApiKey, SessionMetricsAggregateCubeRow, SessionMetricsCubeRow, StoreError,
+    create_api_key, create_project_with_api_key, fetch_event_metrics_aggregate_cube_rows_in_tx,
+    fetch_event_metrics_cube_rows_in_tx, fetch_session_metrics_aggregate_cube_rows_in_tx,
+    fetch_session_metrics_cube_rows_in_tx, generate_api_key_secret, list_api_keys, list_projects,
     resolve_api_key, revoke_api_key,
 };
 use serde::{Deserialize, de::DeserializeOwned};
@@ -40,22 +40,19 @@ struct AppState {
     pool: PgPool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct PublicSessionMetricQuery {
-    start: chrono::DateTime<chrono::Utc>,
-    end: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PublicDailyMetricQuery {
-    start_date: chrono::NaiveDate,
-    end_date: chrono::NaiveDate,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicEventMetricsQuery {
+    metric: EventMetric,
+    event: String,
+    window: MetricsBucketWindow,
+    filters: BTreeMap<String, String>,
+    group_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PublicEventMetricsQuery {
-    event: String,
-    window: EventMetricsDateWindow,
+struct PublicSessionMetricsQuery {
+    metric: SessionMetric,
+    window: MetricsBucketWindow,
     filters: BTreeMap<String, String>,
     group_by: Vec<String>,
 }
@@ -89,19 +86,8 @@ pub fn app(pool: PgPool, authorizer: Arc<StaticAdminAuthorizer>) -> Router {
             "/v1/projects/{project_id}/keys/{key_id}",
             delete(revoke_project_key_route),
         )
-        .route("/v1/metrics/events/aggregate", get(events_aggregate))
-        .route("/v1/metrics/events/daily", get(events_daily))
-        .route("/v1/metrics/sessions/count", get(sessions_count))
-        .route(
-            "/v1/metrics/sessions/count/daily",
-            get(sessions_count_daily),
-        )
-        .route("/v1/metrics/sessions/duration", get(sessions_duration))
-        .route(
-            "/v1/metrics/sessions/duration/total/daily",
-            get(session_duration_total_daily),
-        )
-        .route("/v1/metrics/active-installs", get(active_installs))
+        .route("/v1/metrics/events", get(events_metrics))
+        .route("/v1/metrics/sessions", get(sessions_metrics))
         .with_state(AppState { authorizer, pool })
 }
 
@@ -118,12 +104,19 @@ impl EventMetricsQueryError {
     }
 }
 
+const MAX_GROUP_BY_DIMENSIONS: usize = 2;
+const MAX_EVENT_REFERENCED_DIMENSIONS: usize = 3;
+const MAX_METRIC_GROUPS: usize = 100;
+type GroupKey = Vec<Option<String>>;
+
 fn parse_event_metrics_query(
     raw_query: &str,
 ) -> Result<PublicEventMetricsQuery, EventMetricsQueryError> {
     let mut event = None;
-    let mut start_date = None;
-    let mut end_date = None;
+    let mut metric = None;
+    let mut granularity = None;
+    let mut start = None;
+    let mut end = None;
     let mut filters = BTreeMap::new();
     let mut group_by = Vec::new();
     let mut group_by_seen = BTreeSet::new();
@@ -144,25 +137,38 @@ fn parse_event_metrics_query(
 
                 event = Some(value);
             }
-            "start_date" => {
-                if start_date.is_some() {
+            "metric" => {
+                if metric.is_some() {
                     return Err(EventMetricsQueryError("duplicate_query_key"));
                 }
 
-                start_date = Some(
-                    chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d")
-                        .map_err(|_| EventMetricsQueryError("invalid_date_range"))?,
+                metric = Some(
+                    parse_event_metric(&value).ok_or(EventMetricsQueryError("invalid_metric"))?,
                 );
             }
-            "end_date" => {
-                if end_date.is_some() {
+            "granularity" => {
+                if granularity.is_some() {
                     return Err(EventMetricsQueryError("duplicate_query_key"));
                 }
 
-                end_date = Some(
-                    chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d")
-                        .map_err(|_| EventMetricsQueryError("invalid_date_range"))?,
+                granularity = Some(
+                    parse_metric_granularity(&value)
+                        .ok_or(EventMetricsQueryError("invalid_granularity"))?,
                 );
+            }
+            "start" => {
+                if start.is_some() {
+                    return Err(EventMetricsQueryError("duplicate_query_key"));
+                }
+
+                start = Some(value);
+            }
+            "end" => {
+                if end.is_some() {
+                    return Err(EventMetricsQueryError("duplicate_query_key"));
+                }
+
+                end = Some(value);
             }
             "group_by" => {
                 if value.is_empty() {
@@ -187,6 +193,9 @@ fn parse_event_metrics_query(
                     return Err(EventMetricsQueryError("duplicate_query_key"));
                 }
             }
+            "project_id" | "start_date" | "end_date" => {
+                return Err(EventMetricsQueryError("invalid_query_key"));
+            }
             _ => {
                 if is_reserved_event_property_key(&key) || !is_valid_event_property_key(&key) {
                     return Err(EventMetricsQueryError("invalid_query_key"));
@@ -199,15 +208,20 @@ fn parse_event_metrics_query(
         }
     }
 
+    let metric = metric.ok_or(EventMetricsQueryError("invalid_metric"))?;
     let event = event.ok_or(EventMetricsQueryError("invalid_event"))?;
-    let start_date = start_date.ok_or(EventMetricsQueryError("invalid_date_range"))?;
-    let end_date = end_date.ok_or(EventMetricsQueryError("invalid_date_range"))?;
+    let granularity = granularity.ok_or(EventMetricsQueryError("invalid_granularity"))?;
+    let window = parse_metrics_window(
+        granularity,
+        start
+            .as_deref()
+            .ok_or(EventMetricsQueryError("invalid_time_range"))?,
+        end.as_deref()
+            .ok_or(EventMetricsQueryError("invalid_time_range"))?,
+    )
+    .map_err(EventMetricsQueryError)?;
 
-    if start_date > end_date {
-        return Err(EventMetricsQueryError("invalid_date_range"));
-    }
-
-    if group_by.len() > 2 {
+    if group_by.len() > MAX_GROUP_BY_DIMENSIONS {
         return Err(EventMetricsQueryError("too_many_group_by_dimensions"));
     }
 
@@ -218,97 +232,169 @@ fn parse_event_metrics_query(
 
     let mut referenced_dimensions = filter_keys;
     referenced_dimensions.extend(group_by.iter().cloned());
-    if referenced_dimensions.len() > 3 {
+    if referenced_dimensions.len() > MAX_EVENT_REFERENCED_DIMENSIONS {
         return Err(EventMetricsQueryError("too_many_dimensions"));
     }
 
     Ok(PublicEventMetricsQuery {
+        metric,
         event,
-        window: EventMetricsDateWindow {
-            start_date,
-            end_date,
-        },
+        window,
         filters,
         group_by,
     })
 }
 
-fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricQuery, &'static str> {
+fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQuery, &'static str> {
+    let mut metric = None;
+    let mut granularity = None;
     let mut start = None;
     let mut end = None;
+    let mut filters = BTreeMap::new();
+    let mut group_by = Vec::new();
+    let mut group_by_seen = BTreeSet::new();
 
     for (raw_key, raw_value) in form_urlencoded::parse(raw_query.as_bytes()) {
+        let key = raw_key.into_owned();
         let value = raw_value.into_owned();
 
-        match raw_key.as_ref() {
+        match key.as_str() {
+            "metric" => {
+                if metric.is_some() {
+                    return Err("invalid_request");
+                }
+
+                metric = Some(parse_session_metric(&value).ok_or("invalid_request")?);
+            }
+            "granularity" => {
+                if granularity.is_some() {
+                    return Err("invalid_request");
+                }
+
+                granularity = Some(parse_metric_granularity(&value).ok_or("invalid_request")?);
+            }
             "start" => {
                 if start.is_some() {
                     return Err("invalid_request");
                 }
 
-                start = Some(
-                    chrono::DateTime::parse_from_rfc3339(&value)
-                        .map_err(|_| "invalid_request")?
-                        .with_timezone(&chrono::Utc),
-                );
+                start = Some(value);
             }
             "end" => {
                 if end.is_some() {
                     return Err("invalid_request");
                 }
 
-                end = Some(
-                    chrono::DateTime::parse_from_rfc3339(&value)
-                        .map_err(|_| "invalid_request")?
-                        .with_timezone(&chrono::Utc),
-                );
+                end = Some(value);
+            }
+            "group_by" => {
+                if !is_supported_session_dimension(&value) || !group_by_seen.insert(value.clone()) {
+                    return Err("invalid_request");
+                }
+                group_by.push(value);
+            }
+            "platform" | "app_version" => {
+                if filters.insert(key, value).is_some() {
+                    return Err("invalid_request");
+                }
             }
             _ => return Err("invalid_request"),
         }
     }
 
-    Ok(PublicSessionMetricQuery {
-        start: start.ok_or("invalid_request")?,
-        end: end.ok_or("invalid_request")?,
+    if group_by.len() > MAX_GROUP_BY_DIMENSIONS {
+        return Err("invalid_request");
+    }
+
+    if group_by.iter().any(|key| filters.contains_key(key)) {
+        return Err("invalid_request");
+    }
+
+    Ok(PublicSessionMetricsQuery {
+        metric: metric.ok_or("invalid_request")?,
+        window: parse_metrics_window(
+            granularity.ok_or("invalid_request")?,
+            start.as_deref().ok_or("invalid_request")?,
+            end.as_deref().ok_or("invalid_request")?,
+        )
+        .map_err(|_| "invalid_request")?,
+        filters,
+        group_by,
     })
 }
 
-fn parse_daily_metric_query(raw_query: &str) -> Result<PublicDailyMetricQuery, &'static str> {
-    let mut start_date = None;
-    let mut end_date = None;
+fn parse_event_metric(raw: &str) -> Option<EventMetric> {
+    match raw {
+        "count" => Some(EventMetric::Count),
+        _ => None,
+    }
+}
 
-    for (raw_key, raw_value) in form_urlencoded::parse(raw_query.as_bytes()) {
-        let value = raw_value.into_owned();
+fn parse_session_metric(raw: &str) -> Option<SessionMetric> {
+    match raw {
+        "count" => Some(SessionMetric::Count),
+        "duration_total" => Some(SessionMetric::DurationTotal),
+        "new_installs" => Some(SessionMetric::NewInstalls),
+        _ => None,
+    }
+}
 
-        match raw_key.as_ref() {
-            "start_date" => {
-                if start_date.is_some() {
-                    return Err("invalid_request");
-                }
+fn parse_metric_granularity(raw: &str) -> Option<MetricGranularity> {
+    match raw {
+        "hour" => Some(MetricGranularity::Hour),
+        "day" => Some(MetricGranularity::Day),
+        _ => None,
+    }
+}
 
-                start_date = Some(
-                    chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d")
-                        .map_err(|_| "invalid_request")?,
-                );
-            }
-            "end_date" => {
-                if end_date.is_some() {
-                    return Err("invalid_request");
-                }
+fn parse_metrics_window(
+    granularity: MetricGranularity,
+    start: &str,
+    end: &str,
+) -> Result<MetricsBucketWindow, &'static str> {
+    let (start, end) = match granularity {
+        MetricGranularity::Day => (parse_day_bucket(start)?, parse_day_bucket(end)?),
+        MetricGranularity::Hour => (parse_hour_bucket(start)?, parse_hour_bucket(end)?),
+    };
 
-                end_date = Some(
-                    chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d")
-                        .map_err(|_| "invalid_request")?,
-                );
-            }
-            _ => return Err("invalid_request"),
-        }
+    if start > end {
+        return Err("invalid_time_range");
     }
 
-    Ok(PublicDailyMetricQuery {
-        start_date: start_date.ok_or("invalid_request")?,
-        end_date: end_date.ok_or("invalid_request")?,
+    Ok(MetricsBucketWindow {
+        granularity,
+        start,
+        end,
     })
+}
+
+fn parse_day_bucket(raw: &str) -> Result<DateTime<Utc>, &'static str> {
+    let day = NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| "invalid_time_range")?;
+    Ok(DateTime::from_naive_utc_and_offset(
+        day.and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid UTC datetime"),
+        Utc,
+    ))
+}
+
+fn parse_hour_bucket(raw: &str) -> Result<DateTime<Utc>, &'static str> {
+    if !raw.ends_with('Z') {
+        return Err("invalid_time_range");
+    }
+
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .map_err(|_| "invalid_time_range")?
+        .with_timezone(&Utc);
+
+    if parsed.minute() != 0 || parsed.second() != 0 || parsed.nanosecond() != 0 {
+        return Err("invalid_time_range");
+    }
+
+    Ok(parsed)
+}
+
+fn is_supported_session_dimension(key: &str) -> bool {
+    matches!(key, "platform" | "app_version")
 }
 
 fn parse_json_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, axum::response::Response> {
@@ -559,7 +645,7 @@ fn api_key_secret_json(key: &fantasma_store::ApiKeyRecord, secret: &str) -> serd
     })
 }
 
-async fn events_aggregate(
+async fn events_metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
@@ -575,80 +661,91 @@ async fn events_aggregate(
     };
     let query = EventMetricsQuery {
         project_id: auth.project_id,
+        metric: public_query.metric,
         event: public_query.event,
         window: public_query.window,
         filters: public_query.filters,
         group_by: public_query.group_by,
     };
 
-    match execute_event_metrics_aggregate_query(&state.pool, &query).await {
-        Ok(response) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(response).expect("serialize event metric response")),
-        )
-            .into_response(),
-        Err(EventMetricsResponseError::GroupLimitExceeded) => {
-            query_error_response("group_limit_exceeded")
-        }
-        Err(EventMetricsResponseError::Store(error)) => {
-            tracing::error!(?error, "failed to compute event metrics aggregate");
-            query_error_response("internal_server_error")
-        }
-    }
-}
-
-async fn events_daily(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-) -> impl IntoResponse {
-    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-
-    let public_query = match parse_event_metrics_query(raw_query.as_deref().unwrap_or_default()) {
-        Ok(query) => query,
-        Err(error) => return query_error_response(error.error_code()),
-    };
-    let query = EventMetricsQuery {
-        project_id: auth.project_id,
-        event: public_query.event,
-        window: public_query.window,
-        filters: public_query.filters,
-        group_by: public_query.group_by,
-    };
-
-    match execute_event_metrics_daily_query(&state.pool, &query).await {
+    match execute_event_metrics_query(&state.pool, &query).await {
         Ok(response) => (
             StatusCode::OK,
             Json(serde_json::to_value(response).expect("serialize event metrics response")),
         )
             .into_response(),
-        Err(EventMetricsResponseError::GroupLimitExceeded) => {
+        Err(MetricsResponseError::GroupLimitExceeded) => {
             query_error_response("group_limit_exceeded")
         }
-        Err(EventMetricsResponseError::Store(error)) => {
-            tracing::error!(?error, "failed to compute daily event metrics");
+        Err(MetricsResponseError::Store(error)) => {
+            tracing::error!(?error, "failed to load event metrics");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
+async fn sessions_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> impl IntoResponse {
+    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+
+    let public_query = match parse_session_metric_query(raw_query.as_deref().unwrap_or_default()) {
+        Ok(query) => query,
+        Err(error) => return query_error_response(error),
+    };
+    let query = SessionMetricsQuery {
+        project_id: auth.project_id,
+        metric: public_query.metric,
+        window: public_query.window,
+        filters: public_query.filters,
+        group_by: public_query.group_by,
+    };
+
+    match execute_session_metrics_query(&state.pool, &query).await {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(response).expect("serialize session metrics response")),
+        )
+            .into_response(),
+        Err(MetricsResponseError::GroupLimitExceeded) => {
+            query_error_response("group_limit_exceeded")
+        }
+        Err(MetricsResponseError::Store(error)) => {
+            tracing::error!(?error, "failed to load session metrics");
             query_error_response("internal_server_error")
         }
     }
 }
 
 #[derive(Debug)]
-enum EventMetricsResponseError {
+enum MetricsResponseError {
     GroupLimitExceeded,
     Store(StoreError),
 }
 
-impl From<StoreError> for EventMetricsResponseError {
+impl From<StoreError> for MetricsResponseError {
     fn from(error: StoreError) -> Self {
         Self::Store(error)
     }
 }
 
-type GroupKey = Vec<Option<String>>;
-const MAX_EVENT_METRIC_GROUPS: usize = 100;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetricsCubeValueRow {
+    bucket_start: DateTime<Utc>,
+    dimensions: BTreeMap<String, String>,
+    value: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetricsAggregateValueRow {
+    dimensions: BTreeMap<String, String>,
+    value: u64,
+}
 
 fn query_error_response(error: &'static str) -> axum::response::Response {
     let status = match error {
@@ -661,31 +758,43 @@ fn query_error_response(error: &'static str) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": error }))).into_response()
 }
 
-async fn execute_event_metrics_aggregate_query(
+async fn execute_event_metrics_query(
     pool: &PgPool,
     query: &EventMetricsQuery,
-) -> Result<EventMetricsAggregateResponse, EventMetricsResponseError> {
-    let mut tx = begin_event_metrics_snapshot(pool).await?;
+) -> Result<MetricsResponse, MetricsResponseError> {
+    let mut tx = begin_metrics_snapshot(pool).await?;
     precheck_event_metrics_group_limit(&mut tx, query).await?;
-    let response = load_event_metrics_aggregate_response(&mut tx, query).await?;
+    let counts_by_bucket = load_event_group_counts_by_bucket(&mut tx, query).await?;
     tx.commit().await.map_err(StoreError::Database)?;
-    Ok(response)
+
+    Ok(build_metrics_response(
+        query.metric.as_str(),
+        &query.window,
+        &query.group_by,
+        counts_by_bucket,
+    ))
 }
 
-async fn execute_event_metrics_daily_query(
+async fn execute_session_metrics_query(
     pool: &PgPool,
-    query: &EventMetricsQuery,
-) -> Result<EventMetricsDailyResponse, EventMetricsResponseError> {
-    let mut tx = begin_event_metrics_snapshot(pool).await?;
-    precheck_event_metrics_group_limit(&mut tx, query).await?;
-    let response = load_event_metrics_daily_response(&mut tx, query).await?;
+    query: &SessionMetricsQuery,
+) -> Result<MetricsResponse, MetricsResponseError> {
+    let mut tx = begin_metrics_snapshot(pool).await?;
+    precheck_session_metrics_group_limit(&mut tx, query).await?;
+    let counts_by_bucket = load_session_group_counts_by_bucket(&mut tx, query).await?;
     tx.commit().await.map_err(StoreError::Database)?;
-    Ok(response)
+
+    Ok(build_metrics_response(
+        query.metric.as_str(),
+        &query.window,
+        &query.group_by,
+        counts_by_bucket,
+    ))
 }
 
-async fn begin_event_metrics_snapshot(
+async fn begin_metrics_snapshot(
     pool: &PgPool,
-) -> Result<Transaction<'_, Postgres>, EventMetricsResponseError> {
+) -> Result<Transaction<'_, Postgres>, MetricsResponseError> {
     let mut tx = pool.begin().await.map_err(StoreError::Database)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *tx)
@@ -697,11 +806,91 @@ async fn begin_event_metrics_snapshot(
 async fn precheck_event_metrics_group_limit(
     tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
-) -> Result<(), EventMetricsResponseError> {
+) -> Result<(), MetricsResponseError> {
     match query.group_by.len() {
         0 => Ok(()),
-        1 => precheck_single_group_limit(tx, query).await,
-        2 => precheck_two_group_limit(tx, query).await,
+        1 => {
+            let primary_rows = load_event_aggregate_rows(
+                tx,
+                query,
+                &cube_keys_with(
+                    &query.filters,
+                    std::slice::from_ref(query.group_by.first().expect("group exists")),
+                ),
+                Some(MAX_METRIC_GROUPS + 1),
+            )
+            .await?;
+
+            if primary_rows.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
+
+            let total_rows =
+                load_event_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
+                    .await?;
+            let final_groups = synthesize_single_group_counts(
+                aggregate_rows_to_groups(&primary_rows, &query.group_by),
+                sum_aggregate_rows(&total_rows),
+            )?;
+
+            if final_groups.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
+
+            Ok(())
+        }
+        2 => {
+            let pair_rows = load_event_aggregate_rows(
+                tx,
+                query,
+                &cube_keys_with(&query.filters, &query.group_by),
+                Some(MAX_METRIC_GROUPS + 1),
+            )
+            .await?;
+            if pair_rows.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
+
+            let first_group = vec![query.group_by[0].clone()];
+            let first_rows = load_event_aggregate_rows(
+                tx,
+                query,
+                &cube_keys_with(&query.filters, &first_group),
+                Some(MAX_METRIC_GROUPS + 1),
+            )
+            .await?;
+            if first_rows.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
+
+            let second_group = vec![query.group_by[1].clone()];
+            let second_rows = load_event_aggregate_rows(
+                tx,
+                query,
+                &cube_keys_with(&query.filters, &second_group),
+                Some(MAX_METRIC_GROUPS + 1),
+            )
+            .await?;
+            if second_rows.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
+
+            let total_rows =
+                load_event_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
+                    .await?;
+            let final_groups = synthesize_two_group_counts(
+                aggregate_rows_to_groups(&pair_rows, &query.group_by),
+                aggregate_rows_to_groups(&first_rows, &first_group),
+                aggregate_rows_to_groups(&second_rows, &second_group),
+                sum_aggregate_rows(&total_rows),
+            )?;
+
+            if final_groups.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
+
+            Ok(())
+        }
         other => Err(StoreError::InvariantViolation(format!(
             "event metrics group_by arity must be between 0 and 2, got {other}"
         ))
@@ -709,414 +898,480 @@ async fn precheck_event_metrics_group_limit(
     }
 }
 
-async fn precheck_single_group_limit(
+async fn precheck_session_metrics_group_limit(
     tx: &mut Transaction<'_, Postgres>,
-    query: &EventMetricsQuery,
-) -> Result<(), EventMetricsResponseError> {
-    let group_key = query
-        .group_by
-        .first()
-        .expect("single-group query has one group key");
-    let primary_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        (query.window.start_date, query.window.end_date),
-        &cube_keys_with(query, group_key),
-        &query.filters,
-        Some(MAX_EVENT_METRIC_GROUPS + 1),
-    )
-    .await?;
+    query: &SessionMetricsQuery,
+) -> Result<(), MetricsResponseError> {
+    match query.group_by.len() {
+        0 => Ok(()),
+        1 => {
+            let primary_rows = load_session_aggregate_rows(
+                tx,
+                query,
+                &cube_keys_with(
+                    &query.filters,
+                    std::slice::from_ref(query.group_by.first().expect("group exists")),
+                ),
+                Some(MAX_METRIC_GROUPS + 1),
+            )
+            .await?;
 
-    if primary_rows.len() > MAX_EVENT_METRIC_GROUPS {
-        return Err(EventMetricsResponseError::GroupLimitExceeded);
-    }
+            if primary_rows.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
 
-    let total_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        (query.window.start_date, query.window.end_date),
-        &filter_cube_keys(query),
-        &query.filters,
-        None,
-    )
-    .await?;
+            let total_rows =
+                load_session_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
+                    .await?;
+            let final_groups = synthesize_single_group_counts(
+                aggregate_rows_to_groups(&primary_rows, &query.group_by),
+                sum_aggregate_rows(&total_rows),
+            )?;
 
-    let final_groups = synthesize_single_group_counts(
-        aggregate_rows_to_groups(&primary_rows, &query.group_by),
-        sum_aggregate_rows(&total_rows),
-    )?;
+            if final_groups.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
 
-    if final_groups.len() > MAX_EVENT_METRIC_GROUPS {
-        return Err(EventMetricsResponseError::GroupLimitExceeded);
-    }
-
-    Ok(())
-}
-
-async fn precheck_two_group_limit(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &EventMetricsQuery,
-) -> Result<(), EventMetricsResponseError> {
-    let first_group = query
-        .group_by
-        .first()
-        .expect("two-group query has first group");
-    let second_group = query
-        .group_by
-        .get(1)
-        .expect("two-group query has second group");
-    let pair_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        (query.window.start_date, query.window.end_date),
-        &cube_keys_with_many(query, [&first_group[..], &second_group[..]].as_slice()),
-        &query.filters,
-        Some(MAX_EVENT_METRIC_GROUPS + 1),
-    )
-    .await?;
-
-    if pair_rows.len() > MAX_EVENT_METRIC_GROUPS {
-        return Err(EventMetricsResponseError::GroupLimitExceeded);
-    }
-
-    let first_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        (query.window.start_date, query.window.end_date),
-        &cube_keys_with(query, first_group),
-        &query.filters,
-        Some(MAX_EVENT_METRIC_GROUPS + 1),
-    )
-    .await?;
-
-    if first_rows.len() > MAX_EVENT_METRIC_GROUPS {
-        return Err(EventMetricsResponseError::GroupLimitExceeded);
-    }
-
-    let second_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        (query.window.start_date, query.window.end_date),
-        &cube_keys_with(query, second_group),
-        &query.filters,
-        Some(MAX_EVENT_METRIC_GROUPS + 1),
-    )
-    .await?;
-
-    if second_rows.len() > MAX_EVENT_METRIC_GROUPS {
-        return Err(EventMetricsResponseError::GroupLimitExceeded);
-    }
-
-    let total_rows = fetch_event_metrics_aggregate_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        (query.window.start_date, query.window.end_date),
-        &filter_cube_keys(query),
-        &query.filters,
-        None,
-    )
-    .await?;
-
-    let final_groups = synthesize_two_group_counts(
-        aggregate_rows_to_groups(&pair_rows, &query.group_by),
-        aggregate_rows_to_groups(&first_rows, std::slice::from_ref(first_group)),
-        aggregate_rows_to_groups(&second_rows, std::slice::from_ref(second_group)),
-        sum_aggregate_rows(&total_rows),
-    )?;
-
-    if final_groups.len() > MAX_EVENT_METRIC_GROUPS {
-        return Err(EventMetricsResponseError::GroupLimitExceeded);
-    }
-
-    Ok(())
-}
-
-async fn load_event_metrics_aggregate_response(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &EventMetricsQuery,
-) -> Result<EventMetricsAggregateResponse, EventMetricsResponseError> {
-    let counts_by_day = load_group_counts_by_day(tx, query).await?;
-    let mut totals_by_group = BTreeMap::<GroupKey, u64>::new();
-
-    for groups in counts_by_day.values() {
-        for (group_key, value) in groups {
-            *totals_by_group.entry(group_key.clone()).or_default() += *value;
+            Ok(())
         }
+        2 => {
+            let pair_rows = load_session_aggregate_rows(
+                tx,
+                query,
+                &cube_keys_with(&query.filters, &query.group_by),
+                Some(MAX_METRIC_GROUPS + 1),
+            )
+            .await?;
+            if pair_rows.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
+
+            let first_group = vec![query.group_by[0].clone()];
+            let first_rows = load_session_aggregate_rows(
+                tx,
+                query,
+                &cube_keys_with(&query.filters, &first_group),
+                Some(MAX_METRIC_GROUPS + 1),
+            )
+            .await?;
+            if first_rows.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
+
+            let second_group = vec![query.group_by[1].clone()];
+            let second_rows = load_session_aggregate_rows(
+                tx,
+                query,
+                &cube_keys_with(&query.filters, &second_group),
+                Some(MAX_METRIC_GROUPS + 1),
+            )
+            .await?;
+            if second_rows.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
+
+            let total_rows =
+                load_session_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
+                    .await?;
+            let final_groups = synthesize_two_group_counts(
+                aggregate_rows_to_groups(&pair_rows, &query.group_by),
+                aggregate_rows_to_groups(&first_rows, &first_group),
+                aggregate_rows_to_groups(&second_rows, &second_group),
+                sum_aggregate_rows(&total_rows),
+            )?;
+
+            if final_groups.len() > MAX_METRIC_GROUPS {
+                return Err(MetricsResponseError::GroupLimitExceeded);
+            }
+
+            Ok(())
+        }
+        other => Err(StoreError::InvariantViolation(format!(
+            "session metrics group_by arity must be between 0 and 2, got {other}"
+        ))
+        .into()),
     }
-
-    let rows = if query.group_by.is_empty() {
-        vec![EventMetricsAggregateRow {
-            dimensions: BTreeMap::new(),
-            value: totals_by_group.remove(&Vec::new()).unwrap_or_default(),
-        }]
-    } else {
-        let mut grouped = totals_by_group.into_iter().collect::<Vec<_>>();
-        grouped.sort_by(|(left_key, _), (right_key, _)| compare_group_keys(left_key, right_key));
-        grouped
-            .into_iter()
-            .map(|(group_key, value)| EventMetricsAggregateRow {
-                dimensions: dimensions_for_group(&query.group_by, &group_key),
-                value,
-            })
-            .collect()
-    };
-
-    Ok(EventMetricsAggregateResponse {
-        metric: "event_count".to_owned(),
-        group_by: query.group_by.clone(),
-        rows,
-    })
 }
 
-async fn load_event_metrics_daily_response(
+async fn load_event_group_counts_by_bucket(
     tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
-) -> Result<EventMetricsDailyResponse, EventMetricsResponseError> {
-    let counts_by_day = load_group_counts_by_day(tx, query).await?;
-    let mut series_by_group = BTreeMap::<GroupKey, BTreeMap<chrono::NaiveDate, u64>>::new();
+) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
+    match query.group_by.len() {
+        0 => {
+            let total_rows =
+                load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
+            Ok(sum_rows_by_bucket(&total_rows)
+                .into_iter()
+                .map(|(bucket_start, value)| (bucket_start, BTreeMap::from([(Vec::new(), value)])))
+                .collect())
+        }
+        1 => {
+            let primary_rows =
+                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &query.group_by))
+                    .await?;
+            let total_rows =
+                load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
 
-    for (day, groups) in counts_by_day {
+            synthesize_group_counts_by_bucket(
+                group_rows_by_bucket(&primary_rows, &query.group_by),
+                sum_rows_by_bucket(&total_rows),
+                None,
+            )
+            .map_err(Into::into)
+        }
+        2 => {
+            let pair_rows =
+                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &query.group_by))
+                    .await?;
+            let first_group = vec![query.group_by[0].clone()];
+            let first_rows =
+                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &first_group))
+                    .await?;
+            let second_group = vec![query.group_by[1].clone()];
+            let second_rows =
+                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &second_group))
+                    .await?;
+            let total_rows =
+                load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
+
+            synthesize_group_counts_by_bucket(
+                group_rows_by_bucket(&pair_rows, &query.group_by),
+                sum_rows_by_bucket(&total_rows),
+                Some((
+                    group_rows_by_bucket(&first_rows, &first_group),
+                    group_rows_by_bucket(&second_rows, &second_group),
+                )),
+            )
+            .map_err(Into::into)
+        }
+        other => Err(StoreError::InvariantViolation(format!(
+            "event metrics group_by arity must be between 0 and 2, got {other}"
+        ))
+        .into()),
+    }
+}
+
+async fn load_session_group_counts_by_bucket(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &SessionMetricsQuery,
+) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
+    match query.group_by.len() {
+        0 => {
+            let total_rows =
+                load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
+            Ok(sum_rows_by_bucket(&total_rows)
+                .into_iter()
+                .map(|(bucket_start, value)| (bucket_start, BTreeMap::from([(Vec::new(), value)])))
+                .collect())
+        }
+        1 => {
+            let primary_rows =
+                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &query.group_by))
+                    .await?;
+            let total_rows =
+                load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
+
+            synthesize_group_counts_by_bucket(
+                group_rows_by_bucket(&primary_rows, &query.group_by),
+                sum_rows_by_bucket(&total_rows),
+                None,
+            )
+            .map_err(Into::into)
+        }
+        2 => {
+            let pair_rows =
+                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &query.group_by))
+                    .await?;
+            let first_group = vec![query.group_by[0].clone()];
+            let first_rows =
+                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &first_group))
+                    .await?;
+            let second_group = vec![query.group_by[1].clone()];
+            let second_rows =
+                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &second_group))
+                    .await?;
+            let total_rows =
+                load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
+
+            synthesize_group_counts_by_bucket(
+                group_rows_by_bucket(&pair_rows, &query.group_by),
+                sum_rows_by_bucket(&total_rows),
+                Some((
+                    group_rows_by_bucket(&first_rows, &first_group),
+                    group_rows_by_bucket(&second_rows, &second_group),
+                )),
+            )
+            .map_err(Into::into)
+        }
+        other => Err(StoreError::InvariantViolation(format!(
+            "session metrics group_by arity must be between 0 and 2, got {other}"
+        ))
+        .into()),
+    }
+}
+
+async fn load_event_cube_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &EventMetricsQuery,
+    cube_keys: &[String],
+) -> Result<Vec<MetricsCubeValueRow>, MetricsResponseError> {
+    Ok(fetch_event_metrics_cube_rows_in_tx(
+        tx,
+        query.project_id,
+        query.window.granularity,
+        &query.event,
+        query.window.start,
+        query.window.end,
+        cube_keys,
+        &query.filters,
+    )
+    .await?
+    .into_iter()
+    .map(event_cube_row)
+    .collect())
+}
+
+async fn load_event_aggregate_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &EventMetricsQuery,
+    cube_keys: &[String],
+    limit: Option<usize>,
+) -> Result<Vec<MetricsAggregateValueRow>, MetricsResponseError> {
+    Ok(fetch_event_metrics_aggregate_cube_rows_in_tx(
+        tx,
+        query.project_id,
+        query.window.granularity,
+        &query.event,
+        (query.window.start, query.window.end),
+        cube_keys,
+        &query.filters,
+        limit,
+    )
+    .await?
+    .into_iter()
+    .map(event_aggregate_row)
+    .collect())
+}
+
+async fn load_session_cube_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &SessionMetricsQuery,
+    cube_keys: &[String],
+) -> Result<Vec<MetricsCubeValueRow>, MetricsResponseError> {
+    Ok(fetch_session_metrics_cube_rows_in_tx(
+        tx,
+        query.project_id,
+        query.window.granularity,
+        query.metric,
+        query.window.start,
+        query.window.end,
+        cube_keys,
+        &query.filters,
+    )
+    .await?
+    .into_iter()
+    .map(session_cube_row)
+    .collect())
+}
+
+async fn load_session_aggregate_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &SessionMetricsQuery,
+    cube_keys: &[String],
+    limit: Option<usize>,
+) -> Result<Vec<MetricsAggregateValueRow>, MetricsResponseError> {
+    Ok(fetch_session_metrics_aggregate_cube_rows_in_tx(
+        tx,
+        query.project_id,
+        query.window.granularity,
+        query.metric,
+        (query.window.start, query.window.end),
+        cube_keys,
+        &query.filters,
+        limit,
+    )
+    .await?
+    .into_iter()
+    .map(session_aggregate_row)
+    .collect())
+}
+
+fn event_cube_row(row: EventMetricsCubeRow) -> MetricsCubeValueRow {
+    MetricsCubeValueRow {
+        bucket_start: row.bucket_start,
+        dimensions: row.dimensions,
+        value: row.event_count,
+    }
+}
+
+fn event_aggregate_row(row: EventMetricsAggregateCubeRow) -> MetricsAggregateValueRow {
+    MetricsAggregateValueRow {
+        dimensions: row.dimensions,
+        value: row.event_count,
+    }
+}
+
+fn session_cube_row(row: SessionMetricsCubeRow) -> MetricsCubeValueRow {
+    MetricsCubeValueRow {
+        bucket_start: row.bucket_start,
+        dimensions: row.dimensions,
+        value: row.value,
+    }
+}
+
+fn session_aggregate_row(row: SessionMetricsAggregateCubeRow) -> MetricsAggregateValueRow {
+    MetricsAggregateValueRow {
+        dimensions: row.dimensions,
+        value: row.value,
+    }
+}
+
+fn build_metrics_response(
+    metric: &str,
+    window: &MetricsBucketWindow,
+    group_by: &[String],
+    counts_by_bucket: BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>,
+) -> MetricsResponse {
+    let mut series_by_group = BTreeMap::<GroupKey, BTreeMap<DateTime<Utc>, u64>>::new();
+
+    for (bucket_start, groups) in counts_by_bucket {
         for (group_key, value) in groups {
             series_by_group
                 .entry(group_key)
                 .or_default()
-                .insert(day, value);
+                .insert(bucket_start, value);
         }
     }
 
-    let series = if query.group_by.is_empty() {
-        vec![EventMetricsDailySeries {
+    let series = if group_by.is_empty() {
+        vec![MetricsSeries {
             dimensions: BTreeMap::new(),
-            points: zero_fill_event_metrics_points(
-                &query.window,
+            points: zero_fill_metrics_points(
+                window,
                 series_by_group.remove(&Vec::new()).unwrap_or_default(),
             ),
         }]
     } else {
         let mut grouped = series_by_group.into_iter().collect::<Vec<_>>();
-        grouped.sort_by(|(left_key, _), (right_key, _)| compare_group_keys(left_key, right_key));
+        grouped.sort_by(|(left, _), (right, _)| compare_group_keys(left, right));
         grouped
             .into_iter()
-            .map(|(group_key, points_by_day)| EventMetricsDailySeries {
-                dimensions: dimensions_for_group(&query.group_by, &group_key),
-                points: zero_fill_event_metrics_points(&query.window, points_by_day),
+            .map(|(group_key, points_by_bucket)| MetricsSeries {
+                dimensions: dimensions_for_group(group_by, &group_key),
+                points: zero_fill_metrics_points(window, points_by_bucket),
             })
             .collect()
     };
 
-    Ok(EventMetricsDailyResponse {
-        metric: "event_count_daily".to_owned(),
-        group_by: query.group_by.clone(),
+    MetricsResponse {
+        metric: metric.to_owned(),
+        granularity: window.granularity,
+        group_by: group_by.to_vec(),
         series,
-    })
-}
-
-async fn load_group_counts_by_day(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &EventMetricsQuery,
-) -> Result<BTreeMap<chrono::NaiveDate, BTreeMap<GroupKey, u64>>, EventMetricsResponseError> {
-    match query.group_by.len() {
-        0 => load_ungrouped_counts_by_day(tx, query).await,
-        1 => load_single_group_counts_by_day(tx, query).await,
-        2 => load_two_group_counts_by_day(tx, query).await,
-        other => Err(StoreError::InvariantViolation(format!(
-            "event metrics group_by arity must be between 0 and 2, got {other}"
-        ))
-        .into()),
     }
 }
 
-async fn load_ungrouped_counts_by_day(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &EventMetricsQuery,
-) -> Result<BTreeMap<chrono::NaiveDate, BTreeMap<GroupKey, u64>>, EventMetricsResponseError> {
-    let total_rows = fetch_event_metrics_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        query.window.start_date,
-        query.window.end_date,
-        &filter_cube_keys(query),
-        &query.filters,
-    )
-    .await?;
-    let totals_by_day = sum_rows_by_day(&total_rows);
+fn synthesize_group_counts_by_bucket(
+    primary_by_bucket: BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>,
+    totals_by_bucket: BTreeMap<DateTime<Utc>, u64>,
+    singleton_by_bucket: Option<(
+        BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>,
+        BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>,
+    )>,
+) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, StoreError> {
+    let mut buckets = totals_by_bucket.keys().copied().collect::<BTreeSet<_>>();
+    buckets.extend(primary_by_bucket.keys().copied());
 
-    Ok(totals_by_day
-        .into_iter()
-        .map(|(day, value)| (day, BTreeMap::from([(Vec::new(), value)])))
-        .collect())
-}
-
-async fn load_single_group_counts_by_day(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &EventMetricsQuery,
-) -> Result<BTreeMap<chrono::NaiveDate, BTreeMap<GroupKey, u64>>, EventMetricsResponseError> {
-    let group_key = query
-        .group_by
-        .first()
-        .expect("single-group query has one group key");
-    let primary_rows = fetch_event_metrics_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        query.window.start_date,
-        query.window.end_date,
-        &cube_keys_with(query, group_key),
-        &query.filters,
-    )
-    .await?;
-    let total_rows = fetch_event_metrics_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        query.window.start_date,
-        query.window.end_date,
-        &filter_cube_keys(query),
-        &query.filters,
-    )
-    .await?;
-
-    let non_null_by_day = group_rows_by_day(&primary_rows, &query.group_by);
-    let totals_by_day = sum_rows_by_day(&total_rows);
-    let mut days = totals_by_day.keys().copied().collect::<BTreeSet<_>>();
-    days.extend(non_null_by_day.keys().copied());
-    let mut grouped = BTreeMap::new();
-
-    for day in days {
-        let total = totals_by_day.get(&day).copied().unwrap_or_default();
-        let groups = synthesize_single_group_counts(
-            non_null_by_day.get(&day).cloned().unwrap_or_default(),
-            total,
-        )
-        .map_err(EventMetricsResponseError::from)?;
-
-        if !groups.is_empty() {
-            grouped.insert(day, groups);
-        }
+    if let Some((first_by_bucket, second_by_bucket)) = singleton_by_bucket.as_ref() {
+        buckets.extend(first_by_bucket.keys().copied());
+        buckets.extend(second_by_bucket.keys().copied());
     }
 
-    Ok(grouped)
-}
-
-async fn load_two_group_counts_by_day(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &EventMetricsQuery,
-) -> Result<BTreeMap<chrono::NaiveDate, BTreeMap<GroupKey, u64>>, EventMetricsResponseError> {
-    let first_group = query
-        .group_by
-        .first()
-        .expect("two-group query has first group");
-    let second_group = query
-        .group_by
-        .get(1)
-        .expect("two-group query has second group");
-    let primary_rows = fetch_event_metrics_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        query.window.start_date,
-        query.window.end_date,
-        &cube_keys_with_many(query, [&first_group[..], &second_group[..]].as_slice()),
-        &query.filters,
-    )
-    .await?;
-    let first_rows = fetch_event_metrics_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        query.window.start_date,
-        query.window.end_date,
-        &cube_keys_with(query, first_group),
-        &query.filters,
-    )
-    .await?;
-    let second_rows = fetch_event_metrics_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        query.window.start_date,
-        query.window.end_date,
-        &cube_keys_with(query, second_group),
-        &query.filters,
-    )
-    .await?;
-    let total_rows = fetch_event_metrics_cube_rows_in_tx(
-        tx,
-        query.project_id,
-        &query.event,
-        query.window.start_date,
-        query.window.end_date,
-        &filter_cube_keys(query),
-        &query.filters,
-    )
-    .await?;
-
-    let non_null_by_day = group_rows_by_day(&primary_rows, &query.group_by);
-    let first_by_day = group_rows_by_day(&first_rows, std::slice::from_ref(first_group));
-    let second_by_day = group_rows_by_day(&second_rows, std::slice::from_ref(second_group));
-    let totals_by_day = sum_rows_by_day(&total_rows);
-    let mut days = totals_by_day.keys().copied().collect::<BTreeSet<_>>();
-    days.extend(non_null_by_day.keys().copied());
-    days.extend(first_by_day.keys().copied());
-    days.extend(second_by_day.keys().copied());
     let mut grouped = BTreeMap::new();
 
-    for day in days {
-        let total = totals_by_day.get(&day).copied().unwrap_or_default();
-        let final_groups = synthesize_two_group_counts(
-            non_null_by_day.get(&day).cloned().unwrap_or_default(),
-            first_by_day.get(&day).cloned().unwrap_or_default(),
-            second_by_day.get(&day).cloned().unwrap_or_default(),
-            total,
-        )
-        .map_err(EventMetricsResponseError::from)?;
+    for bucket_start in buckets {
+        let total = totals_by_bucket
+            .get(&bucket_start)
+            .copied()
+            .unwrap_or_default();
+        let final_groups = match singleton_by_bucket.as_ref() {
+            None => synthesize_single_group_counts(
+                primary_by_bucket
+                    .get(&bucket_start)
+                    .cloned()
+                    .unwrap_or_default(),
+                total,
+            )?,
+            Some((first_by_bucket, second_by_bucket)) => synthesize_two_group_counts(
+                primary_by_bucket
+                    .get(&bucket_start)
+                    .cloned()
+                    .unwrap_or_default(),
+                first_by_bucket
+                    .get(&bucket_start)
+                    .cloned()
+                    .unwrap_or_default(),
+                second_by_bucket
+                    .get(&bucket_start)
+                    .cloned()
+                    .unwrap_or_default(),
+                total,
+            )?,
+        };
 
         if !final_groups.is_empty() {
-            grouped.insert(day, final_groups);
+            grouped.insert(bucket_start, final_groups);
         }
     }
 
     Ok(grouped)
 }
 
-fn filter_cube_keys(query: &EventMetricsQuery) -> Vec<String> {
-    query.filters.keys().cloned().collect()
+fn filter_cube_keys(filters: &BTreeMap<String, String>) -> Vec<String> {
+    filters.keys().cloned().collect()
 }
 
-fn cube_keys_with(query: &EventMetricsQuery, group_key: &str) -> Vec<String> {
-    cube_keys_with_many(query, &[group_key])
-}
-
-fn cube_keys_with_many(query: &EventMetricsQuery, group_keys: &[&str]) -> Vec<String> {
-    let mut keys = filter_cube_keys(query);
-    keys.extend(group_keys.iter().map(|key| (*key).to_owned()));
+fn cube_keys_with(filters: &BTreeMap<String, String>, group_keys: &[String]) -> Vec<String> {
+    let mut keys = filter_cube_keys(filters);
+    keys.extend(group_keys.iter().cloned());
     keys.sort();
     keys
 }
 
-fn sum_rows_by_day(rows: &[EventMetricsCubeRow]) -> BTreeMap<chrono::NaiveDate, u64> {
+fn sum_rows_by_bucket(rows: &[MetricsCubeValueRow]) -> BTreeMap<DateTime<Utc>, u64> {
     let mut totals = BTreeMap::new();
 
     for row in rows {
-        *totals.entry(row.day).or_default() += row.event_count;
+        *totals.entry(row.bucket_start).or_default() += row.value;
     }
 
     totals
 }
 
-fn sum_aggregate_rows(rows: &[EventMetricsAggregateCubeRow]) -> u64 {
-    rows.iter().map(|row| row.event_count).sum()
+fn group_rows_by_bucket(
+    rows: &[MetricsCubeValueRow],
+    group_by: &[String],
+) -> BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>> {
+    let mut grouped = BTreeMap::<DateTime<Utc>, BTreeMap<GroupKey, u64>>::new();
+
+    for row in rows {
+        let group_key = group_by
+            .iter()
+            .map(|key| row.dimensions.get(key).cloned())
+            .collect::<Vec<_>>();
+        *grouped
+            .entry(row.bucket_start)
+            .or_default()
+            .entry(group_key)
+            .or_default() += row.value;
+    }
+
+    grouped
 }
 
 fn aggregate_rows_to_groups(
-    rows: &[EventMetricsAggregateCubeRow],
+    rows: &[MetricsAggregateValueRow],
     group_by: &[String],
 ) -> BTreeMap<GroupKey, u64> {
     let mut grouped = BTreeMap::new();
@@ -1124,12 +1379,16 @@ fn aggregate_rows_to_groups(
     for row in rows {
         let group_key = group_by
             .iter()
-            .map(|group_key| row.dimensions.get(group_key).cloned())
+            .map(|key| row.dimensions.get(key).cloned())
             .collect::<Vec<_>>();
-        *grouped.entry(group_key).or_default() += row.event_count;
+        *grouped.entry(group_key).or_default() += row.value;
     }
 
     grouped
+}
+
+fn sum_aggregate_rows(rows: &[MetricsAggregateValueRow]) -> u64 {
+    rows.iter().map(|row| row.value).sum()
 }
 
 fn synthesize_single_group_counts(
@@ -1140,7 +1399,7 @@ fn synthesize_single_group_counts(
 
     if non_null_total > total {
         return Err(StoreError::InvariantViolation(
-            "event metric non-null buckets exceeded total".to_owned(),
+            "grouped non-null buckets exceeded total".to_owned(),
         ));
     }
 
@@ -1194,7 +1453,7 @@ fn synthesize_two_group_counts(
             .unwrap_or_default();
         if used > total_for_first {
             return Err(StoreError::InvariantViolation(
-                "event metric pair totals exceeded first-dimension total".to_owned(),
+                "pair totals exceeded first-dimension total".to_owned(),
             ));
         }
 
@@ -1217,7 +1476,7 @@ fn synthesize_two_group_counts(
             .unwrap_or_default();
         if used > total_for_second {
             return Err(StoreError::InvariantViolation(
-                "event metric pair totals exceeded second-dimension total".to_owned(),
+                "pair totals exceeded second-dimension total".to_owned(),
             ));
         }
 
@@ -1230,7 +1489,7 @@ fn synthesize_two_group_counts(
 
     if returned_total > total {
         return Err(StoreError::InvariantViolation(
-            "event metric grouped totals exceeded total".to_owned(),
+            "grouped totals exceeded total".to_owned(),
         ));
     }
 
@@ -1242,45 +1501,36 @@ fn synthesize_two_group_counts(
     Ok(final_groups)
 }
 
-fn group_rows_by_day(
-    rows: &[EventMetricsCubeRow],
-    group_by: &[String],
-) -> BTreeMap<chrono::NaiveDate, BTreeMap<GroupKey, u64>> {
-    let mut grouped = BTreeMap::<chrono::NaiveDate, BTreeMap<GroupKey, u64>>::new();
-
-    for row in rows {
-        let group_key = group_by
-            .iter()
-            .map(|group_key| row.dimensions.get(group_key).cloned())
-            .collect::<Vec<_>>();
-        *grouped
-            .entry(row.day)
-            .or_default()
-            .entry(group_key)
-            .or_default() += row.event_count;
-    }
-
-    grouped
-}
-
-fn zero_fill_event_metrics_points(
-    window: &EventMetricsDateWindow,
-    points_by_day: BTreeMap<chrono::NaiveDate, u64>,
-) -> Vec<EventMetricsPoint> {
+fn zero_fill_metrics_points(
+    window: &MetricsBucketWindow,
+    points_by_bucket: BTreeMap<DateTime<Utc>, u64>,
+) -> Vec<MetricsPoint> {
     let mut filled = Vec::new();
-    let mut current = window.start_date;
+    let mut current = window.start;
 
-    while current <= window.end_date {
-        filled.push(EventMetricsPoint {
-            date: current,
-            value: points_by_day.get(&current).copied().unwrap_or_default(),
+    while current <= window.end {
+        filled.push(MetricsPoint {
+            bucket: format_bucket(current, window.granularity),
+            value: points_by_bucket.get(&current).copied().unwrap_or_default(),
         });
-        current = current
-            .succ_opt()
-            .expect("event metrics daily range stays within chrono bounds");
+        current = next_bucket_start(current, window.granularity);
     }
 
     filled
+}
+
+fn next_bucket_start(bucket_start: DateTime<Utc>, granularity: MetricGranularity) -> DateTime<Utc> {
+    match granularity {
+        MetricGranularity::Hour => bucket_start + ChronoDuration::hours(1),
+        MetricGranularity::Day => bucket_start + ChronoDuration::days(1),
+    }
+}
+
+fn format_bucket(bucket_start: DateTime<Utc>, granularity: MetricGranularity) -> String {
+    match granularity {
+        MetricGranularity::Hour => bucket_start.to_rfc3339_opts(SecondsFormat::Secs, true),
+        MetricGranularity::Day => bucket_start.format("%Y-%m-%d").to_string(),
+    }
 }
 
 fn dimensions_for_group(
@@ -1311,452 +1561,162 @@ fn compare_group_keys(left: &[Option<String>], right: &[Option<String>]) -> Orde
     left.len().cmp(&right.len())
 }
 
-async fn sessions_count(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-) -> impl IntoResponse {
-    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-    let public_query = match parse_session_metric_query(raw_query.as_deref().unwrap_or_default()) {
-        Ok(query) => query,
-        Err(error) => return query_error_response(error),
-    };
-    let query = SessionMetricQuery {
-        project_id: auth.project_id,
-        start: public_query.start,
-        end: public_query.end,
-    };
-
-    metric_value_response(&query, "sessions_count", async {
-        count_sessions(&state.pool, query.project_id, query.start, query.end).await
-    })
-    .await
-}
-
-async fn sessions_count_daily(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-) -> impl IntoResponse {
-    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-    let public_query = match parse_daily_metric_query(raw_query.as_deref().unwrap_or_default()) {
-        Ok(query) => query,
-        Err(error) => return query_error_response(error),
-    };
-    let query = DailyMetricQuery {
-        project_id: auth.project_id,
-        start_date: public_query.start_date,
-        end_date: public_query.end_date,
-    };
-
-    daily_metric_response(&query, "sessions_count_daily", async {
-        load_daily_metric_series(&state.pool, &query, |record| record.sessions_count as u64).await
-    })
-    .await
-}
-
-async fn sessions_duration(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-) -> impl IntoResponse {
-    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-    let public_query = match parse_session_metric_query(raw_query.as_deref().unwrap_or_default()) {
-        Ok(query) => query,
-        Err(error) => return query_error_response(error),
-    };
-    let query = SessionMetricQuery {
-        project_id: auth.project_id,
-        start: public_query.start,
-        end: public_query.end,
-    };
-
-    metric_value_response(&query, "sessions_duration", async {
-        average_session_duration_seconds(&state.pool, query.project_id, query.start, query.end)
-            .await
-    })
-    .await
-}
-
-async fn session_duration_total_daily(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-) -> impl IntoResponse {
-    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-    let public_query = match parse_daily_metric_query(raw_query.as_deref().unwrap_or_default()) {
-        Ok(query) => query,
-        Err(error) => return query_error_response(error),
-    };
-    let query = DailyMetricQuery {
-        project_id: auth.project_id,
-        start_date: public_query.start_date,
-        end_date: public_query.end_date,
-    };
-
-    daily_metric_response(&query, "session_duration_total_daily", async {
-        load_daily_metric_series(&state.pool, &query, |record| {
-            record.total_duration_seconds as u64
-        })
-        .await
-    })
-    .await
-}
-
-async fn active_installs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-) -> impl IntoResponse {
-    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
-    let public_query = match parse_session_metric_query(raw_query.as_deref().unwrap_or_default()) {
-        Ok(query) => query,
-        Err(error) => return query_error_response(error),
-    };
-    let query = SessionMetricQuery {
-        project_id: auth.project_id,
-        start: public_query.start,
-        end: public_query.end,
-    };
-
-    metric_value_response(&query, "active_installs", async {
-        count_active_installs(&state.pool, query.project_id, query.start, query.end).await
-    })
-    .await
-}
-
-async fn metric_value_response<F>(
-    query: &SessionMetricQuery,
-    metric_name: &'static str,
-    compute: F,
-) -> axum::response::Response
-where
-    F: std::future::Future<Output = Result<u64, StoreError>>,
-{
-    if query.start > query.end {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({ "error": "invalid_time_range" })),
-        )
-            .into_response();
-    }
-
-    match compute.await {
-        Ok(value) => (
-            StatusCode::OK,
-            Json(
-                serde_json::to_value(MetricResponse {
-                    metric: metric_name.to_owned(),
-                    points: vec![MetricSeriesPoint {
-                        date: query.end.date_naive(),
-                        value,
-                    }],
-                })
-                .expect("serialize metric response"),
-            ),
-        )
-            .into_response(),
-        Err(error) => {
-            tracing::error!(?error, "failed to compute derived metric");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal_server_error" })),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn daily_metric_response<F>(
-    query: &DailyMetricQuery,
-    metric_name: &'static str,
-    compute: F,
-) -> axum::response::Response
-where
-    F: std::future::Future<Output = Result<Vec<MetricSeriesPoint>, StoreError>>,
-{
-    if query.start_date > query.end_date {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({ "error": "invalid_date_range" })),
-        )
-            .into_response();
-    }
-
-    match compute.await {
-        Ok(points) => (
-            StatusCode::OK,
-            Json(
-                serde_json::to_value(MetricResponse {
-                    metric: metric_name.to_owned(),
-                    points: zero_fill_daily_points(query, points),
-                })
-                .expect("serialize metric response"),
-            ),
-        )
-            .into_response(),
-        Err(error) => {
-            tracing::error!(?error, "failed to compute daily metric");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal_server_error" })),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn load_daily_metric_series<F>(
-    pool: &PgPool,
-    query: &DailyMetricQuery,
-    value: F,
-) -> Result<Vec<MetricSeriesPoint>, StoreError>
-where
-    F: Fn(&SessionDailyRecord) -> u64,
-{
-    let rows =
-        fetch_session_daily_range(pool, query.project_id, query.start_date, query.end_date).await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|record| MetricSeriesPoint {
-            date: record.day,
-            value: value(&record),
-        })
-        .collect())
-}
-
-fn zero_fill_daily_points(
-    query: &DailyMetricQuery,
-    points: Vec<MetricSeriesPoint>,
-) -> Vec<MetricSeriesPoint> {
-    let values_by_day = points
-        .into_iter()
-        .map(|point| (point.date, point.value))
-        .collect::<BTreeMap<_, _>>();
-    let mut filled = Vec::new();
-    let mut current = query.start_date;
-
-    while current <= query.end_date {
-        filled.push(MetricSeriesPoint {
-            date: current,
-            value: values_by_day.get(&current).copied().unwrap_or(0),
-        });
-        current = current
-            .succ_opt()
-            .expect("valid daily metric range stays within chrono bounds");
-    }
-
-    filled
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
-    use axum::response::Response;
-    use serde_json::Value;
+    use chrono::TimeZone;
     use tower::ServiceExt;
 
-    fn query() -> SessionMetricQuery {
-        serde_json::from_value(serde_json::json!({
-            "project_id": "9bad8b88-5e7a-44ed-98ce-4cf9ddde713a",
-            "start": "2026-01-01T00:00:00Z",
-            "end": "2026-01-02T00:00:00Z"
-        }))
-        .expect("valid query")
+    fn bucket(day: u32, hour: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, day, hour, 0, 0)
+            .single()
+            .expect("valid bucket")
     }
 
-    fn daily_query() -> DailyMetricQuery {
-        serde_json::from_value(serde_json::json!({
-            "project_id": "9bad8b88-5e7a-44ed-98ce-4cf9ddde713a",
-            "start_date": "2026-01-01",
-            "end_date": "2026-01-03"
-        }))
-        .expect("valid daily query")
+    fn day_window() -> MetricsBucketWindow {
+        MetricsBucketWindow {
+            granularity: MetricGranularity::Day,
+            start: bucket(1, 0),
+            end: bucket(3, 0),
+        }
     }
 
-    async fn response_json(response: Response) -> Value {
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read response body");
-        serde_json::from_slice(&body).expect("deserialize response body")
+    fn hour_window() -> MetricsBucketWindow {
+        MetricsBucketWindow {
+            granularity: MetricGranularity::Hour,
+            start: bucket(1, 0),
+            end: bucket(1, 2),
+        }
     }
 
     #[tokio::test]
-    async fn metric_value_response_rejects_invalid_time_ranges() {
-        let response = metric_value_response(
-            &SessionMetricQuery {
-                start: query().end,
-                end: query().start,
-                ..query()
-            },
-            "sessions_count",
-            async { Ok(7) },
-        )
-        .await;
+    async fn build_metrics_response_zero_fills_ungrouped_day_series() {
+        let response = build_metrics_response(
+            "count",
+            &day_window(),
+            &[],
+            BTreeMap::from([
+                (bucket(1, 0), BTreeMap::from([(Vec::new(), 2_u64)])),
+                (bucket(3, 0), BTreeMap::from([(Vec::new(), 4_u64)])),
+            ]),
+        );
 
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[tokio::test]
-    async fn metric_value_response_returns_session_count_payload() {
-        let response = metric_value_response(&query(), "sessions_count", async { Ok(7) }).await;
-
-        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response_json(response).await,
+            serde_json::to_value(response).expect("serialize response"),
             serde_json::json!({
-                "metric": "sessions_count",
-                "points": [
-                    { "date": "2026-01-02", "value": 7 }
+                "metric": "count",
+                "granularity": "day",
+                "group_by": [],
+                "series": [
+                    {
+                        "dimensions": {},
+                        "points": [
+                            { "bucket": "2026-01-01", "value": 2 },
+                            { "bucket": "2026-01-02", "value": 0 },
+                            { "bucket": "2026-01-03", "value": 4 }
+                        ]
+                    }
                 ]
             })
         );
     }
 
     #[tokio::test]
-    async fn metric_value_response_returns_average_duration_payload() {
-        let response =
-            metric_value_response(&query(), "sessions_duration", async { Ok(1800) }).await;
+    async fn build_metrics_response_zero_fills_grouped_hour_series() {
+        let response = build_metrics_response(
+            "count",
+            &hour_window(),
+            &["platform".to_owned()],
+            BTreeMap::from([(
+                bucket(1, 1),
+                BTreeMap::from([(vec![Some("ios".to_owned())], 3_u64)]),
+            )]),
+        );
 
-        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response_json(response).await,
+            serde_json::to_value(response).expect("serialize response"),
             serde_json::json!({
-                "metric": "sessions_duration",
-                "points": [
-                    { "date": "2026-01-02", "value": 1800 }
+                "metric": "count",
+                "granularity": "hour",
+                "group_by": ["platform"],
+                "series": [
+                    {
+                        "dimensions": { "platform": "ios" },
+                        "points": [
+                            { "bucket": "2026-01-01T00:00:00Z", "value": 0 },
+                            { "bucket": "2026-01-01T01:00:00Z", "value": 3 },
+                            { "bucket": "2026-01-01T02:00:00Z", "value": 0 }
+                        ]
+                    }
                 ]
             })
         );
     }
 
     #[tokio::test]
-    async fn metric_value_response_returns_active_installs_payload() {
-        let response = metric_value_response(&query(), "active_installs", async { Ok(3) }).await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(response).await,
-            serde_json::json!({
-                "metric": "active_installs",
-                "points": [
-                    { "date": "2026-01-02", "value": 3 }
-                ]
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn daily_metric_response_rejects_invalid_date_ranges() {
-        let response = daily_metric_response(
-            &DailyMetricQuery {
-                start_date: daily_query().end_date,
-                end_date: daily_query().start_date,
-                ..daily_query()
-            },
-            "sessions_count_daily",
-            async { Ok(vec![]) },
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[tokio::test]
-    async fn daily_metric_response_returns_zero_filled_series_payload() {
-        let response = daily_metric_response(&daily_query(), "sessions_count_daily", async {
-            Ok(vec![
-                MetricSeriesPoint {
-                    date: serde_json::from_value(serde_json::json!("2026-01-01")).expect("date"),
-                    value: 2,
-                },
-                MetricSeriesPoint {
-                    date: serde_json::from_value(serde_json::json!("2026-01-03")).expect("date"),
-                    value: 4,
-                },
-            ])
-        })
-        .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(response).await,
-            serde_json::json!({
-                "metric": "sessions_count_daily",
-                "points": [
-                    { "date": "2026-01-01", "value": 2 },
-                    { "date": "2026-01-02", "value": 0 },
-                    { "date": "2026-01-03", "value": 4 }
-                ]
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn app_exposes_only_supported_daily_metric_routes() {
+    async fn app_exposes_only_metrics_family_routes() {
         let pool = PgPool::connect_lazy("postgres://localhost/fantasma").expect("lazy pool");
         let app = super::app(pool, Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")));
 
-        let sessions_count_response = app
+        let events_family_response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/v1/metrics/sessions/count/daily")
+                    .uri("/v1/metrics/events")
                     .body(axum::body::Body::empty())
                     .expect("request"),
             )
             .await
-            .expect("sessions count route response");
-        let duration_total_response = app
+            .expect("events route response");
+        let sessions_family_response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/v1/metrics/sessions/duration/total/daily")
+                    .uri("/v1/metrics/sessions")
                     .body(axum::body::Body::empty())
                     .expect("request"),
             )
             .await
-            .expect("duration total route response");
-        let active_installs_response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/metrics/active-installs/daily")
-                    .body(axum::body::Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("active installs route response");
+            .expect("sessions route response");
+        let legacy_paths = [
+            "/v1/metrics/events/daily",
+            "/v1/metrics/events/aggregate",
+            "/v1/metrics/sessions/count/daily",
+            "/v1/metrics/sessions/duration",
+            "/v1/metrics/active-installs",
+        ];
 
-        assert_ne!(sessions_count_response.status(), StatusCode::NOT_FOUND);
-        assert_ne!(duration_total_response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(active_installs_response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(events_family_response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(sessions_family_response.status(), StatusCode::NOT_FOUND);
+        for path in legacy_paths {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("legacy route response");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must be removed"
+            );
+        }
     }
 
     #[test]
     fn parse_event_metrics_query_preserves_group_by_request_order() {
         let query = parse_event_metrics_query(
-            "event=app_open&start_date=2026-03-01&end_date=2026-03-02&platform=ios&group_by=provider&group_by=is_paying",
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&group_by=provider&group_by=is_paying",
         )
         .expect("query parses");
 
+        assert_eq!(query.metric, EventMetric::Count);
         assert_eq!(
             query.group_by,
             vec!["provider".to_owned(), "is_paying".to_owned()]
@@ -1767,16 +1727,24 @@ mod tests {
 
     #[test]
     fn parse_event_metrics_query_accepts_requests_without_project_id() {
-        let query =
-            parse_event_metrics_query("event=app_open&start_date=2026-03-01&end_date=2026-03-02")
-                .expect("query parses");
+        let query = parse_event_metrics_query(
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02",
+        )
+        .expect("query parses");
 
         assert_eq!(query.event, "app_open");
         assert_eq!(
             query.window,
-            EventMetricsDateWindow {
-                start_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 1).expect("date"),
-                end_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 2).expect("date"),
+            MetricsBucketWindow {
+                granularity: MetricGranularity::Day,
+                start: Utc
+                    .with_ymd_and_hms(2026, 3, 1, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+                end: Utc
+                    .with_ymd_and_hms(2026, 3, 2, 0, 0, 0)
+                    .single()
+                    .expect("end"),
             }
         );
     }
@@ -1784,7 +1752,7 @@ mod tests {
     #[test]
     fn parse_event_metrics_query_rejects_invalid_property_filter_keys() {
         let error = parse_event_metrics_query(
-            "event=app_open&start_date=2026-03-01&end_date=2026-03-02&plan-name=pro",
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&plan-name=pro",
         )
         .unwrap_err();
 
@@ -1794,7 +1762,7 @@ mod tests {
     #[test]
     fn parse_event_metrics_query_rejects_duplicate_group_by() {
         let error = parse_event_metrics_query(
-            "event=app_open&start_date=2026-03-01&end_date=2026-03-02&group_by=provider&group_by=provider",
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=provider&group_by=provider",
         )
         .unwrap_err();
 
@@ -1802,19 +1770,44 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_metric_query_accepts_exact_public_keys_only() {
-        let query =
-            parse_session_metric_query("start=2026-03-01T00:00:00Z&end=2026-03-02T00:00:00Z")
-                .expect("query parses");
+    fn parse_event_metrics_query_treats_metric_as_required_public_key() {
+        let query = parse_event_metrics_query(
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02",
+        )
+        .expect("query parses");
 
+        assert_eq!(query.metric, EventMetric::Count);
+        assert!(!query.filters.contains_key("metric"));
+    }
+
+    #[test]
+    fn parse_event_metrics_query_treats_start_and_end_as_required_public_keys() {
+        let query = parse_event_metrics_query(
+            "event=app_open&metric=count&granularity=hour&start=2026-03-01T00:00:00Z&end=2026-03-01T01:00:00Z",
+        )
+        .expect("query parses");
+
+        assert_eq!(query.window.granularity, MetricGranularity::Hour);
+        assert!(!query.filters.contains_key("start"));
+        assert!(!query.filters.contains_key("end"));
+    }
+
+    #[test]
+    fn parse_session_metric_query_accepts_exact_public_keys_only() {
+        let query = parse_session_metric_query(
+            "metric=count&granularity=hour&start=2026-03-01T00:00:00Z&end=2026-03-02T00:00:00Z",
+        )
+        .expect("query parses");
+
+        assert_eq!(query.metric, SessionMetric::Count);
         assert_eq!(
-            query.start,
+            query.window.start,
             chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
                 .expect("start")
                 .with_timezone(&chrono::Utc)
         );
         assert_eq!(
-            query.end,
+            query.window.end,
             chrono::DateTime::parse_from_rfc3339("2026-03-02T00:00:00Z")
                 .expect("end")
                 .with_timezone(&chrono::Utc)
@@ -1824,7 +1817,7 @@ mod tests {
     #[test]
     fn parse_session_metric_query_rejects_legacy_project_id() {
         let error = parse_session_metric_query(
-            "project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-03-01T00:00:00Z&end=2026-03-02T00:00:00Z",
+            "project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&metric=count&granularity=day&start=2026-03-01&end=2026-03-02",
         )
         .unwrap_err();
 
@@ -1832,9 +1825,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_daily_metric_query_rejects_legacy_project_id() {
-        let error = parse_daily_metric_query(
-            "project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-03-01&end_date=2026-03-02",
+    fn parse_session_metric_query_rejects_legacy_date_keys() {
+        let error = parse_session_metric_query(
+            "metric=count&granularity=day&start_date=2026-03-01&end_date=2026-03-02",
         )
         .unwrap_err();
 
@@ -1856,21 +1849,20 @@ mod tests {
 
         let ingest_422 = &spec["paths"]["/v1/events"]["post"]["responses"]["422"]["content"]["application/json"]
             ["schema"]["oneOf"];
-        let event_metrics_aggregate_500 =
-            &spec["paths"]["/v1/metrics/events/aggregate"]["get"]["responses"]["500"];
-        let event_metrics_daily_500 =
-            &spec["paths"]["/v1/metrics/events/daily"]["get"]["responses"]["500"];
-        let explicit_filters = &spec["paths"]["/v1/metrics/events/aggregate"]["get"]["x-fantasma-explicit-property-filters"];
+        let event_metrics_500 = &spec["paths"]["/v1/metrics/events"]["get"]["responses"]["500"];
+        let session_metrics_500 = &spec["paths"]["/v1/metrics/sessions"]["get"]["responses"]["500"];
+        let explicit_filters =
+            &spec["paths"]["/v1/metrics/events"]["get"]["x-fantasma-explicit-property-filters"];
         let platform_filter_schema = &spec["components"]["parameters"]["PlatformFilter"]["schema"];
         let operator_auth = &spec["components"]["securitySchemes"]["OperatorBearerAuth"];
         let project_key_auth = &spec["components"]["securitySchemes"]["ProjectKeyHeader"];
-        let metrics_parameters = spec["paths"]["/v1/metrics/events/aggregate"]["get"]["parameters"]
+        let event_metrics_parameters = spec["paths"]["/v1/metrics/events"]["get"]["parameters"]
             .as_sequence()
-            .expect("metrics parameters");
+            .expect("event metrics parameters");
         let management_security = spec["paths"]["/v1/projects"]["get"]["security"]
             .as_sequence()
             .expect("management security");
-        let metrics_security = spec["paths"]["/v1/metrics/events/aggregate"]["get"]["security"]
+        let metrics_security = spec["paths"]["/v1/metrics/events"]["get"]["security"]
             .as_sequence()
             .expect("metrics security");
 
@@ -1895,12 +1887,12 @@ mod tests {
             "ingest 422 must include indexed validation errors in the published envelope"
         );
         assert!(
-            event_metrics_aggregate_500.is_mapping(),
-            "aggregate route must document internal_server_error"
+            event_metrics_500.is_mapping(),
+            "event metrics route must document internal_server_error"
         );
         assert!(
-            event_metrics_daily_500.is_mapping(),
-            "daily route must document internal_server_error"
+            session_metrics_500.is_mapping(),
+            "session metrics route must document internal_server_error"
         );
         assert!(
             explicit_filters.is_mapping(),
@@ -1913,7 +1905,7 @@ mod tests {
         assert_eq!(project_key_auth["in"], "header");
         assert_eq!(project_key_auth["name"], "X-Fantasma-Key");
         assert!(
-            metrics_parameters
+            event_metrics_parameters
                 .iter()
                 .all(|parameter| parameter["$ref"] != "#/components/parameters/ProjectId"),
             "metrics must not document a public project_id query parameter"

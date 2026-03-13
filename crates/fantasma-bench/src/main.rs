@@ -632,24 +632,20 @@ async fn hot_path_ready(
     expected: &HotPathExpectation,
 ) -> Result<bool> {
     let query_urls = hot_path_query_urls();
-    let events_aggregate =
-        fetch_json(client, project, &query_urls["events_aggregate_dim3"]).await?;
-    let events_daily = fetch_json(client, project, &query_urls["events_daily_dim3"]).await?;
-    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_daily"]).await?;
-    let sessions_duration = fetch_json(
-        client,
-        project,
-        &query_urls["sessions_duration_total_daily"],
-    )
-    .await?;
+    let events_day = fetch_json(client, project, &query_urls["events_day_dim2"]).await?;
+    let events_hour = fetch_json(client, project, &query_urls["events_hour_dim2"]).await?;
+    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_day"]).await?;
+    let sessions_duration =
+        fetch_json(client, project, &query_urls["sessions_duration_total_day"]).await?;
 
-    let event_total = sum_metric_rows(&events_aggregate["rows"]);
-    let event_daily_total = sum_metric_series_for_day(&events_daily["series"], expected.target_day);
-    let session_count = metric_point_for_day(&sessions_count["points"], expected.target_day);
-    let session_duration = metric_point_for_day(&sessions_duration["points"], expected.target_day);
+    let event_day_total = sum_metric_series_for_day(&events_day["series"], expected.target_day);
+    let event_hour_total = sum_metric_series(&events_hour["series"]);
+    let session_count = sum_metric_series_for_day(&sessions_count["series"], expected.target_day);
+    let session_duration =
+        sum_metric_series_for_day(&sessions_duration["series"], expected.target_day);
 
-    Ok(event_total == expected.total_events
-        && event_daily_total == expected.total_events
+    Ok(event_day_total == expected.total_events
+        && event_hour_total == expected.total_events
         && session_count == expected.install_count
         && session_duration == expected.total_duration_seconds)
 }
@@ -660,30 +656,29 @@ async fn repair_baseline_ready(
     scenario: &RepairScenario,
 ) -> Result<bool> {
     let query_urls = repair_path_query_urls();
-    let events_daily = fetch_json(client, project, &query_urls["events_daily_dim3"]).await?;
-    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_daily"]).await?;
-    let sessions_duration = fetch_json(
-        client,
-        project,
-        &query_urls["sessions_duration_total_daily"],
-    )
-    .await?;
+    let events_day = fetch_json(client, project, &query_urls["events_day_dim2"]).await?;
+    let events_hour = fetch_json(client, project, &query_urls["events_hour_dim2"]).await?;
+    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_day"]).await?;
+    let sessions_duration =
+        fetch_json(client, project, &query_urls["sessions_duration_total_day"]).await?;
     let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
     let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date");
     let day_3 = NaiveDate::from_ymd_opt(2026, 1, 3).expect("valid date");
 
-    Ok(sum_metric_series_for_day(&events_daily["series"], day_1)
-        + sum_metric_series_for_day(&events_daily["series"], day_2)
-        + sum_metric_series_for_day(&events_daily["series"], day_3)
+    Ok(sum_metric_series_for_day(&events_day["series"], day_1)
+        + sum_metric_series_for_day(&events_day["series"], day_2)
+        + sum_metric_series_for_day(&events_day["series"], day_3)
         == scenario.baseline_total_events as u64
-        && metric_point_for_day(&sessions_count["points"], day_1)
+        && sum_metric_series(&events_hour["series"]) == scenario.baseline_total_events as u64
+        && sum_metric_series_for_day(&sessions_count["series"], day_1)
             == (scenario.group_count as u64) * 2
-        && metric_point_for_day(&sessions_count["points"], day_2) == scenario.group_count as u64
-        && metric_point_for_day(&sessions_count["points"], day_3)
+        && sum_metric_series_for_day(&sessions_count["series"], day_2)
+            == scenario.group_count as u64
+        && sum_metric_series_for_day(&sessions_count["series"], day_3)
             == (scenario.group_count as u64) * 2
-        && metric_point_for_day(&sessions_duration["points"], day_1) == 0
-        && metric_point_for_day(&sessions_duration["points"], day_2) == 0
-        && metric_point_for_day(&sessions_duration["points"], day_3) == 0)
+        && sum_metric_series_for_day(&sessions_duration["series"], day_1) == 0
+        && sum_metric_series_for_day(&sessions_duration["series"], day_2) == 0
+        && sum_metric_series_for_day(&sessions_duration["series"], day_3) == 0)
 }
 
 async fn repair_ready(
@@ -692,34 +687,32 @@ async fn repair_ready(
     scenario: &RepairScenario,
 ) -> Result<bool> {
     let query_urls = repair_path_query_urls();
-    let events_aggregate =
-        fetch_json(client, project, &query_urls["events_aggregate_dim3"]).await?;
-    let events_daily = fetch_json(client, project, &query_urls["events_daily_dim3"]).await?;
-    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_daily"]).await?;
-    let sessions_duration = fetch_json(
-        client,
-        project,
-        &query_urls["sessions_duration_total_daily"],
-    )
-    .await?;
+    let events_day = fetch_json(client, project, &query_urls["events_day_dim2"]).await?;
+    let events_hour = fetch_json(client, project, &query_urls["events_hour_dim2"]).await?;
+    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_day"]).await?;
+    let sessions_duration =
+        fetch_json(client, project, &query_urls["sessions_duration_total_day"]).await?;
     let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
     let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date");
     let day_3 = NaiveDate::from_ymd_opt(2026, 1, 3).expect("valid date");
 
-    Ok(sum_metric_rows(&events_aggregate["rows"])
+    Ok(sum_metric_series(&events_hour["series"])
         == (scenario.baseline_total_events + scenario.late_total_events) as u64
-        && sum_metric_series_for_day(&events_daily["series"], day_1)
+        && sum_metric_series_for_day(&events_day["series"], day_1)
             == (scenario.group_count as u64) * 3
-        && sum_metric_series_for_day(&events_daily["series"], day_2) == scenario.group_count as u64
-        && sum_metric_series_for_day(&events_daily["series"], day_3)
+        && sum_metric_series_for_day(&events_day["series"], day_2) == scenario.group_count as u64
+        && sum_metric_series_for_day(&events_day["series"], day_3)
             == (scenario.group_count as u64) * 3
-        && metric_point_for_day(&sessions_count["points"], day_1) == scenario.group_count as u64
-        && metric_point_for_day(&sessions_count["points"], day_2) == scenario.group_count as u64
-        && metric_point_for_day(&sessions_count["points"], day_3) == scenario.group_count as u64
-        && metric_point_for_day(&sessions_duration["points"], day_1)
+        && sum_metric_series_for_day(&sessions_count["series"], day_1)
+            == scenario.group_count as u64
+        && sum_metric_series_for_day(&sessions_count["series"], day_2)
+            == scenario.group_count as u64
+        && sum_metric_series_for_day(&sessions_count["series"], day_3)
+            == scenario.group_count as u64
+        && sum_metric_series_for_day(&sessions_duration["series"], day_1)
             == (scenario.group_count as u64) * 2_700
-        && metric_point_for_day(&sessions_duration["points"], day_2) == 0
-        && metric_point_for_day(&sessions_duration["points"], day_3)
+        && sum_metric_series_for_day(&sessions_duration["series"], day_2) == 0
+        && sum_metric_series_for_day(&sessions_duration["series"], day_3)
             == (scenario.group_count as u64) * 2_700)
 }
 
@@ -729,22 +722,17 @@ async fn scale_path_ready(
     scenario: &ScaleScenario,
 ) -> Result<bool> {
     let query_urls = scale_path_query_urls(scenario.start_day, scenario.end_day);
-    let events_aggregate =
-        fetch_json(client, project, &query_urls["events_aggregate_dim3"]).await?;
-    let events_daily = fetch_json(client, project, &query_urls["events_daily_dim3"]).await?;
-    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_daily"]).await?;
-    let sessions_duration = fetch_json(
-        client,
-        project,
-        &query_urls["sessions_duration_total_daily"],
-    )
-    .await?;
+    let events_day = fetch_json(client, project, &query_urls["events_day_dim2"]).await?;
+    let events_hour = fetch_json(client, project, &query_urls["events_hour_dim2"]).await?;
+    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_day"]).await?;
+    let sessions_duration =
+        fetch_json(client, project, &query_urls["sessions_duration_total_day"]).await?;
 
     Ok(
-        sum_metric_rows(&events_aggregate["rows"]) == scenario.total_events as u64
-            && sum_metric_series(&events_daily["series"]) == scenario.total_events as u64
-            && sum_metric_points(&sessions_count["points"]) == scenario.total_install_count as u64
-            && sum_metric_points(&sessions_duration["points"]) == scenario.total_duration_seconds,
+        sum_metric_series(&events_day["series"]) == scenario.total_events as u64
+            && sum_metric_series(&events_hour["series"]) == scenario.total_events as u64
+            && sum_metric_series(&sessions_count["series"]) == scenario.total_install_count as u64
+            && sum_metric_series(&sessions_duration["series"]) == scenario.total_duration_seconds,
     )
 }
 
@@ -813,14 +801,6 @@ fn percentile(samples: &[u64], percentile: f64) -> u64 {
     samples[index]
 }
 
-fn sum_metric_rows(rows: &Value) -> u64 {
-    rows.as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| row["value"].as_u64())
-        .sum()
-}
-
 fn sum_metric_series_for_day(series: &Value, day: NaiveDate) -> u64 {
     series
         .as_array()
@@ -853,7 +833,7 @@ fn metric_point_for_day(points: &Value, day: NaiveDate) -> u64 {
         .as_array()
         .into_iter()
         .flatten()
-        .find(|point| point["date"].as_str() == Some(&day.to_string()))
+        .find(|point| point["bucket"].as_str() == Some(&day.to_string()))
         .and_then(|point| point["value"].as_u64())
         .unwrap_or_default()
 }
@@ -1048,30 +1028,30 @@ fn chunk_events(events: Vec<BenchEvent>) -> Vec<Vec<BenchEvent>> {
 fn hot_path_query_urls() -> HashMap<&'static str, String> {
     HashMap::from([
         (
-            "events_aggregate_dim3",
+            "events_day_dim2",
             format!(
-                "{}/v1/metrics/events/aggregate?event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-01&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
-            "events_daily_dim3",
+            "events_hour_dim2",
             format!(
-                "{}/v1/metrics/events/daily?event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-03-01T00:00:00Z&end=2026-03-01T23:00:00Z&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
-            "sessions_count_daily",
+            "sessions_count_day",
             format!(
-                "{}/v1/metrics/sessions/count/daily?start_date=2026-03-01&end_date=2026-03-01",
+                "{}/v1/metrics/sessions?metric=count&granularity=day&start=2026-03-01&end=2026-03-01",
                 benchmark_api_base_url()
             ),
         ),
         (
-            "sessions_duration_total_daily",
+            "sessions_duration_total_day",
             format!(
-                "{}/v1/metrics/sessions/duration/total/daily?start_date=2026-03-01&end_date=2026-03-01",
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=day&start=2026-03-01&end=2026-03-01",
                 benchmark_api_base_url()
             ),
         ),
@@ -1081,30 +1061,30 @@ fn hot_path_query_urls() -> HashMap<&'static str, String> {
 fn repair_path_query_urls() -> HashMap<&'static str, String> {
     HashMap::from([
         (
-            "events_aggregate_dim3",
+            "events_day_dim2",
             format!(
-                "{}/v1/metrics/events/aggregate?event=app_open&start_date=2026-01-01&end_date=2026-01-03&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-03&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
-            "events_daily_dim3",
+            "events_hour_dim2",
             format!(
-                "{}/v1/metrics/events/daily?event=app_open&start_date=2026-01-01&end_date=2026-01-03&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-03T23:00:00Z&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
-            "sessions_count_daily",
+            "sessions_count_day",
             format!(
-                "{}/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-03",
+                "{}/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-03",
                 benchmark_api_base_url()
             ),
         ),
         (
-            "sessions_duration_total_daily",
+            "sessions_duration_total_day",
             format!(
-                "{}/v1/metrics/sessions/duration/total/daily?start_date=2026-01-01&end_date=2026-01-03",
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=day&start=2026-01-01&end=2026-01-03",
                 benchmark_api_base_url()
             ),
         ),
@@ -1117,30 +1097,30 @@ fn scale_path_query_urls(
 ) -> HashMap<&'static str, String> {
     HashMap::from([
         (
-            "events_aggregate_dim3",
+            "events_day_dim2",
             format!(
-                "{}/v1/metrics/events/aggregate?event=app_open&start_date={start_day}&end_date={end_day}&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start={start_day}&end={end_day}&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
-            "events_daily_dim3",
+            "events_hour_dim2",
             format!(
-                "{}/v1/metrics/events/daily?event=app_open&start_date={start_day}&end_date={end_day}&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start={start_day}T00:00:00Z&end={end_day}T23:00:00Z&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
-            "sessions_count_daily",
+            "sessions_count_day",
             format!(
-                "{}/v1/metrics/sessions/count/daily?start_date={start_day}&end_date={end_day}",
+                "{}/v1/metrics/sessions?metric=count&granularity=day&start={start_day}&end={end_day}",
                 benchmark_api_base_url()
             ),
         ),
         (
-            "sessions_duration_total_daily",
+            "sessions_duration_total_day",
             format!(
-                "{}/v1/metrics/sessions/duration/total/daily?start_date={start_day}&end_date={end_day}",
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=day&start={start_day}&end={end_day}",
                 benchmark_api_base_url()
             ),
         ),
@@ -1405,43 +1385,43 @@ mod tests {
     }
 
     fn query_measurements(
-        event_aggregate_dim3_p95_ms: u64,
-        events_daily_dim3_p95_ms: u64,
-        sessions_count_daily_p95_ms: u64,
-        sessions_duration_total_daily_p95_ms: u64,
+        events_day_dim2_p95_ms: u64,
+        events_hour_dim2_p95_ms: u64,
+        sessions_count_day_p95_ms: u64,
+        sessions_duration_total_day_p95_ms: u64,
     ) -> Vec<QueryMeasurement> {
         vec![
             QueryMeasurement {
-                name: "events_aggregate_dim3".to_owned(),
+                name: "events_day_dim2".to_owned(),
                 iterations: 15,
-                min_ms: event_aggregate_dim3_p95_ms,
-                p50_ms: event_aggregate_dim3_p95_ms,
-                p95_ms: event_aggregate_dim3_p95_ms,
-                max_ms: event_aggregate_dim3_p95_ms,
+                min_ms: events_day_dim2_p95_ms,
+                p50_ms: events_day_dim2_p95_ms,
+                p95_ms: events_day_dim2_p95_ms,
+                max_ms: events_day_dim2_p95_ms,
             },
             QueryMeasurement {
-                name: "events_daily_dim3".to_owned(),
+                name: "events_hour_dim2".to_owned(),
                 iterations: 15,
-                min_ms: events_daily_dim3_p95_ms,
-                p50_ms: events_daily_dim3_p95_ms,
-                p95_ms: events_daily_dim3_p95_ms,
-                max_ms: events_daily_dim3_p95_ms,
+                min_ms: events_hour_dim2_p95_ms,
+                p50_ms: events_hour_dim2_p95_ms,
+                p95_ms: events_hour_dim2_p95_ms,
+                max_ms: events_hour_dim2_p95_ms,
             },
             QueryMeasurement {
-                name: "sessions_count_daily".to_owned(),
+                name: "sessions_count_day".to_owned(),
                 iterations: 15,
-                min_ms: sessions_count_daily_p95_ms,
-                p50_ms: sessions_count_daily_p95_ms,
-                p95_ms: sessions_count_daily_p95_ms,
-                max_ms: sessions_count_daily_p95_ms,
+                min_ms: sessions_count_day_p95_ms,
+                p50_ms: sessions_count_day_p95_ms,
+                p95_ms: sessions_count_day_p95_ms,
+                max_ms: sessions_count_day_p95_ms,
             },
             QueryMeasurement {
-                name: "sessions_duration_total_daily".to_owned(),
+                name: "sessions_duration_total_day".to_owned(),
                 iterations: 15,
-                min_ms: sessions_duration_total_daily_p95_ms,
-                p50_ms: sessions_duration_total_daily_p95_ms,
-                p95_ms: sessions_duration_total_daily_p95_ms,
-                max_ms: sessions_duration_total_daily_p95_ms,
+                min_ms: sessions_duration_total_day_p95_ms,
+                p50_ms: sessions_duration_total_day_p95_ms,
+                p95_ms: sessions_duration_total_day_p95_ms,
+                max_ms: sessions_duration_total_day_p95_ms,
             },
         ]
     }
@@ -1608,7 +1588,7 @@ mod tests {
         let budget = ScenarioBudget {
             min_phase_events_per_second: BTreeMap::from([("ingest".to_owned(), 500.0)]),
             max_readiness_ms: BTreeMap::from([("derived_metrics_ready".to_owned(), 1_000)]),
-            max_query_p95_ms: BTreeMap::from([("events_aggregate_dim3".to_owned(), 200)]),
+            max_query_p95_ms: BTreeMap::from([("events_day_dim2".to_owned(), 200)]),
         };
         let result = ScenarioResult {
             scenario: Scenario::Hot,
@@ -1624,7 +1604,7 @@ mod tests {
                 elapsed_ms: 1_500,
             }],
             queries: vec![QueryMeasurement {
-                name: "events_aggregate_dim3".to_owned(),
+                name: "events_day_dim2".to_owned(),
                 iterations: 5,
                 min_ms: 80,
                 p50_ms: 120,
@@ -1642,7 +1622,7 @@ mod tests {
             vec![
                 "ingest events_per_second 200.00 fell below budget 500.00".to_owned(),
                 "derived_metrics_ready readiness 1500ms exceeded budget 1000ms".to_owned(),
-                "events_aggregate_dim3 p95 250ms exceeded budget 200ms".to_owned(),
+                "events_day_dim2 p95 250ms exceeded budget 200ms".to_owned(),
             ]
         );
     }
