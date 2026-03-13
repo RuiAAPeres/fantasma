@@ -50,7 +50,7 @@
     },
     "properties": {
       "type": "object",
-      "maxProperties": 3,
+      "maxProperties": 4,
       "propertyNames": {
         "allOf": [
           {
@@ -79,7 +79,7 @@
       "additionalProperties": {
         "type": "string"
       },
-      "description": "Explicit string event context, capped at 3 keys. The cap is a deliberate performance boundary for Fantasma's bounded worker-built aggregates. Reserved query and built-in keys are rejected, and properties must not be used to reconstruct person-level identity."
+      "description": "Explicit string event context, capped at 4 keys. The cap is a deliberate performance boundary for Fantasma's bounded worker-built aggregates. Reserved query and built-in keys are rejected, and properties must not be used to reconstruct person-level identity."
     }
   }
 }

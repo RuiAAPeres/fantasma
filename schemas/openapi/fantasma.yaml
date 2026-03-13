@@ -9,7 +9,7 @@ info:
     The current public surface covers raw event ingestion, operator-managed
     project provisioning, worker-derived session metrics, and worker-derived
     event metrics. Event properties are explicit string-to-string context with
-    at most 3 keys.
+    at most 4 keys.
 servers:
   - url: http://localhost:8081
     description: Local ingest service
@@ -272,7 +272,7 @@ paths:
           `end_date` fail fast and are never reinterpreted as property filters
 
         `group_by` may be repeated up to twice. The total number of distinct
-        referenced dimensions across filters plus `group_by` is capped at 3.
+        referenced dimensions across filters plus `group_by` is capped at 4.
         Queries exceeding 100 final groups fail with `group_limit_exceeded`.
       x-fantasma-explicit-property-filters:
         type: object
@@ -674,7 +674,7 @@ components:
         - android
     EventProperties:
       type: object
-      maxProperties: 3
+      maxProperties: 4
       propertyNames:
         allOf:
           - type: string
@@ -698,7 +698,7 @@ components:
                 - os_version
       additionalProperties:
         type: string
-      description: Explicit string event context, capped at 3 keys. Reserved keys are rejected, and properties must not be used to reconstruct person-level identity.
+      description: Explicit string event context, capped at 4 keys. Reserved keys are rejected, and properties must not be used to reconstruct person-level identity.
     EventPayload:
       type: object
       description: Install-scoped mobile event payload for Fantasma.

@@ -534,6 +534,110 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn pipeline_exposes_dim4_event_metrics_with_null_buckets(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-03-01T00:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "app_version": "1.4.0",
+                                "os_version": "18.3",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "strava",
+                                    "region": "eu"
+                                }
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-03-01T01:00:00Z",
+                                "install_id": "install-2",
+                                "platform": "ios",
+                                "app_version": "1.4.0",
+                                "os_version": "18.3",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "strava"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    fantasma_worker::process_event_metrics_batch(&pool, 100)
+        .await
+        .expect("event metrics worker batch succeeds");
+
+    let response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&app_version=1.4.0&plan=pro&group_by=provider&group_by=region",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("daily request succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "metric": "count",
+            "granularity": "day",
+            "group_by": ["provider", "region"],
+            "series": [
+                {
+                    "dimensions": {
+                        "provider": "strava",
+                        "region": "eu"
+                    },
+                    "points": [
+                        { "bucket": "2026-03-01", "value": 1 },
+                        { "bucket": "2026-03-02", "value": 0 }
+                    ]
+                },
+                {
+                    "dimensions": {
+                        "provider": "strava",
+                        "region": null
+                    },
+                    "points": [
+                        { "bucket": "2026-03-01", "value": 1 },
+                        { "bucket": "2026-03-02", "value": 0 }
+                    ]
+                }
+            ]
+        })
+    );
+}
+
+#[sqlx::test]
 async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
@@ -612,6 +716,88 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
                 .expect("read response body"),
         )
         .expect("decode response"),
+        serde_json::json!({
+            "error": "group_limit_exceeded"
+        })
+    );
+}
+
+#[sqlx::test]
+async fn pipeline_rejects_dim4_event_metrics_queries_that_exceed_group_limit(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+    let events = (0..101)
+        .map(|index| {
+            serde_json::json!({
+                "event": "app_open",
+                "timestamp": "2026-03-01T00:00:00Z",
+                "install_id": format!("install-{index}"),
+                "platform": "ios",
+                "app_version": "1.4.0",
+                "os_version": "18.3",
+                "properties": {
+                    "plan": "pro",
+                    "provider": format!("provider-{index:03}"),
+                    "region": format!("region-{index:03}")
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let first_ingest_response = ingest
+        .clone()
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({ "events": events[..100].to_vec() }).to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("first ingest request succeeds");
+    let second_ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({ "events": events[100..].to_vec() }).to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("second ingest request succeeds");
+
+    assert_eq!(first_ingest_response.status(), StatusCode::ACCEPTED);
+    assert_eq!(second_ingest_response.status(), StatusCode::ACCEPTED);
+
+    fantasma_worker::process_event_metrics_batch(&pool, 200)
+        .await
+        .expect("event metrics worker batch succeeds");
+
+    let response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-01&app_version=1.4.0&plan=pro&group_by=provider&group_by=region",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("aggregate request succeeds");
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response_json(response).await,
         serde_json::json!({
             "error": "group_limit_exceeded"
         })

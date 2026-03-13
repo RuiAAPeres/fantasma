@@ -7,7 +7,7 @@ use thiserror::Error;
 
 const MAX_BATCH_SIZE: usize = 100;
 const MAX_EVENT_BYTES: usize = 8 * 1024;
-const MAX_PROPERTIES_KEYS: usize = 3;
+const MAX_PROPERTIES_KEYS: usize = 4;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -342,6 +342,21 @@ mod tests {
         }
 
         #[test]
+        fn allows_four_explicit_properties() {
+            let mut event = valid_event();
+            event.properties = BTreeMap::from([
+                ("plan".to_owned(), "pro".to_owned()),
+                ("provider".to_owned(), "strava".to_owned()),
+                ("region".to_owned(), "eu".to_owned()),
+                ("screen".to_owned(), "home".to_owned()),
+            ]);
+
+            let result = event.validate();
+
+            assert_eq!(result, Ok(()));
+        }
+
+        #[test]
         fn returns_error_when_os_version_is_empty() {
             let mut event = valid_event();
             event.os_version = Some(String::new());
@@ -481,6 +496,38 @@ mod tests {
                 vec![EventValidationIssue {
                     index: 0,
                     message: "properties key 'platform' is reserved".to_owned(),
+                }]
+            );
+        }
+
+        #[test]
+        fn returns_indexed_error_when_more_than_four_properties_are_present() {
+            let request: RawEventBatchRequest = serde_json::from_value(serde_json::json!({
+                "events": [
+                    {
+                        "event": "app_open",
+                        "timestamp": "2026-03-01T00:00:00Z",
+                        "install_id": "install_123",
+                        "platform": "ios",
+                        "properties": {
+                            "plan": "pro",
+                            "provider": "strava",
+                            "region": "eu",
+                            "screen": "home",
+                            "variant": "a"
+                        }
+                    }
+                ]
+            }))
+            .expect("raw request parses");
+
+            let result = request.normalize().unwrap_err();
+
+            assert_eq!(
+                result,
+                vec![EventValidationIssue {
+                    index: 0,
+                    message: "properties object may contain at most 4 keys".to_owned(),
                 }]
             );
         }

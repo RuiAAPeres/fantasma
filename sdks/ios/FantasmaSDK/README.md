@@ -35,7 +35,7 @@ Task {
 ```
 
 `track(_:properties:)` only takes the explicit string properties you want on
-the event, with at most 3 keys per event. The SDK adds `platform`,
+the event, with at most 4 keys per event. The SDK adds `platform`,
 `app_version`, and `os_version` automatically.
 
 ## Behavior

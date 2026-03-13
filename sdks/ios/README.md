@@ -33,7 +33,7 @@ Task {
 }
 ```
 
-Pass only explicit string properties to `track(_:properties:)`, with at most 3
+Pass only explicit string properties to `track(_:properties:)`, with at most 4
 keys per event. The SDK auto-populates `platform`, `app_version`, and
 `os_version` for each event.
 

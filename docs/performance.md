@@ -148,12 +148,16 @@ Hard-gated grouped queries:
 
 - event `count` `day` grouped by `provider,region`
 - event `count` `hour` grouped by `provider,region`
+- event `count` `day` filtered by `app_version=1.1.0` and `plan=pro`, grouped by `provider,region`
+- event `count` `hour` filtered by `app_version=1.1.0` and `plan=pro`, grouped by `provider,region`
 - session `count` `day` grouped by `platform,app_version`
 - session `count` `hour` grouped by `platform,app_version`
 - session `duration_total` `day` grouped by `platform,app_version`
 - session `duration_total` `hour` grouped by `platform,app_version`
 - session `new_installs` `day` grouped by `platform,app_version`
 - session `new_installs` `hour` grouped by `platform,app_version`
+
+Those added event queries are the explicit dim4 hard gate for the dim3 -> dim4 slice: `app_version` and `plan` are filters, `provider` and `region` are `group_by`, and the benchmark now proves the grouped event path exercises the dim4 read path instead of stopping at the old `provider,region`-only shape.
 
 Visibility-only reads:
 

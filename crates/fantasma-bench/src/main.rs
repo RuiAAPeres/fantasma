@@ -335,10 +335,10 @@ fn slo_readiness_policy(kind: SloScenarioKind, window: SloWindow) -> SloReadines
 async fn wait_for_full_readiness_before_query_benchmark(
     client: &Client,
     project: &ProvisionedProject,
-    window: SloWindow,
+    scenario: &SloScenarioDefinition,
     expectation: &SloExpectation,
 ) -> Result<()> {
-    let query_specs = slo_query_matrix(window, slo_start_day());
+    let query_specs = slo_query_matrix(scenario.window, slo_start_day());
     let event_specs = query_specs
         .iter()
         .filter(|query| query.hard_gate && query.family == "event")
@@ -354,11 +354,11 @@ async fn wait_for_full_readiness_before_query_benchmark(
 
     tokio::try_join!(
         poll_until_ready(
-            || slo_queries_ready(client, project, &event_specs, expectation),
+            || slo_queries_ready(client, project, &event_specs, scenario, expectation),
             event_label,
         ),
         poll_until_ready(
-            || slo_queries_ready(client, project, &session_specs, expectation),
+            || slo_queries_ready(client, project, &session_specs, scenario, expectation),
             session_label,
         ),
     )?;
@@ -389,6 +389,24 @@ struct SloQuerySpec {
     url: String,
     hard_gate: bool,
     family: &'static str,
+    expected_total: SloQueryExpectedTotal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SloQueryExpectedTotal {
+    Events(SloEventCountExpectation),
+    SessionsCount,
+    SessionsDurationTotal,
+    SessionsNewInstalls,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SloEventCountExpectation {
+    All,
+    FilteredByAppVersionAndPlan {
+        app_version: &'static str,
+        plan: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -593,6 +611,7 @@ struct SloExpectation {
     total_sessions: u64,
     total_duration_seconds: u64,
     total_new_installs: u64,
+    include_repair_late_events: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -812,7 +831,7 @@ async fn run_slo_append_like(
             wait_for_slo_readiness(
                 client,
                 project,
-                scenario.window,
+                scenario,
                 &expectation,
                 readiness_started,
                 readiness_policy.allow_timeout_publication,
@@ -822,13 +841,8 @@ async fn run_slo_append_like(
     .await?;
     let queries = if benchmark_reads {
         if readiness_policy.wait_for_full_readiness_before_queries {
-            wait_for_full_readiness_before_query_benchmark(
-                client,
-                project,
-                scenario.window,
-                &expectation,
-            )
-            .await?;
+            wait_for_full_readiness_before_query_benchmark(client, project, scenario, &expectation)
+                .await?;
         }
         let query_specs = slo_query_matrix(scenario.window, slo_start_day());
         measure_slo_queries(
@@ -863,7 +877,7 @@ async fn run_slo_repair(
     wait_for_slo_expectation(
         client,
         project,
-        scenario.window,
+        scenario,
         &slo_base_expectation(scenario.window),
         Instant::now(),
         "repair seed readiness",
@@ -878,7 +892,7 @@ async fn run_slo_repair(
             wait_for_slo_expectation(
                 client,
                 project,
-                scenario.window,
+                scenario,
                 &expectation,
                 readiness_started,
                 "repair readiness",
@@ -978,6 +992,7 @@ fn slo_base_expectation(window: SloWindow) -> SloExpectation {
         total_duration_seconds: (window.days() * SLO_INSTALL_COUNT_PER_DAY) as u64
             * SLO_SESSION_DURATION_SECONDS,
         total_new_installs: SLO_INSTALL_COUNT_PER_DAY as u64,
+        include_repair_late_events: false,
     }
 }
 
@@ -991,6 +1006,7 @@ fn slo_expectation(scenario: &SloScenarioDefinition) -> SloExpectation {
             repaired_install_days * SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY as u64;
         expectation.total_duration_seconds +=
             repaired_install_days * SLO_REPAIR_DURATION_DELTA_SECONDS;
+        expectation.include_repair_late_events = true;
     }
 
     expectation
@@ -1003,7 +1019,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
     let hour_start = format!("{start_day}T00:00:00Z");
     let hour_end = format!("{end_day}T23:00:00Z");
 
-    let mut queries = Vec::with_capacity(16);
+    let mut queries = Vec::with_capacity(18);
 
     queries.extend([
         SloQuerySpec {
@@ -1014,6 +1030,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: true,
             family: "event",
+            expected_total: SloQueryExpectedTotal::Events(SloEventCountExpectation::All),
         },
         SloQuerySpec {
             name: "events_count_hour_grouped".to_owned(),
@@ -1023,6 +1040,37 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: true,
             family: "event",
+            expected_total: SloQueryExpectedTotal::Events(SloEventCountExpectation::All),
+        },
+        SloQuerySpec {
+            name: "events_count_day_dim4_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start={day_start}&end={day_end}&app_version=1.1.0&plan=pro&group_by=provider&group_by=region",
+                benchmark_api_base_url()
+            ),
+            hard_gate: true,
+            family: "event",
+            expected_total: SloQueryExpectedTotal::Events(
+                SloEventCountExpectation::FilteredByAppVersionAndPlan {
+                    app_version: "1.1.0",
+                    plan: "pro",
+                },
+            ),
+        },
+        SloQuerySpec {
+            name: "events_count_hour_dim4_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start={hour_start}&end={hour_end}&app_version=1.1.0&plan=pro&group_by=provider&group_by=region",
+                benchmark_api_base_url()
+            ),
+            hard_gate: true,
+            family: "event",
+            expected_total: SloQueryExpectedTotal::Events(
+                SloEventCountExpectation::FilteredByAppVersionAndPlan {
+                    app_version: "1.1.0",
+                    plan: "pro",
+                },
+            ),
         },
         SloQuerySpec {
             name: "sessions_count_day_grouped".to_owned(),
@@ -1032,6 +1080,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: true,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsCount,
         },
         SloQuerySpec {
             name: "sessions_count_hour_grouped".to_owned(),
@@ -1041,6 +1090,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: true,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsCount,
         },
         SloQuerySpec {
             name: "sessions_duration_total_day_grouped".to_owned(),
@@ -1050,6 +1100,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: true,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsDurationTotal,
         },
         SloQuerySpec {
             name: "sessions_duration_total_hour_grouped".to_owned(),
@@ -1059,6 +1110,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: true,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsDurationTotal,
         },
         SloQuerySpec {
             name: "sessions_new_installs_day_grouped".to_owned(),
@@ -1068,6 +1120,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: true,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsNewInstalls,
         },
         SloQuerySpec {
             name: "sessions_new_installs_hour_grouped".to_owned(),
@@ -1077,6 +1130,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: true,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsNewInstalls,
         },
     ]);
 
@@ -1089,6 +1143,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: false,
             family: "event",
+            expected_total: SloQueryExpectedTotal::Events(SloEventCountExpectation::All),
         },
         SloQuerySpec {
             name: "events_count_hour_ungrouped".to_owned(),
@@ -1098,6 +1153,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: false,
             family: "event",
+            expected_total: SloQueryExpectedTotal::Events(SloEventCountExpectation::All),
         },
         SloQuerySpec {
             name: "sessions_count_day_ungrouped".to_owned(),
@@ -1107,6 +1163,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: false,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsCount,
         },
         SloQuerySpec {
             name: "sessions_count_hour_ungrouped".to_owned(),
@@ -1116,6 +1173,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: false,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsCount,
         },
         SloQuerySpec {
             name: "sessions_duration_total_day_ungrouped".to_owned(),
@@ -1125,6 +1183,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: false,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsDurationTotal,
         },
         SloQuerySpec {
             name: "sessions_duration_total_hour_ungrouped".to_owned(),
@@ -1134,6 +1193,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: false,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsDurationTotal,
         },
         SloQuerySpec {
             name: "sessions_new_installs_day_ungrouped".to_owned(),
@@ -1143,6 +1203,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: false,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsNewInstalls,
         },
         SloQuerySpec {
             name: "sessions_new_installs_hour_ungrouped".to_owned(),
@@ -1152,6 +1213,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             ),
             hard_gate: false,
             family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsNewInstalls,
         },
     ]);
 
@@ -1321,7 +1383,7 @@ fn slo_event(
 async fn wait_for_slo_readiness(
     client: &Client,
     project: &ProvisionedProject,
-    window: SloWindow,
+    scenario: &SloScenarioDefinition,
     expectation: &SloExpectation,
     scenario_started: Instant,
     allow_timeout_publication: bool,
@@ -1329,7 +1391,7 @@ async fn wait_for_slo_readiness(
     wait_for_slo_expectation(
         client,
         project,
-        window,
+        scenario,
         expectation,
         scenario_started,
         "derived metrics readiness",
@@ -1341,13 +1403,13 @@ async fn wait_for_slo_readiness(
 async fn wait_for_slo_expectation(
     client: &Client,
     project: &ProvisionedProject,
-    window: SloWindow,
+    scenario: &SloScenarioDefinition,
     expectation: &SloExpectation,
     scenario_started: Instant,
     label: &str,
     allow_timeout_publication: bool,
 ) -> Result<Vec<ReadinessMeasurement>> {
-    let query_specs = slo_query_matrix(window, slo_start_day());
+    let query_specs = slo_query_matrix(scenario.window, slo_start_day());
     let event_specs = query_specs
         .iter()
         .filter(|query| query.hard_gate && query.family == "event")
@@ -1361,24 +1423,24 @@ async fn wait_for_slo_expectation(
 
     let event_label = format!("{label} (event metrics)");
     let session_label = format!("{label} (session metrics)");
-    let deadline = scenario_started + window.readiness_timeout();
+    let deadline = scenario_started + scenario.window.readiness_timeout();
     let (event_ready_ms, session_ready_ms) = tokio::try_join!(
         poll_until_elapsed(
-            || slo_queries_ready(client, project, &event_specs, expectation),
+            || slo_queries_ready(client, project, &event_specs, scenario, expectation),
             deadline,
             &event_label,
             scenario_started,
             allow_timeout_publication,
         ),
         poll_until_elapsed(
-            || slo_queries_ready(client, project, &session_specs, expectation),
+            || slo_queries_ready(client, project, &session_specs, scenario, expectation),
             deadline,
             &session_label,
             scenario_started,
             allow_timeout_publication,
         ),
     )?;
-    let timeout_ms = window.readiness_timeout().as_millis() as u64;
+    let timeout_ms = scenario.window.readiness_timeout().as_millis() as u64;
     let event_ready_ms = event_ready_ms.unwrap_or(timeout_ms);
     let session_ready_ms = session_ready_ms.unwrap_or(timeout_ms);
 
@@ -1443,11 +1505,14 @@ async fn slo_queries_ready(
     client: &Client,
     project: &ProvisionedProject,
     queries: &[SloQuerySpec],
+    scenario: &SloScenarioDefinition,
     expectation: &SloExpectation,
 ) -> Result<bool> {
     for query in queries {
         let value = fetch_json(client, project, &query.url).await?;
-        if sum_metric_series(&value["series"]) != expected_total_for_slo_query(query, expectation) {
+        if sum_metric_series(&value["series"])
+            != expected_total_for_slo_query(query, scenario, expectation)
+        {
             return Ok(false);
         }
     }
@@ -1455,14 +1520,59 @@ async fn slo_queries_ready(
     Ok(true)
 }
 
-fn expected_total_for_slo_query(query: &SloQuerySpec, expectation: &SloExpectation) -> u64 {
-    match query.name.as_str() {
-        name if name.starts_with("events_count") => expectation.total_events,
-        name if name.starts_with("sessions_count") => expectation.total_sessions,
-        name if name.starts_with("sessions_duration_total") => expectation.total_duration_seconds,
-        name if name.starts_with("sessions_new_installs") => expectation.total_new_installs,
-        _ => 0,
+fn expected_total_for_slo_query(
+    query: &SloQuerySpec,
+    scenario: &SloScenarioDefinition,
+    expectation: &SloExpectation,
+) -> u64 {
+    match query.expected_total {
+        SloQueryExpectedTotal::Events(SloEventCountExpectation::All) => expectation.total_events,
+        SloQueryExpectedTotal::Events(SloEventCountExpectation::FilteredByAppVersionAndPlan {
+            app_version,
+            plan,
+        }) => filtered_event_total_for_slo_expectation(scenario, expectation, app_version, plan),
+        SloQueryExpectedTotal::SessionsCount => expectation.total_sessions,
+        SloQueryExpectedTotal::SessionsDurationTotal => expectation.total_duration_seconds,
+        SloQueryExpectedTotal::SessionsNewInstalls => expectation.total_new_installs,
     }
+}
+
+fn filtered_event_total_for_slo_expectation(
+    scenario: &SloScenarioDefinition,
+    expectation: &SloExpectation,
+    app_version: &str,
+    plan: &str,
+) -> u64 {
+    let mut total = 0_u64;
+
+    for day_offset in 0..scenario.window.days() {
+        for install_index in 0..SLO_INSTALL_COUNT_PER_DAY {
+            if !slo_event_matches_filters(install_index, day_offset, app_version, plan) {
+                continue;
+            }
+
+            total += SLO_EVENTS_PER_INSTALL_PER_DAY as u64;
+
+            if expectation.include_repair_late_events
+                && install_index % SLO_REPAIR_INSTALL_MODULUS
+                    == day_offset % SLO_REPAIR_INSTALL_MODULUS
+            {
+                total += SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY as u64;
+            }
+        }
+    }
+
+    total
+}
+
+fn slo_event_matches_filters(
+    install_index: usize,
+    day_offset: usize,
+    app_version: &str,
+    plan: &str,
+) -> bool {
+    APP_VERSIONS[(day_offset + install_index) % APP_VERSIONS.len()] == app_version
+        && PLANS[install_index % PLANS.len()] == plan
 }
 
 async fn measure_slo_queries(
@@ -3641,6 +3751,8 @@ mod tests {
             vec![
                 "events_count_day_grouped",
                 "events_count_hour_grouped",
+                "events_count_day_dim4_grouped",
+                "events_count_hour_dim4_grouped",
                 "sessions_count_day_grouped",
                 "sessions_count_hour_grouped",
                 "sessions_duration_total_day_grouped",
@@ -3648,6 +3760,42 @@ mod tests {
                 "sessions_new_installs_day_grouped",
                 "sessions_new_installs_hour_grouped",
             ]
+        );
+    }
+
+    #[test]
+    fn filtered_dim4_event_hard_gates_do_not_expect_the_full_event_total() {
+        let scenario = slo_scenario_definitions()
+            .into_iter()
+            .find(|scenario| scenario.key() == "append-30d")
+            .expect("append-30d scenario");
+        let expectation = slo_expectation(&scenario);
+        let query = slo_query_matrix(scenario.window, slo_start_day())
+            .into_iter()
+            .find(|query| query.name == "events_count_day_dim4_grouped")
+            .expect("dim4 day grouped query");
+
+        assert_eq!(
+            expected_total_for_slo_query(&query, &scenario, &expectation),
+            99_900
+        );
+    }
+
+    #[test]
+    fn repair_seed_filtered_dim4_event_hard_gates_do_not_include_late_events() {
+        let scenario = slo_scenario_definitions()
+            .into_iter()
+            .find(|scenario| scenario.key() == "repair-30d")
+            .expect("repair-30d scenario");
+        let expectation = slo_base_expectation(scenario.window);
+        let query = slo_query_matrix(scenario.window, slo_start_day())
+            .into_iter()
+            .find(|query| query.name == "events_count_day_dim4_grouped")
+            .expect("dim4 day grouped query");
+
+        assert_eq!(
+            expected_total_for_slo_query(&query, &scenario, &expectation),
+            99_900
         );
     }
 

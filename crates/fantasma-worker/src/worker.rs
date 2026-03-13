@@ -3,11 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Timelike, Utc};
 use fantasma_core::MetricGranularity;
 use fantasma_store::{
-    EventCountDailyDim1Delta, EventCountDailyDim2Delta, EventCountDailyDim3Delta,
-    EventCountDailyTotalDelta, InstallFirstSeenRecord, InstallSessionStateRecord, PgPool,
-    RawEventRecord, SessionDailyActiveInstallDelta, SessionDailyDelta, SessionDailyDurationDelta,
-    SessionDailyInstallDelta, SessionMetricDim1Delta, SessionMetricDim2Delta,
-    SessionMetricTotalDelta, SessionRecord, SessionTailUpdate, StoreError,
+    EventMetricBucketDim1Delta, EventMetricBucketDim2Delta, EventMetricBucketDim3Delta,
+    EventMetricBucketDim4Delta, EventMetricBucketTotalDelta, InstallFirstSeenRecord,
+    InstallSessionStateRecord, PgPool, RawEventRecord, SessionDailyActiveInstallDelta,
+    SessionDailyDelta, SessionDailyDurationDelta, SessionDailyInstallDelta, SessionMetricDim1Delta,
+    SessionMetricDim2Delta, SessionMetricTotalDelta, SessionRecord, SessionTailUpdate, StoreError,
     add_session_daily_duration_deltas_in_tx, delete_pending_session_rebuild_buckets_in_tx,
     delete_sessions_overlapping_window_in_tx, enqueue_session_rebuild_buckets_in_tx,
     fetch_events_after_in_tx, fetch_events_for_install_between_in_tx,
@@ -15,12 +15,12 @@ use fantasma_store::{
     insert_install_first_seen_in_tx, insert_session_in_tx, insert_sessions_in_tx,
     load_install_session_states_in_tx, load_pending_session_rebuild_buckets_in_tx,
     load_tail_sessions_for_installs_in_tx, lock_worker_offset, rebuild_session_daily_days_in_tx,
-    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_event_count_daily_dim1_in_tx,
-    upsert_event_count_daily_dim2_in_tx, upsert_event_count_daily_dim3_in_tx,
-    upsert_event_count_daily_totals_in_tx, upsert_install_session_state_in_tx,
-    upsert_session_daily_deltas_in_tx, upsert_session_daily_install_deltas_in_tx,
-    upsert_session_metric_dim1_in_tx, upsert_session_metric_dim2_in_tx,
-    upsert_session_metric_totals_in_tx,
+    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_event_metric_buckets_dim1_in_tx,
+    upsert_event_metric_buckets_dim2_in_tx, upsert_event_metric_buckets_dim3_in_tx,
+    upsert_event_metric_buckets_dim4_in_tx, upsert_event_metric_buckets_total_in_tx,
+    upsert_install_session_state_in_tx, upsert_session_daily_deltas_in_tx,
+    upsert_session_daily_install_deltas_in_tx, upsert_session_metric_dim1_in_tx,
+    upsert_session_metric_dim2_in_tx, upsert_session_metric_totals_in_tx,
 };
 use sqlx::{Postgres, Row, Transaction};
 use tokio::task::JoinSet;
@@ -678,10 +678,11 @@ pub(crate) async fn process_event_metrics_batch_with_config(
         .expect("non-empty batch has last event");
     let rollups = build_event_metric_rollups(&batch);
 
-    upsert_event_count_daily_totals_in_tx(&mut tx, &rollups.total_deltas).await?;
-    upsert_event_count_daily_dim1_in_tx(&mut tx, &rollups.dim1_deltas).await?;
-    upsert_event_count_daily_dim2_in_tx(&mut tx, &rollups.dim2_deltas).await?;
-    upsert_event_count_daily_dim3_in_tx(&mut tx, &rollups.dim3_deltas).await?;
+    upsert_event_metric_buckets_total_in_tx(&mut tx, &rollups.total_deltas).await?;
+    upsert_event_metric_buckets_dim1_in_tx(&mut tx, &rollups.dim1_deltas).await?;
+    upsert_event_metric_buckets_dim2_in_tx(&mut tx, &rollups.dim2_deltas).await?;
+    upsert_event_metric_buckets_dim3_in_tx(&mut tx, &rollups.dim3_deltas).await?;
+    upsert_event_metric_buckets_dim4_in_tx(&mut tx, &rollups.dim4_deltas).await?;
     save_worker_offset_in_tx(&mut tx, EVENT_METRICS_WORKER_NAME, next_offset).await?;
     tx.commit().await.map_err(StoreError::from)?;
 
@@ -690,10 +691,11 @@ pub(crate) async fn process_event_metrics_batch_with_config(
 
 #[derive(Debug, Default)]
 struct EventMetricRollups {
-    total_deltas: Vec<EventCountDailyTotalDelta>,
-    dim1_deltas: Vec<EventCountDailyDim1Delta>,
-    dim2_deltas: Vec<EventCountDailyDim2Delta>,
-    dim3_deltas: Vec<EventCountDailyDim3Delta>,
+    total_deltas: Vec<EventMetricBucketTotalDelta>,
+    dim1_deltas: Vec<EventMetricBucketDim1Delta>,
+    dim2_deltas: Vec<EventMetricBucketDim2Delta>,
+    dim3_deltas: Vec<EventMetricBucketDim3Delta>,
+    dim4_deltas: Vec<EventMetricBucketDim4Delta>,
 }
 
 fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
@@ -727,6 +729,23 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
             Uuid,
             MetricGranularity,
             DateTime<Utc>,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ),
+        i64,
+    >::new();
+    let mut dim4 = BTreeMap::<
+        (
+            Uuid,
+            MetricGranularity,
+            DateTime<Utc>,
+            String,
+            String,
             String,
             String,
             String,
@@ -808,6 +827,35 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                     }
                 }
             }
+
+            for first_index in 0..dimensions.len() {
+                for second_index in first_index + 1..dimensions.len() {
+                    for third_index in second_index + 1..dimensions.len() {
+                        for fourth_index in third_index + 1..dimensions.len() {
+                            let first = &dimensions[first_index];
+                            let second = &dimensions[second_index];
+                            let third = &dimensions[third_index];
+                            let fourth = &dimensions[fourth_index];
+                            *dim4
+                                .entry((
+                                    event.project_id,
+                                    granularity,
+                                    bucket_start,
+                                    event_name.clone(),
+                                    first.0.clone(),
+                                    first.1.clone(),
+                                    second.0.clone(),
+                                    second.1.clone(),
+                                    third.0.clone(),
+                                    third.1.clone(),
+                                    fourth.0.clone(),
+                                    fourth.1.clone(),
+                                ))
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -816,7 +864,7 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
             .into_iter()
             .map(
                 |((project_id, granularity, bucket_start, event_name), event_count)| {
-                    EventCountDailyTotalDelta {
+                    EventMetricBucketTotalDelta {
                         project_id,
                         granularity,
                         bucket_start,
@@ -833,7 +881,7 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                     (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value),
                     event_count,
                 )| {
-                    EventCountDailyDim1Delta {
+                    EventMetricBucketDim1Delta {
                         project_id,
                         granularity,
                         bucket_start,
@@ -860,7 +908,7 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                         dim2_value,
                     ),
                     event_count,
-                )| EventCountDailyDim2Delta {
+                )| EventMetricBucketDim2Delta {
                     project_id,
                     granularity,
                     bucket_start,
@@ -890,7 +938,7 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                         dim3_value,
                     ),
                     event_count,
-                )| EventCountDailyDim3Delta {
+                )| EventMetricBucketDim3Delta {
                     project_id,
                     granularity,
                     bucket_start,
@@ -901,6 +949,42 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                     dim2_value,
                     dim3_key,
                     dim3_value,
+                    event_count,
+                },
+            )
+            .collect(),
+        dim4_deltas: dim4
+            .into_iter()
+            .map(
+                |(
+                    (
+                        project_id,
+                        granularity,
+                        bucket_start,
+                        event_name,
+                        dim1_key,
+                        dim1_value,
+                        dim2_key,
+                        dim2_value,
+                        dim3_key,
+                        dim3_value,
+                        dim4_key,
+                        dim4_value,
+                    ),
+                    event_count,
+                )| EventMetricBucketDim4Delta {
+                    project_id,
+                    granularity,
+                    bucket_start,
+                    event_name,
+                    dim1_key,
+                    dim1_value,
+                    dim2_key,
+                    dim2_value,
+                    dim3_key,
+                    dim3_value,
+                    dim4_key,
+                    dim4_value,
                     event_count,
                 },
             )
@@ -1893,6 +1977,7 @@ mod tests {
                 ("plan".to_owned(), "pro".to_owned()),
                 ("provider".to_owned(), "strava".to_owned()),
                 ("region".to_owned(), "eu".to_owned()),
+                ("screen".to_owned(), "home".to_owned()),
             ]),
         }
     }
@@ -1971,16 +2056,18 @@ mod tests {
         let total_fanout = rollups.total_deltas.len()
             + rollups.dim1_deltas.len()
             + rollups.dim2_deltas.len()
-            + rollups.dim3_deltas.len();
+            + rollups.dim3_deltas.len()
+            + rollups.dim4_deltas.len();
 
         assert_eq!(rollups.total_deltas.len(), 2);
-        assert_eq!(rollups.dim1_deltas.len(), 12);
-        assert_eq!(rollups.dim2_deltas.len(), 30);
-        assert_eq!(rollups.dim3_deltas.len(), 40);
-        assert_eq!(total_fanout, 84);
+        assert_eq!(rollups.dim1_deltas.len(), 14);
+        assert_eq!(rollups.dim2_deltas.len(), 42);
+        assert_eq!(rollups.dim3_deltas.len(), 70);
+        assert_eq!(rollups.dim4_deltas.len(), 70);
+        assert_eq!(total_fanout, 198);
         assert!(
             rollups
-                .dim3_deltas
+                .dim4_deltas
                 .iter()
                 .all(|delta| delta.event_count == 1),
             "single events must increment each bounded cube exactly once"

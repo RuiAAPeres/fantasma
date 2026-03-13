@@ -105,7 +105,7 @@ impl EventMetricsQueryError {
 }
 
 const MAX_GROUP_BY_DIMENSIONS: usize = 2;
-const MAX_EVENT_REFERENCED_DIMENSIONS: usize = 3;
+const MAX_EVENT_REFERENCED_DIMENSIONS: usize = 4;
 const MAX_METRIC_GROUPS: usize = 100;
 type GroupKey = Vec<Option<String>>;
 type CountsByBucket = BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>;
@@ -1791,6 +1791,31 @@ mod tests {
         assert_eq!(query.window.granularity, MetricGranularity::Hour);
         assert!(!query.filters.contains_key("start"));
         assert!(!query.filters.contains_key("end"));
+    }
+
+    #[test]
+    fn parse_event_metrics_query_accepts_four_referenced_dimensions() {
+        let query = parse_event_metrics_query(
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&app_version=1.4.0&plan=pro&group_by=provider&group_by=region",
+        )
+        .expect("query parses");
+
+        assert_eq!(
+            query.group_by,
+            vec!["provider".to_owned(), "region".to_owned()]
+        );
+        assert_eq!(query.filters.get("app_version"), Some(&"1.4.0".to_owned()));
+        assert_eq!(query.filters.get("plan"), Some(&"pro".to_owned()));
+    }
+
+    #[test]
+    fn parse_event_metrics_query_rejects_five_referenced_dimensions() {
+        let error = parse_event_metrics_query(
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.4.0&plan=pro&group_by=provider&group_by=region",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), "too_many_dimensions");
     }
 
     #[test]
