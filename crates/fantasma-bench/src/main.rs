@@ -26,6 +26,14 @@ const REGIONS: [&str; 4] = ["eu", "us", "apac", "latam"];
 const PLANS: [&str; 3] = ["free", "pro", "team"];
 const APP_VERSIONS: [&str; 3] = ["1.0.0", "1.1.0", "1.2.0"];
 const OS_VERSIONS: [&str; 2] = ["18.3", "18.4"];
+const SLO_INSTALL_COUNT_PER_DAY: usize = 1_000;
+const SLO_EVENTS_PER_INSTALL_PER_DAY: usize = 30;
+const SLO_SESSION_DURATION_SECONDS: u64 = 29 * 60;
+const SLO_REPAIR_DURATION_DELTA_SECONDS: u64 = 10 * 60;
+const SLO_REPAIR_INSTALL_MODULUS: usize = 20;
+const SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY: usize = 2;
+const SLO_WARMUP_QUERIES: usize = 10;
+const SLO_MEASURED_QUERIES: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -81,6 +89,7 @@ impl Profile {
 enum BenchCommand {
     Stack(StackArgs),
     Series(SeriesArgs),
+    Slo(SloArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +103,11 @@ struct StackArgs {
 struct SeriesArgs {
     profile: Profile,
     repetitions: usize,
+    output_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SloArgs {
     output_dir: PathBuf,
 }
 
@@ -119,6 +133,10 @@ enum CliCommand {
         profile: Profile,
         #[arg(long, default_value_t = 1)]
         repetitions: usize,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    Slo {
         #[arg(long)]
         output_dir: PathBuf,
     },
@@ -197,6 +215,177 @@ struct SeriesSummary {
     repetitions: usize,
     host: HostMetadata,
     scenarios: Vec<ScenarioResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SloWindow {
+    Days30,
+    Days90,
+    Days180,
+}
+
+impl SloWindow {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Days30 => "30d",
+            Self::Days90 => "90d",
+            Self::Days180 => "180d",
+        }
+    }
+
+    fn days(self) -> usize {
+        match self {
+            Self::Days30 => 30,
+            Self::Days90 => 90,
+            Self::Days180 => 180,
+        }
+    }
+
+    fn total_events(self) -> usize {
+        self.days() * SLO_INSTALL_COUNT_PER_DAY * SLO_EVENTS_PER_INSTALL_PER_DAY
+    }
+
+    fn repetitions(self) -> usize {
+        if matches!(self, Self::Days30) { 3 } else { 1 }
+    }
+
+    fn readiness_timeout(self) -> Duration {
+        match self {
+            Self::Days30 => Duration::from_secs(5 * 60),
+            Self::Days90 => Duration::from_secs(20 * 60),
+            Self::Days180 => Duration::from_secs(40 * 60),
+        }
+    }
+
+    fn grouped_day_budget_ms(self) -> u64 {
+        match self {
+            Self::Days30 => 100,
+            Self::Days90 => 200,
+            Self::Days180 => 350,
+        }
+    }
+
+    fn grouped_hour_budget_ms(self) -> u64 {
+        match self {
+            Self::Days30 => 150,
+            Self::Days90 => 300,
+            Self::Days180 => 500,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SloScenarioKind {
+    Append,
+    Backfill,
+    Repair,
+    Reads,
+}
+
+impl SloScenarioKind {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Backfill => "backfill",
+            Self::Repair => "repair",
+            Self::Reads => "reads",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SloScenarioDefinition {
+    kind: SloScenarioKind,
+    window: SloWindow,
+    repetitions: usize,
+}
+
+impl SloScenarioDefinition {
+    fn key(&self) -> String {
+        format!("{}-{}", self.kind.key(), self.window.key())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SloReadinessPolicy {
+    allow_timeout_publication: bool,
+    wait_for_full_readiness_before_queries: bool,
+}
+
+fn slo_readiness_policy(kind: SloScenarioKind, window: SloWindow) -> SloReadinessPolicy {
+    match (kind, window) {
+        (SloScenarioKind::Reads, SloWindow::Days90 | SloWindow::Days180) => SloReadinessPolicy {
+            allow_timeout_publication: true,
+            wait_for_full_readiness_before_queries: true,
+        },
+        (_, SloWindow::Days90 | SloWindow::Days180) => SloReadinessPolicy {
+            allow_timeout_publication: true,
+            wait_for_full_readiness_before_queries: false,
+        },
+        _ => SloReadinessPolicy {
+            allow_timeout_publication: false,
+            wait_for_full_readiness_before_queries: false,
+        },
+    }
+}
+
+async fn wait_for_full_readiness_before_query_benchmark(
+    client: &Client,
+    project: &ProvisionedProject,
+    window: SloWindow,
+    expectation: &SloExpectation,
+) -> Result<()> {
+    let query_specs = slo_query_matrix(window, slo_start_day());
+    let event_specs = query_specs
+        .iter()
+        .filter(|query| query.hard_gate && query.family == "event")
+        .cloned()
+        .collect::<Vec<_>>();
+    let session_specs = query_specs
+        .iter()
+        .filter(|query| query.hard_gate && query.family == "session")
+        .cloned()
+        .collect::<Vec<_>>();
+    let event_label = "query benchmark readiness (event metrics)";
+    let session_label = "query benchmark readiness (session metrics)";
+
+    tokio::try_join!(
+        poll_until_ready(
+            || slo_queries_ready(client, project, &event_specs, expectation),
+            event_label,
+        ),
+        poll_until_ready(
+            || slo_queries_ready(client, project, &session_specs, expectation),
+            session_label,
+        ),
+    )?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SloScenarioResult {
+    scenario: String,
+    phases: Vec<PhaseMeasurement>,
+    readiness: Vec<ReadinessMeasurement>,
+    queries: Vec<QueryMeasurement>,
+    budget: Option<BudgetEvaluation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SloSummary {
+    host: HostMetadata,
+    scenarios: Vec<SloScenarioResult>,
+}
+
+#[derive(Debug, Clone)]
+struct SloQuerySpec {
+    name: String,
+    url: String,
+    hard_gate: bool,
+    family: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -332,6 +521,7 @@ where
             repetitions,
             output_dir,
         }),
+        CliCommand::Slo { output_dir } => BenchCommand::Slo(SloArgs { output_dir }),
     })
 }
 
@@ -340,6 +530,7 @@ async fn main() -> Result<()> {
     match parse_args(std::env::args_os())? {
         BenchCommand::Stack(args) => run_stack(args).await,
         BenchCommand::Series(args) => run_series(args).await,
+        BenchCommand::Slo(args) => run_slo(args).await,
     }
 }
 
@@ -385,6 +576,1164 @@ async fn run_series(args: SeriesArgs) -> Result<()> {
     println!("{}", render_series_markdown_summary(&summary));
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SloExpectation {
+    total_events: u64,
+    total_sessions: u64,
+    total_duration_seconds: u64,
+    total_new_installs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SloScenarioPaths {
+    scenario_dir: PathBuf,
+    repetitions: usize,
+}
+
+impl SloScenarioPaths {
+    fn run_output(&self, run_number: usize) -> PathBuf {
+        if self.repetitions == 1 {
+            self.scenario_dir.join("result.json")
+        } else {
+            self.scenario_dir.join(format!("run-{run_number:02}.json"))
+        }
+    }
+
+    fn median_output(&self) -> PathBuf {
+        self.scenario_dir.join("median.json")
+    }
+}
+
+async fn run_slo(args: SloArgs) -> Result<()> {
+    let host = collect_host_metadata()?;
+    let scenarios = slo_scenario_definitions();
+
+    run_slo_with_executor(&args.output_dir, host, &scenarios, |scenario| async move {
+        execute_slo_scenario(&scenario).await
+    })
+    .await
+}
+
+#[cfg(test)]
+async fn run_slo_suite<Execute, ExecuteFut>(
+    output_dir: &Path,
+    host: HostMetadata,
+    mut execute: Execute,
+) -> Result<()>
+where
+    Execute: FnMut(SloScenarioDefinition) -> ExecuteFut,
+    ExecuteFut: std::future::Future<Output = Result<SloScenarioResult>>,
+{
+    let scenarios = slo_scenario_definitions();
+    run_slo_with_executor(output_dir, host, &scenarios, move |scenario| {
+        execute(scenario)
+    })
+    .await
+}
+
+async fn run_slo_with_executor<Execute, ExecuteFut>(
+    output_dir: &Path,
+    host: HostMetadata,
+    scenarios: &[SloScenarioDefinition],
+    mut execute: Execute,
+) -> Result<()>
+where
+    Execute: FnMut(SloScenarioDefinition) -> ExecuteFut,
+    ExecuteFut: std::future::Future<Output = Result<SloScenarioResult>>,
+{
+    prepare_clean_output_dir(output_dir)?;
+    write_pretty_json(&host_metadata_output_path(output_dir), &host)?;
+
+    let mut summary_results = Vec::new();
+    let mut suite_failures = Vec::new();
+
+    'suite: for scenario in scenarios.iter().cloned() {
+        let paths = slo_paths(output_dir, &scenario);
+        let mut runs = Vec::with_capacity(scenario.repetitions);
+
+        for run_number in 1..=scenario.repetitions {
+            let mut result = match execute(scenario.clone()).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let failure = format!("scenario execution failed: {error:#}");
+                    let failed_result = slo_execution_failure_result(&scenario, failure.clone());
+                    write_slo_result(&paths.run_output(run_number), &failed_result)?;
+                    suite_failures.push(format!("{}: {}", scenario.key(), failure));
+                    summary_results.push(failed_result);
+                    break 'suite;
+                }
+            };
+            result.budget = Some(evaluate_slo_budget(&scenario, &result));
+            write_slo_result(&paths.run_output(run_number), &result)?;
+            runs.push(result);
+        }
+
+        let published = if scenario.repetitions > 1 {
+            let mut median = aggregate_slo_runs(&scenario, &runs)?;
+            median.budget = Some(evaluate_slo_budget(&scenario, &median));
+            write_slo_result(&paths.median_output(), &median)?;
+            median
+        } else {
+            runs.into_iter()
+                .next()
+                .expect("single-run scenarios publish their raw result")
+        };
+
+        if let Some(budget) = &published.budget
+            && !budget.passed
+        {
+            suite_failures.push(format!(
+                "{}: {}",
+                published.scenario,
+                budget.failures.join("; ")
+            ));
+        }
+
+        summary_results.push(published);
+    }
+
+    let summary = SloSummary {
+        host,
+        scenarios: summary_results,
+    };
+    write_slo_summary(output_dir, &summary)?;
+    println!("{}", render_slo_markdown_summary(&summary));
+
+    if suite_failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "derived metrics SLO suite failed:\n{}",
+            suite_failures.join("\n")
+        )
+    }
+}
+
+fn prepare_clean_output_dir(output_dir: &Path) -> Result<()> {
+    match fs::metadata(output_dir) {
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir_all(output_dir).with_context(|| {
+                format!("remove stale output directory {}", output_dir.display())
+            })?;
+        }
+        Ok(_) => {
+            fs::remove_file(output_dir)
+                .with_context(|| format!("remove stale output file {}", output_dir.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect output path {}", output_dir.display()));
+        }
+    }
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create output directory {}", output_dir.display()))
+}
+
+fn slo_execution_failure_result(
+    scenario: &SloScenarioDefinition,
+    failure: String,
+) -> SloScenarioResult {
+    SloScenarioResult {
+        scenario: scenario.key(),
+        phases: Vec::new(),
+        readiness: Vec::new(),
+        queries: Vec::new(),
+        budget: Some(BudgetEvaluation {
+            passed: false,
+            failures: vec![failure.clone()],
+        }),
+        failure: Some(failure),
+    }
+}
+
+async fn execute_slo_scenario(scenario: &SloScenarioDefinition) -> Result<SloScenarioResult> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build SLO HTTP client")?;
+
+    let mut stack = StackGuard::new(compose_file_path());
+    stack.start()?;
+    wait_for_health(&client).await?;
+    let project = provision_project(&client).await?;
+
+    match scenario.kind {
+        SloScenarioKind::Append => {
+            run_slo_append_like(&client, &project, scenario, false, false).await
+        }
+        SloScenarioKind::Backfill => {
+            run_slo_append_like(&client, &project, scenario, true, false).await
+        }
+        SloScenarioKind::Repair => run_slo_repair(&client, &project, scenario).await,
+        SloScenarioKind::Reads => {
+            run_slo_append_like(&client, &project, scenario, false, true).await
+        }
+    }
+}
+
+async fn run_slo_append_like(
+    client: &Client,
+    project: &ProvisionedProject,
+    scenario: &SloScenarioDefinition,
+    reverse_day_order: bool,
+    benchmark_reads: bool,
+) -> Result<SloScenarioResult> {
+    let expectation = slo_expectation(scenario);
+    let readiness_policy = slo_readiness_policy(scenario.kind, scenario.window);
+    let phase_name = if benchmark_reads {
+        "seed_ingest"
+    } else {
+        "ingest"
+    };
+    let (ingest_phase, readiness) = run_slo_phase_and_wait_for_readiness(
+        || {
+            ingest_slo_window(
+                client,
+                project,
+                scenario.window,
+                reverse_day_order,
+                phase_name,
+            )
+        },
+        |readiness_started| {
+            wait_for_slo_readiness(
+                client,
+                project,
+                scenario.window,
+                &expectation,
+                readiness_started,
+                readiness_policy.allow_timeout_publication,
+            )
+        },
+    )
+    .await?;
+    let queries = if benchmark_reads {
+        if readiness_policy.wait_for_full_readiness_before_queries {
+            wait_for_full_readiness_before_query_benchmark(
+                client,
+                project,
+                scenario.window,
+                &expectation,
+            )
+            .await?;
+        }
+        let query_specs = slo_query_matrix(scenario.window, slo_start_day());
+        measure_slo_queries(
+            client,
+            project,
+            &query_specs,
+            SLO_WARMUP_QUERIES,
+            SLO_MEASURED_QUERIES,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+
+    Ok(SloScenarioResult {
+        scenario: scenario.key(),
+        phases: vec![ingest_phase],
+        readiness,
+        queries,
+        budget: None,
+        failure: None,
+    })
+}
+
+async fn run_slo_repair(
+    client: &Client,
+    project: &ProvisionedProject,
+    scenario: &SloScenarioDefinition,
+) -> Result<SloScenarioResult> {
+    let seed_phase =
+        ingest_slo_window(client, project, scenario.window, false, "seed_ingest").await?;
+    wait_for_slo_expectation(
+        client,
+        project,
+        scenario.window,
+        &slo_base_expectation(scenario.window),
+        Instant::now(),
+        "repair seed readiness",
+        false,
+    )
+    .await?;
+
+    let expectation = slo_expectation(scenario);
+    let (repair_phase, readiness) = run_slo_phase_and_wait_for_readiness(
+        || ingest_slo_repair_window(client, project, scenario.window),
+        |readiness_started| {
+            wait_for_slo_expectation(
+                client,
+                project,
+                scenario.window,
+                &expectation,
+                readiness_started,
+                "repair readiness",
+                !matches!(scenario.window, SloWindow::Days30),
+            )
+        },
+    )
+    .await?;
+
+    Ok(SloScenarioResult {
+        scenario: scenario.key(),
+        phases: vec![seed_phase, repair_phase],
+        readiness,
+        queries: Vec::new(),
+        budget: None,
+        failure: None,
+    })
+}
+
+async fn run_slo_phase_and_wait_for_readiness<Phase, PhaseFut, Wait, WaitFut, PhaseOutput>(
+    phase: Phase,
+    wait_for_readiness: Wait,
+) -> Result<(PhaseOutput, Vec<ReadinessMeasurement>)>
+where
+    Phase: FnOnce() -> PhaseFut,
+    PhaseFut: std::future::Future<Output = Result<PhaseOutput>>,
+    Wait: FnOnce(Instant) -> WaitFut,
+    WaitFut: std::future::Future<Output = Result<Vec<ReadinessMeasurement>>>,
+{
+    let phase_output = phase().await?;
+    let readiness_started = Instant::now();
+    let readiness = wait_for_readiness(readiness_started).await?;
+
+    Ok((phase_output, readiness))
+}
+
+fn slo_scenario_definitions() -> Vec<SloScenarioDefinition> {
+    let mut scenarios = Vec::with_capacity(12);
+    for window in [SloWindow::Days30, SloWindow::Days90, SloWindow::Days180] {
+        for kind in [
+            SloScenarioKind::Append,
+            SloScenarioKind::Backfill,
+            SloScenarioKind::Repair,
+            SloScenarioKind::Reads,
+        ] {
+            scenarios.push(SloScenarioDefinition {
+                kind,
+                window,
+                repetitions: window.repetitions(),
+            });
+        }
+    }
+    scenarios
+}
+
+fn slo_paths(output_dir: &Path, scenario: &SloScenarioDefinition) -> SloScenarioPaths {
+    SloScenarioPaths {
+        scenario_dir: output_dir.join(scenario.key()),
+        repetitions: scenario.repetitions,
+    }
+}
+
+fn slo_start_day() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid SLO suite start day")
+}
+
+fn slo_base_expectation(window: SloWindow) -> SloExpectation {
+    SloExpectation {
+        total_events: window.total_events() as u64,
+        total_sessions: (window.days() * SLO_INSTALL_COUNT_PER_DAY) as u64,
+        total_duration_seconds: (window.days() * SLO_INSTALL_COUNT_PER_DAY) as u64
+            * SLO_SESSION_DURATION_SECONDS,
+        total_new_installs: SLO_INSTALL_COUNT_PER_DAY as u64,
+    }
+}
+
+fn slo_expectation(scenario: &SloScenarioDefinition) -> SloExpectation {
+    let mut expectation = slo_base_expectation(scenario.window);
+
+    if matches!(scenario.kind, SloScenarioKind::Repair) {
+        let repaired_install_days = (scenario.window.days() * SLO_INSTALL_COUNT_PER_DAY
+            / SLO_REPAIR_INSTALL_MODULUS) as u64;
+        expectation.total_events +=
+            repaired_install_days * SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY as u64;
+        expectation.total_duration_seconds +=
+            repaired_install_days * SLO_REPAIR_DURATION_DELTA_SECONDS;
+    }
+
+    expectation
+}
+
+fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec> {
+    let end_day = start_day + ChronoDuration::days(window.days().saturating_sub(1) as i64);
+    let day_start = start_day.to_string();
+    let day_end = end_day.to_string();
+    let hour_start = format!("{start_day}T00:00:00Z");
+    let hour_end = format!("{end_day}T23:00:00Z");
+
+    let mut queries = Vec::with_capacity(16);
+
+    queries.extend([
+        SloQuerySpec {
+            name: "events_count_day_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start={day_start}&end={day_end}&group_by=provider&group_by=region",
+                benchmark_api_base_url()
+            ),
+            hard_gate: true,
+            family: "event",
+        },
+        SloQuerySpec {
+            name: "events_count_hour_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start={hour_start}&end={hour_end}&group_by=provider&group_by=region",
+                benchmark_api_base_url()
+            ),
+            hard_gate: true,
+            family: "event",
+        },
+        SloQuerySpec {
+            name: "sessions_count_day_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=count&granularity=day&start={day_start}&end={day_end}&group_by=platform&group_by=app_version",
+                benchmark_api_base_url()
+            ),
+            hard_gate: true,
+            family: "session",
+        },
+        SloQuerySpec {
+            name: "sessions_count_hour_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=count&granularity=hour&start={hour_start}&end={hour_end}&group_by=platform&group_by=app_version",
+                benchmark_api_base_url()
+            ),
+            hard_gate: true,
+            family: "session",
+        },
+        SloQuerySpec {
+            name: "sessions_duration_total_day_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=day&start={day_start}&end={day_end}&group_by=platform&group_by=app_version",
+                benchmark_api_base_url()
+            ),
+            hard_gate: true,
+            family: "session",
+        },
+        SloQuerySpec {
+            name: "sessions_duration_total_hour_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=hour&start={hour_start}&end={hour_end}&group_by=platform&group_by=app_version",
+                benchmark_api_base_url()
+            ),
+            hard_gate: true,
+            family: "session",
+        },
+        SloQuerySpec {
+            name: "sessions_new_installs_day_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=new_installs&granularity=day&start={day_start}&end={day_end}&group_by=platform&group_by=app_version",
+                benchmark_api_base_url()
+            ),
+            hard_gate: true,
+            family: "session",
+        },
+        SloQuerySpec {
+            name: "sessions_new_installs_hour_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=new_installs&granularity=hour&start={hour_start}&end={hour_end}&group_by=platform&group_by=app_version",
+                benchmark_api_base_url()
+            ),
+            hard_gate: true,
+            family: "session",
+        },
+    ]);
+
+    queries.extend([
+        SloQuerySpec {
+            name: "events_count_day_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start={day_start}&end={day_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "event",
+        },
+        SloQuerySpec {
+            name: "events_count_hour_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start={hour_start}&end={hour_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "event",
+        },
+        SloQuerySpec {
+            name: "sessions_count_day_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=count&granularity=day&start={day_start}&end={day_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+        },
+        SloQuerySpec {
+            name: "sessions_count_hour_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=count&granularity=hour&start={hour_start}&end={hour_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+        },
+        SloQuerySpec {
+            name: "sessions_duration_total_day_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=day&start={day_start}&end={day_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+        },
+        SloQuerySpec {
+            name: "sessions_duration_total_hour_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=hour&start={hour_start}&end={hour_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+        },
+        SloQuerySpec {
+            name: "sessions_new_installs_day_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=new_installs&granularity=day&start={day_start}&end={day_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+        },
+        SloQuerySpec {
+            name: "sessions_new_installs_hour_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=new_installs&granularity=hour&start={hour_start}&end={hour_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+        },
+    ]);
+
+    queries
+}
+
+async fn ingest_slo_window(
+    client: &Client,
+    project: &ProvisionedProject,
+    window: SloWindow,
+    reverse_day_order: bool,
+    phase_name: &str,
+) -> Result<PhaseMeasurement> {
+    let started = Instant::now();
+    let mut events_sent = 0usize;
+
+    for day_offset in slo_day_offsets(window, reverse_day_order) {
+        let day = slo_start_day() + ChronoDuration::days(day_offset as i64);
+        let day_events = slo_day_events(day, day_offset)?;
+        events_sent += day_events.len();
+        post_event_chunks(client, project, &day_events).await?;
+    }
+
+    let elapsed = started.elapsed();
+    Ok(PhaseMeasurement {
+        name: phase_name.to_owned(),
+        events_sent,
+        elapsed_ms: elapsed.as_millis() as u64,
+        events_per_second: throughput(events_sent, elapsed),
+    })
+}
+
+async fn ingest_slo_repair_window(
+    client: &Client,
+    project: &ProvisionedProject,
+    window: SloWindow,
+) -> Result<PhaseMeasurement> {
+    let started = Instant::now();
+    let mut events_sent = 0usize;
+
+    for day_offset in 0..window.days() {
+        let day = slo_start_day() + ChronoDuration::days(day_offset as i64);
+        let late_events = slo_day_repair_events(day, day_offset)?;
+        events_sent += late_events.len();
+        if !late_events.is_empty() {
+            post_event_chunks(client, project, &late_events).await?;
+        }
+    }
+
+    let elapsed = started.elapsed();
+    Ok(PhaseMeasurement {
+        name: "repair_ingest".to_owned(),
+        events_sent,
+        elapsed_ms: elapsed.as_millis() as u64,
+        events_per_second: throughput(events_sent, elapsed),
+    })
+}
+
+fn slo_day_offsets(window: SloWindow, reverse_day_order: bool) -> Vec<usize> {
+    let mut offsets = (0..window.days()).collect::<Vec<_>>();
+    if reverse_day_order {
+        offsets.reverse();
+    }
+    offsets
+}
+
+fn slo_day_events(day: NaiveDate, day_offset: usize) -> Result<Vec<BenchEvent>> {
+    let mut events = Vec::with_capacity(SLO_INSTALL_COUNT_PER_DAY * SLO_EVENTS_PER_INSTALL_PER_DAY);
+
+    for install_index in 0..SLO_INSTALL_COUNT_PER_DAY {
+        events.extend(slo_install_day_events(day, day_offset, install_index)?);
+    }
+
+    events.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    Ok(events)
+}
+
+fn slo_day_repair_events(day: NaiveDate, day_offset: usize) -> Result<Vec<BenchEvent>> {
+    let mut events = Vec::with_capacity(
+        (SLO_INSTALL_COUNT_PER_DAY / SLO_REPAIR_INSTALL_MODULUS)
+            * SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY,
+    );
+
+    for install_index in 0..SLO_INSTALL_COUNT_PER_DAY {
+        if install_index % SLO_REPAIR_INSTALL_MODULUS != day_offset % SLO_REPAIR_INSTALL_MODULUS {
+            continue;
+        }
+
+        let base = slo_install_base_time(day, day_offset, install_index)?;
+        let mut repair_events = Vec::with_capacity(SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY);
+        for offset_minutes in 0..SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY {
+            repair_events.push(slo_event(
+                install_index,
+                day_offset,
+                base - ChronoDuration::minutes((10 - offset_minutes) as i64),
+            ));
+        }
+        events.extend(repair_events);
+    }
+
+    events.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    Ok(events)
+}
+
+fn slo_install_day_events(
+    day: NaiveDate,
+    day_offset: usize,
+    install_index: usize,
+) -> Result<Vec<BenchEvent>> {
+    let base = slo_install_base_time(day, day_offset, install_index)?;
+    let mut events = Vec::with_capacity(SLO_EVENTS_PER_INSTALL_PER_DAY);
+
+    for event_offset in 0..SLO_EVENTS_PER_INSTALL_PER_DAY {
+        events.push(slo_event(
+            install_index,
+            day_offset,
+            base + ChronoDuration::minutes(event_offset as i64),
+        ));
+    }
+
+    Ok(events)
+}
+
+fn slo_install_base_time(
+    day: NaiveDate,
+    day_offset: usize,
+    install_index: usize,
+) -> Result<chrono::DateTime<Utc>> {
+    let start_hour = ((day_offset * 7) + install_index) % 24;
+    Utc.with_ymd_and_hms(day.year(), day.month(), day.day(), start_hour as u32, 10, 0)
+        .single()
+        .ok_or_else(|| anyhow!("invalid SLO event timestamp for {}", day))
+}
+
+fn slo_event(
+    install_index: usize,
+    day_offset: usize,
+    timestamp: chrono::DateTime<Utc>,
+) -> BenchEvent {
+    let install_id = format!("slo-install-{install_index:04}");
+    let platform = if install_index % 2 == 0 {
+        "ios"
+    } else {
+        "android"
+    };
+    let app_version = APP_VERSIONS[(day_offset + install_index) % APP_VERSIONS.len()];
+    let os_version = OS_VERSIONS[(day_offset + install_index) % OS_VERSIONS.len()];
+    let provider = PROVIDERS[install_index % PROVIDERS.len()];
+    let region = REGIONS[(install_index / PROVIDERS.len()) % REGIONS.len()];
+    let plan = PLANS[install_index % PLANS.len()];
+
+    BenchEvent {
+        event: "app_open".to_owned(),
+        timestamp: timestamp.to_rfc3339(),
+        install_id,
+        platform: platform.to_owned(),
+        app_version: app_version.to_owned(),
+        os_version: os_version.to_owned(),
+        properties: BTreeMap::from([
+            ("plan".to_owned(), plan.to_owned()),
+            ("provider".to_owned(), provider.to_owned()),
+            ("region".to_owned(), region.to_owned()),
+        ]),
+    }
+}
+
+async fn wait_for_slo_readiness(
+    client: &Client,
+    project: &ProvisionedProject,
+    window: SloWindow,
+    expectation: &SloExpectation,
+    scenario_started: Instant,
+    allow_timeout_publication: bool,
+) -> Result<Vec<ReadinessMeasurement>> {
+    wait_for_slo_expectation(
+        client,
+        project,
+        window,
+        expectation,
+        scenario_started,
+        "derived metrics readiness",
+        allow_timeout_publication,
+    )
+    .await
+}
+
+async fn wait_for_slo_expectation(
+    client: &Client,
+    project: &ProvisionedProject,
+    window: SloWindow,
+    expectation: &SloExpectation,
+    scenario_started: Instant,
+    label: &str,
+    allow_timeout_publication: bool,
+) -> Result<Vec<ReadinessMeasurement>> {
+    let query_specs = slo_query_matrix(window, slo_start_day());
+    let event_specs = query_specs
+        .iter()
+        .filter(|query| query.hard_gate && query.family == "event")
+        .cloned()
+        .collect::<Vec<_>>();
+    let session_specs = query_specs
+        .iter()
+        .filter(|query| query.hard_gate && query.family == "session")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let event_label = format!("{label} (event metrics)");
+    let session_label = format!("{label} (session metrics)");
+    let deadline = scenario_started + window.readiness_timeout();
+    let (event_ready_ms, session_ready_ms) = tokio::try_join!(
+        poll_until_elapsed(
+            || slo_queries_ready(client, project, &event_specs, expectation),
+            deadline,
+            &event_label,
+            scenario_started,
+            allow_timeout_publication,
+        ),
+        poll_until_elapsed(
+            || slo_queries_ready(client, project, &session_specs, expectation),
+            deadline,
+            &session_label,
+            scenario_started,
+            allow_timeout_publication,
+        ),
+    )?;
+    let timeout_ms = window.readiness_timeout().as_millis() as u64;
+    let event_ready_ms = event_ready_ms.unwrap_or(timeout_ms);
+    let session_ready_ms = session_ready_ms.unwrap_or(timeout_ms);
+
+    Ok(vec![
+        ReadinessMeasurement {
+            name: "event_metrics_ready_ms".to_owned(),
+            elapsed_ms: event_ready_ms,
+        },
+        ReadinessMeasurement {
+            name: "session_metrics_ready_ms".to_owned(),
+            elapsed_ms: session_ready_ms,
+        },
+        ReadinessMeasurement {
+            name: "derived_metrics_ready_ms".to_owned(),
+            elapsed_ms: event_ready_ms.max(session_ready_ms),
+        },
+    ])
+}
+
+async fn poll_until_elapsed<F, Fut>(
+    mut check: F,
+    deadline: Instant,
+    label: &str,
+    started_at: Instant,
+    allow_timeout_publication: bool,
+) -> Result<Option<u64>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    loop {
+        if check().await? {
+            return Ok(Some(started_at.elapsed().as_millis() as u64));
+        }
+
+        if Instant::now() >= deadline {
+            if allow_timeout_publication {
+                return Ok(None);
+            }
+            bail!("timed out waiting for {}", label);
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn poll_until_ready<F, Fut>(mut check: F, _label: &str) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    loop {
+        if check().await? {
+            return Ok(());
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn slo_queries_ready(
+    client: &Client,
+    project: &ProvisionedProject,
+    queries: &[SloQuerySpec],
+    expectation: &SloExpectation,
+) -> Result<bool> {
+    for query in queries {
+        let value = fetch_json(client, project, &query.url).await?;
+        if sum_metric_series(&value["series"]) != expected_total_for_slo_query(query, expectation) {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn expected_total_for_slo_query(query: &SloQuerySpec, expectation: &SloExpectation) -> u64 {
+    match query.name.as_str() {
+        name if name.starts_with("events_count") => expectation.total_events,
+        name if name.starts_with("sessions_count") => expectation.total_sessions,
+        name if name.starts_with("sessions_duration_total") => expectation.total_duration_seconds,
+        name if name.starts_with("sessions_new_installs") => expectation.total_new_installs,
+        _ => 0,
+    }
+}
+
+async fn measure_slo_queries(
+    client: &Client,
+    project: &ProvisionedProject,
+    queries: &[SloQuerySpec],
+    warmup_iterations: usize,
+    measured_iterations: usize,
+) -> Result<Vec<QueryMeasurement>> {
+    let mut measurements = Vec::with_capacity(queries.len());
+
+    for query in queries {
+        for _ in 0..warmup_iterations {
+            fetch_json(client, project, &query.url).await?;
+        }
+
+        let mut samples = Vec::with_capacity(measured_iterations);
+        for _ in 0..measured_iterations {
+            let started = Instant::now();
+            fetch_json(client, project, &query.url).await?;
+            samples.push(started.elapsed().as_millis() as u64);
+        }
+        samples.sort_unstable();
+
+        measurements.push(QueryMeasurement {
+            name: query.name.to_owned(),
+            iterations: measured_iterations,
+            min_ms: *samples.first().unwrap_or(&0),
+            p50_ms: percentile(&samples, 0.50),
+            p95_ms: percentile(&samples, 0.95),
+            max_ms: *samples.last().unwrap_or(&0),
+        });
+    }
+
+    Ok(measurements)
+}
+
+fn evaluate_slo_budget(
+    scenario: &SloScenarioDefinition,
+    result: &SloScenarioResult,
+) -> BudgetEvaluation {
+    let mut failures = Vec::new();
+
+    if matches!(
+        scenario.kind,
+        SloScenarioKind::Append | SloScenarioKind::Backfill | SloScenarioKind::Repair
+    ) && matches!(scenario.window, SloWindow::Days30)
+    {
+        for (name, maximum) in [
+            ("event_metrics_ready_ms", 30_000_u64),
+            ("session_metrics_ready_ms", 60_000_u64),
+            ("derived_metrics_ready_ms", 60_000_u64),
+        ] {
+            match result.readiness.iter().find(|entry| entry.name == name) {
+                Some(readiness) if readiness.elapsed_ms > maximum => failures.push(format!(
+                    "{} readiness {}ms exceeded budget {}ms",
+                    name, readiness.elapsed_ms, maximum
+                )),
+                Some(_) => {}
+                None => failures.push(format!("missing readiness measurement for {}", name)),
+            }
+        }
+    }
+
+    for query in result
+        .queries
+        .iter()
+        .filter(|query| is_slo_grouped_query(&query.name))
+    {
+        let maximum = if query.name.contains("_day_") {
+            scenario.window.grouped_day_budget_ms()
+        } else {
+            scenario.window.grouped_hour_budget_ms()
+        };
+
+        if query.p95_ms > maximum {
+            failures.push(format!(
+                "{} p95 {}ms exceeded budget {}ms",
+                query.name, query.p95_ms, maximum
+            ));
+        }
+    }
+
+    BudgetEvaluation {
+        passed: failures.is_empty(),
+        failures,
+    }
+}
+
+fn is_slo_grouped_query(name: &str) -> bool {
+    name.ends_with("_grouped")
+}
+
+fn aggregate_slo_runs(
+    scenario: &SloScenarioDefinition,
+    runs: &[SloScenarioResult],
+) -> Result<SloScenarioResult> {
+    let first = runs
+        .first()
+        .ok_or_else(|| anyhow!("cannot aggregate empty SLO run list"))?;
+
+    for run in runs {
+        if run.scenario != scenario.key() {
+            bail!(
+                "SLO scenario mismatch while aggregating {}: got {}",
+                scenario.key(),
+                run.scenario
+            );
+        }
+    }
+
+    let phases = first
+        .phases
+        .iter()
+        .map(|phase| {
+            let mut elapsed_samples = Vec::with_capacity(runs.len());
+            let mut throughput_samples = Vec::with_capacity(runs.len());
+
+            for run in runs {
+                let candidate = run
+                    .phases
+                    .iter()
+                    .find(|measurement| measurement.name == phase.name)
+                    .ok_or_else(|| anyhow!("missing phase measurement for {}", phase.name))?;
+                if candidate.events_sent != phase.events_sent {
+                    bail!("phase {} changed events_sent across SLO runs", phase.name);
+                }
+                elapsed_samples.push(candidate.elapsed_ms);
+                throughput_samples.push(candidate.events_per_second);
+            }
+
+            Ok(PhaseMeasurement {
+                name: phase.name.clone(),
+                events_sent: phase.events_sent,
+                elapsed_ms: median_u64(&elapsed_samples),
+                events_per_second: median_f64(&throughput_samples),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let readiness = first
+        .readiness
+        .iter()
+        .map(|measurement| {
+            let mut samples = Vec::with_capacity(runs.len());
+            for run in runs {
+                let candidate = run
+                    .readiness
+                    .iter()
+                    .find(|entry| entry.name == measurement.name)
+                    .ok_or_else(|| {
+                        anyhow!("missing readiness measurement for {}", measurement.name)
+                    })?;
+                samples.push(candidate.elapsed_ms);
+            }
+
+            Ok(ReadinessMeasurement {
+                name: measurement.name.clone(),
+                elapsed_ms: median_u64(&samples),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let queries = first
+        .queries
+        .iter()
+        .map(|query| {
+            let mut min_samples = Vec::with_capacity(runs.len());
+            let mut p50_samples = Vec::with_capacity(runs.len());
+            let mut p95_samples = Vec::with_capacity(runs.len());
+            let mut max_samples = Vec::with_capacity(runs.len());
+
+            for run in runs {
+                let candidate = run
+                    .queries
+                    .iter()
+                    .find(|entry| entry.name == query.name)
+                    .ok_or_else(|| anyhow!("missing query measurement for {}", query.name))?;
+                if candidate.iterations != query.iterations {
+                    bail!(
+                        "query {} changed iteration count across SLO runs",
+                        query.name
+                    );
+                }
+                min_samples.push(candidate.min_ms);
+                p50_samples.push(candidate.p50_ms);
+                p95_samples.push(candidate.p95_ms);
+                max_samples.push(candidate.max_ms);
+            }
+
+            Ok(QueryMeasurement {
+                name: query.name.clone(),
+                iterations: query.iterations,
+                min_ms: median_u64(&min_samples),
+                p50_ms: median_u64(&p50_samples),
+                p95_ms: median_u64(&p95_samples),
+                max_ms: median_u64(&max_samples),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(SloScenarioResult {
+        scenario: scenario.key(),
+        phases,
+        readiness,
+        queries,
+        budget: None,
+        failure: None,
+    })
+}
+
+fn write_slo_result(output: &Path, result: &SloScenarioResult) -> Result<()> {
+    write_pretty_json(output, result)?;
+    write_markdown(
+        output.with_extension("md"),
+        render_slo_markdown_result(result),
+    )?;
+    Ok(())
+}
+
+fn write_slo_summary(output_dir: &Path, summary: &SloSummary) -> Result<()> {
+    let output = summary_output_path(output_dir);
+    write_pretty_json(&output, summary)?;
+    write_markdown(
+        output.with_extension("md"),
+        render_slo_markdown_summary(summary),
+    )?;
+    Ok(())
+}
+
+fn render_slo_markdown_result(result: &SloScenarioResult) -> String {
+    render_slo_scenario_section(result, None)
+}
+
+fn render_slo_markdown_summary(summary: &SloSummary) -> String {
+    let mut lines = vec![
+        "# Fantasma Derived Metrics SLO Suite".to_owned(),
+        String::new(),
+        format!(
+            "- Host: {} / {} GiB / {} / {}",
+            summary.host.cpu_model,
+            format_memory_gib(summary.host.memory_gib),
+            summary.host.os_kernel,
+            summary.host.architecture
+        ),
+        format!("- Benchmarked at: {}", summary.host.benchmarked_at),
+        String::new(),
+    ];
+
+    for scenario in &summary.scenarios {
+        lines.push(render_slo_scenario_section(scenario, Some("##")));
+        lines.push(String::new());
+    }
+
+    lines.join("\n").trim_end().to_owned()
+}
+
+fn render_slo_scenario_section(result: &SloScenarioResult, heading_prefix: Option<&str>) -> String {
+    let mut lines = Vec::new();
+
+    if let Some(prefix) = heading_prefix {
+        lines.push(format!("{prefix} {}", result.scenario));
+        lines.push(String::new());
+    } else {
+        lines.push(format!(
+            "# Fantasma Derived Metrics SLO: {}",
+            result.scenario
+        ));
+        lines.push(String::new());
+    }
+
+    for phase in &result.phases {
+        lines.push(format!(
+            "- {}: {} events in {}ms ({:.2} events/s)",
+            phase.name, phase.events_sent, phase.elapsed_ms, phase.events_per_second
+        ));
+    }
+    for readiness in &result.readiness {
+        lines.push(format!("- {}: {}ms", readiness.name, readiness.elapsed_ms));
+    }
+    if let Some(failure) = &result.failure {
+        lines.push(format!("- Failure: {}", failure));
+    }
+    if let Some(budget) = &result.budget {
+        lines.push(format!(
+            "- Budget: {}",
+            if budget.passed { "PASS" } else { "FAIL" }
+        ));
+        for failure in &budget.failures {
+            lines.push(format!("  - {}", failure));
+        }
+    }
+
+    if !result.queries.is_empty() {
+        lines.push(String::new());
+        lines.push("| Query | p50 (ms) | p95 (ms) | min (ms) | max (ms) |".to_owned());
+        lines.push("| --- | ---: | ---: | ---: | ---: |".to_owned());
+        for query in &result.queries {
+            lines.push(format!(
+                "| {} | {} | {} | {} | {} |",
+                query.name, query.p50_ms, query.p95_ms, query.min_ms, query.max_ms
+            ));
+        }
+    }
+
+    lines.join("\n")
 }
 
 async fn execute_scenario(scenario: Scenario, profile: Profile) -> Result<ScenarioResult> {
@@ -614,19 +1963,41 @@ async fn post_batches(
     batches: &[Vec<BenchEvent>],
 ) -> Result<()> {
     for batch in batches {
-        let response = client
-            .post(format!("{}/v1/events", benchmark_ingest_base_url()))
-            .header("x-fantasma-key", &project.ingest_key)
-            .json(&EventBatch { events: batch })
-            .send()
-            .await
-            .context("POST /v1/events")?;
+        post_event_batch(client, project, batch).await?;
+    }
 
-        let status = response.status();
-        if status != StatusCode::ACCEPTED {
-            let body = response.text().await.unwrap_or_default();
-            bail!("ingest returned {}: {}", status, body);
-        }
+    Ok(())
+}
+
+async fn post_event_chunks(
+    client: &Client,
+    project: &ProvisionedProject,
+    events: &[BenchEvent],
+) -> Result<()> {
+    for batch in events.chunks(POST_BATCH_SIZE) {
+        post_event_batch(client, project, batch).await?;
+    }
+
+    Ok(())
+}
+
+async fn post_event_batch(
+    client: &Client,
+    project: &ProvisionedProject,
+    batch: &[BenchEvent],
+) -> Result<()> {
+    let response = client
+        .post(format!("{}/v1/events", benchmark_ingest_base_url()))
+        .header("x-fantasma-key", &project.ingest_key)
+        .json(&EventBatch { events: batch })
+        .send()
+        .await
+        .context("POST /v1/events")?;
+
+    let status = response.status();
+    if status != StatusCode::ACCEPTED {
+        let body = response.text().await.unwrap_or_default();
+        bail!("ingest returned {}: {}", status, body);
     }
 
     Ok(())
@@ -1793,7 +3164,11 @@ fn run_best_effort(command: &mut Command) {
 mod tests {
     use super::*;
     use anyhow::anyhow;
-    use std::fs;
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+    };
+    use tempfile::tempdir;
 
     fn snapshot_command(command: &Command) -> Vec<String> {
         std::iter::once(command.get_program().to_string_lossy().into_owned())
@@ -1845,6 +3220,17 @@ mod tests {
                 max_ms: sessions_duration_total_day_p95_ms,
             },
         ]
+    }
+
+    fn dummy_slo_host() -> HostMetadata {
+        HostMetadata {
+            cpu_model: "Test CPU".to_owned(),
+            memory_bytes: 8_589_934_592,
+            memory_gib: 8.0,
+            os_kernel: "TestOS 1.0".to_owned(),
+            architecture: "arm64".to_owned(),
+            benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
+        }
     }
 
     fn recent_main_runner_samples() -> Vec<(ScenarioBudget, ScenarioResult)> {
@@ -1996,6 +3382,476 @@ mod tests {
                 repetitions: 5,
                 output_dir: PathBuf::from("artifacts/performance/2026-03-13-m3-pro-heavy"),
             })
+        );
+    }
+
+    #[test]
+    fn parse_slo_command_reads_output_dir() {
+        let command = parse_args([
+            "fantasma-bench",
+            "slo",
+            "--output-dir",
+            "artifacts/performance/2026-03-13-derived-metrics-slo",
+        ])
+        .expect("parse slo command");
+
+        assert_eq!(
+            command,
+            BenchCommand::Slo(SloArgs {
+                output_dir: PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo"),
+            })
+        );
+    }
+
+    #[test]
+    fn slo_scenarios_lock_workload_sizes_and_repetition_policy() {
+        let scenarios = slo_scenario_definitions();
+
+        assert_eq!(scenarios.len(), 12);
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.key() == "append-30d")
+                .expect("append-30d")
+                .window
+                .total_events(),
+            900_000
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.key() == "append-90d")
+                .expect("append-90d")
+                .window
+                .total_events(),
+            2_700_000
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.key() == "append-180d")
+                .expect("append-180d")
+                .window
+                .total_events(),
+            5_400_000
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.key() == "append-30d")
+                .expect("append-30d")
+                .repetitions,
+            3
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.key() == "reads-180d")
+                .expect("reads-180d")
+                .repetitions,
+            1
+        );
+    }
+
+    #[test]
+    fn slo_visibility_timeouts_match_publication_policy() {
+        assert_eq!(
+            SloWindow::Days30.readiness_timeout(),
+            Duration::from_secs(5 * 60)
+        );
+        assert_eq!(
+            SloWindow::Days90.readiness_timeout(),
+            Duration::from_secs(20 * 60)
+        );
+        assert_eq!(
+            SloWindow::Days180.readiness_timeout(),
+            Duration::from_secs(40 * 60)
+        );
+    }
+
+    #[test]
+    fn reads_scenarios_treat_readiness_timeouts_as_visibility_only() {
+        assert_eq!(
+            slo_readiness_policy(SloScenarioKind::Reads, SloWindow::Days30),
+            SloReadinessPolicy {
+                allow_timeout_publication: false,
+                wait_for_full_readiness_before_queries: false,
+            }
+        );
+        assert_eq!(
+            slo_readiness_policy(SloScenarioKind::Reads, SloWindow::Days90),
+            SloReadinessPolicy {
+                allow_timeout_publication: true,
+                wait_for_full_readiness_before_queries: true,
+            }
+        );
+        assert_eq!(
+            slo_readiness_policy(SloScenarioKind::Reads, SloWindow::Days180),
+            SloReadinessPolicy {
+                allow_timeout_publication: true,
+                wait_for_full_readiness_before_queries: true,
+            }
+        );
+        assert_eq!(
+            slo_readiness_policy(SloScenarioKind::Append, SloWindow::Days180),
+            SloReadinessPolicy {
+                allow_timeout_publication: true,
+                wait_for_full_readiness_before_queries: false,
+            }
+        );
+    }
+
+    #[test]
+    fn prepare_clean_output_dir_removes_stale_artifacts_before_a_rerun() {
+        let tempdir = tempdir().expect("create tempdir");
+        let output_dir = tempdir.path().join("slo-output");
+
+        fs::create_dir_all(output_dir.join("append-30d")).expect("create stale scenario dir");
+        fs::write(output_dir.join("summary.json"), "stale").expect("write stale summary");
+        fs::write(
+            output_dir.join("append-30d").join("run-01.json"),
+            "stale scenario",
+        )
+        .expect("write stale scenario output");
+
+        prepare_clean_output_dir(&output_dir).expect("prepare clean output dir");
+
+        assert!(output_dir.is_dir());
+        assert!(
+            fs::read_dir(&output_dir)
+                .expect("read cleaned output dir")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn slo_grouped_query_matrix_contains_the_required_hard_gate_queries() {
+        let queries = slo_query_matrix(
+            SloWindow::Days30,
+            NaiveDate::from_ymd_opt(2026, 1, 1).expect("start day"),
+        );
+
+        let hard_gate_queries = queries
+            .iter()
+            .filter(|query| query.hard_gate)
+            .map(|query| query.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            hard_gate_queries,
+            vec![
+                "events_count_day_grouped",
+                "events_count_hour_grouped",
+                "sessions_count_day_grouped",
+                "sessions_count_hour_grouped",
+                "sessions_duration_total_day_grouped",
+                "sessions_duration_total_hour_grouped",
+                "sessions_new_installs_day_grouped",
+                "sessions_new_installs_hour_grouped",
+            ]
+        );
+    }
+
+    #[test]
+    fn slo_budget_evaluation_only_gates_30d_freshness_and_grouped_reads() {
+        let append_90 = SloScenarioResult {
+            scenario: "append-90d".to_owned(),
+            phases: vec![],
+            readiness: vec![
+                ReadinessMeasurement {
+                    name: "event_metrics_ready_ms".to_owned(),
+                    elapsed_ms: 45_000,
+                },
+                ReadinessMeasurement {
+                    name: "session_metrics_ready_ms".to_owned(),
+                    elapsed_ms: 90_000,
+                },
+                ReadinessMeasurement {
+                    name: "derived_metrics_ready_ms".to_owned(),
+                    elapsed_ms: 90_000,
+                },
+            ],
+            queries: vec![],
+            budget: None,
+            failure: None,
+        };
+        let reads_180 = SloScenarioResult {
+            scenario: "reads-180d".to_owned(),
+            phases: vec![],
+            readiness: vec![],
+            queries: vec![QueryMeasurement {
+                name: "sessions_count_hour_grouped".to_owned(),
+                iterations: 100,
+                min_ms: 200,
+                p50_ms: 300,
+                p95_ms: 600,
+                max_ms: 700,
+            }],
+            budget: None,
+            failure: None,
+        };
+
+        let append_90_budget = evaluate_slo_budget(
+            &slo_scenario_definitions()
+                .into_iter()
+                .find(|scenario| scenario.key() == "append-90d")
+                .expect("append-90d"),
+            &append_90,
+        );
+        let reads_180_budget = evaluate_slo_budget(
+            &slo_scenario_definitions()
+                .into_iter()
+                .find(|scenario| scenario.key() == "reads-180d")
+                .expect("reads-180d"),
+            &reads_180,
+        );
+
+        assert!(append_90_budget.passed);
+        assert!(!reads_180_budget.passed);
+        assert_eq!(
+            reads_180_budget.failures,
+            vec!["sessions_count_hour_grouped p95 600ms exceeded budget 500ms".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_until_elapsed_anchors_timeout_to_reported_start_instant() {
+        let started_at = Instant::now() - Duration::from_secs(1);
+        let deadline = started_at + Duration::from_millis(10);
+        let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let elapsed = poll_until_elapsed(
+            {
+                let checks = std::sync::Arc::clone(&checks);
+                move || {
+                    let checks = std::sync::Arc::clone(&checks);
+                    async move {
+                        checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok::<_, anyhow::Error>(false)
+                    }
+                }
+            },
+            deadline,
+            "anchored readiness",
+            started_at,
+            true,
+        )
+        .await
+        .expect("timeout publication succeeds");
+
+        assert_eq!(elapsed, None);
+        assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_slo_phase_and_wait_for_readiness_starts_after_phase_completion() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let (phase_output, readiness) = run_slo_phase_and_wait_for_readiness(
+            {
+                let events = Arc::clone(&events);
+                move || {
+                    let events = Arc::clone(&events);
+                    async move {
+                        events.lock().expect("lock events").push("phase");
+                        Ok::<_, anyhow::Error>("phase-output")
+                    }
+                }
+            },
+            {
+                let events = Arc::clone(&events);
+                move |_started_at| {
+                    let events = Arc::clone(&events);
+                    async move {
+                        let recorded = events.lock().expect("lock events").clone();
+                        assert_eq!(recorded, vec!["phase"]);
+                        events.lock().expect("lock events").push("readiness");
+                        Ok::<_, anyhow::Error>(vec![ReadinessMeasurement {
+                            name: "derived_metrics_ready_ms".to_owned(),
+                            elapsed_ms: 123,
+                        }])
+                    }
+                }
+            },
+        )
+        .await
+        .expect("measure readiness");
+
+        assert_eq!(phase_output, "phase-output");
+        assert_eq!(
+            readiness,
+            vec![ReadinessMeasurement {
+                name: "derived_metrics_ready_ms".to_owned(),
+                elapsed_ms: 123,
+            }]
+        );
+        assert_eq!(
+            events.lock().expect("lock events").as_slice(),
+            ["phase", "readiness"]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_slo_suite_writes_summary_even_when_a_scenario_fails() {
+        let tempdir = tempdir().expect("create tempdir");
+        let output_dir = tempdir.path().join("derived-metrics-slo");
+        fs::create_dir_all(output_dir.join("stale-scenario")).expect("create stale subtree");
+        fs::write(output_dir.join("summary.json"), "stale").expect("write stale summary");
+
+        let error = run_slo_suite(&output_dir, dummy_slo_host(), |scenario| async move {
+            let scenario_key = scenario.key();
+            Err::<SloScenarioResult, anyhow::Error>(anyhow!(
+                "intentional failure for {scenario_key}"
+            ))
+        })
+        .await
+        .expect_err("suite should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("scenario execution failed: intentional failure for append-30d")
+        );
+        assert!(host_metadata_output_path(&output_dir).exists());
+        assert!(summary_output_path(&output_dir).exists());
+        assert!(
+            summary_output_path(&output_dir)
+                .with_extension("md")
+                .exists()
+        );
+        assert!(output_dir.join("append-30d").join("run-01.json").exists());
+        assert!(output_dir.join("append-30d").join("run-01.md").exists());
+        assert!(!output_dir.join("stale-scenario").exists());
+
+        let summary: SloSummary = serde_json::from_str(
+            &fs::read_to_string(summary_output_path(&output_dir)).expect("read summary json"),
+        )
+        .expect("parse summary json");
+        assert_eq!(summary.scenarios.len(), 1);
+        assert_eq!(summary.scenarios[0].scenario, "append-30d");
+        assert_eq!(
+            summary.scenarios[0].budget,
+            Some(BudgetEvaluation {
+                passed: false,
+                failures: vec![
+                    "scenario execution failed: intentional failure for append-30d".to_owned()
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn render_slo_markdown_summary_includes_family_readiness_and_budgets() {
+        let summary = SloSummary {
+            host: HostMetadata {
+                cpu_model: "Apple M3 Pro".to_owned(),
+                memory_bytes: 38_654_705_664,
+                memory_gib: 36.0,
+                os_kernel: "Darwin 25.1.0".to_owned(),
+                architecture: "arm64".to_owned(),
+                benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
+            },
+            scenarios: vec![SloScenarioResult {
+                scenario: "append-30d".to_owned(),
+                phases: vec![PhaseMeasurement {
+                    name: "ingest".to_owned(),
+                    events_sent: 900_000,
+                    elapsed_ms: 15_000,
+                    events_per_second: 60_000.0,
+                }],
+                readiness: vec![
+                    ReadinessMeasurement {
+                        name: "event_metrics_ready_ms".to_owned(),
+                        elapsed_ms: 20_000,
+                    },
+                    ReadinessMeasurement {
+                        name: "session_metrics_ready_ms".to_owned(),
+                        elapsed_ms: 40_000,
+                    },
+                    ReadinessMeasurement {
+                        name: "derived_metrics_ready_ms".to_owned(),
+                        elapsed_ms: 40_000,
+                    },
+                ],
+                queries: vec![QueryMeasurement {
+                    name: "events_count_day_grouped".to_owned(),
+                    iterations: 100,
+                    min_ms: 50,
+                    p50_ms: 60,
+                    p95_ms: 80,
+                    max_ms: 95,
+                }],
+                budget: Some(BudgetEvaluation {
+                    passed: true,
+                    failures: vec![],
+                }),
+                failure: None,
+            }],
+        };
+
+        let markdown = render_slo_markdown_summary(&summary);
+
+        assert!(markdown.contains("# Fantasma Derived Metrics SLO Suite"));
+        assert!(markdown.contains("## append-30d"));
+        assert!(markdown.contains("- event_metrics_ready_ms: 20000ms"));
+        assert!(markdown.contains("- session_metrics_ready_ms: 40000ms"));
+        assert!(markdown.contains("- derived_metrics_ready_ms: 40000ms"));
+        assert!(markdown.contains("- Budget: PASS"));
+        assert!(markdown.contains("| events_count_day_grouped | 60 | 80 | 50 | 95 |"));
+    }
+
+    #[test]
+    fn slo_summary_json_rendering_preserves_family_readiness_fields() {
+        let summary = SloSummary {
+            host: HostMetadata {
+                cpu_model: "Apple M3 Pro".to_owned(),
+                memory_bytes: 38_654_705_664,
+                memory_gib: 36.0,
+                os_kernel: "Darwin 25.1.0".to_owned(),
+                architecture: "arm64".to_owned(),
+                benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
+            },
+            scenarios: vec![SloScenarioResult {
+                scenario: "reads-30d".to_owned(),
+                phases: vec![],
+                readiness: vec![
+                    ReadinessMeasurement {
+                        name: "event_metrics_ready_ms".to_owned(),
+                        elapsed_ms: 18_000,
+                    },
+                    ReadinessMeasurement {
+                        name: "session_metrics_ready_ms".to_owned(),
+                        elapsed_ms: 35_000,
+                    },
+                    ReadinessMeasurement {
+                        name: "derived_metrics_ready_ms".to_owned(),
+                        elapsed_ms: 35_000,
+                    },
+                ],
+                queries: vec![],
+                budget: Some(BudgetEvaluation {
+                    passed: true,
+                    failures: vec![],
+                }),
+                failure: None,
+            }],
+        };
+
+        let rendered = serde_json::to_value(&summary).expect("serialize SLO summary");
+
+        assert_eq!(rendered["scenarios"][0]["scenario"], "reads-30d");
+        assert_eq!(
+            rendered["scenarios"][0]["readiness"][0]["name"],
+            "event_metrics_ready_ms"
+        );
+        assert_eq!(
+            rendered["scenarios"][0]["readiness"][1]["name"],
+            "session_metrics_ready_ms"
+        );
+        assert_eq!(
+            rendered["scenarios"][0]["readiness"][2]["name"],
+            "derived_metrics_ready_ms"
         );
     }
 

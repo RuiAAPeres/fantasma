@@ -71,18 +71,27 @@ Current derived metric:
 
 Current worker behavior:
 
+- run one `sessions` lane and one `event_metrics` lane concurrently inside the same worker process
+- keep a separate `worker_offsets` checkpoint per lane and hold the claimed offset-row lock for the full batch window until the final offset save commits
+- repoll immediately after progress and sleep only after an idle tick, so busy lanes stay work-conserving
 - poll `events_raw` in batches ordered by raw event id
-- group events by `project_id` and `install_id`
-- load one persisted tail state row per `(project_id, install_id)` from `install_session_state`
+- group session-lane batches by `project_id` and `install_id`
+- load one persisted state row per `(project_id, install_id)` from `install_session_state`
 - sort each install batch by `(timestamp, id)` and process forward only
 - infer sessions from event timestamps with a 30-minute inactivity rule
 - keep at most one mutable tail session per install
 - extend the current tail session in place when a new event is newer than or equal to the tail end and inside the inactivity window
 - insert a new immutable session row and replace tail state when a new event exceeds the inactivity window
+- keep `last_processed_event_id` in `install_session_state` so per-install replay becomes a no-op even if the lane offset is rewound after some install work already committed
+- treat `install_session_state` as durable worker state and never delete or reset it during ordinary append, repair, or session rewrites
+- classify session-lane work items into incremental vs repair and run those queues with separate bounded concurrency so repair load cannot consume append slots
 - switch an install into a bounded repair path when a batch contains older-than-tail events
 - derive replacement sessions from raw events inside the overlapping repair window and rewrite only those derived rows
 - rebuild only the exact touched UTC start days for `session_daily` and `session_daily_installs` after a repair
 - rebuild only the exact touched hourly and daily session metric buckets after session changes
+- if a later install in the claimed batch fails after earlier install work already committed, rebuild the successful installs' touched buckets before releasing the lane lock or surfacing the error so replay filtering cannot strand stale aggregates
+- enqueue touched session day/hour buckets durably inside each child install transaction so a later coordinator rollback cannot strand committed session changes behind replay filtering
+- drain and rebuild the pending session bucket queue inside the coordinator transaction before deleting those queue rows and advancing the lane offset
 - preserve grouped session dimensions from the pre-repair session assignment so late events do not rebucket `platform` or `app_version`
 - keep the normal append path incremental: `session_daily` still updates directly from new sessions and tail-session duration deltas
 - update `session_daily_installs` incrementally so daily active installs never depend on `COUNT(DISTINCT ...)` rebuilds
@@ -94,12 +103,19 @@ Current worker behavior:
 Current aggregate ownership:
 
 - `sessions` stores immutable closed sessions plus one mutable tail session per install
-- `install_session_state` is the worker's steady-state decision surface for sessionization
+- `install_session_state` is the worker's durable per-install sessionization and replay-progress state
 - `session_daily` stores UTC `DATE` buckets used by bounded session repair and incremental session-count / duration maintenance
 - `session_daily_installs` stores per-day install membership so internal install bookkeeping stays incremental without `COUNT(DISTINCT ...)` rebuilds
 - bounded event metric cuboids store worker-derived hourly and daily series for event counts
 - bounded session metric rollups store worker-derived hourly and daily series for `count`, `duration_total`, and `new_installs`
 - `install_first_seen` fixes each install to the bucket of its first accepted event and never rebuckets late arrivals
+
+Current freshness/read performance proofing:
+
+- `fantasma-bench slo` measures event-derived readiness and session-derived readiness separately
+- `event_metrics_ready_ms` and `session_metrics_ready_ms` are published independently because the worker now runs those families in different internal lanes
+- `derived_metrics_ready_ms` is the max of the two family readiness values and represents the public derived-surface freshness ceiling
+- grouped public reads are benchmarked only after readiness is reached so read latency is measured independently from ingest freshness
 
 Planned aggregates:
 

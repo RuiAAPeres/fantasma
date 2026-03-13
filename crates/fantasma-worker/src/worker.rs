@@ -7,25 +7,30 @@ use fantasma_store::{
     EventCountDailyTotalDelta, InstallFirstSeenRecord, InstallSessionStateRecord, PgPool,
     RawEventRecord, SessionMetricDim1Delta, SessionMetricDim2Delta, SessionMetricTotalDelta,
     SessionRecord, SessionTailUpdate, StoreError, add_session_daily_duration_delta_in_tx,
-    delete_sessions_overlapping_window_in_tx, fetch_events_after,
+    delete_pending_session_rebuild_buckets_in_tx, delete_sessions_overlapping_window_in_tx,
+    enqueue_session_rebuild_buckets_in_tx, fetch_events_after_in_tx,
     fetch_events_for_install_between_in_tx, fetch_latest_session_for_install_in_tx,
     fetch_sessions_overlapping_window_in_tx, increment_session_daily_for_new_session_in_tx,
     insert_install_first_seen_in_tx, insert_session_in_tx, load_install_first_seen_in_tx,
-    load_install_session_state_in_tx, lock_worker_offset, rebuild_session_daily_days_in_tx,
-    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_event_count_daily_dim1_in_tx,
+    load_install_session_states_in_tx, load_pending_session_rebuild_buckets_in_tx,
+    lock_worker_offset, rebuild_session_daily_days_in_tx, save_worker_offset_in_tx,
+    update_session_tail_in_tx, upsert_event_count_daily_dim1_in_tx,
     upsert_event_count_daily_dim2_in_tx, upsert_event_count_daily_dim3_in_tx,
     upsert_event_count_daily_totals_in_tx, upsert_install_session_state_in_tx,
     upsert_session_metric_dim1_in_tx, upsert_session_metric_dim2_in_tx,
     upsert_session_metric_totals_in_tx,
 };
 use sqlx::{Postgres, Row, Transaction};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::sessionization;
 
 const SESSION_TIMEOUT_MINS: i64 = 30;
-const SESSION_WORKER_NAME: &str = "sessions";
-const EVENT_METRICS_WORKER_NAME: &str = "event_metrics";
+pub(crate) const SESSION_WORKER_NAME: &str = "sessions";
+pub(crate) const EVENT_METRICS_WORKER_NAME: &str = "event_metrics";
+const DEFAULT_SESSION_INCREMENTAL_CONCURRENCY: usize = 8;
+const DEFAULT_SESSION_REPAIR_CONCURRENCY: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecomputeWindow {
@@ -40,11 +45,6 @@ struct SessionRepairBuckets {
 }
 
 impl SessionRepairBuckets {
-    fn extend(&mut self, other: Self) {
-        self.days.extend(other.days);
-        self.hours.extend(other.hours);
-    }
-
     fn insert_timestamp(&mut self, timestamp: DateTime<Utc>) {
         self.days.insert(timestamp.date_naive());
         self.hours.insert(bucket_start_for_granularity(
@@ -60,78 +60,397 @@ impl SessionRepairBuckets {
     fn is_empty(&self) -> bool {
         self.days.is_empty() && self.hours.is_empty()
     }
+
+    fn day_bucket_starts(&self) -> Vec<DateTime<Utc>> {
+        self.days
+            .iter()
+            .copied()
+            .map(bucket_start_for_day)
+            .collect()
+    }
+
+    fn hour_bucket_starts(&self) -> Vec<DateTime<Utc>> {
+        self.hours.iter().copied().collect()
+    }
 }
 
 pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usize, StoreError> {
+    Ok(process_session_batch_with_config(
+        pool,
+        SessionBatchConfig {
+            batch_size,
+            incremental_concurrency: DEFAULT_SESSION_INCREMENTAL_CONCURRENCY,
+            repair_concurrency: DEFAULT_SESSION_REPAIR_CONCURRENCY,
+        },
+    )
+    .await?
+    .processed_events)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SessionBatchConfig {
+    pub batch_size: i64,
+    pub incremental_concurrency: usize,
+    pub repair_concurrency: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionBatchOutcome {
+    pub(crate) processed_events: usize,
+    pub(crate) advanced_offset: bool,
+}
+
+impl SessionBatchConfig {
+    fn normalized(self) -> Self {
+        Self {
+            batch_size: self.batch_size.max(1),
+            incremental_concurrency: self.incremental_concurrency.max(1),
+            repair_concurrency: self.repair_concurrency.max(1),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SessionWorkItem {
+    project_id: Uuid,
+    install_id: String,
+    events: Vec<RawEventRecord>,
+    tail_state: Option<InstallSessionStateRecord>,
+    highest_processed_event_id: i64,
+    kind: SessionWorkKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionWorkKind {
+    Incremental,
+    Repair,
+}
+
+pub(crate) async fn process_session_batch_with_config(
+    pool: &PgPool,
+    config: SessionBatchConfig,
+) -> Result<SessionBatchOutcome, StoreError> {
+    process_session_batch_inner(pool, config, SessionBatchHooks::default()).await
+}
+
+async fn process_session_batch_inner(
+    pool: &PgPool,
+    config: SessionBatchConfig,
+    hooks: SessionBatchHooks,
+) -> Result<SessionBatchOutcome, StoreError> {
+    let config = config.normalized();
     let mut tx = pool.begin().await.map_err(StoreError::from)?;
     let last_processed_event_id = lock_worker_offset(&mut tx, SESSION_WORKER_NAME).await?;
-    let batch = fetch_events_after(pool, last_processed_event_id, batch_size).await?;
-    let processed_events = batch.len();
-    let mut touched_buckets_by_project = BTreeMap::<Uuid, SessionRepairBuckets>::new();
-
+    let batch =
+        fetch_events_after_in_tx(&mut tx, last_processed_event_id, config.batch_size).await?;
     if batch.is_empty() {
         tx.commit().await.map_err(StoreError::from)?;
-        return Ok(0);
+        return Ok(SessionBatchOutcome {
+            processed_events: 0,
+            advanced_offset: false,
+        });
     }
 
     let next_offset = batch
         .last()
         .map(|event| event.id)
         .expect("non-empty batch has last event");
+    let mut processed_events = 0_usize;
+    let mut incremental_items = Vec::new();
+    let mut repair_items = Vec::new();
+    let grouped = group_events(batch);
+    let project_ids = grouped
+        .keys()
+        .map(|(project_id, _)| *project_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let install_keys = grouped
+        .keys()
+        .map(|(project_id, install_id)| (*project_id, install_id.clone()))
+        .collect::<Vec<_>>();
+    let tail_states = load_install_session_states_in_tx(&mut tx, &install_keys).await?;
 
-    for ((project_id, install_id), events) in group_events(batch) {
-        let touched_buckets =
-            process_install_batch(&mut tx, project_id, &install_id, events).await?;
+    for ((project_id, install_id), events) in grouped {
+        let tail_state = tail_states.get(&(project_id, install_id.clone())).cloned();
+        let events = filter_replayed_events(tail_state.as_ref(), events);
+        if events.is_empty() {
+            continue;
+        }
 
-        if !touched_buckets.is_empty() {
-            touched_buckets_by_project
-                .entry(project_id)
-                .or_default()
-                .extend(touched_buckets);
+        processed_events += events.len();
+        let highest_processed_event_id = events
+            .iter()
+            .map(|event| event.id)
+            .max()
+            .expect("non-empty install batch has last event");
+        let kind = if needs_exact_day_repair(tail_state.as_ref(), &events) {
+            SessionWorkKind::Repair
+        } else {
+            SessionWorkKind::Incremental
+        };
+        let item = SessionWorkItem {
+            project_id,
+            install_id,
+            events,
+            tail_state,
+            highest_processed_event_id,
+            kind,
+        };
+
+        match kind {
+            SessionWorkKind::Incremental => incremental_items.push(item),
+            SessionWorkKind::Repair => repair_items.push(item),
         }
     }
 
-    for (project_id, touched_buckets) in touched_buckets_by_project {
-        let days = touched_buckets.days.iter().copied().collect::<Vec<_>>();
-        if !days.is_empty() {
-            rebuild_session_daily_days_in_tx(&mut tx, project_id, &days).await?;
-            rebuild_session_metric_buckets_in_tx(
-                &mut tx,
-                project_id,
-                MetricGranularity::Day,
-                &days
-                    .iter()
-                    .map(|day| bucket_start_for_day(*day))
-                    .collect::<Vec<_>>(),
-            )
-            .await?;
-        }
+    let (incremental_queue, repair_queue) = tokio::join!(
+        run_session_work_queue(
+            pool.clone(),
+            incremental_items,
+            config.incremental_concurrency
+        ),
+        run_session_work_queue(pool.clone(), repair_items, config.repair_concurrency),
+    );
+    let incremental_queue = incremental_queue?;
+    let repair_queue = repair_queue?;
 
-        let hours = touched_buckets.hours.into_iter().collect::<Vec<_>>();
-        if !hours.is_empty() {
-            rebuild_session_metric_buckets_in_tx(
-                &mut tx,
-                project_id,
-                MetricGranularity::Hour,
-                &hours,
-            )
-            .await?;
-        }
+    rebuild_pending_session_buckets_in_tx(&mut tx, &project_ids).await?;
+    hooks.fail_before_coordinator_finalize()?;
+
+    if let Some(error) = merge_session_queue_errors(incremental_queue.error, repair_queue.error) {
+        tx.commit().await.map_err(StoreError::from)?;
+        return Err(error);
     }
 
     save_worker_offset_in_tx(&mut tx, SESSION_WORKER_NAME, next_offset).await?;
     tx.commit().await.map_err(StoreError::from)?;
 
-    Ok(processed_events)
+    Ok(SessionBatchOutcome {
+        processed_events,
+        advanced_offset: true,
+    })
+}
+
+struct SessionWorkQueueResult {
+    error: Option<StoreError>,
+}
+
+async fn run_session_work_queue(
+    pool: PgPool,
+    items: Vec<SessionWorkItem>,
+    concurrency: usize,
+) -> Result<SessionWorkQueueResult, StoreError> {
+    if items.is_empty() {
+        return Ok(SessionWorkQueueResult { error: None });
+    }
+
+    let mut work_items = items.into_iter();
+    let mut work_set = JoinSet::new();
+    let concurrency = concurrency.max(1);
+    let mut error = None;
+
+    for _ in 0..concurrency {
+        let Some(item) = work_items.next() else {
+            break;
+        };
+        let pool = pool.clone();
+        work_set.spawn(async move { process_session_work_item(&pool, item).await });
+    }
+
+    while let Some(join_result) = work_set.join_next().await {
+        match join_result {
+            Ok(Ok(())) => {
+                if error.is_none() {
+                    if let Some(item) = work_items.next() {
+                        let pool = pool.clone();
+                        work_set.spawn(async move { process_session_work_item(&pool, item).await });
+                    }
+                }
+            }
+            Ok(Err(join_error)) => {
+                if error.is_none() {
+                    error = Some(join_error);
+                    work_set.abort_all();
+                }
+            }
+            Err(join_error) if join_error.is_cancelled() => {}
+            Err(join_error) => {
+                if error.is_none() {
+                    error = Some(StoreError::InvariantViolation(format!(
+                        "session work item task failed: {join_error}"
+                    )));
+                    work_set.abort_all();
+                }
+            }
+        }
+    }
+
+    Ok(SessionWorkQueueResult { error })
+}
+
+async fn process_session_work_item(pool: &PgPool, item: SessionWorkItem) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await.map_err(StoreError::from)?;
+    let touched_buckets = match item.kind {
+        SessionWorkKind::Incremental => {
+            process_install_batch_incremental(
+                &mut tx,
+                item.project_id,
+                &item.install_id,
+                item.events,
+                item.tail_state,
+            )
+            .await?
+        }
+        SessionWorkKind::Repair => {
+            repair_install_batch(
+                &mut tx,
+                item.project_id,
+                &item.install_id,
+                item.events,
+                item.highest_processed_event_id,
+            )
+            .await?
+        }
+    };
+    enqueue_session_rebuild_buckets_in_tx(
+        &mut tx,
+        item.project_id,
+        &touched_buckets.day_bucket_starts(),
+        &touched_buckets.hour_bucket_starts(),
+    )
+    .await?;
+    tx.commit().await.map_err(StoreError::from)?;
+
+    Ok(())
+}
+
+async fn rebuild_pending_session_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_ids: &[Uuid],
+) -> Result<(), StoreError> {
+    let pending_buckets = load_pending_session_rebuild_buckets_in_tx(tx, project_ids).await?;
+    let mut touched_buckets_by_project = BTreeMap::<Uuid, SessionRepairBuckets>::new();
+
+    for bucket in pending_buckets {
+        let touched_buckets = touched_buckets_by_project
+            .entry(bucket.project_id)
+            .or_default();
+        match bucket.granularity {
+            MetricGranularity::Day => {
+                touched_buckets
+                    .days
+                    .insert(bucket.bucket_start.date_naive());
+            }
+            MetricGranularity::Hour => {
+                touched_buckets.hours.insert(bucket.bucket_start);
+            }
+        }
+    }
+
+    for (project_id, touched_buckets) in touched_buckets_by_project {
+        if !touched_buckets.is_empty() {
+            let days = touched_buckets.days.iter().copied().collect::<Vec<_>>();
+            if !days.is_empty() {
+                rebuild_session_daily_days_in_tx(tx, project_id, &days).await?;
+                rebuild_session_metric_buckets_in_tx(
+                    tx,
+                    project_id,
+                    MetricGranularity::Day,
+                    &days
+                        .iter()
+                        .map(|day| bucket_start_for_day(*day))
+                        .collect::<Vec<_>>(),
+                )
+                .await?;
+            }
+
+            let hours = touched_buckets.hours.into_iter().collect::<Vec<_>>();
+            if !hours.is_empty() {
+                rebuild_session_metric_buckets_in_tx(
+                    tx,
+                    project_id,
+                    MetricGranularity::Hour,
+                    &hours,
+                )
+                .await?;
+            }
+        }
+    }
+
+    delete_pending_session_rebuild_buckets_in_tx(tx, project_ids).await?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionBatchHooks {
+    fail_before_coordinator_finalize: bool,
+}
+
+impl SessionBatchHooks {
+    fn fail_before_coordinator_finalize(self) -> Result<(), StoreError> {
+        if self.fail_before_coordinator_finalize {
+            return Err(StoreError::InvariantViolation(
+                "session batch hook forced coordinator finalize failure".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionBatchTestHooks(SessionBatchHooks);
+
+#[cfg(test)]
+impl SessionBatchTestHooks {
+    fn fail_before_coordinator_finalize() -> Self {
+        Self(SessionBatchHooks {
+            fail_before_coordinator_finalize: true,
+        })
+    }
+}
+
+#[cfg(test)]
+async fn process_session_batch_with_hooks(
+    pool: &PgPool,
+    config: SessionBatchConfig,
+    hooks: SessionBatchTestHooks,
+) -> Result<SessionBatchOutcome, StoreError> {
+    process_session_batch_inner(pool, config, hooks.0).await
+}
+
+fn merge_session_queue_errors(
+    left: Option<StoreError>,
+    right: Option<StoreError>,
+) -> Option<StoreError> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(StoreError::InvariantViolation(format!(
+            "{left}; secondary session queue failure: {right}"
+        ))),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
 }
 
 pub async fn process_event_metrics_batch(
     pool: &PgPool,
     batch_size: i64,
 ) -> Result<usize, StoreError> {
+    process_event_metrics_batch_with_config(pool, batch_size).await
+}
+
+pub(crate) async fn process_event_metrics_batch_with_config(
+    pool: &PgPool,
+    batch_size: i64,
+) -> Result<usize, StoreError> {
+    let batch_size = batch_size.max(1);
     let mut tx = pool.begin().await.map_err(StoreError::from)?;
     let last_processed_event_id = lock_worker_offset(&mut tx, EVENT_METRICS_WORKER_NAME).await?;
-    let batch = fetch_events_after(pool, last_processed_event_id, batch_size).await?;
+    let batch = fetch_events_after_in_tx(&mut tx, last_processed_event_id, batch_size).await?;
     let processed_events = batch.len();
 
     if batch.is_empty() {
@@ -430,19 +749,18 @@ fn group_events(batch: Vec<RawEventRecord>) -> BTreeMap<(Uuid, String), Vec<RawE
     grouped
 }
 
-async fn process_install_batch(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    project_id: Uuid,
-    install_id: &str,
+fn filter_replayed_events(
+    tail_state: Option<&InstallSessionStateRecord>,
     events: Vec<RawEventRecord>,
-) -> Result<SessionRepairBuckets, StoreError> {
-    let tail_state = load_install_session_state_in_tx(tx, project_id, install_id).await?;
+) -> Vec<RawEventRecord> {
+    let Some(tail_state) = tail_state else {
+        return events;
+    };
 
-    if needs_exact_day_repair(tail_state.as_ref(), &events) {
-        return repair_install_batch(tx, project_id, install_id, events).await;
-    }
-
-    process_install_batch_incremental(tx, project_id, install_id, events, tail_state).await
+    events
+        .into_iter()
+        .filter(|event| event.id > tail_state.last_processed_event_id)
+        .collect()
 }
 
 fn needs_exact_day_repair(
@@ -466,6 +784,10 @@ async fn process_install_batch_incremental(
     mut tail_state: Option<InstallSessionStateRecord>,
 ) -> Result<SessionRepairBuckets, StoreError> {
     let mut touched_buckets = SessionRepairBuckets::default();
+    let mut install_progress = tail_state
+        .as_ref()
+        .map(|state| state.last_processed_event_id)
+        .unwrap_or_default();
     let existing_first_seen = load_install_first_seen_in_tx(tx, project_id, install_id).await?;
     if existing_first_seen.is_none() {
         if let Some(first_accepted_event) = events.iter().min_by_key(|event| event.id) {
@@ -484,6 +806,7 @@ async fn process_install_batch_incremental(
     }
 
     for event in events {
+        install_progress = install_progress.max(event.id);
         match tail_state.as_mut() {
             None => {
                 let session = session_from_event(&event);
@@ -497,7 +820,7 @@ async fn process_install_batch_incremental(
                 )
                 .await?;
 
-                let state = install_state_from_session(&session);
+                let state = install_state_from_session(&session, install_progress);
                 upsert_install_session_state_in_tx(tx, &state).await?;
                 tail_state = Some(state);
                 touched_buckets.insert_session(&session);
@@ -514,7 +837,7 @@ async fn process_install_batch_incremental(
 
                 if gap <= ChronoDuration::minutes(SESSION_TIMEOUT_MINS) {
                     touched_buckets.insert_timestamp(state.tail_session_start);
-                    extend_tail_session(tx, state, &event).await?;
+                    extend_tail_session(tx, state, &event, install_progress).await?;
                 } else {
                     let session = session_from_event(&event);
                     insert_session_in_tx(tx, &session).await?;
@@ -527,7 +850,7 @@ async fn process_install_batch_incremental(
                     )
                     .await?;
 
-                    let next_state = install_state_from_session(&session);
+                    let next_state = install_state_from_session(&session, install_progress);
                     upsert_install_session_state_in_tx(tx, &next_state).await?;
                     *state = next_state;
                     touched_buckets.insert_session(&session);
@@ -544,6 +867,7 @@ async fn repair_install_batch(
     project_id: Uuid,
     install_id: &str,
     batch_events: Vec<RawEventRecord>,
+    highest_processed_event_id: i64,
 ) -> Result<SessionRepairBuckets, StoreError> {
     let batch_min_ts = batch_events
         .first()
@@ -599,7 +923,7 @@ async fn repair_install_batch(
         )));
     };
 
-    let next_state = install_state_from_session(&latest_session);
+    let next_state = install_state_from_session(&latest_session, highest_processed_event_id);
     upsert_install_session_state_in_tx(tx, &next_state).await?;
 
     Ok(touched_buckets)
@@ -709,6 +1033,7 @@ async fn extend_tail_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     state: &mut InstallSessionStateRecord,
     event: &RawEventRecord,
+    processed_event_id: i64,
 ) -> Result<(), StoreError> {
     let new_end = state.tail_session_end.max(event.timestamp);
     let new_duration = new_end
@@ -756,6 +1081,7 @@ async fn extend_tail_session(
     state.tail_session_end = new_end;
     state.tail_event_count = new_event_count;
     state.tail_duration_seconds = new_duration;
+    state.last_processed_event_id = state.last_processed_event_id.max(processed_event_id);
     upsert_install_session_state_in_tx(tx, state).await?;
 
     Ok(())
@@ -783,7 +1109,10 @@ fn session_from_event(event: &RawEventRecord) -> SessionRecord {
     }
 }
 
-fn install_state_from_session(session: &SessionRecord) -> InstallSessionStateRecord {
+fn install_state_from_session(
+    session: &SessionRecord,
+    last_processed_event_id: i64,
+) -> InstallSessionStateRecord {
     InstallSessionStateRecord {
         project_id: session.project_id,
         install_id: session.install_id.clone(),
@@ -793,6 +1122,7 @@ fn install_state_from_session(session: &SessionRecord) -> InstallSessionStateRec
         tail_event_count: session.event_count,
         tail_duration_seconds: session.duration_seconds,
         tail_day: session.session_start.date_naive(),
+        last_processed_event_id,
     }
 }
 
@@ -1164,7 +1494,8 @@ mod tests {
     use fantasma_store::{
         BootstrapConfig, RawEventRecord, average_session_duration_seconds, count_active_installs,
         count_sessions, fetch_latest_session_for_install, insert_events,
-        load_install_session_state, load_worker_offset,
+        load_install_session_state, load_pending_session_rebuild_buckets_in_tx, load_worker_offset,
+        save_worker_offset,
     };
     use sqlx::Row;
 
@@ -1283,6 +1614,17 @@ mod tests {
         })
     }
 
+    async fn pending_session_rebuild_buckets(
+        pool: &PgPool,
+    ) -> Vec<fantasma_store::PendingSessionRebuildBucketRecord> {
+        let mut tx = pool.begin().await.expect("begin pending rebuild bucket tx");
+        let pending = load_pending_session_rebuild_buckets_in_tx(&mut tx, &[project_id()])
+            .await
+            .expect("load pending session rebuild buckets");
+        tx.commit().await.expect("commit pending rebuild bucket tx");
+        pending
+    }
+
     #[test]
     fn max_dimension_event_metrics_fanout_stays_bounded() {
         let rollups = build_event_metric_rollups(&[raw_event_with_max_dimensions()]);
@@ -1398,6 +1740,119 @@ mod tests {
             .expect("tail exists");
         assert_eq!(tail.tail_session_end, timestamp(1, 0, 10));
         assert_eq!(tail.tail_event_count, 2);
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 600))
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_worker_records_install_progress_for_processed_events(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 0, 0), event("install-1", 1, 0, 10)],
+        )
+        .await
+        .expect("insert events");
+
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process batch");
+
+        let tail = load_install_session_state(&pool, project_id(), "install-1")
+            .await
+            .expect("load tail state")
+            .expect("tail state exists");
+
+        assert_eq!(tail.last_processed_event_id, 2);
+    }
+
+    #[sqlx::test]
+    async fn session_worker_persists_max_raw_id_when_timestamp_order_differs(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 0, 10), event("install-1", 1, 0, 0)],
+        )
+        .await
+        .expect("insert events");
+
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        let tail = load_install_session_state(&pool, project_id(), "install-1")
+            .await
+            .expect("load tail state")
+            .expect("tail state exists");
+        assert_eq!(tail.last_processed_event_id, 2);
+
+        save_worker_offset(&pool, SESSION_WORKER_NAME, 0)
+            .await
+            .expect("rewind worker offset");
+
+        let replayed = process_session_batch(&pool, 100)
+            .await
+            .expect("replay batch");
+
+        assert_eq!(replayed, 0);
+        assert_eq!(
+            count_sessions(
+                &pool,
+                project_id(),
+                timestamp(1, 0, 0),
+                timestamp(1, 23, 59)
+            )
+            .await
+            .expect("count sessions"),
+            1
+        );
+    }
+
+    #[sqlx::test]
+    async fn replayed_install_batch_is_a_no_op_once_install_progress_is_recorded(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 0, 0), event("install-1", 1, 0, 10)],
+        )
+        .await
+        .expect("insert events");
+
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        save_worker_offset(&pool, SESSION_WORKER_NAME, 0)
+            .await
+            .expect("rewind worker offset");
+
+        let replayed = process_session_batch(&pool, 100)
+            .await
+            .expect("replay batch");
+
+        assert_eq!(replayed, 0);
+        assert_eq!(
+            count_sessions(
+                &pool,
+                project_id(),
+                timestamp(1, 0, 0),
+                timestamp(1, 23, 59)
+            )
+            .await
+            .expect("count sessions"),
+            1
+        );
         assert_eq!(
             session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
             Some((1, 1, 600))
@@ -1743,6 +2198,235 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn successful_incremental_work_rebuilds_metrics_before_later_batch_failure(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[
+                event("install-a", 1, 0, 0),
+                event("install-a", 1, 0, 10),
+                event("install-b", 1, 1, 0),
+                event("install-b", 1, 1, 10),
+            ],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        sqlx::query("DELETE FROM sessions WHERE project_id = $1 AND install_id = $2")
+            .bind(project_id())
+            .bind("install-b")
+            .execute(&pool)
+            .await
+            .expect("delete broken install session row");
+
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-a", 1, 0, 20), event("install-b", 1, 1, 20)],
+        )
+        .await
+        .expect("insert mixed batch");
+
+        let error = process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect_err("later install should fail batch");
+
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 20 * 60))
+        );
+
+        let hour_zero_duration = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT duration_total_seconds
+            FROM session_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = 'hour'
+              AND bucket_start = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(1, 0, 0))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch hour-zero duration");
+        let day_duration = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT duration_total_seconds
+            FROM session_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = 'day'
+              AND bucket_start = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(1, 0, 0))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch day duration");
+
+        assert_eq!(hour_zero_duration, 20 * 60);
+        assert_eq!(day_duration, 20 * 60);
+    }
+
+    #[sqlx::test]
+    async fn replayed_batch_rebuilds_metrics_after_coordinator_failure(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 50)])
+            .await
+            .expect("insert initial event");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 1, 10)])
+            .await
+            .expect("insert extending event");
+
+        let error = process_session_batch_with_hooks(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+            SessionBatchTestHooks::fail_before_coordinator_finalize(),
+        )
+        .await
+        .expect_err("coordinator finalize should fail after child commit");
+
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+
+        let session = fetch_latest_session_for_install(&pool, project_id(), "install-1")
+            .await
+            .expect("fetch extended session")
+            .expect("session exists");
+        assert_eq!(session.session_end, timestamp(1, 1, 10));
+        assert_eq!(session.duration_seconds, 20 * 60);
+        assert_eq!(
+            load_worker_offset(&pool, SESSION_WORKER_NAME)
+                .await
+                .expect("load worker offset"),
+            1
+        );
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 20 * 60))
+        );
+        assert_eq!(
+            pending_session_rebuild_buckets(&pool).await,
+            vec![
+                fantasma_store::PendingSessionRebuildBucketRecord {
+                    project_id: project_id(),
+                    granularity: MetricGranularity::Day,
+                    bucket_start: timestamp(1, 0, 0),
+                },
+                fantasma_store::PendingSessionRebuildBucketRecord {
+                    project_id: project_id(),
+                    granularity: MetricGranularity::Hour,
+                    bucket_start: timestamp(1, 0, 0),
+                },
+            ]
+        );
+        let stale_hour_duration = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT duration_total_seconds
+            FROM session_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = 'hour'
+              AND bucket_start = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(1, 0, 0))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch stale hour duration");
+        assert_eq!(stale_hour_duration, 0);
+
+        let replayed = process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("replay failed coordinator batch");
+
+        assert_eq!(
+            replayed,
+            SessionBatchOutcome {
+                processed_events: 0,
+                advanced_offset: true,
+            }
+        );
+        assert_eq!(
+            load_worker_offset(&pool, SESSION_WORKER_NAME)
+                .await
+                .expect("load advanced worker offset"),
+            2
+        );
+        assert!(
+            pending_session_rebuild_buckets(&pool).await.is_empty(),
+            "replay must drain the durable rebuild queue"
+        );
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 20 * 60))
+        );
+
+        let hour_zero_duration = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT duration_total_seconds
+            FROM session_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = 'hour'
+              AND bucket_start = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(1, 0, 0))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch hour-zero duration");
+        let day_duration = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT duration_total_seconds
+            FROM session_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = 'day'
+              AND bucket_start = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(1, 0, 0))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch day duration");
+
+        assert_eq!(hour_zero_duration, 20 * 60);
+        assert_eq!(day_duration, 20 * 60);
+    }
+
+    #[sqlx::test]
     async fn missing_session_daily_row_causes_hard_failure(pool: PgPool) {
         fantasma_store::bootstrap(&pool, &bootstrap_config())
             .await
@@ -1826,6 +2510,40 @@ mod tests {
                 .expect("load offset"),
             2
         );
+    }
+
+    #[sqlx::test]
+    async fn session_worker_records_per_install_progress_after_batch(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 0, 0), event("install-1", 1, 0, 10)],
+        )
+        .await
+        .expect("insert events");
+
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process batch");
+
+        let last_processed_event_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT last_processed_event_id
+            FROM install_session_state
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch install progress");
+
+        assert_eq!(last_processed_event_id, 2);
     }
 
     #[sqlx::test]

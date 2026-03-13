@@ -140,6 +140,7 @@ pub struct InstallSessionStateRecord {
     pub tail_event_count: i32,
     pub tail_duration_seconds: i32,
     pub tail_day: NaiveDate,
+    pub last_processed_event_id: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +270,13 @@ pub struct InstallFirstSeenRecord {
     pub first_seen_at: DateTime<Utc>,
     pub platform: Platform,
     pub app_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSessionRebuildBucketRecord {
+    pub project_id: Uuid,
+    pub granularity: MetricGranularity,
+    pub bucket_start: DateTime<Utc>,
 }
 
 pub async fn connect(config: &DatabaseConfig) -> Result<PgPool, StoreError> {
@@ -1295,6 +1303,25 @@ pub async fn fetch_events_after(
     last_processed_event_id: i64,
     limit: i64,
 ) -> Result<Vec<RawEventRecord>, StoreError> {
+    fetch_events_after_in_executor(pool, last_processed_event_id, limit).await
+}
+
+pub async fn fetch_events_after_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    last_processed_event_id: i64,
+    limit: i64,
+) -> Result<Vec<RawEventRecord>, StoreError> {
+    fetch_events_after_in_executor(&mut **tx, last_processed_event_id, limit).await
+}
+
+async fn fetch_events_after_in_executor<'a, E>(
+    executor: E,
+    last_processed_event_id: i64,
+    limit: i64,
+) -> Result<Vec<RawEventRecord>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let rows = sqlx::query(
         r#"
         SELECT id, project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties
@@ -1306,7 +1333,7 @@ pub async fn fetch_events_after(
     )
     .bind(last_processed_event_id)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
 
     rows.into_iter().map(raw_event_from_row).collect()
@@ -1451,6 +1478,45 @@ pub async fn load_install_session_state_in_tx(
     load_install_session_state_in_executor(&mut **tx, project_id, install_id).await
 }
 
+pub async fn load_install_session_states_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    installs: &[(Uuid, String)],
+) -> Result<BTreeMap<(Uuid, String), InstallSessionStateRecord>, StoreError> {
+    if installs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new("WITH requested(project_id, install_id) AS (");
+    builder.push_values(installs, |mut row, (project_id, install_id)| {
+        row.push_bind(project_id).push_bind(install_id);
+    });
+    builder.push(
+        ") SELECT \
+            s.project_id, \
+            s.install_id, \
+            s.tail_session_id, \
+            s.tail_session_start, \
+            s.tail_session_end, \
+            s.tail_event_count, \
+            s.tail_duration_seconds, \
+            s.tail_day, \
+            s.last_processed_event_id \
+          FROM install_session_state s \
+          INNER JOIN requested r \
+            ON s.project_id = r.project_id \
+           AND s.install_id = r.install_id",
+    );
+
+    let rows = builder.build().fetch_all(&mut **tx).await?;
+    let mut states = BTreeMap::new();
+    for row in rows {
+        let state = install_session_state_from_row(row)?;
+        states.insert((state.project_id, state.install_id.clone()), state);
+    }
+
+    Ok(states)
+}
+
 async fn load_install_session_state_in_executor<'a, E>(
     executor: E,
     project_id: Uuid,
@@ -1469,7 +1535,8 @@ where
             tail_session_end,
             tail_event_count,
             tail_duration_seconds,
-            tail_day
+            tail_day,
+            last_processed_event_id
         FROM install_session_state
         WHERE project_id = $1
           AND install_id = $2
@@ -1514,9 +1581,10 @@ where
             tail_session_end,
             tail_event_count,
             tail_duration_seconds,
-            tail_day
+            tail_day,
+            last_processed_event_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (project_id, install_id) DO UPDATE SET
             tail_session_id = EXCLUDED.tail_session_id,
             tail_session_start = EXCLUDED.tail_session_start,
@@ -1524,6 +1592,7 @@ where
             tail_event_count = EXCLUDED.tail_event_count,
             tail_duration_seconds = EXCLUDED.tail_duration_seconds,
             tail_day = EXCLUDED.tail_day,
+            last_processed_event_id = EXCLUDED.last_processed_event_id,
             updated_at = now()
         "#,
     )
@@ -1535,10 +1604,124 @@ where
     .bind(state.tail_event_count)
     .bind(state.tail_duration_seconds)
     .bind(state.tail_day)
+    .bind(state.last_processed_event_id)
     .execute(executor)
     .await?;
 
     Ok(result.rows_affected())
+}
+
+pub async fn enqueue_session_rebuild_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    day_bucket_starts: &[DateTime<Utc>],
+    hour_bucket_starts: &[DateTime<Utc>],
+) -> Result<(), StoreError> {
+    let mut pending_rows = Vec::with_capacity(
+        day_bucket_starts
+            .len()
+            .saturating_add(hour_bucket_starts.len()),
+    );
+    pending_rows.extend(
+        day_bucket_starts
+            .iter()
+            .copied()
+            .map(|bucket_start| (MetricGranularity::Day, bucket_start)),
+    );
+    pending_rows.extend(
+        hour_bucket_starts
+            .iter()
+            .copied()
+            .map(|bucket_start| (MetricGranularity::Hour, bucket_start)),
+    );
+
+    if pending_rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "INSERT INTO session_rebuild_queue (project_id, granularity, bucket_start) ",
+    );
+    builder.push_values(
+        pending_rows,
+        |mut separated, (granularity, bucket_start)| {
+            separated
+                .push_bind(project_id)
+                .push_bind(granularity.as_str())
+                .push_bind(bucket_start);
+        },
+    );
+    builder.push(" ON CONFLICT (project_id, granularity, bucket_start) DO NOTHING");
+    builder.build().execute(&mut **tx).await?;
+
+    Ok(())
+}
+
+pub async fn load_pending_session_rebuild_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_ids: &[Uuid],
+) -> Result<Vec<PendingSessionRebuildBucketRecord>, StoreError> {
+    if project_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new("WITH requested(project_id) AS (");
+    builder.push_values(project_ids, |mut row, project_id| {
+        row.push_bind(project_id);
+    });
+    builder.push(
+        ") SELECT \
+            q.project_id, \
+            q.granularity, \
+            q.bucket_start \
+          FROM session_rebuild_queue q \
+          INNER JOIN requested r \
+            ON q.project_id = r.project_id \
+          ORDER BY q.project_id ASC, q.granularity ASC, q.bucket_start ASC",
+    );
+
+    let rows = builder.build().fetch_all(&mut **tx).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(PendingSessionRebuildBucketRecord {
+                project_id: row.try_get("project_id")?,
+                granularity: metric_granularity_from_str(row.try_get::<&str, _>("granularity")?)?,
+                bucket_start: row.try_get("bucket_start")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn delete_pending_session_rebuild_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_ids: &[Uuid],
+) -> Result<u64, StoreError> {
+    if project_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new("WITH requested(project_id) AS (");
+    builder.push_values(project_ids, |mut row, project_id| {
+        row.push_bind(project_id);
+    });
+    builder.push(
+        ") DELETE FROM session_rebuild_queue q \
+         USING requested r \
+         WHERE q.project_id = r.project_id",
+    );
+
+    let result = builder.build().execute(&mut **tx).await?;
+    Ok(result.rows_affected())
+}
+
+fn metric_granularity_from_str(value: &str) -> Result<MetricGranularity, StoreError> {
+    match value {
+        "day" => Ok(MetricGranularity::Day),
+        "hour" => Ok(MetricGranularity::Hour),
+        other => Err(StoreError::InvariantViolation(format!(
+            "unknown metric granularity {other}"
+        ))),
+    }
 }
 
 pub async fn insert_session_in_tx(
@@ -1924,6 +2107,20 @@ pub async fn load_worker_offset(pool: &PgPool, worker_name: &str) -> Result<i64,
     .unwrap_or(0);
 
     Ok(offset)
+}
+
+pub async fn load_raw_event_tail_id(pool: &PgPool) -> Result<i64, StoreError> {
+    let tail_id = sqlx::query_scalar::<_, Option<i64>>(
+        r#"
+        SELECT MAX(id)
+        FROM events_raw
+        "#,
+    )
+    .fetch_one(pool)
+    .await?
+    .unwrap_or(0);
+
+    Ok(tail_id)
 }
 
 pub async fn lock_worker_offset(
@@ -3019,6 +3216,7 @@ fn install_session_state_from_row(
         tail_event_count: row.try_get("tail_event_count")?,
         tail_duration_seconds: row.try_get("tail_duration_seconds")?,
         tail_day: row.try_get("tail_day")?,
+        last_processed_event_id: row.try_get("last_processed_event_id")?,
     })
 }
 
@@ -3154,6 +3352,7 @@ mod tests {
             tail_event_count: event_count,
             tail_duration_seconds: (end_minutes as i32) * 60,
             tail_day: NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+            last_processed_event_id: 0,
         }
     }
 
@@ -3914,6 +4113,47 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn run_migrations_adds_install_session_progress_column(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let column_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'install_session_state'
+                  AND column_name = 'last_processed_event_id'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch install progress column existence");
+
+        assert!(column_exists);
+    }
+
+    #[sqlx::test]
+    async fn run_migrations_creates_session_rebuild_queue_table(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let table_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_name = 'session_rebuild_queue'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session rebuild queue existence");
+
+        assert!(table_exists);
+    }
+
+    #[sqlx::test]
     async fn run_migrations_creates_session_daily_installs_table(pool: PgPool) {
         run_migrations(&pool).await.expect("migrations succeed");
 
@@ -3992,6 +4232,213 @@ mod tests {
         assert_eq!(stored.tail_session_end, timestamp(10));
         assert_eq!(stored.tail_event_count, 2);
         assert_eq!(stored.tail_duration_seconds, 600);
+        assert_eq!(stored.last_processed_event_id, 0);
+    }
+
+    #[sqlx::test]
+    async fn install_session_state_persists_last_processed_event_id(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        upsert_install_session_state(&pool, &tail_state(10, 2))
+            .await
+            .expect("save tail state");
+
+        let initial = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT last_processed_event_id
+            FROM install_session_state
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch initial last processed event id");
+        assert_eq!(initial, 0);
+
+        sqlx::query(
+            r#"
+            UPDATE install_session_state
+            SET last_processed_event_id = $3
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .bind(42_i64)
+        .execute(&pool)
+        .await
+        .expect("update last processed event id");
+
+        let updated = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT last_processed_event_id
+            FROM install_session_state
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch updated last processed event id");
+        assert_eq!(updated, 42);
+    }
+
+    #[sqlx::test]
+    async fn load_install_session_states_returns_requested_rows(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        upsert_install_session_state(&pool, &tail_state(10, 2))
+            .await
+            .expect("save first tail state");
+        upsert_install_session_state(
+            &pool,
+            &InstallSessionStateRecord {
+                project_id: project_id(),
+                install_id: "install-2".to_owned(),
+                tail_session_id: "install-2:2026-01-01T00:00:00+00:00".to_owned(),
+                tail_session_start: timestamp(0),
+                tail_session_end: timestamp(20),
+                tail_event_count: 3,
+                tail_duration_seconds: 1_200,
+                tail_day: NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+                last_processed_event_id: 77,
+            },
+        )
+        .await
+        .expect("save second tail state");
+
+        let mut tx = pool.begin().await.expect("begin transaction");
+        let states = load_install_session_states_in_tx(
+            &mut tx,
+            &[
+                (project_id(), "install-1".to_owned()),
+                (project_id(), "install-2".to_owned()),
+                (project_id(), "missing".to_owned()),
+            ],
+        )
+        .await
+        .expect("load install states");
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(
+            states
+                .get(&(project_id(), "install-1".to_owned()))
+                .expect("install-1 state")
+                .tail_event_count,
+            2
+        );
+        assert_eq!(
+            states
+                .get(&(project_id(), "install-2".to_owned()))
+                .expect("install-2 state")
+                .last_processed_event_id,
+            77
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_rebuild_queue_round_trips_pending_buckets_by_project(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+        let other_project = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects (id, name) VALUES ($1, $2)")
+            .bind(other_project)
+            .bind("Other")
+            .execute(&pool)
+            .await
+            .expect("insert other project");
+
+        let mut tx = pool.begin().await.expect("begin queue seed tx");
+        enqueue_session_rebuild_buckets_in_tx(
+            &mut tx,
+            project_id(),
+            &[timestamp(0)],
+            &[timestamp(0), timestamp(60)],
+        )
+        .await
+        .expect("enqueue primary project buckets");
+        enqueue_session_rebuild_buckets_in_tx(
+            &mut tx,
+            other_project,
+            &[timestamp(24 * 60)],
+            &[timestamp(24 * 60)],
+        )
+        .await
+        .expect("enqueue other project buckets");
+        tx.commit().await.expect("commit queue seed tx");
+
+        let mut load_tx = pool.begin().await.expect("begin queue load tx");
+        let pending = load_pending_session_rebuild_buckets_in_tx(&mut load_tx, &[project_id()])
+            .await
+            .expect("load pending buckets");
+        assert_eq!(
+            pending,
+            vec![
+                PendingSessionRebuildBucketRecord {
+                    project_id: project_id(),
+                    granularity: MetricGranularity::Day,
+                    bucket_start: timestamp(0),
+                },
+                PendingSessionRebuildBucketRecord {
+                    project_id: project_id(),
+                    granularity: MetricGranularity::Hour,
+                    bucket_start: timestamp(0),
+                },
+                PendingSessionRebuildBucketRecord {
+                    project_id: project_id(),
+                    granularity: MetricGranularity::Hour,
+                    bucket_start: timestamp(60),
+                },
+            ]
+        );
+        let deleted = delete_pending_session_rebuild_buckets_in_tx(&mut load_tx, &[project_id()])
+            .await
+            .expect("delete pending buckets");
+        load_tx.commit().await.expect("commit queue delete tx");
+
+        assert_eq!(deleted, 3);
+
+        let mut verify_tx = pool.begin().await.expect("begin queue verify tx");
+        let primary_pending =
+            load_pending_session_rebuild_buckets_in_tx(&mut verify_tx, &[project_id()])
+                .await
+                .expect("load deleted project buckets");
+        let other_pending =
+            load_pending_session_rebuild_buckets_in_tx(&mut verify_tx, &[other_project])
+                .await
+                .expect("load untouched project buckets");
+        verify_tx.commit().await.expect("commit queue verify tx");
+
+        assert!(primary_pending.is_empty());
+        assert_eq!(
+            other_pending,
+            vec![
+                PendingSessionRebuildBucketRecord {
+                    project_id: other_project,
+                    granularity: MetricGranularity::Day,
+                    bucket_start: timestamp(24 * 60),
+                },
+                PendingSessionRebuildBucketRecord {
+                    project_id: other_project,
+                    granularity: MetricGranularity::Hour,
+                    bucket_start: timestamp(24 * 60),
+                },
+            ]
+        );
     }
 
     #[sqlx::test]
