@@ -1,0 +1,72 @@
+{
+  "host": {
+    "cpu_model": "Apple M3 Pro",
+    "memory_bytes": 38654705664,
+    "memory_gib": 36.0,
+    "os_kernel": "Darwin 25.1.0",
+    "architecture": "aarch64",
+    "benchmarked_at": "2026-03-13T16:14:14.996707+00:00"
+  },
+  "scenarios": [
+    {
+      "scenario": "append-90d",
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 2700000,
+          "elapsed_ms": 94219,
+          "events_per_second": 28656.579601457543
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 144
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 41116
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 41116
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "append-180d",
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 5400000,
+          "elapsed_ms": 197072,
+          "events_per_second": 27401.08644546209
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 277
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 74275
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 74275
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    }
+  ]
+}

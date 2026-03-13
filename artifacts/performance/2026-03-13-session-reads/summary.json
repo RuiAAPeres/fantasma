@@ -1,0 +1,489 @@
+{
+  "host": {
+    "cpu_model": "Apple M3 Pro",
+    "memory_bytes": 38654705664,
+    "memory_gib": 36.0,
+    "os_kernel": "Darwin 25.1.0",
+    "architecture": "aarch64",
+    "benchmarked_at": "2026-03-13T16:32:31.266302+00:00"
+  },
+  "scenarios": [
+    {
+      "scenario": "reads-30d",
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 900000,
+          "elapsed_ms": 35143,
+          "events_per_second": 25609.14505201289
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 62
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 14526
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 14526
+        }
+      ],
+      "queries": [
+        {
+          "name": "events_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 3,
+          "p50_ms": 4,
+          "p95_ms": 6,
+          "max_ms": 6
+        },
+        {
+          "name": "events_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 30,
+          "p50_ms": 32,
+          "p95_ms": 37,
+          "max_ms": 45
+        },
+        {
+          "name": "sessions_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 14,
+          "p95_ms": 16,
+          "max_ms": 19
+        },
+        {
+          "name": "sessions_duration_total_day_grouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_duration_total_hour_grouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 14,
+          "p95_ms": 15,
+          "max_ms": 18
+        },
+        {
+          "name": "sessions_new_installs_day_grouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 4,
+          "max_ms": 5
+        },
+        {
+          "name": "sessions_new_installs_hour_grouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 14,
+          "p95_ms": 15,
+          "max_ms": 17
+        },
+        {
+          "name": "events_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "events_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 4
+        },
+        {
+          "name": "sessions_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_duration_total_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_duration_total_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 4,
+          "max_ms": 5
+        },
+        {
+          "name": "sessions_new_installs_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "sessions_new_installs_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        }
+      ],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "reads-90d",
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 2700000,
+          "elapsed_ms": 99493,
+          "events_per_second": 27137.51599262728
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 143
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 32820
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 32820
+        }
+      ],
+      "queries": [
+        {
+          "name": "events_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 9,
+          "p50_ms": 10,
+          "p95_ms": 11,
+          "max_ms": 11
+        },
+        {
+          "name": "events_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 94,
+          "p50_ms": 96,
+          "p95_ms": 98,
+          "max_ms": 101
+        },
+        {
+          "name": "sessions_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 4,
+          "p50_ms": 4,
+          "p95_ms": 5,
+          "max_ms": 9
+        },
+        {
+          "name": "sessions_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 37,
+          "p50_ms": 38,
+          "p95_ms": 39,
+          "max_ms": 41
+        },
+        {
+          "name": "sessions_duration_total_day_grouped",
+          "iterations": 100,
+          "min_ms": 4,
+          "p50_ms": 4,
+          "p95_ms": 5,
+          "max_ms": 5
+        },
+        {
+          "name": "sessions_duration_total_hour_grouped",
+          "iterations": 100,
+          "min_ms": 36,
+          "p50_ms": 38,
+          "p95_ms": 39,
+          "max_ms": 42
+        },
+        {
+          "name": "sessions_new_installs_day_grouped",
+          "iterations": 100,
+          "min_ms": 3,
+          "p50_ms": 4,
+          "p95_ms": 4,
+          "max_ms": 5
+        },
+        {
+          "name": "sessions_new_installs_hour_grouped",
+          "iterations": 100,
+          "min_ms": 36,
+          "p50_ms": 37,
+          "p95_ms": 38,
+          "max_ms": 40
+        },
+        {
+          "name": "events_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "events_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 5,
+          "p50_ms": 6,
+          "p95_ms": 6,
+          "max_ms": 6
+        },
+        {
+          "name": "sessions_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 5,
+          "p50_ms": 6,
+          "p95_ms": 6,
+          "max_ms": 6
+        },
+        {
+          "name": "sessions_duration_total_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_duration_total_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 5,
+          "p50_ms": 6,
+          "p95_ms": 6,
+          "max_ms": 6
+        },
+        {
+          "name": "sessions_new_installs_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_new_installs_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 5,
+          "p50_ms": 5,
+          "p95_ms": 6,
+          "max_ms": 6
+        }
+      ],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "reads-180d",
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 5400000,
+          "elapsed_ms": 205286,
+          "events_per_second": 26304.716570415785
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 272
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 64953
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 64953
+        }
+      ],
+      "queries": [
+        {
+          "name": "events_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 17,
+          "p50_ms": 18,
+          "p95_ms": 19,
+          "max_ms": 23
+        },
+        {
+          "name": "events_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 184,
+          "p50_ms": 189,
+          "p95_ms": 191,
+          "max_ms": 194
+        },
+        {
+          "name": "sessions_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 6,
+          "p50_ms": 7,
+          "p95_ms": 7,
+          "max_ms": 8
+        },
+        {
+          "name": "sessions_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 71,
+          "p50_ms": 73,
+          "p95_ms": 75,
+          "max_ms": 82
+        },
+        {
+          "name": "sessions_duration_total_day_grouped",
+          "iterations": 100,
+          "min_ms": 6,
+          "p50_ms": 7,
+          "p95_ms": 8,
+          "max_ms": 9
+        },
+        {
+          "name": "sessions_duration_total_hour_grouped",
+          "iterations": 100,
+          "min_ms": 71,
+          "p50_ms": 74,
+          "p95_ms": 76,
+          "max_ms": 78
+        },
+        {
+          "name": "sessions_new_installs_day_grouped",
+          "iterations": 100,
+          "min_ms": 6,
+          "p50_ms": 6,
+          "p95_ms": 7,
+          "max_ms": 7
+        },
+        {
+          "name": "sessions_new_installs_hour_grouped",
+          "iterations": 100,
+          "min_ms": 71,
+          "p50_ms": 73,
+          "p95_ms": 75,
+          "max_ms": 77
+        },
+        {
+          "name": "events_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "events_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 10,
+          "p50_ms": 11,
+          "p95_ms": 11,
+          "max_ms": 11
+        },
+        {
+          "name": "sessions_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 10,
+          "p50_ms": 11,
+          "p95_ms": 11,
+          "max_ms": 12
+        },
+        {
+          "name": "sessions_duration_total_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_duration_total_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 10,
+          "p50_ms": 11,
+          "p95_ms": 11,
+          "max_ms": 11
+        },
+        {
+          "name": "sessions_new_installs_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_new_installs_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 10,
+          "p50_ms": 10,
+          "p95_ms": 11,
+          "max_ms": 15
+        }
+      ],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    }
+  ]
+}

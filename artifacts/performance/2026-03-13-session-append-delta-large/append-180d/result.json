@@ -1,0 +1,30 @@
+{
+  "scenario": "append-180d",
+  "phases": [
+    {
+      "name": "ingest",
+      "events_sent": 5400000,
+      "elapsed_ms": 197072,
+      "events_per_second": 27401.08644546209
+    }
+  ],
+  "readiness": [
+    {
+      "name": "event_metrics_ready_ms",
+      "elapsed_ms": 277
+    },
+    {
+      "name": "session_metrics_ready_ms",
+      "elapsed_ms": 74275
+    },
+    {
+      "name": "derived_metrics_ready_ms",
+      "elapsed_ms": 74275
+    }
+  ],
+  "queries": [],
+  "budget": {
+    "passed": true,
+    "failures": []
+  }
+}

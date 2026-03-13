@@ -1,0 +1,36 @@
+{
+  "scenario": "repair-90d",
+  "phases": [
+    {
+      "name": "seed_ingest",
+      "events_sent": 2700000,
+      "elapsed_ms": 95391,
+      "events_per_second": 28304.26444442033
+    },
+    {
+      "name": "repair_ingest",
+      "events_sent": 9000,
+      "elapsed_ms": 411,
+      "events_per_second": 21897.0421709004
+    }
+  ],
+  "readiness": [
+    {
+      "name": "event_metrics_ready_ms",
+      "elapsed_ms": 827
+    },
+    {
+      "name": "session_metrics_ready_ms",
+      "elapsed_ms": 5315
+    },
+    {
+      "name": "derived_metrics_ready_ms",
+      "elapsed_ms": 5315
+    }
+  ],
+  "queries": [],
+  "budget": {
+    "passed": true,
+    "failures": []
+  }
+}

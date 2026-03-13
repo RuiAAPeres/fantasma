@@ -1,0 +1,13 @@
+{
+  "scenario": "repair-30d",
+  "phases": [],
+  "readiness": [],
+  "queries": [],
+  "budget": {
+    "passed": false,
+    "failures": [
+      "scenario execution failed: timed out waiting for repair readiness (event metrics)"
+    ]
+  },
+  "failure": "scenario execution failed: timed out waiting for repair readiness (event metrics)"
+}

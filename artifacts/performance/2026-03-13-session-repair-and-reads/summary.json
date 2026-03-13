@@ -1,0 +1,25 @@
+{
+  "host": {
+    "cpu_model": "Apple M3 Pro",
+    "memory_bytes": 38654705664,
+    "memory_gib": 36.0,
+    "os_kernel": "Darwin 25.1.0",
+    "architecture": "aarch64",
+    "benchmarked_at": "2026-03-13T16:24:42.457636+00:00"
+  },
+  "scenarios": [
+    {
+      "scenario": "repair-30d",
+      "phases": [],
+      "readiness": [],
+      "queries": [],
+      "budget": {
+        "passed": false,
+        "failures": [
+          "scenario execution failed: timed out waiting for repair readiness (event metrics)"
+        ]
+      },
+      "failure": "scenario execution failed: timed out waiting for repair readiness (event metrics)"
+    }
+  ]
+}
