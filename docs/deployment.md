@@ -17,9 +17,9 @@ The default stack includes:
 Repository files:
 
 - Compose stack: `infra/docker/compose.yaml`
-- service images: `infra/docker/Dockerfile.ingest`,
-  `infra/docker/Dockerfile.api`, `infra/docker/Dockerfile.worker`
+- service images: `infra/docker/Dockerfile.ingest`, `infra/docker/Dockerfile.api`, `infra/docker/Dockerfile.worker`
 - benchmark stack: [`infra/docker/compose.bench.yaml`](../infra/docker/compose.bench.yaml)
+- local provisioning helper: [`scripts/provision-project.sh`](../scripts/provision-project.sh)
 
 ## Configuration
 
@@ -27,36 +27,23 @@ Shared runtime variables:
 
 - `FANTASMA_DATABASE_URL`: required by ingest, API, and worker
 - `FANTASMA_LOG_LEVEL`: optional tracing filter
-- `FANTASMA_PROJECT_ID`: optional local bootstrap override; binaries fall
-  back to the repository's default local project UUID when unset
-- `FANTASMA_PROJECT_NAME`: optional local bootstrap override; binaries fall
-  back to `Local Development Project`
-- `FANTASMA_INGEST_KEY`: optional local bootstrap ingest key
 
 HTTP service variables:
 
-- `FANTASMA_BIND_ADDRESS`: bind address for `fantasma-ingest` and
-  `fantasma-api`
-- `FANTASMA_ADMIN_TOKEN`: bearer token consumed by `fantasma-api`; defaults
-  to `fg_pat_dev`
+- `FANTASMA_BIND_ADDRESS`: bind address for `fantasma-ingest` and `fantasma-api`
+- `FANTASMA_ADMIN_TOKEN`: operator bearer token consumed only by `fantasma-api`; defaults to `fg_pat_dev`
 
 Worker variables:
 
-- `FANTASMA_WORKER_POLL_INTERVAL_MS`: worker sleep interval in milliseconds;
-  defaults to `5000`
+- `FANTASMA_WORKER_POLL_INTERVAL_MS`: worker sleep interval in milliseconds; defaults to `5000`
 - `FANTASMA_WORKER_BATCH_SIZE`: worker batch size; defaults to `500`
 
 Current Compose defaults:
 
-- all three services get
-  `postgres://fantasma:fantasma@postgres:5432/fantasma`
-- `fantasma-ingest` gets `0.0.0.0:8081`, `fg_ing_test`,
-  `fg_pat_dev`, and explicit local project id/name values
-- `fantasma-api` gets `0.0.0.0:8082`, `fg_ing_test`,
-  `fg_pat_dev`, and explicit local project id/name values
-- `fantasma-worker` gets `FANTASMA_WORKER_POLL_INTERVAL_MS=5000` and uses
-  its built-in local project defaults because the Compose file does not pass
-  project id/name or ingest key to the worker
+- all three services get `postgres://fantasma:fantasma@postgres:5432/fantasma`
+- `fantasma-ingest` gets `0.0.0.0:8081`
+- `fantasma-api` gets `0.0.0.0:8082` and `FANTASMA_ADMIN_TOKEN=fg_pat_dev`
+- `fantasma-worker` gets `FANTASMA_WORKER_POLL_INTERVAL_MS=5000`
 
 ## Startup Behavior
 
@@ -64,8 +51,9 @@ On startup, `fantasma-ingest`, `fantasma-api`, and `fantasma-worker` all:
 
 - connect to Postgres using a pooled connection
 - run SQL migrations from `crates/fantasma-store/migrations/`
-- ensure the seeded local project exists using the configured project id,
-  project name, and any provided ingest key
+
+They do not seed a project or create API keys at startup. Provisioning happens
+through the operator management API after the stack is healthy.
 
 There is no separate migration job in the default stack. The dashboard, when
 enabled, serves static files from `apps/dashboard-web/public` through Nginx.
@@ -76,7 +64,7 @@ Before bringing the stack up, confirm:
 
 - enough free disk for Docker layers, Cargo build output, and Postgres data
 - a healthy Docker daemon
-- `docker` and `curl` are installed for the smoke path
+- `docker`, `curl`, and `python3` are installed for the smoke/provisioning path
 
 ## Bring Up
 
@@ -105,6 +93,29 @@ Stop the stack and remove volumes:
 docker compose -f infra/docker/compose.yaml down --volumes --remove-orphans
 ```
 
+## Provision a Project
+
+Once the stack is healthy, create a project and both scoped keys through the
+management API:
+
+```bash
+PROVISIONED="$(./scripts/provision-project.sh \
+  --project-name "Local Development" \
+  --ingest-key-name "ios-sdk" \
+  --read-key-name "dashboard")"
+printf '%s\n' "$PROVISIONED"
+```
+
+Extract the returned secrets if you want shell variables for later commands:
+
+```bash
+INGEST_KEY="$(printf '%s' "$PROVISIONED" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ingest_key"]["secret"])')"
+READ_KEY="$(printf '%s' "$PROVISIONED" | python3 -c 'import json,sys; print(json.load(sys.stdin)["read_key"]["secret"])')"
+```
+
+Use the ingest key only with `POST /v1/events`. Use the read key only with
+`/v1/metrics/*`.
+
 ## Smoke Verification
 
 Run the preflighted smoke script:
@@ -117,14 +128,14 @@ The smoke path:
 
 - checks free disk and Docker availability
 - runs the stack in a disposable Compose project
-- waits for `http://localhost:8081/health` and
-  `http://localhost:8082/health`
+- waits for `http://localhost:8081/health` and `http://localhost:8082/health`
+- provisions a project plus scoped ingest/read keys on the blank database
 - ingests sample events
 - polls worker-derived metrics until the expected data appears
 - tears the stack down with volumes on exit
 
-Set `FANTASMA_SMOKE_PROJECT_NAME` if you need a stable Compose project name
-for debugging.
+Set `FANTASMA_SMOKE_PROJECT_NAME` if you need a stable Compose project name for
+debugging.
 
 Worker-built metrics are asynchronous. If you verify manually, expect a short
 delay between ingesting events and seeing derived metric reads update.
@@ -141,12 +152,26 @@ curl -fsS http://localhost:8081/health
 curl -fsS http://localhost:8082/health
 ```
 
+Provision a project:
+
+```bash
+PROVISIONED="$(./scripts/provision-project.sh \
+  --project-name "Manual Checks" \
+  --ingest-key-name "manual-ingest" \
+  --read-key-name "manual-read")"
+```
+
+```bash
+INGEST_KEY="$(printf '%s' "$PROVISIONED" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ingest_key"]["secret"])')"
+READ_KEY="$(printf '%s' "$PROVISIONED" | python3 -c 'import json,sys; print(json.load(sys.stdin)["read_key"]["secret"])')"
+```
+
 Ingest sample events:
 
 ```bash
 curl -fsS -X POST http://localhost:8081/v1/events \
   -H "Content-Type: application/json" \
-  -H "X-Fantasma-Key: fg_ing_test" \
+  -H "X-Fantasma-Key: ${INGEST_KEY}" \
   -d '{
     "events": [
       {
@@ -178,23 +203,23 @@ curl -fsS -X POST http://localhost:8081/v1/events \
 Query derived metrics:
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/sessions/count/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
-  -H "Authorization: Bearer fg_pat_dev"
+curl -fsS "http://localhost:8082/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-02" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/sessions/duration/total/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
-  -H "Authorization: Bearer fg_pat_dev"
+curl -fsS "http://localhost:8082/v1/metrics/sessions/duration/total/daily?start_date=2026-01-01&end_date=2026-01-02" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/events/aggregate?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&platform=ios&group_by=provider" \
-  -H "Authorization: Bearer fg_pat_dev"
+curl -fsS "http://localhost:8082/v1/metrics/events/aggregate?event=app_open&start_date=2026-01-01&end_date=2026-01-02&platform=ios&group_by=provider" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/events/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&group_by=provider" \
-  -H "Authorization: Bearer fg_pat_dev"
+curl -fsS "http://localhost:8082/v1/metrics/events/daily?event=app_open&start_date=2026-01-01&end_date=2026-01-02&group_by=provider" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
 ## Related Docs

@@ -59,6 +59,9 @@ The benchmark harness runs the stack in its own Compose project (`fantasma-bench
 
 That keeps local benchmark runs from tearing down or colliding with the default development stack on `8081` / `8082`.
 
+Each run provisions its own blank-database project plus scoped ingest/read keys
+through the operator management API before driving traffic.
+
 ## Workloads
 
 `hot-path`

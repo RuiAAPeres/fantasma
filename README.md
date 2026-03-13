@@ -26,6 +26,7 @@ Fantasma is not trying to be a full product analytics suite. It does not target:
 Today Fantasma is centered on:
 
 - a Rust backend and public API
+- operator-provisioned projects with separate ingest and read keys
 - background aggregation workers
 - durable mobile SDKs
 - simple self-hosted deployment

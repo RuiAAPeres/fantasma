@@ -1,10 +1,7 @@
 use std::{env, time::Duration};
 
-use fantasma_store::{
-    BootstrapConfig, DatabaseConfig, connect, ensure_local_project, run_migrations,
-};
+use fantasma_store::{DatabaseConfig, connect, run_migrations};
 use tracing::{error, info};
-use uuid::Uuid;
 
 const DEFAULT_BATCH_SIZE: i64 = 500;
 
@@ -17,13 +14,6 @@ async fn main() {
         .try_init();
 
     let database_url = env::var("FANTASMA_DATABASE_URL").expect("FANTASMA_DATABASE_URL");
-    let project_id = env::var("FANTASMA_PROJECT_ID")
-        .ok()
-        .and_then(|value| Uuid::parse_str(&value).ok())
-        .unwrap_or_else(default_project_id);
-    let project_name = env::var("FANTASMA_PROJECT_NAME")
-        .unwrap_or_else(|_| "Local Development Project".to_owned());
-    let ingest_key = env::var("FANTASMA_INGEST_KEY").ok();
     let poll_interval = env::var("FANTASMA_WORKER_POLL_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -36,16 +26,6 @@ async fn main() {
         .await
         .expect("connect database");
     run_migrations(&pool).await.expect("migrate database");
-    ensure_local_project(
-        &pool,
-        Some(&BootstrapConfig {
-            project_id,
-            project_name,
-            ingest_key,
-        }),
-    )
-    .await
-    .expect("seed database");
 
     info!("fantasma-worker started with {poll_interval}ms poll interval");
 
@@ -76,8 +56,4 @@ async fn main() {
 
         tokio::time::sleep(Duration::from_millis(poll_interval)).await;
     }
-}
-
-fn default_project_id() -> Uuid {
-    Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a)
 }

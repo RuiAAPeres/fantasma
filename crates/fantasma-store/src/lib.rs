@@ -36,6 +36,53 @@ pub struct BootstrapConfig {
     pub ingest_key: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyKind {
+    Ingest,
+    Read,
+}
+
+impl ApiKeyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ingest => "ingest",
+            Self::Read => "read",
+        }
+    }
+
+    pub fn secret_prefix(self) -> &'static str {
+        match self {
+            Self::Ingest => "fg_ing_",
+            Self::Read => "fg_rd_",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyRecord {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub name: String,
+    pub kind: ApiKeyKind,
+    pub key_prefix: String,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedApiKey {
+    pub key_id: Uuid,
+    pub project_id: Uuid,
+    pub kind: ApiKeyKind,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -204,15 +251,20 @@ pub async fn ensure_local_project(
 
         sqlx::query(
             r#"
-            INSERT INTO api_keys (id, project_id, key_prefix, key_hash)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO api_keys (id, project_id, name, kind, key_prefix, key_hash)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (key_hash) DO UPDATE
             SET project_id = EXCLUDED.project_id,
-                key_prefix = EXCLUDED.key_prefix
+                name = EXCLUDED.name,
+                kind = EXCLUDED.kind,
+                key_prefix = EXCLUDED.key_prefix,
+                revoked_at = NULL
             "#,
         )
         .bind(Uuid::new_v4())
         .bind(config.project_id)
+        .bind("Bootstrap key")
+        .bind(ApiKeyKind::Ingest.as_str())
         .bind(key_prefix)
         .bind(key_hash)
         .execute(pool)
@@ -229,18 +281,207 @@ pub async fn bootstrap(pool: &PgPool, config: &BootstrapConfig) -> Result<(), St
     Ok(())
 }
 
+pub async fn create_project(pool: &PgPool, name: &str) -> Result<ProjectRecord, StoreError> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO projects (id, name)
+        VALUES ($1, $2)
+        RETURNING id, name, created_at
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(name)
+    .fetch_one(pool)
+    .await?;
+
+    project_record_from_row(&row)
+}
+
+pub async fn create_project_with_api_key(
+    pool: &PgPool,
+    project_name: &str,
+    key_name: &str,
+    kind: ApiKeyKind,
+    secret: &str,
+) -> Result<(ProjectRecord, ApiKeyRecord), StoreError> {
+    let mut tx = pool.begin().await?;
+
+    let project_row = sqlx::query(
+        r#"
+        INSERT INTO projects (id, name)
+        VALUES ($1, $2)
+        RETURNING id, name, created_at
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(project_name)
+    .fetch_one(&mut *tx)
+    .await?;
+    let project = project_record_from_row(&project_row)?;
+
+    let key_row = sqlx::query(
+        r#"
+        INSERT INTO api_keys (id, project_id, name, kind, key_prefix, key_hash)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, project_id, name, kind, key_prefix, created_at, revoked_at
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(project.id)
+    .bind(key_name)
+    .bind(kind.as_str())
+    .bind(derive_key_prefix(secret))
+    .bind(hash_ingest_key(secret))
+    .fetch_one(&mut *tx)
+    .await?;
+    let key = api_key_record_from_row(&key_row)?;
+
+    tx.commit().await?;
+
+    Ok((project, key))
+}
+
+pub async fn list_projects(pool: &PgPool) -> Result<Vec<ProjectRecord>, StoreError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, name, created_at
+        FROM projects
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter().map(project_record_from_row).collect()
+}
+
+pub async fn load_project(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> Result<Option<ProjectRecord>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, name, created_at
+        FROM projects
+        WHERE id = $1
+        "#,
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(project_record_from_row).transpose()
+}
+
+pub async fn create_api_key(
+    pool: &PgPool,
+    project_id: Uuid,
+    name: &str,
+    kind: ApiKeyKind,
+    secret: &str,
+) -> Result<Option<ApiKeyRecord>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO api_keys (id, project_id, name, kind, key_prefix, key_hash)
+        SELECT $1, projects.id, $2, $3, $4, $5
+        FROM projects
+        WHERE projects.id = $6
+        RETURNING id, project_id, name, kind, key_prefix, created_at, revoked_at
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(name)
+    .bind(kind.as_str())
+    .bind(derive_key_prefix(secret))
+    .bind(hash_ingest_key(secret))
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(api_key_record_from_row).transpose()
+}
+
+pub fn generate_api_key_secret(kind: ApiKeyKind) -> String {
+    format!("{}{}", kind.secret_prefix(), Uuid::new_v4().simple())
+}
+
+pub async fn list_api_keys(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> Result<Option<Vec<ApiKeyRecord>>, StoreError> {
+    if load_project(pool, project_id).await?.is_none() {
+        return Ok(None);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, project_id, name, kind, key_prefix, created_at, revoked_at
+        FROM api_keys
+        WHERE project_id = $1
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter()
+        .map(api_key_record_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+pub async fn revoke_api_key(
+    pool: &PgPool,
+    project_id: Uuid,
+    key_id: Uuid,
+) -> Result<bool, StoreError> {
+    let revoked = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        UPDATE api_keys
+        SET revoked_at = COALESCE(revoked_at, now())
+        WHERE project_id = $1
+          AND id = $2
+        RETURNING id
+        "#,
+    )
+    .bind(project_id)
+    .bind(key_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(revoked.is_some())
+}
+
+pub async fn resolve_api_key(
+    pool: &PgPool,
+    secret: &str,
+) -> Result<Option<ResolvedApiKey>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, project_id, kind
+        FROM api_keys
+        WHERE key_hash = $1
+          AND revoked_at IS NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(hash_ingest_key(secret))
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(resolved_api_key_from_row).transpose()
+}
+
 pub async fn resolve_project_id_for_ingest_key(
     pool: &PgPool,
     ingest_key: &str,
 ) -> Result<Option<Uuid>, StoreError> {
-    let project_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT project_id FROM api_keys WHERE key_hash = $1 LIMIT 1",
-    )
-    .bind(hash_ingest_key(ingest_key))
-    .fetch_optional(pool)
-    .await?;
+    let resolved = resolve_api_key(pool, ingest_key).await?;
 
-    Ok(project_id)
+    Ok(resolved
+        .filter(|record| record.kind == ApiKeyKind::Ingest)
+        .map(|record| record.project_id))
 }
 
 pub async fn insert_events(
@@ -1957,6 +2198,44 @@ fn platform_from_str(value: &str) -> Result<Platform, StoreError> {
     }
 }
 
+fn api_key_kind_from_str(value: &str) -> Result<ApiKeyKind, StoreError> {
+    match value {
+        "ingest" => Ok(ApiKeyKind::Ingest),
+        "read" => Ok(ApiKeyKind::Read),
+        other => Err(StoreError::InvariantViolation(format!(
+            "invalid api key kind: {other}"
+        ))),
+    }
+}
+
+fn project_record_from_row(row: &sqlx::postgres::PgRow) -> Result<ProjectRecord, StoreError> {
+    Ok(ProjectRecord {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn api_key_record_from_row(row: &sqlx::postgres::PgRow) -> Result<ApiKeyRecord, StoreError> {
+    Ok(ApiKeyRecord {
+        id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        name: row.try_get("name")?,
+        kind: api_key_kind_from_str(row.try_get("kind")?)?,
+        key_prefix: row.try_get("key_prefix")?,
+        created_at: row.try_get("created_at")?,
+        revoked_at: row.try_get("revoked_at")?,
+    })
+}
+
+fn resolved_api_key_from_row(row: &sqlx::postgres::PgRow) -> Result<ResolvedApiKey, StoreError> {
+    Ok(ResolvedApiKey {
+        key_id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        kind: api_key_kind_from_str(row.try_get("kind")?)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2518,6 +2797,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn forward_migration_extends_api_keys_for_scoped_project_keys() {
+        let migration = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("migrations/0008_scoped_project_api_keys.sql"),
+        )
+        .expect("read migration");
+
+        assert!(
+            migration.contains("ALTER TABLE api_keys")
+                && migration.contains("ADD COLUMN name TEXT NOT NULL")
+                && migration.contains("ADD COLUMN kind TEXT NOT NULL")
+                && migration.contains("ADD COLUMN revoked_at TIMESTAMPTZ"),
+            "0008 must add name, kind, and revoked_at to api_keys"
+        );
+        assert!(
+            !migration.contains("UPDATE api_keys"),
+            "0008 should not carry legacy api_keys backfill logic in a brand-new stack"
+        );
+    }
+
+    #[sqlx::test]
+    async fn run_migrations_extends_api_keys_for_scoped_project_keys(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let columns = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'api_keys'
+              AND column_name IN ('name', 'kind', 'revoked_at')
+            ORDER BY column_name ASC
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch api_keys columns");
+
+        assert_eq!(
+            columns,
+            vec![
+                "kind".to_owned(),
+                "name".to_owned(),
+                "revoked_at".to_owned(),
+            ]
+        );
+    }
+
     #[sqlx::test]
     async fn ensure_local_project_seeds_project_and_ingest_key_when_config_present(pool: PgPool) {
         run_migrations(&pool).await.expect("migrations succeed");
@@ -2558,6 +2885,142 @@ mod tests {
             .expect("count projects");
 
         assert_eq!(project_count, 0);
+    }
+
+    #[sqlx::test]
+    async fn create_project_lists_projects_in_creation_order(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let alpha = create_project(&pool, "Alpha")
+            .await
+            .expect("create alpha project");
+        let beta = create_project(&pool, "Beta")
+            .await
+            .expect("create beta project");
+        let projects = list_projects(&pool).await.expect("list projects");
+
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].id, alpha.id);
+        assert_eq!(projects[0].name, "Alpha");
+        assert_eq!(projects[1].id, beta.id);
+        assert_eq!(projects[1].name, "Beta");
+    }
+
+    #[sqlx::test]
+    async fn create_project_with_api_key_returns_both_records(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let secret = generate_api_key_secret(ApiKeyKind::Ingest);
+        let (project, key) = create_project_with_api_key(
+            &pool,
+            "Provisioned Project",
+            "bootstrap",
+            ApiKeyKind::Ingest,
+            &secret,
+        )
+        .await
+        .expect("create project with api key");
+
+        let projects = list_projects(&pool).await.expect("list projects");
+        let keys = list_api_keys(&pool, project.id)
+            .await
+            .expect("list keys")
+            .expect("project exists");
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, project.id);
+        assert_eq!(projects[0].name, "Provisioned Project");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].id, key.id);
+        assert_eq!(keys[0].name, "bootstrap");
+        assert_eq!(keys[0].kind, ApiKeyKind::Ingest);
+    }
+
+    #[sqlx::test]
+    async fn api_key_lifecycle_round_trips_kinds_and_revocation(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let project = create_project(&pool, "Metrics Project")
+            .await
+            .expect("create project");
+        let ingest_secret = "fg_ing_test_secret";
+        let read_secret = "fg_rd_test_secret";
+        let ingest_key = create_api_key(
+            &pool,
+            project.id,
+            "ios-prod",
+            ApiKeyKind::Ingest,
+            ingest_secret,
+        )
+        .await
+        .expect("create ingest key")
+        .expect("project exists");
+        let read_key = create_api_key(
+            &pool,
+            project.id,
+            "dashboard",
+            ApiKeyKind::Read,
+            read_secret,
+        )
+        .await
+        .expect("create read key")
+        .expect("project exists");
+
+        let listed = list_api_keys(&pool, project.id)
+            .await
+            .expect("list project keys")
+            .expect("project exists");
+        let resolved_ingest = resolve_api_key(&pool, ingest_secret)
+            .await
+            .expect("resolve ingest key")
+            .expect("ingest key is active");
+        let resolved_read = resolve_api_key(&pool, read_secret)
+            .await
+            .expect("resolve read key")
+            .expect("read key is active");
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, ingest_key.id);
+        assert_eq!(listed[0].name, "ios-prod");
+        assert_eq!(listed[0].kind, ApiKeyKind::Ingest);
+        assert_eq!(listed[0].revoked_at, None);
+        assert_eq!(listed[1].id, read_key.id);
+        assert_eq!(listed[1].kind, ApiKeyKind::Read);
+        assert_eq!(resolved_ingest.project_id, project.id);
+        assert_eq!(resolved_ingest.key_id, ingest_key.id);
+        assert_eq!(resolved_ingest.kind, ApiKeyKind::Ingest);
+        assert_eq!(resolved_read.kind, ApiKeyKind::Read);
+
+        assert!(
+            revoke_api_key(&pool, project.id, ingest_key.id)
+                .await
+                .expect("revoke ingest key"),
+            "existing key should be revocable"
+        );
+        assert!(
+            revoke_api_key(&pool, project.id, ingest_key.id)
+                .await
+                .expect("repeat revoke stays idempotent"),
+            "repeat revoke should still report the resource exists"
+        );
+        assert!(
+            !revoke_api_key(&pool, project.id, Uuid::new_v4())
+                .await
+                .expect("unknown key is ignored"),
+            "unknown project/key pair should report no resource"
+        );
+        assert_eq!(
+            resolve_api_key(&pool, ingest_secret)
+                .await
+                .expect("resolve revoked ingest key"),
+            None
+        );
+        assert!(
+            list_api_keys(&pool, Uuid::new_v4())
+                .await
+                .expect("list missing project")
+                .is_none()
+        );
     }
 
     #[sqlx::test]

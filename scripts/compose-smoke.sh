@@ -4,9 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/infra/docker/compose.yaml"
 PROJECT_NAME="${FANTASMA_SMOKE_PROJECT_NAME:-fantasma-smoke-$$}"
+ADMIN_TOKEN="${FANTASMA_ADMIN_TOKEN:-fg_pat_dev}"
 MIN_FREE_KB=5000000
 TIMEOUT_SECONDS=60
 SLEEP_SECONDS=2
+INGEST_KEY=""
+READ_KEY=""
 
 compose() {
   docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
@@ -75,17 +78,17 @@ poll_metrics() {
 
   while true; do
     count_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/sessions/count/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
-      -H "Authorization: Bearer fg_pat_dev" || true)"
+      "http://localhost:8082/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-02" \
+      -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     duration_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/sessions/duration/total/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02" \
-      -H "Authorization: Bearer fg_pat_dev" || true)"
+      "http://localhost:8082/v1/metrics/sessions/duration/total/daily?start_date=2026-01-01&end_date=2026-01-02" \
+      -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     event_aggregate_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/events/aggregate?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&platform=ios&group_by=provider" \
-      -H "Authorization: Bearer fg_pat_dev" || true)"
+      "http://localhost:8082/v1/metrics/events/aggregate?event=app_open&start_date=2026-01-01&end_date=2026-01-02&platform=ios&group_by=provider" \
+      -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     event_daily_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/events/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-01-01&end_date=2026-01-02&group_by=provider" \
-      -H "Authorization: Bearer fg_pat_dev" || true)"
+      "http://localhost:8082/v1/metrics/events/daily?event=app_open&start_date=2026-01-01&end_date=2026-01-02&group_by=provider" \
+      -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     count_compact="$(printf '%s' "$count_response" | tr -d '[:space:]')"
     duration_compact="$(printf '%s' "$duration_response" | tr -d '[:space:]')"
     event_aggregate_compact="$(printf '%s' "$event_aggregate_response" | tr -d '[:space:]')"
@@ -125,6 +128,7 @@ poll_metrics() {
 main() {
   require_cmd docker
   require_cmd curl
+  require_cmd python3
   check_disk
   check_docker
 
@@ -134,9 +138,37 @@ main() {
   compose up -d --build
   wait_for_http
 
+  local provisioned
+  provisioned="$(
+    "$ROOT_DIR/scripts/provision-project.sh" \
+      --api-url "http://localhost:8082" \
+      --admin-token "$ADMIN_TOKEN" \
+      --project-name "Compose Smoke" \
+      --ingest-key-name "smoke-ingest" \
+      --read-key-name "smoke-read"
+  )"
+  INGEST_KEY="$(
+    python3 - "$provisioned" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+print(payload["ingest_key"]["secret"])
+PY
+  )"
+  READ_KEY="$(
+    python3 - "$provisioned" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+print(payload["read_key"]["secret"])
+PY
+  )"
+
   curl -fsS -X POST "http://localhost:8081/v1/events" \
     -H "Content-Type: application/json" \
-    -H "X-Fantasma-Key: fg_ing_test" \
+    -H "X-Fantasma-Key: ${INGEST_KEY}" \
     -d '{
       "events": [
         {

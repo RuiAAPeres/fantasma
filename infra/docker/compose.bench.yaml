@@ -19,10 +19,6 @@ services:
     environment:
       FANTASMA_BIND_ADDRESS: 0.0.0.0:8081
       FANTASMA_DATABASE_URL: postgres://fantasma:fantasma@postgres:5432/fantasma
-      FANTASMA_INGEST_KEY: fg_ing_test
-      FANTASMA_ADMIN_TOKEN: fg_pat_dev
-      FANTASMA_PROJECT_ID: 9bad8b88-5e7a-44ed-98ce-4cf9ddde713a
-      FANTASMA_PROJECT_NAME: Bench Project
     ports:
       - "18081:8081"
 
@@ -35,10 +31,7 @@ services:
     environment:
       FANTASMA_BIND_ADDRESS: 0.0.0.0:8082
       FANTASMA_DATABASE_URL: postgres://fantasma:fantasma@postgres:5432/fantasma
-      FANTASMA_INGEST_KEY: fg_ing_test
-      FANTASMA_ADMIN_TOKEN: fg_pat_dev
-      FANTASMA_PROJECT_ID: 9bad8b88-5e7a-44ed-98ce-4cf9ddde713a
-      FANTASMA_PROJECT_NAME: Bench Project
+      FANTASMA_ADMIN_TOKEN: ${FANTASMA_ADMIN_TOKEN:-fg_pat_dev}
     ports:
       - "18082:8082"
 
@@ -50,8 +43,6 @@ services:
       - postgres
     environment:
       FANTASMA_DATABASE_URL: postgres://fantasma:fantasma@postgres:5432/fantasma
-      FANTASMA_PROJECT_ID: 9bad8b88-5e7a-44ed-98ce-4cf9ddde713a
-      FANTASMA_PROJECT_NAME: Bench Project
       FANTASMA_WORKER_BATCH_SIZE: 1000
       FANTASMA_WORKER_POLL_INTERVAL_MS: 50
 

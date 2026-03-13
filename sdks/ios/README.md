@@ -21,7 +21,7 @@ Task {
     do {
         try await Fantasma.configure(
             serverURL: serverURL,
-            writeKey: "fg_ing_test"
+            writeKey: "<ingest-key-from-provision-project>"
         )
         try await Fantasma.track("app_open")
         try await Fantasma.track("screen_view", properties: ["screen": "Home"])
@@ -40,6 +40,7 @@ keys per event. The SDK auto-populates `platform`, `app_version`, and
 Behavior notes:
 
 - Every tracked event is written to a local SQLite queue before upload.
+- `writeKey` must be a project-scoped `ingest` key, not a metrics read key.
 - The SDK adds `timestamp`, `install_id`, `platform = "ios"`, `app_version`, and `os_version`.
 - Event properties remain explicit string-to-string context passed by the app.
 - `clear()` rotates `install_id` and preserves already queued events.

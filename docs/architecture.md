@@ -18,6 +18,11 @@
 ## High-Level Flow
 
 ```text
+operator
+  -> GET/POST /v1/projects*
+  -> fantasma-api
+  -> projects + api_keys in Postgres
+
 curl / SDK
   -> POST /v1/events
   -> Rust ingest service
@@ -114,10 +119,19 @@ Planned aggregates:
 
 Responsibilities:
 
+- expose operator-authenticated project/key management routes
 - expose project-scoped query endpoints
 - parse the explicit event-metrics query surface from raw query params
 - read only worker-derived aggregates for analytics queries
 - provide a stable public API for first-party and third-party clients
+
+Auth model:
+
+- one static operator bearer token is reserved for `/v1/projects*`
+- project keys are scoped to exactly one project and one key kind
+- `ingest` keys authenticate `POST /v1/events`
+- `read` keys authenticate `/v1/metrics/*`
+- metrics project scope is derived from the authenticated key, not from a public `project_id` parameter
 
 ## Data Model Direction
 
@@ -130,6 +144,13 @@ Core persisted concepts:
 - `session_daily`
 - `worker_offsets`
 - aggregate tables keyed by project, metric window, and dimensions
+
+Current `api_keys` shape:
+
+- stores one row per project-scoped secret
+- keeps only hash plus redacted prefix, never the plaintext key
+- tracks a required `kind` of `ingest` or `read`
+- supports soft revocation through `revoked_at`
 
 Event requirements:
 
@@ -163,7 +184,8 @@ Event metrics use exactly two endpoint shapes:
 
 Query semantics:
 
-- `project_id`, `event`, `start_date`, and `end_date` are required
+- authenticated project scope comes from the caller's `read` key
+- `event`, `start_date`, and `end_date` are required
 - built-in equality filters use normal query params: `platform`, `app_version`, `os_version`
 - any other non-reserved query key matching `^[a-z][a-z0-9_]{0,62}$` is an equality filter on an explicit string property
 - `group_by` may be repeated up to twice
@@ -198,7 +220,7 @@ Current iOS SDK shape:
 - expose a single static `Fantasma` facade backed by one shared client
 - serialize each tracked event to JSON and store it as an immutable SQLite row
 - auto-populate `platform`, `app_version`, and `os_version`
-- upload queued events asynchronously to `POST /v1/events` using the existing batch contract
+- upload queued events asynchronously to `POST /v1/events` using an `ingest` key only
 
 Current upload triggers:
 

@@ -5,22 +5,9 @@ use axum::{
     http::{Request, StatusCode},
 };
 use fantasma_auth::StaticAdminAuthorizer;
-use fantasma_store::{BootstrapConfig, PgPool, ensure_local_project, run_migrations};
+use fantasma_store::{PgPool, run_migrations};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use tower::ServiceExt;
-use uuid::Uuid;
-
-fn project_id() -> Uuid {
-    Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a)
-}
-
-fn bootstrap_config() -> BootstrapConfig {
-    BootstrapConfig {
-        project_id: project_id(),
-        project_name: "Pipeline Test Project".to_owned(),
-        ingest_key: Some("fg_ing_test".to_owned()),
-    }
-}
 
 fn scale_like_events(day: &str, install_count: usize) -> Vec<serde_json::Value> {
     let providers = ["strava", "garmin", "polar", "oura"];
@@ -57,24 +44,201 @@ fn scale_like_events(day: &str, install_count: usize) -> Vec<serde_json::Value> 
     events
 }
 
-#[sqlx::test]
-async fn pipeline_exposes_daily_metrics_after_worker_batch(pool: PgPool) {
-    run_migrations(&pool).await.expect("migrations succeed");
-    ensure_local_project(&pool, Some(&bootstrap_config()))
+async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body"),
+    )
+    .expect("decode response body")
+}
+
+#[derive(Debug, Clone)]
+struct ProvisionedProject {
+    ingest_key: String,
+    read_key: String,
+}
+
+async fn provision_project(api: axum::Router) -> ProvisionedProject {
+    let create_project_response = api
+        .clone()
+        .oneshot(
+            Request::post("/v1/projects")
+                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "Pipeline Project",
+                        "ingest_key_name": "ios-demo"
+                    })
+                    .to_string(),
+                ))
+                .expect("valid create-project request"),
+        )
         .await
-        .expect("seed local project");
+        .expect("create-project request succeeds");
+    assert_eq!(create_project_response.status(), StatusCode::CREATED);
+
+    let created_project = response_json(create_project_response).await;
+    let project_id = created_project["project"]["id"]
+        .as_str()
+        .expect("project id")
+        .to_owned();
+    let ingest_key = created_project["ingest_key"]["secret"]
+        .as_str()
+        .expect("ingest key secret")
+        .to_owned();
+
+    let create_read_key_response = api
+        .oneshot(
+            Request::post(format!("/v1/projects/{project_id}/keys"))
+                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "dashboard",
+                        "kind": "read"
+                    })
+                    .to_string(),
+                ))
+                .expect("valid create-key request"),
+        )
+        .await
+        .expect("create-key request succeeds");
+    assert_eq!(create_read_key_response.status(), StatusCode::CREATED);
+
+    let created_read_key = response_json(create_read_key_response).await;
+    let read_key = created_read_key["key"]["secret"]
+        .as_str()
+        .expect("read key secret")
+        .to_owned();
+
+    ProvisionedProject {
+        ingest_key,
+        read_key,
+    }
+}
+
+#[sqlx::test]
+async fn pipeline_provisions_project_and_scopes_ingest_and_read_keys(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
 
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
         Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
     );
+    let provisioned = provision_project(api.clone()).await;
 
     let ingest_response = ingest
         .oneshot(
             Request::post("/v1/events")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-fantasma-key", "fg_ing_test")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios"
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:10:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    fantasma_worker::process_session_batch(&pool, 100)
+        .await
+        .expect("worker batch succeeds");
+
+    let read_metrics_response = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-02",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid read metrics request"),
+        )
+        .await
+        .expect("read metrics request succeeds");
+
+    assert_eq!(read_metrics_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(read_metrics_response).await,
+        serde_json::json!({
+            "metric": "sessions_count_daily",
+            "points": [
+                { "date": "2026-01-01", "value": 1 },
+                { "date": "2026-01-02", "value": 0 }
+            ]
+        })
+    );
+
+    let ingest_key_metrics_response = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-02",
+            )
+            .header("x-fantasma-key", &provisioned.ingest_key)
+            .body(Body::empty())
+            .expect("valid ingest-key metrics request"),
+        )
+        .await
+        .expect("ingest-key metrics request succeeds");
+
+    assert_eq!(
+        ingest_key_metrics_response.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let operator_metrics_response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-02",
+            )
+            .header(AUTHORIZATION, "Bearer fg_pat_dev")
+            .body(Body::empty())
+            .expect("valid operator metrics request"),
+        )
+        .await
+        .expect("operator metrics request succeeds");
+
+    assert_eq!(operator_metrics_response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test]
+async fn pipeline_exposes_daily_metrics_after_worker_batch(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
                 .body(Body::from(
                     serde_json::json!({
                         "events": [
@@ -109,9 +273,9 @@ async fn pipeline_exposes_daily_metrics_after_worker_batch(pool: PgPool) {
         .clone()
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions/count/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02",
+                "/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-02",
             )
-            .header(AUTHORIZATION, "Bearer fg_pat_dev")
+            .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
             .expect("valid api request"),
         )
@@ -139,9 +303,9 @@ async fn pipeline_exposes_daily_metrics_after_worker_batch(pool: PgPool) {
         .clone()
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions/duration/total/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02",
+                "/v1/metrics/sessions/duration/total/daily?start_date=2026-01-01&end_date=2026-01-02",
             )
-            .header(AUTHORIZATION, "Bearer fg_pat_dev")
+            .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
             .expect("valid api request"),
         )
@@ -168,9 +332,9 @@ async fn pipeline_exposes_daily_metrics_after_worker_batch(pool: PgPool) {
     let active_installs_response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/active-installs/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start_date=2026-01-01&end_date=2026-01-02",
+                "/v1/metrics/active-installs/daily?start_date=2026-01-01&end_date=2026-01-02",
             )
-            .header(AUTHORIZATION, "Bearer fg_pat_dev")
+            .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
             .expect("valid api request"),
         )
@@ -183,21 +347,19 @@ async fn pipeline_exposes_daily_metrics_after_worker_batch(pool: PgPool) {
 #[sqlx::test]
 async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
-    ensure_local_project(&pool, Some(&bootstrap_config()))
-        .await
-        .expect("seed local project");
 
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
         Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
     );
+    let provisioned = provision_project(api.clone()).await;
 
     let ingest_response = ingest
         .oneshot(
             Request::post("/v1/events")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-fantasma-key", "fg_ing_test")
+                .header("x-fantasma-key", &provisioned.ingest_key)
                 .body(Body::from(
                     serde_json::json!({
                         "events": [
@@ -243,9 +405,9 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
         .clone()
         .oneshot(
             Request::get(
-                "/v1/metrics/events/aggregate?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider",
+                "/v1/metrics/events/aggregate?event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider",
             )
-            .header(AUTHORIZATION, "Bearer fg_pat_dev")
+            .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
             .expect("valid api request"),
         )
@@ -277,9 +439,9 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
     let daily_response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/events/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-03-01&end_date=2026-03-02&os_version=18.3&group_by=provider&group_by=is_paying",
+                "/v1/metrics/events/daily?event=app_open&start_date=2026-03-01&end_date=2026-03-02&os_version=18.3&group_by=provider&group_by=is_paying",
             )
-            .header(AUTHORIZATION, "Bearer fg_pat_dev")
+            .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
             .expect("valid api request"),
         )
@@ -326,15 +488,13 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
 #[sqlx::test]
 async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
-    ensure_local_project(&pool, Some(&bootstrap_config()))
-        .await
-        .expect("seed local project");
 
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
         Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
     );
+    let provisioned = provision_project(api.clone()).await;
     let events = (0..101)
         .map(|index| {
             serde_json::json!({
@@ -356,7 +516,7 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
         .oneshot(
             Request::post("/v1/events")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-fantasma-key", "fg_ing_test")
+                .header("x-fantasma-key", &provisioned.ingest_key)
                 .body(Body::from(
                     serde_json::json!({ "events": events[..100].to_vec() }).to_string(),
                 ))
@@ -368,7 +528,7 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
         .oneshot(
             Request::post("/v1/events")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-fantasma-key", "fg_ing_test")
+                .header("x-fantasma-key", &provisioned.ingest_key)
                 .body(Body::from(
                     serde_json::json!({ "events": events[100..].to_vec() }).to_string(),
                 ))
@@ -387,9 +547,9 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
     let response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/events/aggregate?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-03-01&end_date=2026-03-01&group_by=provider",
+                "/v1/metrics/events/aggregate?event=app_open&start_date=2026-03-01&end_date=2026-03-01&group_by=provider",
             )
-            .header(AUTHORIZATION, "Bearer fg_pat_dev")
+            .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
             .expect("valid api request"),
         )
@@ -415,15 +575,13 @@ async fn pipeline_keeps_grouped_event_metrics_daily_queries_200_during_worker_ca
     pool: PgPool,
 ) {
     run_migrations(&pool).await.expect("migrations succeed");
-    ensure_local_project(&pool, Some(&bootstrap_config()))
-        .await
-        .expect("seed local project");
 
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
         Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
     );
+    let provisioned = provision_project(api.clone()).await;
     let events = scale_like_events("2026-04-01", 120);
 
     for batch in events.chunks(100) {
@@ -432,7 +590,7 @@ async fn pipeline_keeps_grouped_event_metrics_daily_queries_200_during_worker_ca
             .oneshot(
                 Request::post("/v1/events")
                     .header(CONTENT_TYPE, "application/json")
-                    .header("x-fantasma-key", "fg_ing_test")
+                    .header("x-fantasma-key", &provisioned.ingest_key)
                     .body(Body::from(
                         serde_json::json!({ "events": batch.to_vec() }).to_string(),
                     ))
@@ -457,7 +615,7 @@ async fn pipeline_keeps_grouped_event_metrics_daily_queries_200_during_worker_ca
         }
     });
 
-    let query = "/v1/metrics/events/daily?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&event=app_open&start_date=2026-04-01&end_date=2026-04-01&platform=ios&group_by=provider&group_by=region";
+    let query = "/v1/metrics/events/daily?event=app_open&start_date=2026-04-01&end_date=2026-04-01&platform=ios&group_by=provider&group_by=region";
     let mut saw_internal_server_error = false;
     let mut query_count = 0;
 
@@ -466,7 +624,7 @@ async fn pipeline_keeps_grouped_event_metrics_daily_queries_200_during_worker_ca
             .clone()
             .oneshot(
                 Request::get(query)
-                    .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                    .header("x-fantasma-key", &provisioned.read_key)
                     .body(Body::empty())
                     .expect("valid api request"),
             )

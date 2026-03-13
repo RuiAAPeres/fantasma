@@ -6,16 +6,18 @@ info:
     Fantasma is a privacy-first, self-hosted, install-scoped mobile analytics
     platform.
 
-    The current public surface covers raw event ingestion plus worker-derived
-    session metrics and worker-derived event metrics. Event properties are
-    explicit string-to-string context with at most 3 keys.
+    The current public surface covers raw event ingestion, operator-managed
+    project provisioning, worker-derived session metrics, and worker-derived
+    event metrics. Event properties are explicit string-to-string context with
+    at most 3 keys.
 servers:
   - url: http://localhost:8081
     description: Local ingest service
   - url: http://localhost:8082
-    description: Local query API service
+    description: Local API service
 tags:
   - name: ingest
+  - name: management
   - name: metrics
 paths:
   /v1/events:
@@ -24,13 +26,9 @@ paths:
         - ingest
       summary: Ingest a batch of mobile events
       operationId: ingestEvents
-      parameters:
-        - in: header
-          name: X-Fantasma-Key
-          required: true
-          schema:
-            type: string
-          description: Project-scoped ingest key.
+      description: Accepts only project-scoped `ingest` keys.
+      security:
+        - ProjectKeyHeader: []
       requestBody:
         required: true
         content:
@@ -45,7 +43,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/EventAcceptedResponse'
         '401':
-          description: Missing or invalid ingest key.
+          description: Missing, invalid, revoked, or wrong-kind ingest key.
           content:
             application/json:
               schema:
@@ -73,12 +71,192 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/projects:
+    get:
+      tags:
+        - management
+      summary: List projects
+      operationId: listProjects
+      security:
+        - OperatorBearerAuth: []
+      responses:
+        '200':
+          description: Projects in creation order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectListResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while listing projects.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      tags:
+        - management
+      summary: Create a project and its initial ingest key
+      operationId: createProject
+      security:
+        - OperatorBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProjectRequest'
+      responses:
+        '201':
+          description: Project created with one plaintext ingest key returned once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateProjectResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while creating the project or ingest key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/projects/{project_id}/keys:
+    get:
+      tags:
+        - management
+      summary: List API keys for a project
+      operationId: listProjectKeys
+      security:
+        - OperatorBearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectPathId'
+      responses:
+        '200':
+          description: Project keys, including revoked keys.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectKeyListResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Project not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while listing project keys.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      tags:
+        - management
+      summary: Create an ingest or read key for a project
+      operationId: createProjectKey
+      security:
+        - OperatorBearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectPathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProjectKeyRequest'
+      responses:
+        '201':
+          description: Project key created with plaintext secret returned once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateProjectKeyResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Project not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while creating the project key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/projects/{project_id}/keys/{key_id}:
+    delete:
+      tags:
+        - management
+      summary: Revoke a project key
+      operationId: revokeProjectKey
+      security:
+        - OperatorBearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectPathId'
+        - $ref: '#/components/parameters/KeyPathId'
+      responses:
+        '204':
+          description: Key revoked, or already revoked, under the specified project.
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Project/key resource not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while revoking the project key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/metrics/events/aggregate:
     get:
       tags:
         - metrics
       summary: Return worker-derived event counts aggregated over an inclusive UTC date range
       operationId: getEventMetricsAggregate
+      security:
+        - ProjectKeyHeader: []
       description: |
         Event metrics are eventually consistent because the API reads only from
         worker-built daily rollups.
@@ -102,8 +280,6 @@ paths:
         additionalProperties:
           type: string
       parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/ProjectId'
         - $ref: '#/components/parameters/EventName'
         - $ref: '#/components/parameters/StartDate'
         - $ref: '#/components/parameters/EndDate'
@@ -119,7 +295,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/EventMetricsAggregateResponse'
         '401':
-          description: Missing or invalid admin token.
+          description: Missing, invalid, revoked, or wrong-kind project read key.
           content:
             application/json:
               schema:
@@ -128,7 +304,6 @@ paths:
           description: |
             Invalid query. Error envelope is `{ "error": "..." }` with one of:
 
-            - `invalid_project_id`
             - `invalid_event`
             - `invalid_date_range`
             - `invalid_query_key`
@@ -155,6 +330,8 @@ paths:
         - metrics
       summary: Return worker-derived daily event-count series for an inclusive UTC date range
       operationId: getEventMetricsDaily
+      security:
+        - ProjectKeyHeader: []
       description: |
         Event metrics are eventually consistent because the API reads only from
         worker-built daily rollups.
@@ -178,8 +355,6 @@ paths:
         additionalProperties:
           type: string
       parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/ProjectId'
         - $ref: '#/components/parameters/EventName'
         - $ref: '#/components/parameters/StartDate'
         - $ref: '#/components/parameters/EndDate'
@@ -195,7 +370,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/EventMetricsDailyResponse'
         '401':
-          description: Missing or invalid admin token.
+          description: Missing, invalid, revoked, or wrong-kind project read key.
           content:
             application/json:
               schema:
@@ -204,7 +379,6 @@ paths:
           description: |
             Invalid query. Error envelope is `{ "error": "..." }` with one of:
 
-            - `invalid_project_id`
             - `invalid_event`
             - `invalid_date_range`
             - `invalid_query_key`
@@ -231,9 +405,13 @@ paths:
         - metrics
       summary: Count derived sessions in a time range
       operationId: getSessionsCount
+      security:
+        - ProjectKeyHeader: []
+      description: |
+        Project scope is derived from the authenticated `read` key. Public
+        query parameters are limited to `start` and `end`; unknown parameters,
+        including `project_id`, are rejected.
       parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/ProjectId'
         - $ref: '#/components/parameters/StartDateTime'
         - $ref: '#/components/parameters/EndDateTime'
       responses:
@@ -244,13 +422,17 @@ paths:
               schema:
                 $ref: '#/components/schemas/MetricResponse'
         '401':
-          description: Missing or invalid admin token.
+          description: Missing, invalid, revoked, or wrong-kind project read key.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
-          description: Invalid query parameters.
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `invalid_request`
+            - `invalid_time_range`
           content:
             application/json:
               schema:
@@ -261,9 +443,13 @@ paths:
         - metrics
       summary: Return daily derived session counts for an inclusive UTC date range
       operationId: getSessionsCountDaily
+      security:
+        - ProjectKeyHeader: []
+      description: |
+        Project scope is derived from the authenticated `read` key. Public
+        query parameters are limited to `start_date` and `end_date`; unknown
+        parameters, including `project_id`, are rejected.
       parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/ProjectId'
         - $ref: '#/components/parameters/StartDate'
         - $ref: '#/components/parameters/EndDate'
       responses:
@@ -274,13 +460,17 @@ paths:
               schema:
                 $ref: '#/components/schemas/MetricResponse'
         '401':
-          description: Missing or invalid admin token.
+          description: Missing, invalid, revoked, or wrong-kind project read key.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
-          description: Invalid inclusive date range.
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `invalid_request`
+            - `invalid_date_range`
           content:
             application/json:
               schema:
@@ -291,9 +481,13 @@ paths:
         - metrics
       summary: Average derived session duration in seconds for a time range
       operationId: getSessionsDuration
+      security:
+        - ProjectKeyHeader: []
+      description: |
+        Project scope is derived from the authenticated `read` key. Public
+        query parameters are limited to `start` and `end`; unknown parameters,
+        including `project_id`, are rejected.
       parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/ProjectId'
         - $ref: '#/components/parameters/StartDateTime'
         - $ref: '#/components/parameters/EndDateTime'
       responses:
@@ -304,13 +498,17 @@ paths:
               schema:
                 $ref: '#/components/schemas/MetricResponse'
         '401':
-          description: Missing or invalid admin token.
+          description: Missing, invalid, revoked, or wrong-kind project read key.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
-          description: Invalid query parameters.
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `invalid_request`
+            - `invalid_time_range`
           content:
             application/json:
               schema:
@@ -321,9 +519,13 @@ paths:
         - metrics
       summary: Return total derived session duration per UTC day for an inclusive UTC date range
       operationId: getSessionDurationTotalDaily
+      security:
+        - ProjectKeyHeader: []
+      description: |
+        Project scope is derived from the authenticated `read` key. Public
+        query parameters are limited to `start_date` and `end_date`; unknown
+        parameters, including `project_id`, are rejected.
       parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/ProjectId'
         - $ref: '#/components/parameters/StartDate'
         - $ref: '#/components/parameters/EndDate'
       responses:
@@ -334,13 +536,17 @@ paths:
               schema:
                 $ref: '#/components/schemas/MetricResponse'
         '401':
-          description: Missing or invalid admin token.
+          description: Missing, invalid, revoked, or wrong-kind project read key.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
-          description: Invalid inclusive date range.
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `invalid_request`
+            - `invalid_date_range`
           content:
             application/json:
               schema:
@@ -351,9 +557,13 @@ paths:
         - metrics
       summary: Count distinct installs with a derived session overlapping the time range
       operationId: getActiveInstalls
+      security:
+        - ProjectKeyHeader: []
+      description: |
+        Project scope is derived from the authenticated `read` key. Public
+        query parameters are limited to `start` and `end`; unknown parameters,
+        including `project_id`, are rejected.
       parameters:
-        - $ref: '#/components/parameters/Authorization'
-        - $ref: '#/components/parameters/ProjectId'
         - $ref: '#/components/parameters/StartDateTime'
         - $ref: '#/components/parameters/EndDateTime'
       responses:
@@ -364,29 +574,43 @@ paths:
               schema:
                 $ref: '#/components/schemas/MetricResponse'
         '401':
-          description: Missing or invalid admin token.
+          description: Missing, invalid, revoked, or wrong-kind project read key.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
-          description: Invalid query parameters.
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `invalid_request`
+            - `invalid_time_range`
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 components:
-  parameters:
-    Authorization:
+  securitySchemes:
+    OperatorBearerAuth:
+      type: http
+      scheme: bearer
+      description: Operator bearer token for `/v1/projects*` management routes.
+    ProjectKeyHeader:
+      type: apiKey
       in: header
-      name: Authorization
+      name: X-Fantasma-Key
+      description: Project-scoped key header. Ingest routes require `ingest` keys; metrics routes require `read` keys.
+  parameters:
+    ProjectPathId:
+      in: path
+      name: project_id
       required: true
       schema:
         type: string
-      description: Bearer admin token, for example `Bearer fg_pat_xxx`.
-    ProjectId:
-      in: query
-      name: project_id
+        format: uuid
+    KeyPathId:
+      in: path
+      name: key_id
       required: true
       schema:
         type: string
@@ -465,6 +689,151 @@ components:
         format: date
       description: Inclusive UTC end date.
   schemas:
+    Project:
+      type: object
+      required:
+        - id
+        - name
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+        created_at:
+          type: string
+          format: date-time
+    ProjectListResponse:
+      type: object
+      required:
+        - projects
+      properties:
+        projects:
+          type: array
+          items:
+            $ref: '#/components/schemas/Project'
+    ProjectKeyKind:
+      type: string
+      enum:
+        - ingest
+        - read
+    ProjectKey:
+      type: object
+      required:
+        - id
+        - name
+        - kind
+        - prefix
+        - created_at
+        - revoked_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+        kind:
+          $ref: '#/components/schemas/ProjectKeyKind'
+        prefix:
+          type: string
+          minLength: 1
+          description: Redacted key prefix only. Full secrets are returned only on create responses.
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+    ProjectKeyWithSecret:
+      type: object
+      required:
+        - id
+        - name
+        - kind
+        - prefix
+        - secret
+        - created_at
+        - revoked_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+        kind:
+          $ref: '#/components/schemas/ProjectKeyKind'
+        prefix:
+          type: string
+          minLength: 1
+        secret:
+          type: string
+          minLength: 1
+          description: Plaintext secret returned exactly once when the key is created.
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+    ProjectKeyListResponse:
+      type: object
+      required:
+        - keys
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectKey'
+    CreateProjectRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - ingest_key_name
+      properties:
+        name:
+          type: string
+          minLength: 1
+        ingest_key_name:
+          type: string
+          minLength: 1
+    CreateProjectResponse:
+      type: object
+      required:
+        - project
+        - ingest_key
+      properties:
+        project:
+          $ref: '#/components/schemas/Project'
+        ingest_key:
+          $ref: '#/components/schemas/ProjectKeyWithSecret'
+    CreateProjectKeyRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - kind
+      properties:
+        name:
+          type: string
+          minLength: 1
+        kind:
+          $ref: '#/components/schemas/ProjectKeyKind'
+    CreateProjectKeyResponse:
+      type: object
+      required:
+        - key
+      properties:
+        key:
+          $ref: '#/components/schemas/ProjectKeyWithSecret'
     Platform:
       type: string
       enum:

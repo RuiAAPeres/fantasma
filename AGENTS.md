@@ -113,6 +113,9 @@ Fantasma now expects Codex agents to use the installed `superpowers` skills when
 - Use `finishing-a-development-branch` before final handoff when the task includes branch cleanup, verification, and merge-readiness work.
 - Do not use git worktrees in this repository. Work in the current checkout even if a generic skill suggests creating a worktree.
 - Keep superpowers usage pragmatic: choose the smallest applicable workflow, but do not skip a clearly relevant skill.
+- Treat this repository as active development and not deployed anywhere unless the user explicitly says otherwise.
+- Do not raise review findings about backward compatibility, upgrade paths, migration backfills, legacy client support, or existing production databases unless the user explicitly asks for deployment, rollout, upgrade, or compatibility review.
+- Breaking changes are expected in this stage. Review the current intended contract and code correctness, not hypothetical deployed history.
 
 ## Build Order
 

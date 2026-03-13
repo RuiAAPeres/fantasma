@@ -13,10 +13,9 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const PROJECT_ID: &str = "9bad8b88-5e7a-44ed-98ce-4cf9ddde713a";
-const INGEST_KEY: &str = "fg_ing_test";
-const ADMIN_TOKEN: &str = "fg_pat_dev";
+const DEFAULT_ADMIN_TOKEN: &str = "fg_pat_dev";
 const BENCHMARK_COMPOSE_PROJECT_NAME: &str = "fantasma-bench";
+const BENCHMARK_PROJECT_NAME: &str = "Fantasma Benchmark";
 const INGEST_BASE_URL: &str = "http://127.0.0.1:18081";
 const API_BASE_URL: &str = "http://127.0.0.1:18082";
 const POST_BATCH_SIZE: usize = 100;
@@ -163,6 +162,33 @@ struct EventBatch<'a> {
     events: &'a [BenchEvent],
 }
 
+#[derive(Debug, Clone)]
+struct ProvisionedProject {
+    ingest_key: String,
+    read_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatedProjectResponse {
+    project: CreatedProject,
+    ingest_key: CreatedKey,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatedProject {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatedKeyResponse {
+    key: CreatedKey,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatedKey {
+    secret: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProfileConfig {
     hot_path_install_count: usize,
@@ -256,11 +282,14 @@ async fn run_stack(args: StackArgs) -> Result<()> {
     let mut stack = StackGuard::new(compose_file_path());
     stack.start()?;
     wait_for_health(&client).await?;
+    let project = provision_project(&client).await?;
 
     let mut result = match args.scenario {
-        Scenario::Hot => run_hot_path(&client, args.profile, profile_config).await?,
-        Scenario::Repair => run_repair_path(&client, args.profile, profile_config).await?,
-        Scenario::Scale => run_scale_path(&client, args.profile, profile_config).await?,
+        Scenario::Hot => run_hot_path(&client, &project, args.profile, profile_config).await?,
+        Scenario::Repair => {
+            run_repair_path(&client, &project, args.profile, profile_config).await?
+        }
+        Scenario::Scale => run_scale_path(&client, &project, args.profile, profile_config).await?,
     };
     result.budget = budget
         .as_ref()
@@ -280,6 +309,7 @@ async fn run_stack(args: StackArgs) -> Result<()> {
 
 async fn run_hot_path(
     client: &Client,
+    project: &ProvisionedProject,
     profile: Profile,
     config: ProfileConfig,
 ) -> Result<ScenarioResult> {
@@ -287,7 +317,7 @@ async fn run_hot_path(
     let event_count = events.len();
     let batches = chunk_events(events);
     let ingest_started = Instant::now();
-    post_batches(client, &batches).await?;
+    post_batches(client, project, &batches).await?;
     let ingest_elapsed = ingest_started.elapsed();
 
     let expected = HotPathExpectation {
@@ -298,7 +328,7 @@ async fn run_hot_path(
     };
     let derive_started = Instant::now();
     poll_until(
-        || hot_path_ready(client, &expected),
+        || hot_path_ready(client, project, &expected),
         config.settle_timeout,
         "hot-path derived metrics readiness",
     )
@@ -307,6 +337,7 @@ async fn run_hot_path(
 
     let queries = measure_queries(
         client,
+        project,
         &hot_path_query_urls(),
         config.warmup_queries,
         config.measured_queries,
@@ -333,6 +364,7 @@ async fn run_hot_path(
 
 async fn run_repair_path(
     client: &Client,
+    project: &ProvisionedProject,
     profile: Profile,
     config: ProfileConfig,
 ) -> Result<ScenarioResult> {
@@ -340,11 +372,11 @@ async fn run_repair_path(
 
     let baseline_batches = chunk_events(scenario.baseline_events.clone());
     let seed_ingest_started = Instant::now();
-    post_batches(client, &baseline_batches).await?;
+    post_batches(client, project, &baseline_batches).await?;
     let seed_ingest_elapsed = seed_ingest_started.elapsed();
     let seed_ready_started = Instant::now();
     poll_until(
-        || repair_baseline_ready(client, &scenario),
+        || repair_baseline_ready(client, project, &scenario),
         config.settle_timeout,
         "repair baseline readiness",
     )
@@ -353,12 +385,12 @@ async fn run_repair_path(
 
     let late_batches = chunk_events(scenario.late_events.clone());
     let ingest_started = Instant::now();
-    post_batches(client, &late_batches).await?;
+    post_batches(client, project, &late_batches).await?;
     let ingest_elapsed = ingest_started.elapsed();
 
     let derive_started = Instant::now();
     poll_until(
-        || repair_ready(client, &scenario),
+        || repair_ready(client, project, &scenario),
         config.settle_timeout,
         "repair derived metrics readiness",
     )
@@ -367,6 +399,7 @@ async fn run_repair_path(
 
     let queries = measure_queries(
         client,
+        project,
         &repair_path_query_urls(),
         config.warmup_queries,
         config.measured_queries,
@@ -407,18 +440,19 @@ async fn run_repair_path(
 
 async fn run_scale_path(
     client: &Client,
+    project: &ProvisionedProject,
     profile: Profile,
     config: ProfileConfig,
 ) -> Result<ScenarioResult> {
     let scenario = scale_scenario(config.scale_day_count, config.scale_install_count_per_day)?;
     let batches = chunk_events(scenario.events.clone());
     let ingest_started = Instant::now();
-    post_batches(client, &batches).await?;
+    post_batches(client, project, &batches).await?;
     let ingest_elapsed = ingest_started.elapsed();
 
     let derive_started = Instant::now();
     poll_until(
-        || scale_path_ready(client, &scenario),
+        || scale_path_ready(client, project, &scenario),
         config.settle_timeout,
         "scale-path derived metrics readiness",
     )
@@ -427,6 +461,7 @@ async fn run_scale_path(
 
     let queries = measure_queries(
         client,
+        project,
         &scale_path_query_urls(scenario.start_day, scenario.end_day),
         config.warmup_queries,
         config.measured_queries,
@@ -459,11 +494,15 @@ fn throughput(events_sent: usize, elapsed: Duration) -> f64 {
     events_sent as f64 / elapsed.as_secs_f64()
 }
 
-async fn post_batches(client: &Client, batches: &[Vec<BenchEvent>]) -> Result<()> {
+async fn post_batches(
+    client: &Client,
+    project: &ProvisionedProject,
+    batches: &[Vec<BenchEvent>],
+) -> Result<()> {
     for batch in batches {
         let response = client
             .post(format!("{}/v1/events", benchmark_ingest_base_url()))
-            .header("x-fantasma-key", INGEST_KEY)
+            .header("x-fantasma-key", &project.ingest_key)
             .json(&EventBatch { events: batch })
             .send()
             .await
@@ -477,6 +516,63 @@ async fn post_batches(client: &Client, batches: &[Vec<BenchEvent>]) -> Result<()
     }
 
     Ok(())
+}
+
+async fn provision_project(client: &Client) -> Result<ProvisionedProject> {
+    let create_project_response = client
+        .post(format!("{}/v1/projects", benchmark_api_base_url()))
+        .bearer_auth(benchmark_admin_token())
+        .json(&serde_json::json!({
+            "name": BENCHMARK_PROJECT_NAME,
+            "ingest_key_name": "bench-ingest"
+        }))
+        .send()
+        .await
+        .context("POST /v1/projects")?;
+    let status = create_project_response.status();
+    if status != StatusCode::CREATED {
+        let body = create_project_response.text().await.unwrap_or_default();
+        bail!("POST /v1/projects returned {}: {}", status, body);
+    }
+
+    let created_project = create_project_response
+        .json::<CreatedProjectResponse>()
+        .await
+        .context("decode project provisioning response")?;
+
+    let create_read_key_response = client
+        .post(format!(
+            "{}/v1/projects/{}/keys",
+            benchmark_api_base_url(),
+            created_project.project.id
+        ))
+        .bearer_auth(benchmark_admin_token())
+        .json(&serde_json::json!({
+            "name": "bench-read",
+            "kind": "read"
+        }))
+        .send()
+        .await
+        .context("POST /v1/projects/{project_id}/keys")?;
+    let status = create_read_key_response.status();
+    if status != StatusCode::CREATED {
+        let body = create_read_key_response.text().await.unwrap_or_default();
+        bail!(
+            "POST /v1/projects/{{project_id}}/keys returned {}: {}",
+            status,
+            body
+        );
+    }
+
+    let created_read_key = create_read_key_response
+        .json::<CreatedKeyResponse>()
+        .await
+        .context("decode read-key provisioning response")?;
+
+    Ok(ProvisionedProject {
+        ingest_key: created_project.ingest_key.secret,
+        read_key: created_read_key.key.secret,
+    })
 }
 
 async fn wait_for_health(client: &Client) -> Result<()> {
@@ -530,13 +626,22 @@ struct HotPathExpectation {
     target_day: NaiveDate,
 }
 
-async fn hot_path_ready(client: &Client, expected: &HotPathExpectation) -> Result<bool> {
+async fn hot_path_ready(
+    client: &Client,
+    project: &ProvisionedProject,
+    expected: &HotPathExpectation,
+) -> Result<bool> {
     let query_urls = hot_path_query_urls();
-    let events_aggregate = fetch_json(client, &query_urls["events_aggregate_dim3"]).await?;
-    let events_daily = fetch_json(client, &query_urls["events_daily_dim3"]).await?;
-    let sessions_count = fetch_json(client, &query_urls["sessions_count_daily"]).await?;
-    let sessions_duration =
-        fetch_json(client, &query_urls["sessions_duration_total_daily"]).await?;
+    let events_aggregate =
+        fetch_json(client, project, &query_urls["events_aggregate_dim3"]).await?;
+    let events_daily = fetch_json(client, project, &query_urls["events_daily_dim3"]).await?;
+    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_daily"]).await?;
+    let sessions_duration = fetch_json(
+        client,
+        project,
+        &query_urls["sessions_duration_total_daily"],
+    )
+    .await?;
 
     let event_total = sum_metric_rows(&events_aggregate["rows"]);
     let event_daily_total = sum_metric_series_for_day(&events_daily["series"], expected.target_day);
@@ -549,12 +654,20 @@ async fn hot_path_ready(client: &Client, expected: &HotPathExpectation) -> Resul
         && session_duration == expected.total_duration_seconds)
 }
 
-async fn repair_baseline_ready(client: &Client, scenario: &RepairScenario) -> Result<bool> {
+async fn repair_baseline_ready(
+    client: &Client,
+    project: &ProvisionedProject,
+    scenario: &RepairScenario,
+) -> Result<bool> {
     let query_urls = repair_path_query_urls();
-    let events_daily = fetch_json(client, &query_urls["events_daily_dim3"]).await?;
-    let sessions_count = fetch_json(client, &query_urls["sessions_count_daily"]).await?;
-    let sessions_duration =
-        fetch_json(client, &query_urls["sessions_duration_total_daily"]).await?;
+    let events_daily = fetch_json(client, project, &query_urls["events_daily_dim3"]).await?;
+    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_daily"]).await?;
+    let sessions_duration = fetch_json(
+        client,
+        project,
+        &query_urls["sessions_duration_total_daily"],
+    )
+    .await?;
     let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
     let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date");
     let day_3 = NaiveDate::from_ymd_opt(2026, 1, 3).expect("valid date");
@@ -573,13 +686,22 @@ async fn repair_baseline_ready(client: &Client, scenario: &RepairScenario) -> Re
         && metric_point_for_day(&sessions_duration["points"], day_3) == 0)
 }
 
-async fn repair_ready(client: &Client, scenario: &RepairScenario) -> Result<bool> {
+async fn repair_ready(
+    client: &Client,
+    project: &ProvisionedProject,
+    scenario: &RepairScenario,
+) -> Result<bool> {
     let query_urls = repair_path_query_urls();
-    let events_aggregate = fetch_json(client, &query_urls["events_aggregate_dim3"]).await?;
-    let events_daily = fetch_json(client, &query_urls["events_daily_dim3"]).await?;
-    let sessions_count = fetch_json(client, &query_urls["sessions_count_daily"]).await?;
-    let sessions_duration =
-        fetch_json(client, &query_urls["sessions_duration_total_daily"]).await?;
+    let events_aggregate =
+        fetch_json(client, project, &query_urls["events_aggregate_dim3"]).await?;
+    let events_daily = fetch_json(client, project, &query_urls["events_daily_dim3"]).await?;
+    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_daily"]).await?;
+    let sessions_duration = fetch_json(
+        client,
+        project,
+        &query_urls["sessions_duration_total_daily"],
+    )
+    .await?;
     let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
     let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date");
     let day_3 = NaiveDate::from_ymd_opt(2026, 1, 3).expect("valid date");
@@ -601,13 +723,22 @@ async fn repair_ready(client: &Client, scenario: &RepairScenario) -> Result<bool
             == (scenario.group_count as u64) * 2_700)
 }
 
-async fn scale_path_ready(client: &Client, scenario: &ScaleScenario) -> Result<bool> {
+async fn scale_path_ready(
+    client: &Client,
+    project: &ProvisionedProject,
+    scenario: &ScaleScenario,
+) -> Result<bool> {
     let query_urls = scale_path_query_urls(scenario.start_day, scenario.end_day);
-    let events_aggregate = fetch_json(client, &query_urls["events_aggregate_dim3"]).await?;
-    let events_daily = fetch_json(client, &query_urls["events_daily_dim3"]).await?;
-    let sessions_count = fetch_json(client, &query_urls["sessions_count_daily"]).await?;
-    let sessions_duration =
-        fetch_json(client, &query_urls["sessions_duration_total_daily"]).await?;
+    let events_aggregate =
+        fetch_json(client, project, &query_urls["events_aggregate_dim3"]).await?;
+    let events_daily = fetch_json(client, project, &query_urls["events_daily_dim3"]).await?;
+    let sessions_count = fetch_json(client, project, &query_urls["sessions_count_daily"]).await?;
+    let sessions_duration = fetch_json(
+        client,
+        project,
+        &query_urls["sessions_duration_total_daily"],
+    )
+    .await?;
 
     Ok(
         sum_metric_rows(&events_aggregate["rows"]) == scenario.total_events as u64
@@ -617,10 +748,10 @@ async fn scale_path_ready(client: &Client, scenario: &ScaleScenario) -> Result<b
     )
 }
 
-async fn fetch_json(client: &Client, url: &str) -> Result<Value> {
+async fn fetch_json(client: &Client, project: &ProvisionedProject, url: &str) -> Result<Value> {
     let response = client
         .get(url)
-        .bearer_auth(ADMIN_TOKEN)
+        .header("x-fantasma-key", &project.read_key)
         .send()
         .await
         .with_context(|| format!("GET {}", url))?;
@@ -638,6 +769,7 @@ async fn fetch_json(client: &Client, url: &str) -> Result<Value> {
 
 async fn measure_queries(
     client: &Client,
+    project: &ProvisionedProject,
     query_urls: &HashMap<&'static str, String>,
     warmup_iterations: usize,
     measured_iterations: usize,
@@ -646,13 +778,13 @@ async fn measure_queries(
 
     for (name, url) in query_urls {
         for _ in 0..warmup_iterations {
-            fetch_json(client, url).await?;
+            fetch_json(client, project, url).await?;
         }
 
         let mut samples = Vec::with_capacity(measured_iterations);
         for _ in 0..measured_iterations {
             let started = Instant::now();
-            fetch_json(client, url).await?;
+            fetch_json(client, project, url).await?;
             samples.push(started.elapsed().as_millis() as u64);
         }
         samples.sort_unstable();
@@ -918,28 +1050,28 @@ fn hot_path_query_urls() -> HashMap<&'static str, String> {
         (
             "events_aggregate_dim3",
             format!(
-                "{}/v1/metrics/events/aggregate?project_id={PROJECT_ID}&event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events/aggregate?event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
             "events_daily_dim3",
             format!(
-                "{}/v1/metrics/events/daily?project_id={PROJECT_ID}&event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events/daily?event=app_open&start_date=2026-03-01&end_date=2026-03-01&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
             "sessions_count_daily",
             format!(
-                "{}/v1/metrics/sessions/count/daily?project_id={PROJECT_ID}&start_date=2026-03-01&end_date=2026-03-01",
+                "{}/v1/metrics/sessions/count/daily?start_date=2026-03-01&end_date=2026-03-01",
                 benchmark_api_base_url()
             ),
         ),
         (
             "sessions_duration_total_daily",
             format!(
-                "{}/v1/metrics/sessions/duration/total/daily?project_id={PROJECT_ID}&start_date=2026-03-01&end_date=2026-03-01",
+                "{}/v1/metrics/sessions/duration/total/daily?start_date=2026-03-01&end_date=2026-03-01",
                 benchmark_api_base_url()
             ),
         ),
@@ -951,28 +1083,28 @@ fn repair_path_query_urls() -> HashMap<&'static str, String> {
         (
             "events_aggregate_dim3",
             format!(
-                "{}/v1/metrics/events/aggregate?project_id={PROJECT_ID}&event=app_open&start_date=2026-01-01&end_date=2026-01-03&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events/aggregate?event=app_open&start_date=2026-01-01&end_date=2026-01-03&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
             "events_daily_dim3",
             format!(
-                "{}/v1/metrics/events/daily?project_id={PROJECT_ID}&event=app_open&start_date=2026-01-01&end_date=2026-01-03&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events/daily?event=app_open&start_date=2026-01-01&end_date=2026-01-03&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
             "sessions_count_daily",
             format!(
-                "{}/v1/metrics/sessions/count/daily?project_id={PROJECT_ID}&start_date=2026-01-01&end_date=2026-01-03",
+                "{}/v1/metrics/sessions/count/daily?start_date=2026-01-01&end_date=2026-01-03",
                 benchmark_api_base_url()
             ),
         ),
         (
             "sessions_duration_total_daily",
             format!(
-                "{}/v1/metrics/sessions/duration/total/daily?project_id={PROJECT_ID}&start_date=2026-01-01&end_date=2026-01-03",
+                "{}/v1/metrics/sessions/duration/total/daily?start_date=2026-01-01&end_date=2026-01-03",
                 benchmark_api_base_url()
             ),
         ),
@@ -987,28 +1119,28 @@ fn scale_path_query_urls(
         (
             "events_aggregate_dim3",
             format!(
-                "{}/v1/metrics/events/aggregate?project_id={PROJECT_ID}&event=app_open&start_date={start_day}&end_date={end_day}&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events/aggregate?event=app_open&start_date={start_day}&end_date={end_day}&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
             "events_daily_dim3",
             format!(
-                "{}/v1/metrics/events/daily?project_id={PROJECT_ID}&event=app_open&start_date={start_day}&end_date={end_day}&platform=ios&group_by=provider&group_by=region",
+                "{}/v1/metrics/events/daily?event=app_open&start_date={start_day}&end_date={end_day}&platform=ios&group_by=provider&group_by=region",
                 benchmark_api_base_url()
             ),
         ),
         (
             "sessions_count_daily",
             format!(
-                "{}/v1/metrics/sessions/count/daily?project_id={PROJECT_ID}&start_date={start_day}&end_date={end_day}",
+                "{}/v1/metrics/sessions/count/daily?start_date={start_day}&end_date={end_day}",
                 benchmark_api_base_url()
             ),
         ),
         (
             "sessions_duration_total_daily",
             format!(
-                "{}/v1/metrics/sessions/duration/total/daily?project_id={PROJECT_ID}&start_date={start_day}&end_date={end_day}",
+                "{}/v1/metrics/sessions/duration/total/daily?start_date={start_day}&end_date={end_day}",
                 benchmark_api_base_url()
             ),
         ),
@@ -1158,6 +1290,10 @@ fn benchmark_ingest_base_url() -> &'static str {
 
 fn benchmark_api_base_url() -> &'static str {
     API_BASE_URL
+}
+
+fn benchmark_admin_token() -> String {
+    std::env::var("FANTASMA_ADMIN_TOKEN").unwrap_or_else(|_| DEFAULT_ADMIN_TOKEN.to_owned())
 }
 
 fn budget_file_path() -> PathBuf {
@@ -1613,5 +1749,34 @@ mod tests {
             error.to_string().contains("cleanup failed"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn benchmark_query_urls_do_not_embed_project_ids() {
+        for url in hot_path_query_urls().values() {
+            assert!(
+                !url.contains("project_id="),
+                "hot-path query url leaked project_id: {url}"
+            );
+        }
+
+        for url in repair_path_query_urls().values() {
+            assert!(
+                !url.contains("project_id="),
+                "repair-path query url leaked project_id: {url}"
+            );
+        }
+
+        for url in scale_path_query_urls(
+            NaiveDate::from_ymd_opt(2026, 1, 1).expect("start day"),
+            NaiveDate::from_ymd_opt(2026, 1, 3).expect("end day"),
+        )
+        .values()
+        {
+            assert!(
+                !url.contains("project_id="),
+                "scale-path query url leaked project_id: {url}"
+            );
+        }
     }
 }

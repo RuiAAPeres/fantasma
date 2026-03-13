@@ -22,7 +22,7 @@ Task {
     do {
         try await Fantasma.configure(
             serverURL: serverURL,
-            writeKey: "fg_ing_test"
+            writeKey: "<ingest-key-from-provision-project>"
         )
         try await Fantasma.track("app_open")
         try await Fantasma.track("screen_view", properties: ["screen": "Home"])
@@ -41,6 +41,7 @@ the event, with at most 3 keys per event. The SDK adds `platform`,
 ## Behavior
 
 - Tracked events are persisted to SQLite before upload.
+- `writeKey` must be a project-scoped `ingest` key.
 - Events are uploaded in JSON batches to `POST /v1/events`.
 - Successful `202 Accepted` responses delete uploaded rows from the queue.
 - Failed uploads leave rows in SQLite for later replay.
