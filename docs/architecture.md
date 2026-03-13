@@ -19,7 +19,8 @@
 
 ```text
 operator
-  -> GET/POST /v1/projects*
+  -> fantasma CLI
+  -> GET/POST /v1/projects* and GET /v1/metrics/*
   -> fantasma-api
   -> projects + api_keys in Postgres
 
@@ -140,6 +141,13 @@ Responsibilities:
 - read only worker-derived aggregates for analytics queries
 - provide a stable public API for first-party and third-party clients
 
+Current operator access pattern:
+
+- the Fantasma CLI is the primary manual operator surface for remote instances
+- operators authenticate the CLI with the install-time bearer token
+- the CLI stores named instance profiles plus one local `read` key per project
+- shell helpers remain useful for smoke checks and automation, not as the main human workflow
+
 Auth model:
 
 - one static operator bearer token is reserved for `/v1/projects*`
@@ -147,6 +155,7 @@ Auth model:
 - `ingest` keys authenticate `POST /v1/events`
 - `read` keys authenticate `/v1/metrics/*`
 - metrics project scope is derived from the authenticated key, not from a public `project_id` parameter
+- the CLI does not add user accounts or alternate auth paths; it wraps the same operator and project-key model directly
 
 ## Data Model Direction
 
@@ -178,7 +187,7 @@ Optional event fields:
 
 - `app_version`
 - `os_version`
-- at most 3 explicit string `properties`
+- at most 4 explicit string `properties`
 
 Identity model:
 
@@ -213,7 +222,7 @@ Event metrics:
 - built-in equality filters use `platform`, `app_version`, and `os_version`
 - any other non-reserved query key matching `^[a-z][a-z0-9_]{0,62}$` is an equality filter on an explicit string property
 - `group_by` may be repeated up to twice
-- the total number of distinct referenced dimensions across filters plus `group_by` is capped at 3
+- the total number of distinct referenced dimensions across filters plus `group_by` is capped at 4
 - grouped event metrics synthesize explicit `null` buckets from lower-order cuboids so grouped totals add back up to the filtered total
 
 Session metrics:

@@ -19,7 +19,9 @@ Repository files:
 - Compose stack: `infra/docker/compose.yaml`
 - service images: `infra/docker/Dockerfile.ingest`, `infra/docker/Dockerfile.api`, `infra/docker/Dockerfile.worker`
 - benchmark stack: [`infra/docker/compose.bench.yaml`](../infra/docker/compose.bench.yaml)
-- local provisioning helper: [`scripts/provision-project.sh`](../scripts/provision-project.sh)
+- operator CLI: `cargo run -p fantasma-cli -- ...`
+- CLI smoke helper: [`scripts/cli-smoke.sh`](../scripts/cli-smoke.sh)
+- automation helper: [`scripts/provision-project.sh`](../scripts/provision-project.sh)
 
 ## Configuration
 
@@ -64,6 +66,17 @@ The worker keeps one process but runs independent `sessions` and
 `event_metrics` lanes internally; each lane repolls immediately after useful
 work and only sleeps after an idle tick.
 
+## Operator Workflow
+
+The primary manual operator workflow is the Fantasma CLI against the API
+service URL. The CLI manages remote instance profiles, validates the operator
+token, provisions projects and keys, and runs metrics queries without dropping
+operators into raw curl by default.
+
+The first operator bearer token still comes from deployment configuration such
+as `FANTASMA_ADMIN_TOKEN`. Fantasma does not expose a separate bootstrap or
+account-creation flow in this slice.
+
 ## Preconditions
 
 Before bringing the stack up, confirm:
@@ -99,10 +112,70 @@ Stop the stack and remove volumes:
 docker compose -f infra/docker/compose.yaml down --volumes --remove-orphans
 ```
 
+## CLI Access
+
+Run the CLI directly from the workspace:
+
+```bash
+cargo run -p fantasma-cli -- instances add local --url http://localhost:8082
+```
+
+The saved API base URL may include a path prefix when Fantasma is published
+behind a reverse proxy, for example `https://ops.example.com/fantasma/`.
+
+Save the install-time operator token for that instance:
+
+```bash
+cargo run -p fantasma-cli -- auth login --instance local --token "${FANTASMA_ADMIN_TOKEN:-fg_pat_dev}"
+```
+
+The CLI stores local state under an XDG-style config path:
+
+- `${XDG_CONFIG_HOME}/fantasma/config.toml` when `XDG_CONFIG_HOME` is set
+- `~/.config/fantasma/config.toml` otherwise
+
+Each instance profile stores the API base URL, operator token, active project,
+and at most one locally saved `read` key per project. `read` keys are local
+operator conveniences created through the CLI; on a new machine, create a new
+project `read` key instead of importing an old one.
+
+The current persisted-config path and permission model targets Unix-like
+operator machines. Config writes fail closed on non-Unix platforms until the
+CLI grows an equally strict credential-storage path there.
+
 ## Provision a Project
 
-Once the stack is healthy, create a project and both scoped keys through the
-management API:
+The CLI is the primary manual provisioning path once the stack is healthy:
+
+```bash
+cargo run -p fantasma-cli -- projects create \
+  --name "Local Development" \
+  --ingest-key-name "ios-sdk"
+```
+
+The command prints the project id and the initial ingest key secret once. That
+ingest key is not persisted locally by the CLI.
+
+Select the project you want to operate on:
+
+```bash
+cargo run -p fantasma-cli -- projects use <project-id>
+```
+
+Create and locally save a dedicated `read` key for CLI metrics access:
+
+```bash
+cargo run -p fantasma-cli -- keys create --kind read --name "local-cli"
+```
+
+The CLI stores at most one local `read` key per project. Creating another one
+replaces the previous local entry for that project on that machine.
+
+## Automation Helper
+
+`scripts/provision-project.sh` remains useful for smoke checks and automation
+when you want one shell command that creates a project plus an optional `read`
+key:
 
 ```bash
 PROVISIONED="$(./scripts/provision-project.sh \
@@ -120,7 +193,8 @@ READ_KEY="$(printf '%s' "$PROVISIONED" | python3 -c 'import json,sys; print(json
 ```
 
 Use the ingest key only with `POST /v1/events`. Use the read key only with
-`/v1/metrics/*`.
+`/v1/metrics/*`. Keep the script for automation; prefer the CLI for manual
+operator work.
 
 ## Smoke Verification
 
@@ -146,10 +220,22 @@ debugging.
 Worker-built metrics are asynchronous. If you verify manually, expect a short
 delay between ingesting events and seeing derived metric reads update.
 
+Run the CLI-driven smoke path against the same local stack:
+
+```bash
+./scripts/cli-smoke.sh
+```
+
+That helper uses a fresh `XDG_CONFIG_HOME`, provisions an instance/profile
+through the CLI, creates a project plus a local `read` key, ingests one sample
+event with the printed ingest key, and polls one CLI metrics query until the
+derived session count appears.
+
 ## Manual Checks
 
-Use these commands when you need to inspect the running stack without the smoke
-script.
+Use these commands when you need to inspect the running stack manually. Prefer
+the CLI for management and metrics, and use raw curl when you specifically need
+to inspect the HTTP contract.
 
 Health endpoints:
 
@@ -158,7 +244,48 @@ curl -fsS http://localhost:8081/health
 curl -fsS http://localhost:8082/health
 ```
 
-Provision a project:
+Show the current CLI/operator status:
+
+```bash
+cargo run -p fantasma-cli -- status
+```
+
+List projects:
+
+```bash
+cargo run -p fantasma-cli -- projects list
+```
+
+Create a new `read` key for the active project if this machine does not have
+one yet:
+
+```bash
+cargo run -p fantasma-cli -- keys create --kind read --name "manual-read"
+```
+
+Query derived metrics through the CLI:
+
+```bash
+cargo run -p fantasma-cli -- metrics sessions \
+  --metric count \
+  --granularity day \
+  --start 2026-01-01 \
+  --end 2026-01-02
+```
+
+```bash
+cargo run -p fantasma-cli -- metrics events \
+  --event app_open \
+  --metric count \
+  --granularity day \
+  --start 2026-01-01 \
+  --end 2026-01-02 \
+  --filter platform=ios \
+  --group-by provider
+```
+
+If you need raw shell variables for curl-based checks, use the automation
+helper:
 
 ```bash
 PROVISIONED="$(./scripts/provision-project.sh \

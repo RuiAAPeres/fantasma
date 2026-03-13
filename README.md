@@ -26,13 +26,17 @@ Fantasma is not trying to be a full product analytics suite. It does not target:
 Today Fantasma is centered on:
 
 - a Rust backend and public API
+- an operator-facing CLI for self-hosted management and metrics access
 - operator-provisioned projects with separate ingest and read keys
 - background aggregation workers
 - durable mobile SDKs
 - simple self-hosted deployment
 
-The dashboard is secondary and should consume the same public API as everything
-else.
+The API remains the primary interface. The CLI is the primary operator
+workflow for self-hosted instances. Any future dashboard or hosted experience
+is secondary and should consume the same public API rather than bypassing it.
+
+Run `cargo run -p fantasma-cli -- --help` for the operator CLI entry point.
 
 ## Learn More
 
