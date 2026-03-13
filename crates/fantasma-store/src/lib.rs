@@ -3998,7 +3998,12 @@ mod tests {
                 'idx_event_metric_buckets_total_project_event_bucket',
                 'idx_event_metric_buckets_dim1_project_event_bucket',
                 'idx_event_metric_buckets_dim2_project_event_bucket',
+                'idx_event_metric_buckets_dim2_project_event_dim1_value_bucket',
+                'idx_event_metric_buckets_dim2_project_event_dim2_value_bucket',
                 'idx_event_metric_buckets_dim3_project_event_bucket',
+                'idx_event_metric_buckets_dim3_project_event_dim1_value_bucket',
+                'idx_event_metric_buckets_dim3_project_event_dim2_value_bucket',
+                'idx_event_metric_buckets_dim3_project_event_dim3_value_bucket',
                 'idx_event_metric_buckets_dim4_project_event_bucket',
                 'idx_event_metric_buckets_dim4_project_event_dim1_value_bucket',
                 'idx_event_metric_buckets_dim4_project_event_dim2_value_bucket',
@@ -4102,7 +4107,12 @@ mod tests {
             vec![
                 "idx_event_metric_buckets_dim1_project_event_bucket".to_owned(),
                 "idx_event_metric_buckets_dim2_project_event_bucket".to_owned(),
+                "idx_event_metric_buckets_dim2_project_event_dim1_value_bucket".to_owned(),
+                "idx_event_metric_buckets_dim2_project_event_dim2_value_bucket".to_owned(),
                 "idx_event_metric_buckets_dim3_project_event_bucket".to_owned(),
+                "idx_event_metric_buckets_dim3_project_event_dim1_value_bucket".to_owned(),
+                "idx_event_metric_buckets_dim3_project_event_dim2_value_bucket".to_owned(),
+                "idx_event_metric_buckets_dim3_project_event_dim3_value_bucket".to_owned(),
                 "idx_event_metric_buckets_dim4_project_event_bucket".to_owned(),
                 "idx_event_metric_buckets_dim4_project_event_dim1_value_bucket".to_owned(),
                 "idx_event_metric_buckets_dim4_project_event_dim2_value_bucket".to_owned(),
@@ -4241,8 +4251,8 @@ mod tests {
         assert!(
             index_names
                 .iter()
-                .any(|name| name == "idx_event_metric_buckets_dim2_project_event_bucket"),
-            "dim2 read path should use a dedicated read index, got {index_names:?} from {plan:#}"
+                .any(|name| name == "idx_event_metric_buckets_dim2_project_event_dim2_value_bucket"),
+            "dim2 read path should use the dim2 value index, got {index_names:?} from {plan:#}"
         );
     }
 
@@ -4337,8 +4347,8 @@ mod tests {
         assert!(
             index_names
                 .iter()
-                .any(|name| name == "idx_event_metric_buckets_dim3_project_event_bucket"),
-            "dim3 read path should use a dedicated read index, got {index_names:?} from {plan:#}"
+                .any(|name| name == "idx_event_metric_buckets_dim3_project_event_dim3_value_bucket"),
+            "dim3 read path should use the dim3 value index, got {index_names:?} from {plan:#}"
         );
     }
 
@@ -5216,6 +5226,24 @@ mod tests {
     fn forward_migration_adds_dim4_bucket_storage_and_cleans_legacy_daily_tables() {
         let migration = include_str!("../migrations/0012_event_metric_dim4_cleanup.sql");
 
+        assert!(
+            migration.contains(
+                "DROP INDEX IF EXISTS idx_event_metric_buckets_dim2_project_event_bucket"
+            ) && migration
+                .contains("idx_event_metric_buckets_dim2_project_event_dim1_value_bucket")
+                && migration
+                    .contains("idx_event_metric_buckets_dim2_project_event_dim2_value_bucket")
+                && migration.contains(
+                    "DROP INDEX IF EXISTS idx_event_metric_buckets_dim3_project_event_bucket"
+                )
+                && migration
+                    .contains("idx_event_metric_buckets_dim3_project_event_dim1_value_bucket")
+                && migration
+                    .contains("idx_event_metric_buckets_dim3_project_event_dim2_value_bucket")
+                && migration
+                    .contains("idx_event_metric_buckets_dim3_project_event_dim3_value_bucket"),
+            "0012 must realign dim2/dim3 bucket indexes to the bounded later-dimension read pattern"
+        );
         assert!(
             migration.contains("CREATE TABLE IF NOT EXISTS event_metric_buckets_dim4")
                 && migration.contains("idx_event_metric_buckets_dim4_project_event_bucket")
