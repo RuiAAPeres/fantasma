@@ -109,6 +109,7 @@ struct SeriesArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SloArgs {
     output_dir: PathBuf,
+    scenarios: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -139,6 +140,8 @@ enum CliCommand {
     Slo {
         #[arg(long)]
         output_dir: PathBuf,
+        #[arg(long = "scenario")]
+        scenarios: Vec<String>,
     },
 }
 
@@ -521,7 +524,13 @@ where
             repetitions,
             output_dir,
         }),
-        CliCommand::Slo { output_dir } => BenchCommand::Slo(SloArgs { output_dir }),
+        CliCommand::Slo {
+            output_dir,
+            scenarios,
+        } => BenchCommand::Slo(SloArgs {
+            output_dir,
+            scenarios,
+        }),
     })
 }
 
@@ -608,7 +617,7 @@ impl SloScenarioPaths {
 
 async fn run_slo(args: SloArgs) -> Result<()> {
     let host = collect_host_metadata()?;
-    let scenarios = slo_scenario_definitions();
+    let scenarios = select_slo_scenarios(&args.scenarios)?;
 
     run_slo_with_executor(&args.output_dir, host, &scenarios, |scenario| async move {
         execute_slo_scenario(&scenario).await
@@ -923,6 +932,32 @@ fn slo_scenario_definitions() -> Vec<SloScenarioDefinition> {
         }
     }
     scenarios
+}
+
+fn select_slo_scenarios(requested: &[String]) -> Result<Vec<SloScenarioDefinition>> {
+    let scenarios = slo_scenario_definitions();
+    if requested.is_empty() {
+        return Ok(scenarios);
+    }
+
+    let known = scenarios
+        .iter()
+        .map(|scenario| (scenario.key(), scenario.clone()))
+        .collect::<HashMap<_, _>>();
+    let unknown = requested
+        .iter()
+        .filter(|key| !known.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        bail!("unknown slo scenario: {}", unknown.join(", "));
+    }
+
+    let requested = requested.to_vec();
+    Ok(scenarios
+        .into_iter()
+        .filter(|scenario| requested.iter().any(|key| key == &scenario.key()))
+        .collect())
 }
 
 fn slo_paths(output_dir: &Path, scenario: &SloScenarioDefinition) -> SloScenarioPaths {
@@ -1257,7 +1292,7 @@ fn slo_event(
     timestamp: chrono::DateTime<Utc>,
 ) -> BenchEvent {
     let install_id = format!("slo-install-{install_index:04}");
-    let platform = if install_index % 2 == 0 {
+    let platform = if install_index.is_multiple_of(2) {
         "ios"
     } else {
         "android"
@@ -2995,7 +3030,7 @@ fn collect_host_metadata() -> Result<HostMetadata> {
 
 fn detect_cpu_model() -> String {
     command_stdout("sysctl", ["-n", "machdep.cpu.brand_string"])
-        .or_else(|| read_linux_cpu_model())
+        .or_else(read_linux_cpu_model)
         .unwrap_or_else(|| "unknown cpu".to_owned())
 }
 
@@ -3399,7 +3434,70 @@ mod tests {
             command,
             BenchCommand::Slo(SloArgs {
                 output_dir: PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo"),
+                scenarios: Vec::new(),
             })
+        );
+    }
+
+    #[test]
+    fn parse_slo_command_reads_requested_scenarios() {
+        let command = parse_args([
+            "fantasma-bench",
+            "slo",
+            "--output-dir",
+            "artifacts/performance/2026-03-13-derived-metrics-slo",
+            "--scenario",
+            "append-30d",
+            "--scenario",
+            "reads-90d",
+        ])
+        .expect("parse slo command");
+
+        assert_eq!(
+            command,
+            BenchCommand::Slo(SloArgs {
+                output_dir: PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo"),
+                scenarios: vec!["append-30d".to_owned(), "reads-90d".to_owned()],
+            })
+        );
+    }
+
+    #[test]
+    fn select_slo_scenarios_filters_requested_keys() {
+        let scenarios = select_slo_scenarios(&["append-30d".to_owned(), "reads-90d".to_owned()])
+            .expect("select requested scenarios");
+
+        assert_eq!(
+            scenarios
+                .iter()
+                .map(|scenario| scenario.key())
+                .collect::<Vec<_>>(),
+            vec!["append-30d", "reads-90d"]
+        );
+    }
+
+    #[test]
+    fn select_slo_scenarios_rejects_unknown_keys() {
+        let error = select_slo_scenarios(&["unknown".to_owned()])
+            .expect_err("unknown scenario should fail");
+
+        assert!(error.to_string().contains("unknown slo scenario"));
+    }
+
+    #[test]
+    fn select_slo_scenarios_returns_all_when_no_filter_is_supplied() {
+        let scenarios = select_slo_scenarios(&[]).expect("load default scenarios");
+
+        assert_eq!(scenarios.len(), 12);
+        assert_eq!(
+            scenarios
+                .iter()
+                .map(|scenario| scenario.key())
+                .collect::<Vec<_>>(),
+            slo_scenario_definitions()
+                .iter()
+                .map(|scenario| scenario.key())
+                .collect::<Vec<_>>()
         );
     }
 

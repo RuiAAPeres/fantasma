@@ -5,18 +5,20 @@ use fantasma_core::MetricGranularity;
 use fantasma_store::{
     EventCountDailyDim1Delta, EventCountDailyDim2Delta, EventCountDailyDim3Delta,
     EventCountDailyTotalDelta, InstallFirstSeenRecord, InstallSessionStateRecord, PgPool,
-    RawEventRecord, SessionMetricDim1Delta, SessionMetricDim2Delta, SessionMetricTotalDelta,
-    SessionRecord, SessionTailUpdate, StoreError, add_session_daily_duration_delta_in_tx,
-    delete_pending_session_rebuild_buckets_in_tx, delete_sessions_overlapping_window_in_tx,
-    enqueue_session_rebuild_buckets_in_tx, fetch_events_after_in_tx,
-    fetch_events_for_install_between_in_tx, fetch_latest_session_for_install_in_tx,
-    fetch_sessions_overlapping_window_in_tx, increment_session_daily_for_new_session_in_tx,
-    insert_install_first_seen_in_tx, insert_session_in_tx, load_install_first_seen_in_tx,
+    RawEventRecord, SessionDailyActiveInstallDelta, SessionDailyDelta, SessionDailyDurationDelta,
+    SessionDailyInstallDelta, SessionMetricDim1Delta, SessionMetricDim2Delta,
+    SessionMetricTotalDelta, SessionRecord, SessionTailUpdate, StoreError,
+    add_session_daily_duration_deltas_in_tx, delete_pending_session_rebuild_buckets_in_tx,
+    delete_sessions_overlapping_window_in_tx, enqueue_session_rebuild_buckets_in_tx,
+    fetch_events_after_in_tx, fetch_events_for_install_between_in_tx,
+    fetch_latest_session_for_install_in_tx, fetch_sessions_overlapping_window_in_tx,
+    insert_install_first_seen_in_tx, insert_session_in_tx, insert_sessions_in_tx,
     load_install_session_states_in_tx, load_pending_session_rebuild_buckets_in_tx,
-    lock_worker_offset, rebuild_session_daily_days_in_tx, save_worker_offset_in_tx,
-    update_session_tail_in_tx, upsert_event_count_daily_dim1_in_tx,
+    load_tail_sessions_for_installs_in_tx, lock_worker_offset, rebuild_session_daily_days_in_tx,
+    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_event_count_daily_dim1_in_tx,
     upsert_event_count_daily_dim2_in_tx, upsert_event_count_daily_dim3_in_tx,
     upsert_event_count_daily_totals_in_tx, upsert_install_session_state_in_tx,
+    upsert_session_daily_deltas_in_tx, upsert_session_daily_install_deltas_in_tx,
     upsert_session_metric_dim1_in_tx, upsert_session_metric_dim2_in_tx,
     upsert_session_metric_totals_in_tx,
 };
@@ -74,6 +76,209 @@ impl SessionRepairBuckets {
     }
 }
 
+#[derive(Debug)]
+struct IncrementalSessionPlan {
+    first_seen: Option<InstallFirstSeenRecord>,
+    tail_update: Option<SessionRecord>,
+    new_sessions: Vec<SessionRecord>,
+    next_state: InstallSessionStateRecord,
+    daily_install_deltas: Vec<SessionDailyInstallDelta>,
+    daily_session_counts_by_day: BTreeMap<NaiveDate, i64>,
+    daily_duration_deltas_by_day: BTreeMap<NaiveDate, i64>,
+    session_metric_accumulator: SessionMetricAccumulator,
+}
+
+#[derive(Debug, Default)]
+struct SessionMetricAccumulator {
+    totals: BTreeMap<(MetricGranularity, DateTime<Utc>), SessionMetricDeltaValue>,
+    dim1: BTreeMap<(MetricGranularity, DateTime<Utc>, String, String), SessionMetricDeltaValue>,
+    dim2: BTreeMap<SessionMetricDim2Key, SessionMetricDeltaValue>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionMetricDeltaValue {
+    session_count: i64,
+    duration_total_seconds: i64,
+    new_installs: i64,
+}
+
+type SessionMetricDim2Key = (
+    MetricGranularity,
+    DateTime<Utc>,
+    String,
+    String,
+    String,
+    String,
+);
+
+impl SessionMetricAccumulator {
+    fn add_session_delta(
+        &mut self,
+        session: &SessionRecord,
+        session_count_delta: i64,
+        duration_delta: i64,
+    ) {
+        for granularity in [MetricGranularity::Day, MetricGranularity::Hour] {
+            let bucket_start = bucket_start_for_granularity(session.session_start, granularity);
+            self.totals
+                .entry((granularity, bucket_start))
+                .or_default()
+                .add(session_count_delta, duration_delta, 0);
+
+            let platform_value = platform_dimension_value(&session.platform);
+            self.dim1
+                .entry((
+                    granularity,
+                    bucket_start,
+                    "platform".to_owned(),
+                    platform_value.clone(),
+                ))
+                .or_default()
+                .add(session_count_delta, duration_delta, 0);
+
+            if let Some(app_version) = session.app_version.as_ref() {
+                self.dim1
+                    .entry((
+                        granularity,
+                        bucket_start,
+                        "app_version".to_owned(),
+                        app_version.clone(),
+                    ))
+                    .or_default()
+                    .add(session_count_delta, duration_delta, 0);
+                self.dim2
+                    .entry((
+                        granularity,
+                        bucket_start,
+                        "app_version".to_owned(),
+                        app_version.clone(),
+                        "platform".to_owned(),
+                        platform_value.clone(),
+                    ))
+                    .or_default()
+                    .add(session_count_delta, duration_delta, 0);
+            }
+        }
+    }
+
+    fn add_new_install_delta(&mut self, first_seen: &InstallFirstSeenRecord) {
+        for granularity in [MetricGranularity::Day, MetricGranularity::Hour] {
+            let bucket_start = bucket_start_for_granularity(first_seen.first_seen_at, granularity);
+            self.totals
+                .entry((granularity, bucket_start))
+                .or_default()
+                .add(0, 0, 1);
+
+            let platform_value = platform_dimension_value(&first_seen.platform);
+            self.dim1
+                .entry((
+                    granularity,
+                    bucket_start,
+                    "platform".to_owned(),
+                    platform_value.clone(),
+                ))
+                .or_default()
+                .add(0, 0, 1);
+
+            if let Some(app_version) = first_seen.app_version.as_ref() {
+                self.dim1
+                    .entry((
+                        granularity,
+                        bucket_start,
+                        "app_version".to_owned(),
+                        app_version.clone(),
+                    ))
+                    .or_default()
+                    .add(0, 0, 1);
+                self.dim2
+                    .entry((
+                        granularity,
+                        bucket_start,
+                        "app_version".to_owned(),
+                        app_version.clone(),
+                        "platform".to_owned(),
+                        platform_value.clone(),
+                    ))
+                    .or_default()
+                    .add(0, 0, 1);
+            }
+        }
+    }
+
+    fn into_store_deltas(
+        self,
+        project_id: Uuid,
+    ) -> (
+        Vec<SessionMetricTotalDelta>,
+        Vec<SessionMetricDim1Delta>,
+        Vec<SessionMetricDim2Delta>,
+    ) {
+        let totals = self
+            .totals
+            .into_iter()
+            .map(
+                |((granularity, bucket_start), value)| SessionMetricTotalDelta {
+                    project_id,
+                    granularity,
+                    bucket_start,
+                    session_count: value.session_count,
+                    duration_total_seconds: value.duration_total_seconds,
+                    new_installs: value.new_installs,
+                },
+            )
+            .collect::<Vec<_>>();
+        let dim1 = self
+            .dim1
+            .into_iter()
+            .map(
+                |((granularity, bucket_start, dim1_key, dim1_value), value)| {
+                    SessionMetricDim1Delta {
+                        project_id,
+                        granularity,
+                        bucket_start,
+                        dim1_key,
+                        dim1_value,
+                        session_count: value.session_count,
+                        duration_total_seconds: value.duration_total_seconds,
+                        new_installs: value.new_installs,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        let dim2 = self
+            .dim2
+            .into_iter()
+            .map(
+                |(
+                    (granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value),
+                    value,
+                )| SessionMetricDim2Delta {
+                    project_id,
+                    granularity,
+                    bucket_start,
+                    dim1_key,
+                    dim1_value,
+                    dim2_key,
+                    dim2_value,
+                    session_count: value.session_count,
+                    duration_total_seconds: value.duration_total_seconds,
+                    new_installs: value.new_installs,
+                },
+            )
+            .collect::<Vec<_>>();
+
+        (totals, dim1, dim2)
+    }
+}
+
+impl SessionMetricDeltaValue {
+    fn add(&mut self, session_count: i64, duration_total_seconds: i64, new_installs: i64) {
+        self.session_count += session_count;
+        self.duration_total_seconds += duration_total_seconds;
+        self.new_installs += new_installs;
+    }
+}
+
 pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usize, StoreError> {
     Ok(process_session_batch_with_config(
         pool,
@@ -116,6 +321,7 @@ struct SessionWorkItem {
     install_id: String,
     events: Vec<RawEventRecord>,
     tail_state: Option<InstallSessionStateRecord>,
+    tail_session: Option<SessionRecord>,
     highest_processed_event_id: i64,
     kind: SessionWorkKind,
 }
@@ -170,9 +376,13 @@ async fn process_session_batch_inner(
         .map(|(project_id, install_id)| (*project_id, install_id.clone()))
         .collect::<Vec<_>>();
     let tail_states = load_install_session_states_in_tx(&mut tx, &install_keys).await?;
+    let tail_sessions = load_tail_sessions_for_installs_in_tx(&mut tx, &install_keys).await?;
 
     for ((project_id, install_id), events) in grouped {
         let tail_state = tail_states.get(&(project_id, install_id.clone())).cloned();
+        let tail_session = tail_sessions
+            .get(&(project_id, install_id.clone()))
+            .cloned();
         let events = filter_replayed_events(tail_state.as_ref(), events);
         if events.is_empty() {
             continue;
@@ -194,6 +404,7 @@ async fn process_session_batch_inner(
             install_id,
             events,
             tail_state,
+            tail_session,
             highest_processed_event_id,
             kind,
         };
@@ -261,11 +472,11 @@ async fn run_session_work_queue(
     while let Some(join_result) = work_set.join_next().await {
         match join_result {
             Ok(Ok(())) => {
-                if error.is_none() {
-                    if let Some(item) = work_items.next() {
-                        let pool = pool.clone();
-                        work_set.spawn(async move { process_session_work_item(&pool, item).await });
-                    }
+                if error.is_none()
+                    && let Some(item) = work_items.next()
+                {
+                    let pool = pool.clone();
+                    work_set.spawn(async move { process_session_work_item(&pool, item).await });
                 }
             }
             Ok(Err(join_error)) => {
@@ -299,6 +510,7 @@ async fn process_session_work_item(pool: &PgPool, item: SessionWorkItem) -> Resu
                 &item.install_id,
                 item.events,
                 item.tail_state,
+                item.tail_session,
             )
             .await?
         }
@@ -313,13 +525,15 @@ async fn process_session_work_item(pool: &PgPool, item: SessionWorkItem) -> Resu
             .await?
         }
     };
-    enqueue_session_rebuild_buckets_in_tx(
-        &mut tx,
-        item.project_id,
-        &touched_buckets.day_bucket_starts(),
-        &touched_buckets.hour_bucket_starts(),
-    )
-    .await?;
+    if item.kind == SessionWorkKind::Repair {
+        enqueue_session_rebuild_buckets_in_tx(
+            &mut tx,
+            item.project_id,
+            &touched_buckets.day_bucket_starts(),
+            &touched_buckets.hour_bucket_starts(),
+        )
+        .await?;
+    }
     tx.commit().await.map_err(StoreError::from)?;
 
     Ok(())
@@ -781,85 +995,229 @@ async fn process_install_batch_incremental(
     project_id: Uuid,
     install_id: &str,
     events: Vec<RawEventRecord>,
-    mut tail_state: Option<InstallSessionStateRecord>,
+    tail_state: Option<InstallSessionStateRecord>,
+    tail_session: Option<SessionRecord>,
 ) -> Result<SessionRepairBuckets, StoreError> {
-    let mut touched_buckets = SessionRepairBuckets::default();
-    let mut install_progress = tail_state
-        .as_ref()
-        .map(|state| state.last_processed_event_id)
-        .unwrap_or_default();
-    let existing_first_seen = load_install_first_seen_in_tx(tx, project_id, install_id).await?;
-    if existing_first_seen.is_none() {
-        if let Some(first_accepted_event) = events.iter().min_by_key(|event| event.id) {
-            let first_seen = InstallFirstSeenRecord {
+    let plan =
+        plan_incremental_session_batch(project_id, install_id, events, tail_state, tail_session)?;
+    apply_incremental_session_plan(tx, plan).await?;
+
+    Ok(SessionRepairBuckets::default())
+}
+
+fn plan_incremental_session_batch(
+    project_id: Uuid,
+    install_id: &str,
+    events: Vec<RawEventRecord>,
+    tail_state: Option<InstallSessionStateRecord>,
+    tail_session: Option<SessionRecord>,
+) -> Result<IncrementalSessionPlan, StoreError> {
+    if events.is_empty() {
+        return Err(StoreError::InvariantViolation(format!(
+            "incremental session batch for project {project_id} install {install_id} was empty"
+        )));
+    }
+
+    if let Some(state) = tail_state.as_ref()
+        && tail_session.is_none()
+    {
+        return Err(StoreError::InvariantViolation(format!(
+            "tail session {} missing for project {} install {}",
+            state.tail_session_id, state.project_id, state.install_id
+        )));
+    }
+
+    let first_seen =
+        events
+            .iter()
+            .min_by_key(|event| event.id)
+            .map(|event| InstallFirstSeenRecord {
                 project_id,
                 install_id: install_id.to_owned(),
-                first_seen_event_id: first_accepted_event.id,
-                first_seen_at: first_accepted_event.timestamp,
-                platform: first_accepted_event.platform.clone(),
-                app_version: first_accepted_event.app_version.clone(),
-            };
-            if insert_install_first_seen_in_tx(tx, &first_seen).await? {
-                touched_buckets.insert_timestamp(first_seen.first_seen_at);
-            }
+                first_seen_event_id: event.id,
+                first_seen_at: event.timestamp,
+                platform: event.platform.clone(),
+                app_version: event.app_version.clone(),
+            });
+    let highest_processed_event_id = events
+        .iter()
+        .map(|event| event.id)
+        .max()
+        .expect("non-empty events have a max id");
+    let original_tail = tail_session.clone();
+    let append_sessions = sessionization::derive_append_sessions(
+        tail_session,
+        &events
+            .iter()
+            .map(|event| sessionization::SessionEvent {
+                project_id: event.project_id,
+                timestamp: event.timestamp,
+                install_id: event.install_id.clone(),
+                platform: event.platform.clone(),
+                app_version: event.app_version.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    let final_session = append_sessions
+        .new_sessions
+        .last()
+        .cloned()
+        .or_else(|| append_sessions.updated_tail.clone())
+        .ok_or_else(|| {
+            StoreError::InvariantViolation(format!(
+                "incremental session batch for project {project_id} install {install_id} produced no sessions"
+            ))
+        })?;
+    let next_state = install_state_from_session(&final_session, highest_processed_event_id);
+
+    let mut session_metric_accumulator = SessionMetricAccumulator::default();
+    let mut daily_session_counts_by_day = BTreeMap::<NaiveDate, i64>::new();
+    let mut daily_duration_deltas_by_day = BTreeMap::<NaiveDate, i64>::new();
+    let mut daily_install_counts = BTreeMap::<NaiveDate, i32>::new();
+
+    if let (Some(original_tail), Some(updated_tail)) = (
+        original_tail.as_ref(),
+        append_sessions.updated_tail.as_ref(),
+    ) {
+        let duration_delta =
+            i64::from(updated_tail.duration_seconds - original_tail.duration_seconds);
+        if duration_delta > 0 {
+            *daily_duration_deltas_by_day
+                .entry(updated_tail.session_start.date_naive())
+                .or_default() += duration_delta;
+            session_metric_accumulator.add_session_delta(updated_tail, 0, duration_delta);
         }
     }
 
-    for event in events {
-        install_progress = install_progress.max(event.id);
-        match tail_state.as_mut() {
-            None => {
-                let session = session_from_event(&event);
-                insert_session_in_tx(tx, &session).await?;
-                increment_session_daily_for_new_session_in_tx(
-                    tx,
-                    session.project_id,
-                    session.session_start.date_naive(),
-                    &session.install_id,
-                    session.duration_seconds as i64,
-                )
-                .await?;
-
-                let state = install_state_from_session(&session, install_progress);
-                upsert_install_session_state_in_tx(tx, &state).await?;
-                tail_state = Some(state);
-                touched_buckets.insert_session(&session);
-            }
-            Some(state) if event.timestamp < state.tail_session_end => {
-                return Err(StoreError::InvariantViolation(format!(
-                    "incremental path received older-than-tail event for project {project_id} install {install_id}"
-                )));
-            }
-            Some(state) => {
-                let gap = event
-                    .timestamp
-                    .signed_duration_since(state.tail_session_end);
-
-                if gap <= ChronoDuration::minutes(SESSION_TIMEOUT_MINS) {
-                    touched_buckets.insert_timestamp(state.tail_session_start);
-                    extend_tail_session(tx, state, &event, install_progress).await?;
-                } else {
-                    let session = session_from_event(&event);
-                    insert_session_in_tx(tx, &session).await?;
-                    increment_session_daily_for_new_session_in_tx(
-                        tx,
-                        session.project_id,
-                        session.session_start.date_naive(),
-                        &session.install_id,
-                        session.duration_seconds as i64,
-                    )
-                    .await?;
-
-                    let next_state = install_state_from_session(&session, install_progress);
-                    upsert_install_session_state_in_tx(tx, &next_state).await?;
-                    *state = next_state;
-                    touched_buckets.insert_session(&session);
-                }
-            }
-        }
+    for session in &append_sessions.new_sessions {
+        let day = session.session_start.date_naive();
+        *daily_session_counts_by_day.entry(day).or_default() += 1;
+        *daily_duration_deltas_by_day.entry(day).or_default() +=
+            i64::from(session.duration_seconds);
+        *daily_install_counts.entry(day).or_default() += 1;
+        session_metric_accumulator.add_session_delta(
+            session,
+            1,
+            i64::from(session.duration_seconds),
+        );
     }
 
-    Ok(touched_buckets)
+    let daily_install_deltas = daily_install_counts
+        .into_iter()
+        .map(|(day, session_count)| SessionDailyInstallDelta {
+            project_id,
+            day,
+            install_id: install_id.to_owned(),
+            session_count,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(IncrementalSessionPlan {
+        first_seen,
+        tail_update: tail_update_from_append_sessions(original_tail, append_sessions.updated_tail),
+        new_sessions: append_sessions.new_sessions,
+        next_state,
+        daily_install_deltas,
+        daily_session_counts_by_day,
+        daily_duration_deltas_by_day,
+        session_metric_accumulator,
+    })
+}
+
+async fn apply_incremental_session_plan(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mut plan: IncrementalSessionPlan,
+) -> Result<(), StoreError> {
+    let first_seen_inserted = if let Some(first_seen) = plan.first_seen.as_ref() {
+        insert_install_first_seen_in_tx(tx, first_seen).await?
+    } else {
+        false
+    };
+    if first_seen_inserted {
+        let first_seen = plan
+            .first_seen
+            .as_ref()
+            .expect("inserted first_seen requires a record");
+        plan.session_metric_accumulator
+            .add_new_install_delta(first_seen);
+    }
+
+    if let Some(tail_update) = plan.tail_update.as_ref() {
+        let updated_session_rows = update_session_tail_in_tx(
+            tx,
+            SessionTailUpdate {
+                project_id: tail_update.project_id,
+                session_id: &tail_update.session_id,
+                session_end: tail_update.session_end,
+                event_count: tail_update.event_count,
+                duration_seconds: tail_update.duration_seconds,
+            },
+        )
+        .await?;
+        ensure_rows_affected(
+            updated_session_rows,
+            1,
+            format!(
+                "tail session {} missing for project {} install {}",
+                tail_update.session_id, tail_update.project_id, tail_update.install_id
+            ),
+        )?;
+    }
+
+    let inserted_sessions = insert_sessions_in_tx(tx, &plan.new_sessions).await?;
+    ensure_rows_affected(
+        inserted_sessions,
+        plan.new_sessions.len() as u64,
+        format!(
+            "expected to insert {} sessions for project {} install {}",
+            plan.new_sessions.len(),
+            plan.next_state.project_id,
+            plan.next_state.install_id
+        ),
+    )?;
+
+    let active_install_deltas =
+        upsert_session_daily_install_deltas_in_tx(tx, &plan.daily_install_deltas).await?;
+    let (daily_upserts, duration_updates) = build_session_daily_deltas(
+        plan.next_state.project_id,
+        plan.daily_session_counts_by_day,
+        plan.daily_duration_deltas_by_day,
+        active_install_deltas,
+    );
+    let upserted_daily_rows = upsert_session_daily_deltas_in_tx(tx, &daily_upserts).await?;
+    ensure_rows_affected(
+        upserted_daily_rows,
+        daily_upserts.len() as u64,
+        format!(
+            "expected to upsert {} session_daily rows for project {} install {}",
+            daily_upserts.len(),
+            plan.next_state.project_id,
+            plan.next_state.install_id
+        ),
+    )?;
+    let updated_duration_rows =
+        add_session_daily_duration_deltas_in_tx(tx, &duration_updates).await?;
+    ensure_rows_affected(
+        updated_duration_rows,
+        duration_updates.len() as u64,
+        format!(
+            "expected to update {} existing session_daily rows for project {} install {}",
+            duration_updates.len(),
+            plan.next_state.project_id,
+            plan.next_state.install_id
+        ),
+    )?;
+
+    let (session_total_deltas, session_dim1_deltas, session_dim2_deltas) = plan
+        .session_metric_accumulator
+        .into_store_deltas(plan.next_state.project_id);
+    upsert_session_metric_totals_in_tx(tx, &session_total_deltas).await?;
+    upsert_session_metric_dim1_in_tx(tx, &session_dim1_deltas).await?;
+    upsert_session_metric_dim2_in_tx(tx, &session_dim2_deltas).await?;
+
+    upsert_install_session_state_in_tx(tx, &plan.next_state).await?;
+
+    Ok(())
 }
 
 async fn repair_install_batch(
@@ -1029,84 +1387,82 @@ fn preserve_repaired_session_dimensions(
     }
 }
 
-async fn extend_tail_session(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    state: &mut InstallSessionStateRecord,
-    event: &RawEventRecord,
-    processed_event_id: i64,
-) -> Result<(), StoreError> {
-    let new_end = state.tail_session_end.max(event.timestamp);
-    let new_duration = new_end
-        .signed_duration_since(state.tail_session_start)
-        .num_seconds() as i32;
-    let duration_delta = i64::from(new_duration - state.tail_duration_seconds);
-    let new_event_count = state.tail_event_count + 1;
-
-    let updated_session_rows = update_session_tail_in_tx(
-        tx,
-        SessionTailUpdate {
-            project_id: state.project_id,
-            session_id: &state.tail_session_id,
-            session_end: new_end,
-            event_count: new_event_count,
-            duration_seconds: new_duration,
-        },
-    )
-    .await?;
-    ensure_single_row_update(
-        updated_session_rows,
-        format!(
-            "tail session {} missing for project {} install {}",
-            state.tail_session_id, state.project_id, state.install_id
-        ),
-    )?;
-
-    if duration_delta > 0 {
-        let updated_daily_rows = add_session_daily_duration_delta_in_tx(
-            tx,
-            state.project_id,
-            state.tail_day,
-            duration_delta,
-        )
-        .await?;
-        ensure_single_row_update(
-            updated_daily_rows,
-            format!(
-                "session_daily missing for project {} day {}",
-                state.project_id, state.tail_day
-            ),
-        )?;
+fn tail_update_from_append_sessions(
+    original_tail: Option<SessionRecord>,
+    updated_tail: Option<SessionRecord>,
+) -> Option<SessionRecord> {
+    match (original_tail, updated_tail) {
+        (Some(original), Some(updated))
+            if original.session_end != updated.session_end
+                || original.event_count != updated.event_count
+                || original.duration_seconds != updated.duration_seconds =>
+        {
+            Some(updated)
+        }
+        _ => None,
     }
-
-    state.tail_session_end = new_end;
-    state.tail_event_count = new_event_count;
-    state.tail_duration_seconds = new_duration;
-    state.last_processed_event_id = state.last_processed_event_id.max(processed_event_id);
-    upsert_install_session_state_in_tx(tx, state).await?;
-
-    Ok(())
 }
 
-fn ensure_single_row_update(rows_affected: u64, message: String) -> Result<(), StoreError> {
-    if rows_affected == 1 {
+fn build_session_daily_deltas(
+    project_id: Uuid,
+    daily_session_counts_by_day: BTreeMap<NaiveDate, i64>,
+    mut daily_duration_deltas_by_day: BTreeMap<NaiveDate, i64>,
+    active_install_deltas: Vec<SessionDailyActiveInstallDelta>,
+) -> (Vec<SessionDailyDelta>, Vec<SessionDailyDurationDelta>) {
+    let mut active_by_day = active_install_deltas
+        .into_iter()
+        .map(|delta| (delta.day, delta.active_installs))
+        .collect::<BTreeMap<_, _>>();
+    let mut daily_upserts = Vec::new();
+
+    let days = daily_session_counts_by_day
+        .keys()
+        .copied()
+        .chain(active_by_day.keys().copied())
+        .collect::<BTreeSet<_>>();
+
+    for day in days {
+        let sessions_count = daily_session_counts_by_day
+            .get(&day)
+            .copied()
+            .unwrap_or_default();
+        let active_installs = active_by_day.remove(&day).unwrap_or_default();
+        let total_duration_seconds = daily_duration_deltas_by_day
+            .remove(&day)
+            .unwrap_or_default();
+        daily_upserts.push(SessionDailyDelta {
+            project_id,
+            day,
+            sessions_count,
+            active_installs,
+            total_duration_seconds,
+        });
+    }
+
+    let duration_updates = daily_duration_deltas_by_day
+        .into_iter()
+        .filter_map(|(day, duration_delta)| {
+            (duration_delta != 0).then_some(SessionDailyDurationDelta {
+                project_id,
+                day,
+                duration_delta,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    (daily_upserts, duration_updates)
+}
+
+fn ensure_rows_affected(
+    rows_affected: u64,
+    expected: u64,
+    message: String,
+) -> Result<(), StoreError> {
+    if rows_affected == expected {
         return Ok(());
     }
 
     Err(StoreError::InvariantViolation(message))
-}
-
-fn session_from_event(event: &RawEventRecord) -> SessionRecord {
-    SessionRecord {
-        project_id: event.project_id,
-        install_id: event.install_id.clone(),
-        session_id: format!("{}:{}", event.install_id, event.timestamp.to_rfc3339()),
-        session_start: event.timestamp,
-        session_end: event.timestamp,
-        event_count: 1,
-        duration_seconds: 0,
-        platform: event.platform.clone(),
-        app_version: event.app_version.clone(),
-    }
 }
 
 fn install_state_from_session(
@@ -1322,18 +1678,10 @@ async fn rebuild_session_metric_buckets_in_tx(
             project_id,
             granularity,
             bucket_start: row.try_get("bucket_start").expect("bucket_start"),
-            dim1_key: "app_version".min("platform").to_owned(),
-            dim1_value: if "app_version" < "platform" {
-                row.try_get("app_version").expect("app_version")
-            } else {
-                row.try_get("platform").expect("platform")
-            },
-            dim2_key: "app_version".max("platform").to_owned(),
-            dim2_value: if "app_version" < "platform" {
-                row.try_get("platform").expect("platform")
-            } else {
-                row.try_get("app_version").expect("app_version")
-            },
+            dim1_key: "app_version".to_owned(),
+            dim1_value: row.try_get("app_version").expect("app_version"),
+            dim2_key: "platform".to_owned(),
+            dim2_value: row.try_get("platform").expect("platform"),
             session_count: row.try_get("session_count").expect("session_count"),
             duration_total_seconds: row
                 .try_get("duration_total_seconds")
@@ -1462,18 +1810,10 @@ async fn rebuild_session_metric_buckets_in_tx(
             project_id,
             granularity,
             bucket_start: row.try_get("bucket_start").expect("bucket_start"),
-            dim1_key: "app_version".min("platform").to_owned(),
-            dim1_value: if "app_version" < "platform" {
-                row.try_get("app_version").expect("app_version")
-            } else {
-                row.try_get("platform").expect("platform")
-            },
-            dim2_key: "app_version".max("platform").to_owned(),
-            dim2_value: if "app_version" < "platform" {
-                row.try_get("platform").expect("platform")
-            } else {
-                row.try_get("app_version").expect("app_version")
-            },
+            dim1_key: "app_version".to_owned(),
+            dim1_value: row.try_get("app_version").expect("app_version"),
+            dim2_key: "platform".to_owned(),
+            dim2_value: row.try_get("platform").expect("platform"),
             session_count: 0,
             duration_total_seconds: 0,
             new_installs: row.try_get("new_installs").expect("new_installs"),
@@ -2198,7 +2538,9 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn successful_incremental_work_rebuilds_metrics_before_later_batch_failure(pool: PgPool) {
+    async fn successful_incremental_work_commits_append_deltas_before_later_batch_failure(
+        pool: PgPool,
+    ) {
         fantasma_store::bootstrap(&pool, &bootstrap_config())
             .await
             .expect("bootstrap succeeds");
@@ -2245,9 +2587,13 @@ mod tests {
         .expect_err("later install should fail batch");
 
         assert!(matches!(error, StoreError::InvariantViolation(_)));
+        assert!(
+            pending_session_rebuild_buckets(&pool).await.is_empty(),
+            "append work should not enqueue rebuild buckets even when a later install fails",
+        );
         assert_eq!(
             session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
-            Some((1, 1, 20 * 60))
+            Some((2, 2, 30 * 60))
         );
 
         let hour_zero_duration = sqlx::query_scalar::<_, i64>(
@@ -2280,11 +2626,18 @@ mod tests {
         .expect("fetch day duration");
 
         assert_eq!(hour_zero_duration, 20 * 60);
-        assert_eq!(day_duration, 20 * 60);
+        assert_eq!(day_duration, 30 * 60);
+        assert_eq!(
+            load_worker_offset(&pool, SESSION_WORKER_NAME)
+                .await
+                .expect("load session offset"),
+            4,
+            "offset should not advance past the failed batch",
+        );
     }
 
     #[sqlx::test]
-    async fn replayed_batch_rebuilds_metrics_after_coordinator_failure(pool: PgPool) {
+    async fn replayed_append_batch_only_advances_offset_after_coordinator_failure(pool: PgPool) {
         fantasma_store::bootstrap(&pool, &bootstrap_config())
             .await
             .expect("bootstrap succeeds");
@@ -2329,22 +2682,12 @@ mod tests {
             session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
             Some((1, 1, 20 * 60))
         );
-        assert_eq!(
-            pending_session_rebuild_buckets(&pool).await,
-            vec![
-                fantasma_store::PendingSessionRebuildBucketRecord {
-                    project_id: project_id(),
-                    granularity: MetricGranularity::Day,
-                    bucket_start: timestamp(1, 0, 0),
-                },
-                fantasma_store::PendingSessionRebuildBucketRecord {
-                    project_id: project_id(),
-                    granularity: MetricGranularity::Hour,
-                    bucket_start: timestamp(1, 0, 0),
-                },
-            ]
+        assert!(
+            pending_session_rebuild_buckets(&pool).await.is_empty(),
+            "append child commit should not leave rebuild work behind"
         );
-        let stale_hour_duration = sqlx::query_scalar::<_, i64>(
+
+        let hour_zero_duration = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT duration_total_seconds
             FROM session_metric_buckets_total
@@ -2357,8 +2700,24 @@ mod tests {
         .bind(timestamp(1, 0, 0))
         .fetch_one(&pool)
         .await
-        .expect("fetch stale hour duration");
-        assert_eq!(stale_hour_duration, 0);
+        .expect("fetch hour-zero duration");
+        let day_duration = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT duration_total_seconds
+            FROM session_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = 'day'
+              AND bucket_start = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(1, 0, 0))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch day duration");
+
+        assert_eq!(hour_zero_duration, 20 * 60);
+        assert_eq!(day_duration, 20 * 60);
 
         let replayed = process_session_batch_with_config(
             &pool,
@@ -2393,7 +2752,60 @@ mod tests {
             Some((1, 1, 20 * 60))
         );
 
-        let hour_zero_duration = sqlx::query_scalar::<_, i64>(
+        assert_eq!(hour_zero_duration, 20 * 60);
+        assert_eq!(day_duration, 20 * 60);
+    }
+
+    #[sqlx::test]
+    async fn cross_midnight_append_commit_leaves_daily_and_metric_state_final(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[
+                event("install-1", 1, 23, 55),
+                event("install-1", 2, 0, 20),
+                event("install-1", 2, 1, 0),
+            ],
+        )
+        .await
+        .expect("insert append events");
+
+        let error = process_session_batch_with_hooks(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+            SessionBatchTestHooks::fail_before_coordinator_finalize(),
+        )
+        .await
+        .expect_err("coordinator finalize should fail after append child commit");
+
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+        assert_eq!(
+            load_worker_offset(&pool, SESSION_WORKER_NAME)
+                .await
+                .expect("load worker offset"),
+            0
+        );
+        assert!(
+            pending_session_rebuild_buckets(&pool).await.is_empty(),
+            "append child commit should not rely on queued rebuilds"
+        );
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 25 * 60))
+        );
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()).await,
+            Some((1, 1, 0))
+        );
+
+        let jan_1_hour_duration = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT duration_total_seconds
             FROM session_metric_buckets_total
@@ -2403,13 +2815,13 @@ mod tests {
             "#,
         )
         .bind(project_id())
-        .bind(timestamp(1, 0, 0))
+        .bind(timestamp(1, 23, 0))
         .fetch_one(&pool)
         .await
-        .expect("fetch hour-zero duration");
-        let day_duration = sqlx::query_scalar::<_, i64>(
+        .expect("fetch january 1 hourly duration");
+        let jan_2_day_bucket = sqlx::query(
             r#"
-            SELECT duration_total_seconds
+            SELECT session_count, duration_total_seconds
             FROM session_metric_buckets_total
             WHERE project_id = $1
               AND granularity = 'day'
@@ -2417,13 +2829,112 @@ mod tests {
             "#,
         )
         .bind(project_id())
-        .bind(timestamp(1, 0, 0))
+        .bind(timestamp(2, 0, 0))
         .fetch_one(&pool)
         .await
-        .expect("fetch day duration");
+        .expect("fetch january 2 daily bucket");
+        let jan_1_hour_dim1_bucket = sqlx::query(
+            r#"
+            SELECT session_count, duration_total_seconds
+            FROM session_metric_buckets_dim1
+            WHERE project_id = $1
+              AND granularity = 'hour'
+              AND bucket_start = $2
+              AND dim1_key = 'platform'
+              AND dim1_value = 'ios'
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(1, 23, 0))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch january 1 hourly dim1 bucket");
+        let jan_1_hour_dim2_bucket = sqlx::query(
+            r#"
+            SELECT session_count, duration_total_seconds
+            FROM session_metric_buckets_dim2
+            WHERE project_id = $1
+              AND granularity = 'hour'
+              AND bucket_start = $2
+              AND dim1_key = 'app_version'
+              AND dim1_value = '1.0.0'
+              AND dim2_key = 'platform'
+              AND dim2_value = 'ios'
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(1, 23, 0))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch january 1 hourly dim2 bucket");
+        let jan_2_day_dim2_bucket = sqlx::query(
+            r#"
+            SELECT session_count, duration_total_seconds
+            FROM session_metric_buckets_dim2
+            WHERE project_id = $1
+              AND granularity = 'day'
+              AND bucket_start = $2
+              AND dim1_key = 'app_version'
+              AND dim1_value = '1.0.0'
+              AND dim2_key = 'platform'
+              AND dim2_value = 'ios'
+            "#,
+        )
+        .bind(project_id())
+        .bind(timestamp(2, 0, 0))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch january 2 daily dim2 bucket");
 
-        assert_eq!(hour_zero_duration, 20 * 60);
-        assert_eq!(day_duration, 20 * 60);
+        assert_eq!(jan_1_hour_duration, 25 * 60);
+        assert_eq!(
+            jan_1_hour_dim1_bucket
+                .try_get::<i64, _>("session_count")
+                .expect("session count"),
+            1
+        );
+        assert_eq!(
+            jan_1_hour_dim1_bucket
+                .try_get::<i64, _>("duration_total_seconds")
+                .expect("duration"),
+            25 * 60
+        );
+        assert_eq!(
+            jan_1_hour_dim2_bucket
+                .try_get::<i64, _>("session_count")
+                .expect("session count"),
+            1
+        );
+        assert_eq!(
+            jan_1_hour_dim2_bucket
+                .try_get::<i64, _>("duration_total_seconds")
+                .expect("duration"),
+            25 * 60
+        );
+        assert_eq!(
+            jan_2_day_bucket
+                .try_get::<i64, _>("session_count")
+                .expect("session count"),
+            1
+        );
+        assert_eq!(
+            jan_2_day_bucket
+                .try_get::<i64, _>("duration_total_seconds")
+                .expect("duration"),
+            0
+        );
+        assert_eq!(
+            jan_2_day_dim2_bucket
+                .try_get::<i64, _>("session_count")
+                .expect("session count"),
+            1
+        );
+        assert_eq!(
+            jan_2_day_dim2_bucket
+                .try_get::<i64, _>("duration_total_seconds")
+                .expect("duration"),
+            0
+        );
     }
 
     #[sqlx::test]

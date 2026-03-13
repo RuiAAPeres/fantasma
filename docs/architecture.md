@@ -76,25 +76,31 @@ Current worker behavior:
 - repoll immediately after progress and sleep only after an idle tick, so busy lanes stay work-conserving
 - poll `events_raw` in batches ordered by raw event id
 - group session-lane batches by `project_id` and `install_id`
-- load one persisted state row per `(project_id, install_id)` from `install_session_state`
+- load one persisted state row per `(project_id, install_id)` from `install_session_state` plus the referenced tail session row when append work needs it
 - sort each install batch by `(timestamp, id)` and process forward only
 - infer sessions from event timestamps with a 30-minute inactivity rule
-- keep at most one mutable tail session per install
-- extend the current tail session in place when a new event is newer than or equal to the tail end and inside the inactivity window
-- insert a new immutable session row and replace tail state when a new event exceeds the inactivity window
+- keep at most one mutable persisted tail session per install
+- plan append-only batches in memory first, then apply only the net outcome for the install batch
+- update the preexisting tail session at most once when append events extend it inside the inactivity window
+- insert new immutable session rows for later derived sessions and replace tail state once per install batch
 - keep `last_processed_event_id` in `install_session_state` so per-install replay becomes a no-op even if the lane offset is rewound after some install work already committed
 - treat `install_session_state` as durable worker state and never delete or reset it during ordinary append, repair, or session rewrites
 - classify session-lane work items into incremental vs repair and run those queues with separate bounded concurrency so repair load cannot consume append slots
 - switch an install into a bounded repair path when a batch contains older-than-tail events
 - derive replacement sessions from raw events inside the overlapping repair window and rewrite only those derived rows
-- rebuild only the exact touched UTC start days for `session_daily` and `session_daily_installs` after a repair
-- rebuild only the exact touched hourly and daily session metric buckets after session changes
-- if a later install in the claimed batch fails after earlier install work already committed, rebuild the successful installs' touched buckets before releasing the lane lock or surfacing the error so replay filtering cannot strand stale aggregates
-- enqueue touched session day/hour buckets durably inside each child install transaction so a later coordinator rollback cannot strand committed session changes behind replay filtering
-- drain and rebuild the pending session bucket queue inside the coordinator transaction before deleting those queue rows and advancing the lane offset
+- leave append-derived state final at child-transaction commit time: `sessions`, `install_first_seen`, `install_session_state`, `session_daily_installs`, `session_daily`, and the session metric bucket tables are already correct before the coordinator advances offsets
+- persist append outcomes with set-based helpers wherever practical so hot-path writes stay batched instead of reintroducing per-event SQL churn
+- update `install_first_seen` on append with one `INSERT ... ON CONFLICT DO NOTHING` attempt at most and derive `new_installs` from the insert result rather than a read-before-write precheck
+- update `session_daily_installs` once per touched `(project_id, install_id, day)` on append; `active_installs` contributes at most `0/1` per install-day even when `session_count` for that install-day is greater than `1`
+- update `session_daily` from net per-day append deltas only; append-only cross-midnight sessions still keep `duration_total` on the session-start bucket while daily counters remain correct for each affected UTC day
+- rebuild only the exact touched UTC days for `session_daily` and `session_daily_installs` after a repair
+- rebuild only the exact touched hourly and daily session metric buckets after repair/backfill session changes
+- keep append and repair intentionally different maintenance paths in this slice: append commits direct deltas, repair/backfill recomputes exact touched windows from source tables
+- if a later repair install in the claimed batch fails after earlier repair work already committed, rebuild the successful installs' touched buckets before releasing the lane lock or surfacing the error so replay filtering cannot strand stale aggregates
+- enqueue touched session day/hour buckets durably only for repair/backfill child transactions
+- drain the pending session bucket queue only for repair/backfill work inside the coordinator transaction before deleting those queue rows and advancing the lane offset
 - preserve grouped session dimensions from the pre-repair session assignment so late events do not rebucket `platform` or `app_version`
-- keep the normal append path incremental: `session_daily` still updates directly from new sessions and tail-session duration deltas
-- update `session_daily_installs` incrementally so daily active installs never depend on `COUNT(DISTINCT ...)` rebuilds
+- keep the normal append path incremental and delta-based: direct session metric bucket deltas replace append-path delete-and-rescan maintenance
 - derive event-count cuboids incrementally from raw events into bounded hourly and daily totals, single-dimension rollups, two-dimension rollups, and three-dimension rollups
 - derive session metric rollups incrementally for `count`, `duration_total`, and `new_installs`
 - keep event-metrics rollups keyed only by canonical string dimensions, never by the full property bag

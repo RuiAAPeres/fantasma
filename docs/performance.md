@@ -8,6 +8,15 @@ cargo run -p fantasma-bench -- \
   --output-dir artifacts/performance/2026-03-13-derived-metrics-slo
 ```
 
+For slice iteration, the same suite also supports scenario selection without changing workload semantics, readiness definitions, or output shape:
+
+```bash
+cargo run -p fantasma-bench -- \
+  slo \
+  --output-dir artifacts/performance/2026-03-13-derived-metrics-slo \
+  --scenario append-30d
+```
+
 This slice separates two questions that were previously mixed together:
 
 - freshness: how long it takes the worker to make derived data queryable after raw ingest completes
@@ -42,6 +51,8 @@ cargo run -p fantasma-bench -- \
   slo \
   --output-dir artifacts/performance/2026-03-13-derived-metrics-slo
 ```
+
+Use repeated `--scenario <key>` flags when you want to run only a subset of the fixed suite during iteration. The selected scenarios still use the same workload model, readiness measurements, per-scenario artifact format, and top-level summary schema as the full suite.
 
 The harness starts the benchmark stack in its own Compose project, provisions a blank-database project plus scoped ingest/read keys, clears the target output directory before each run, drives the fixed workload, and writes:
 
@@ -182,6 +193,46 @@ Use the published results like this:
 - If freshness passes but `reads-*` misses grouped-read budgets, the derived tables are ready fast enough and the problem is on the query/read path.
 - If event readiness is fast but session readiness is slow, the session lane is the limiter.
 - If session readiness is fast but event readiness is slow, the event cuboid lane is the limiter.
+
+## Session Append Rewrite
+
+The March 13, 2026 append-delta slice keeps the public metrics API unchanged and changes only internal session-lane maintenance:
+
+- append child transactions must leave `sessions`, `install_first_seen`, `install_session_state`, `session_daily_installs`, `session_daily`, and the session metric bucket tables final at commit time
+- append-only batches are planned in memory per `(project_id, install_id)` and then applied as net tail/session/day/bucket deltas instead of per-event tail-extension churn
+- append persistence uses set-based store helpers for session inserts, daily state upserts, and session metric bucket upserts wherever practical
+- repair/backfill remains rebuild-based and continues to own exact-day `session_daily` rebuilds plus exact touched session bucket rebuilds
+- `event_metrics_ready_ms` is still published alongside the session-lane numbers so session work can improve without silently regressing the healthy event lane
+
+Fresh `append-30d` median published from `artifacts/performance/2026-03-13-session-append-delta/` on this machine:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| ingest elapsed | `34.883s` | `33.223s` |
+| `event_metrics_ready_ms` | `180` | `58` |
+| `session_metrics_ready_ms` | `189_630` | `13_378` |
+| `derived_metrics_ready_ms` | `189_630` | `13_378` |
+
+Current append-only publication from the same suite:
+
+| Scenario | Events | Ingest | `event_metrics_ready_ms` | `session_metrics_ready_ms` | `derived_metrics_ready_ms` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `append-30d` | `900,000` | `33.223s` | `58` | `13_378` | `13_378` |
+| `append-90d` | `2,700,000` | `94.219s` | `144` | `41_116` | `41_116` |
+| `append-180d` | `5,400,000` | `197.072s` | `277` | `74_275` | `74_275` |
+
+Artifacts:
+
+- [summary.json](/Users/ruiperes/Code/fantasma/artifacts/performance/2026-03-13-session-append-delta/summary.json) for the fresh repeated `append-30d` median
+- [summary.json](/Users/ruiperes/Code/fantasma/artifacts/performance/2026-03-13-session-append-delta-large/summary.json) for the fresh `append-90d` and `append-180d` publication
+
+Interpretation:
+
+- the append rewrite materially reduced the session lane and brought `append-30d session_metrics_ready_ms` under the `<= 60_000ms` target
+- the event lane stayed healthy and improved on this run instead of regressing
+- the public readiness ceiling for `append-30d` is now the same `13.378s` session-lane median because the event lane is no longer close to the bottleneck
+- `append-90d` still stays well under the suite's `20m` visibility timeout with a `41.116s` session-lane readiness result
+- `append-180d` publishes as visibility-only context in this suite; it landed at `74.275s`, above the `30d` hard target but still far below the `40m` visibility timeout
 
 ## Legacy Commands
 

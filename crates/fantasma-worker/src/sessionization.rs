@@ -13,6 +13,12 @@ pub(crate) struct SessionEvent {
     pub(crate) app_version: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct AppendSessions {
+    pub(crate) updated_tail: Option<fantasma_store::SessionRecord>,
+    pub(crate) new_sessions: Vec<fantasma_store::SessionRecord>,
+}
+
 pub(crate) fn derive_sessions(events: &[SessionEvent]) -> Vec<fantasma_store::SessionRecord> {
     if events.is_empty() {
         return Vec::new();
@@ -33,6 +39,48 @@ pub(crate) fn derive_sessions(events: &[SessionEvent]) -> Vec<fantasma_store::Se
 
     sessions.push(current);
     sessions
+}
+
+pub(crate) fn derive_append_sessions(
+    tail_session: Option<fantasma_store::SessionRecord>,
+    events: &[SessionEvent],
+) -> AppendSessions {
+    if events.is_empty() {
+        return AppendSessions {
+            updated_tail: tail_session,
+            new_sessions: Vec::new(),
+        };
+    }
+
+    let mut updated_tail = tail_session;
+    let mut new_sessions = Vec::new();
+
+    for event in events {
+        if let Some(current) = new_sessions.last_mut() {
+            if continues_session(current, event.timestamp) {
+                apply_event(current, event);
+            } else {
+                new_sessions.push(session_from_event(event));
+            }
+            continue;
+        }
+
+        if let Some(current_tail) = updated_tail.as_mut() {
+            if continues_session(current_tail, event.timestamp) {
+                apply_event(current_tail, event);
+            } else {
+                new_sessions.push(session_from_event(event));
+            }
+            continue;
+        }
+
+        new_sessions.push(session_from_event(event));
+    }
+
+    AppendSessions {
+        updated_tail,
+        new_sessions,
+    }
 }
 
 fn continues_session(session: &fantasma_store::SessionRecord, timestamp: DateTime<Utc>) -> bool {
@@ -141,5 +189,43 @@ mod tests {
         assert_eq!(sessions[0].session_end, timestamp(2, 0, 20));
         assert_eq!(sessions[0].duration_seconds, 25 * 60);
         assert_eq!(sessions[0].app_version.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn append_sessions_extends_existing_tail_once_and_then_starts_new_sessions() {
+        let tail = fantasma_store::SessionRecord {
+            project_id: project_id(),
+            install_id: "install-1".to_owned(),
+            session_id: "install-1:2026-01-01T00:00:00+00:00".to_owned(),
+            session_start: timestamp(1, 0, 0),
+            session_end: timestamp(1, 0, 10),
+            event_count: 2,
+            duration_seconds: 10 * 60,
+            platform: Platform::Ios,
+            app_version: Some("1.0.0".to_owned()),
+        };
+
+        let appended = derive_append_sessions(
+            Some(tail),
+            &[
+                event("install-1", 1, 0, 20, Some("1.0.1")),
+                event("install-1", 1, 1, 0, Some("1.1.0")),
+                event("install-1", 1, 1, 10, Some("1.1.1")),
+            ],
+        );
+
+        let updated_tail = appended.updated_tail.expect("updated tail exists");
+        assert_eq!(updated_tail.session_end, timestamp(1, 0, 20));
+        assert_eq!(updated_tail.event_count, 3);
+        assert_eq!(updated_tail.duration_seconds, 20 * 60);
+        assert_eq!(updated_tail.app_version.as_deref(), Some("1.0.0"));
+        assert_eq!(appended.new_sessions.len(), 1);
+        assert_eq!(appended.new_sessions[0].session_start, timestamp(1, 1, 0));
+        assert_eq!(appended.new_sessions[0].session_end, timestamp(1, 1, 10));
+        assert_eq!(appended.new_sessions[0].duration_seconds, 10 * 60);
+        assert_eq!(
+            appended.new_sessions[0].app_version.as_deref(),
+            Some("1.1.0")
+        );
     }
 }

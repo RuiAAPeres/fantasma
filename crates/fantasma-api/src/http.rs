@@ -108,6 +108,8 @@ const MAX_GROUP_BY_DIMENSIONS: usize = 2;
 const MAX_EVENT_REFERENCED_DIMENSIONS: usize = 3;
 const MAX_METRIC_GROUPS: usize = 100;
 type GroupKey = Vec<Option<String>>;
+type CountsByBucket = BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>;
+type SingletonCountsByBucket = (CountsByBucket, CountsByBucket);
 
 fn parse_event_metrics_query(
     raw_query: &str,
@@ -397,6 +399,7 @@ fn is_supported_session_dimension(key: &str) -> bool {
     matches!(key, "platform" | "app_version")
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_json_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, axum::response::Response> {
     serde_json::from_slice(body).map_err(|_| query_error_response("invalid_request"))
 }
@@ -562,6 +565,7 @@ async fn revoke_project_key_route(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn authorize_operator(
     authorizer: &StaticAdminAuthorizer,
     headers: &HeaderMap,
@@ -1273,13 +1277,10 @@ fn build_metrics_response(
 }
 
 fn synthesize_group_counts_by_bucket(
-    primary_by_bucket: BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>,
+    primary_by_bucket: CountsByBucket,
     totals_by_bucket: BTreeMap<DateTime<Utc>, u64>,
-    singleton_by_bucket: Option<(
-        BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>,
-        BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>,
-    )>,
-) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, StoreError> {
+    singleton_by_bucket: Option<SingletonCountsByBucket>,
+) -> Result<CountsByBucket, StoreError> {
     let mut buckets = totals_by_bucket.keys().copied().collect::<BTreeSet<_>>();
     buckets.extend(primary_by_bucket.keys().copied());
 
