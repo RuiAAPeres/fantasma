@@ -1,0 +1,120 @@
+{
+  "host": {
+    "cpu_model": "Apple M3 Pro",
+    "memory_bytes": 38654705664,
+    "memory_gib": 36.0,
+    "os_kernel": "Darwin 25.1.0",
+    "architecture": "aarch64",
+    "benchmarked_at": "2026-03-13T17:56:35.213225+00:00"
+  },
+  "scenarios": [
+    {
+      "scenario": "repair-30d",
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 900000,
+          "elapsed_ms": 30673,
+          "events_per_second": 29341.385772377525
+        },
+        {
+          "name": "repair_ingest",
+          "events_sent": 3000,
+          "elapsed_ms": 122,
+          "events_per_second": 24483.17546785818
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 382
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 1432
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 1432
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "repair-90d",
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 2700000,
+          "elapsed_ms": 104320,
+          "events_per_second": 25881.890737973445
+        },
+        {
+          "name": "repair_ingest",
+          "events_sent": 9000,
+          "elapsed_ms": 413,
+          "events_per_second": 21739.233302314104
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 962
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 6059
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 6059
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "repair-180d",
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 5400000,
+          "elapsed_ms": 187273,
+          "events_per_second": 28834.890261968732
+        },
+        {
+          "name": "repair_ingest",
+          "events_sent": 18000,
+          "elapsed_ms": 760,
+          "events_per_second": 23658.763067370674
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 1849
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 11714
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 11714
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    }
+  ]
+}

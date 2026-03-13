@@ -12,7 +12,13 @@ use uuid::Uuid;
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
+const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+fn max_rows_per_batched_statement(bind_params_per_row: usize) -> usize {
+    debug_assert!(bind_params_per_row > 0);
+    (POSTGRES_MAX_BIND_PARAMS / bind_params_per_row).max(1)
+}
 
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
@@ -625,24 +631,26 @@ pub async fn upsert_event_count_daily_totals_in_tx(
         return Ok(());
     }
 
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO event_metric_buckets_total \
-         (project_id, granularity, bucket_start, event_name, event_count) ",
-    );
-    builder.push_values(deltas, |mut separated, delta| {
-        separated.push_bind(delta.project_id);
-        separated.push_bind(delta.granularity.as_str());
-        separated.push_bind(delta.bucket_start);
-        separated.push_bind(&delta.event_name);
-        separated.push_bind(delta.event_count);
-    });
-    builder.push(
-        " ON CONFLICT (project_id, granularity, bucket_start, event_name) DO UPDATE SET \
-          event_count = event_metric_buckets_total.event_count + EXCLUDED.event_count, \
-          updated_at = now()",
-    );
+    for chunk in deltas.chunks(max_rows_per_batched_statement(5)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO event_metric_buckets_total \
+             (project_id, granularity, bucket_start, event_name, event_count) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(&delta.event_name);
+            separated.push_bind(delta.event_count);
+        });
+        builder.push(
+            " ON CONFLICT (project_id, granularity, bucket_start, event_name) DO UPDATE SET \
+              event_count = event_metric_buckets_total.event_count + EXCLUDED.event_count, \
+              updated_at = now()",
+        );
 
-    builder.build().execute(&mut **tx).await?;
+        builder.build().execute(&mut **tx).await?;
+    }
 
     Ok(())
 }
@@ -655,26 +663,28 @@ pub async fn upsert_event_count_daily_dim1_in_tx(
         return Ok(());
     }
 
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO event_metric_buckets_dim1 \
-         (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, event_count) ",
-    );
-    builder.push_values(deltas, |mut separated, delta| {
-        separated.push_bind(delta.project_id);
-        separated.push_bind(delta.granularity.as_str());
-        separated.push_bind(delta.bucket_start);
-        separated.push_bind(&delta.event_name);
-        separated.push_bind(&delta.dim1_key);
-        separated.push_bind(&delta.dim1_value);
-        separated.push_bind(delta.event_count);
-    });
-    builder.push(
-        " ON CONFLICT (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value) DO UPDATE SET \
-          event_count = event_metric_buckets_dim1.event_count + EXCLUDED.event_count, \
-          updated_at = now()",
-    );
+    for chunk in deltas.chunks(max_rows_per_batched_statement(7)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO event_metric_buckets_dim1 \
+             (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, event_count) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(&delta.event_name);
+            separated.push_bind(&delta.dim1_key);
+            separated.push_bind(&delta.dim1_value);
+            separated.push_bind(delta.event_count);
+        });
+        builder.push(
+            " ON CONFLICT (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value) DO UPDATE SET \
+              event_count = event_metric_buckets_dim1.event_count + EXCLUDED.event_count, \
+              updated_at = now()",
+        );
 
-    builder.build().execute(&mut **tx).await?;
+        builder.build().execute(&mut **tx).await?;
+    }
 
     Ok(())
 }
@@ -687,30 +697,32 @@ pub async fn upsert_event_count_daily_dim2_in_tx(
         return Ok(());
     }
 
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO event_metric_buckets_dim2 \
-         (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, event_count) ",
-    );
-    builder.push_values(deltas, |mut separated, delta| {
-        separated.push_bind(delta.project_id);
-        separated.push_bind(delta.granularity.as_str());
-        separated.push_bind(delta.bucket_start);
-        separated.push_bind(&delta.event_name);
-        separated.push_bind(&delta.dim1_key);
-        separated.push_bind(&delta.dim1_value);
-        separated.push_bind(&delta.dim2_key);
-        separated.push_bind(&delta.dim2_value);
-        separated.push_bind(delta.event_count);
-    });
-    builder.push(
-        " ON CONFLICT \
-          (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value) \
-          DO UPDATE SET \
-          event_count = event_metric_buckets_dim2.event_count + EXCLUDED.event_count, \
-          updated_at = now()",
-    );
+    for chunk in deltas.chunks(max_rows_per_batched_statement(9)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO event_metric_buckets_dim2 \
+             (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, event_count) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(&delta.event_name);
+            separated.push_bind(&delta.dim1_key);
+            separated.push_bind(&delta.dim1_value);
+            separated.push_bind(&delta.dim2_key);
+            separated.push_bind(&delta.dim2_value);
+            separated.push_bind(delta.event_count);
+        });
+        builder.push(
+            " ON CONFLICT \
+              (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value) \
+              DO UPDATE SET \
+              event_count = event_metric_buckets_dim2.event_count + EXCLUDED.event_count, \
+              updated_at = now()",
+        );
 
-    builder.build().execute(&mut **tx).await?;
+        builder.build().execute(&mut **tx).await?;
+    }
 
     Ok(())
 }
@@ -723,32 +735,34 @@ pub async fn upsert_event_count_daily_dim3_in_tx(
         return Ok(());
     }
 
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO event_metric_buckets_dim3 \
-         (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count) ",
-    );
-    builder.push_values(deltas, |mut separated, delta| {
-        separated.push_bind(delta.project_id);
-        separated.push_bind(delta.granularity.as_str());
-        separated.push_bind(delta.bucket_start);
-        separated.push_bind(&delta.event_name);
-        separated.push_bind(&delta.dim1_key);
-        separated.push_bind(&delta.dim1_value);
-        separated.push_bind(&delta.dim2_key);
-        separated.push_bind(&delta.dim2_value);
-        separated.push_bind(&delta.dim3_key);
-        separated.push_bind(&delta.dim3_value);
-        separated.push_bind(delta.event_count);
-    });
-    builder.push(
-        " ON CONFLICT \
-          (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value) \
-          DO UPDATE SET \
-          event_count = event_metric_buckets_dim3.event_count + EXCLUDED.event_count, \
-          updated_at = now()",
-    );
+    for chunk in deltas.chunks(max_rows_per_batched_statement(11)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO event_metric_buckets_dim3 \
+             (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(&delta.event_name);
+            separated.push_bind(&delta.dim1_key);
+            separated.push_bind(&delta.dim1_value);
+            separated.push_bind(&delta.dim2_key);
+            separated.push_bind(&delta.dim2_value);
+            separated.push_bind(&delta.dim3_key);
+            separated.push_bind(&delta.dim3_value);
+            separated.push_bind(delta.event_count);
+        });
+        builder.push(
+            " ON CONFLICT \
+              (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value) \
+              DO UPDATE SET \
+              event_count = event_metric_buckets_dim3.event_count + EXCLUDED.event_count, \
+              updated_at = now()",
+        );
 
-    builder.build().execute(&mut **tx).await?;
+        builder.build().execute(&mut **tx).await?;
+    }
 
     Ok(())
 }
@@ -761,27 +775,29 @@ pub async fn upsert_session_metric_totals_in_tx(
         return Ok(());
     }
 
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO session_metric_buckets_total \
-         (project_id, granularity, bucket_start, session_count, duration_total_seconds, new_installs) ",
-    );
-    builder.push_values(deltas, |mut separated, delta| {
-        separated.push_bind(delta.project_id);
-        separated.push_bind(delta.granularity.as_str());
-        separated.push_bind(delta.bucket_start);
-        separated.push_bind(delta.session_count);
-        separated.push_bind(delta.duration_total_seconds);
-        separated.push_bind(delta.new_installs);
-    });
-    builder.push(
-        " ON CONFLICT (project_id, granularity, bucket_start) DO UPDATE SET \
-          session_count = session_metric_buckets_total.session_count + EXCLUDED.session_count, \
-          duration_total_seconds = session_metric_buckets_total.duration_total_seconds + EXCLUDED.duration_total_seconds, \
-          new_installs = session_metric_buckets_total.new_installs + EXCLUDED.new_installs, \
-          updated_at = now()",
-    );
+    for chunk in deltas.chunks(max_rows_per_batched_statement(6)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_metric_buckets_total \
+             (project_id, granularity, bucket_start, session_count, duration_total_seconds, new_installs) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(delta.session_count);
+            separated.push_bind(delta.duration_total_seconds);
+            separated.push_bind(delta.new_installs);
+        });
+        builder.push(
+            " ON CONFLICT (project_id, granularity, bucket_start) DO UPDATE SET \
+              session_count = session_metric_buckets_total.session_count + EXCLUDED.session_count, \
+              duration_total_seconds = session_metric_buckets_total.duration_total_seconds + EXCLUDED.duration_total_seconds, \
+              new_installs = session_metric_buckets_total.new_installs + EXCLUDED.new_installs, \
+              updated_at = now()",
+        );
 
-    builder.build().execute(&mut **tx).await?;
+        builder.build().execute(&mut **tx).await?;
+    }
 
     Ok(())
 }
@@ -794,29 +810,31 @@ pub async fn upsert_session_metric_dim1_in_tx(
         return Ok(());
     }
 
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO session_metric_buckets_dim1 \
-         (project_id, granularity, bucket_start, dim1_key, dim1_value, session_count, duration_total_seconds, new_installs) ",
-    );
-    builder.push_values(deltas, |mut separated, delta| {
-        separated.push_bind(delta.project_id);
-        separated.push_bind(delta.granularity.as_str());
-        separated.push_bind(delta.bucket_start);
-        separated.push_bind(&delta.dim1_key);
-        separated.push_bind(&delta.dim1_value);
-        separated.push_bind(delta.session_count);
-        separated.push_bind(delta.duration_total_seconds);
-        separated.push_bind(delta.new_installs);
-    });
-    builder.push(
-        " ON CONFLICT (project_id, granularity, bucket_start, dim1_key, dim1_value) DO UPDATE SET \
-          session_count = session_metric_buckets_dim1.session_count + EXCLUDED.session_count, \
-          duration_total_seconds = session_metric_buckets_dim1.duration_total_seconds + EXCLUDED.duration_total_seconds, \
-          new_installs = session_metric_buckets_dim1.new_installs + EXCLUDED.new_installs, \
-          updated_at = now()",
-    );
+    for chunk in deltas.chunks(max_rows_per_batched_statement(8)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_metric_buckets_dim1 \
+             (project_id, granularity, bucket_start, dim1_key, dim1_value, session_count, duration_total_seconds, new_installs) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(&delta.dim1_key);
+            separated.push_bind(&delta.dim1_value);
+            separated.push_bind(delta.session_count);
+            separated.push_bind(delta.duration_total_seconds);
+            separated.push_bind(delta.new_installs);
+        });
+        builder.push(
+            " ON CONFLICT (project_id, granularity, bucket_start, dim1_key, dim1_value) DO UPDATE SET \
+              session_count = session_metric_buckets_dim1.session_count + EXCLUDED.session_count, \
+              duration_total_seconds = session_metric_buckets_dim1.duration_total_seconds + EXCLUDED.duration_total_seconds, \
+              new_installs = session_metric_buckets_dim1.new_installs + EXCLUDED.new_installs, \
+              updated_at = now()",
+        );
 
-    builder.build().execute(&mut **tx).await?;
+        builder.build().execute(&mut **tx).await?;
+    }
 
     Ok(())
 }
@@ -829,33 +847,35 @@ pub async fn upsert_session_metric_dim2_in_tx(
         return Ok(());
     }
 
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO session_metric_buckets_dim2 \
-         (project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, session_count, duration_total_seconds, new_installs) ",
-    );
-    builder.push_values(deltas, |mut separated, delta| {
-        separated.push_bind(delta.project_id);
-        separated.push_bind(delta.granularity.as_str());
-        separated.push_bind(delta.bucket_start);
-        separated.push_bind(&delta.dim1_key);
-        separated.push_bind(&delta.dim1_value);
-        separated.push_bind(&delta.dim2_key);
-        separated.push_bind(&delta.dim2_value);
-        separated.push_bind(delta.session_count);
-        separated.push_bind(delta.duration_total_seconds);
-        separated.push_bind(delta.new_installs);
-    });
-    builder.push(
-        " ON CONFLICT \
-          (project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value) \
-          DO UPDATE SET \
-          session_count = session_metric_buckets_dim2.session_count + EXCLUDED.session_count, \
-          duration_total_seconds = session_metric_buckets_dim2.duration_total_seconds + EXCLUDED.duration_total_seconds, \
-          new_installs = session_metric_buckets_dim2.new_installs + EXCLUDED.new_installs, \
-          updated_at = now()",
-    );
+    for chunk in deltas.chunks(max_rows_per_batched_statement(10)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_metric_buckets_dim2 \
+             (project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, session_count, duration_total_seconds, new_installs) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(&delta.dim1_key);
+            separated.push_bind(&delta.dim1_value);
+            separated.push_bind(&delta.dim2_key);
+            separated.push_bind(&delta.dim2_value);
+            separated.push_bind(delta.session_count);
+            separated.push_bind(delta.duration_total_seconds);
+            separated.push_bind(delta.new_installs);
+        });
+        builder.push(
+            " ON CONFLICT \
+              (project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value) \
+              DO UPDATE SET \
+              session_count = session_metric_buckets_dim2.session_count + EXCLUDED.session_count, \
+              duration_total_seconds = session_metric_buckets_dim2.duration_total_seconds + EXCLUDED.duration_total_seconds, \
+              new_installs = session_metric_buckets_dim2.new_installs + EXCLUDED.new_installs, \
+              updated_at = now()",
+        );
 
-    builder.build().execute(&mut **tx).await?;
+        builder.build().execute(&mut **tx).await?;
+    }
 
     Ok(())
 }
@@ -4020,6 +4040,577 @@ mod tests {
                     || name == "idx_event_count_daily_dim3_project_event_dim3_value_day"
             }),
             "dim3 read path should use a dedicated read index, got {index_names:?} from {plan:#}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn event_metric_total_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let deltas = (0..13_108)
+            .map(|index| EventCountDailyTotalDelta {
+                project_id: project_id(),
+                granularity: MetricGranularity::Hour,
+                bucket_start: timestamp(index as i64 * 60),
+                event_name: "app_open".to_owned(),
+                event_count: 1,
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_event_count_daily_totals_in_tx(&mut tx, &deltas)
+            .await
+            .expect("large total upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*)::BIGINT AS row_count, COALESCE(SUM(event_count), 0)::BIGINT AS total_count
+            FROM event_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = $2
+              AND event_name = $3
+            "#,
+        )
+        .bind(project_id())
+        .bind(MetricGranularity::Hour.as_str())
+        .bind("app_open")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch total counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            13_108
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_count").expect("total_count"),
+            13_108
+        );
+    }
+
+    #[sqlx::test]
+    async fn event_metric_dim1_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let deltas = (0..9_363)
+            .map(|index| EventCountDailyDim1Delta {
+                project_id: project_id(),
+                granularity: MetricGranularity::Hour,
+                bucket_start: timestamp(60),
+                event_name: "app_open".to_owned(),
+                dim1_key: "provider".to_owned(),
+                dim1_value: format!("provider-{index:04}"),
+                event_count: 1,
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_event_count_daily_dim1_in_tx(&mut tx, &deltas)
+            .await
+            .expect("large dim1 upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*)::BIGINT AS row_count, COALESCE(SUM(event_count), 0)::BIGINT AS total_count
+            FROM event_metric_buckets_dim1
+            WHERE project_id = $1
+              AND granularity = $2
+              AND bucket_start = $3
+              AND event_name = $4
+            "#,
+        )
+        .bind(project_id())
+        .bind(MetricGranularity::Hour.as_str())
+        .bind(timestamp(60))
+        .bind("app_open")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch dim1 counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            9_363
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_count").expect("total_count"),
+            9_363
+        );
+    }
+
+    #[sqlx::test]
+    async fn event_metric_dim2_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let deltas = (0..7_282)
+            .map(|index| EventCountDailyDim2Delta {
+                project_id: project_id(),
+                granularity: MetricGranularity::Hour,
+                bucket_start: timestamp(60),
+                event_name: "app_open".to_owned(),
+                dim1_key: "app_version".to_owned(),
+                dim1_value: "1.0.0".to_owned(),
+                dim2_key: "provider".to_owned(),
+                dim2_value: format!("provider-{index:04}"),
+                event_count: 1,
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_event_count_daily_dim2_in_tx(&mut tx, &deltas)
+            .await
+            .expect("large dim2 upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*)::BIGINT AS row_count, COALESCE(SUM(event_count), 0)::BIGINT AS total_count
+            FROM event_metric_buckets_dim2
+            WHERE project_id = $1
+              AND granularity = $2
+              AND bucket_start = $3
+              AND event_name = $4
+            "#,
+        )
+        .bind(project_id())
+        .bind(MetricGranularity::Hour.as_str())
+        .bind(timestamp(60))
+        .bind("app_open")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch dim2 counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            7_282
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_count").expect("total_count"),
+            7_282
+        );
+    }
+
+    #[sqlx::test]
+    async fn event_metric_dim3_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let deltas = (0..6_000)
+            .map(|index| EventCountDailyDim3Delta {
+                project_id: project_id(),
+                granularity: MetricGranularity::Hour,
+                bucket_start: timestamp(60),
+                event_name: "app_open".to_owned(),
+                dim1_key: "app_version".to_owned(),
+                dim1_value: "1.0.0".to_owned(),
+                dim2_key: "plan".to_owned(),
+                dim2_value: "pro".to_owned(),
+                dim3_key: "provider".to_owned(),
+                dim3_value: format!("provider-{index:04}"),
+                event_count: 1,
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_event_count_daily_dim3_in_tx(&mut tx, &deltas)
+            .await
+            .expect("large dim3 upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*)::BIGINT AS row_count, COALESCE(SUM(event_count), 0)::BIGINT AS total_count
+            FROM event_metric_buckets_dim3
+            WHERE project_id = $1
+              AND granularity = $2
+              AND bucket_start = $3
+              AND event_name = $4
+            "#,
+        )
+        .bind(project_id())
+        .bind(MetricGranularity::Hour.as_str())
+        .bind(timestamp(60))
+        .bind("app_open")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch dim3 counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            6_000
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_count").expect("total_count"),
+            6_000
+        );
+    }
+
+    #[sqlx::test]
+    async fn event_metric_dim3_conflicts_accumulate_across_chunk_boundaries(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let chunk_rows = max_rows_per_batched_statement(11);
+        let deltas = (0..(chunk_rows + 1))
+            .map(|index| {
+                let provider = if index == 0 || index == chunk_rows {
+                    "strava".to_owned()
+                } else {
+                    format!("provider-{index:04}")
+                };
+
+                EventCountDailyDim3Delta {
+                    project_id: project_id(),
+                    granularity: MetricGranularity::Hour,
+                    bucket_start: timestamp(60),
+                    event_name: "app_open".to_owned(),
+                    dim1_key: "app_version".to_owned(),
+                    dim1_value: "1.0.0".to_owned(),
+                    dim2_key: "plan".to_owned(),
+                    dim2_value: "pro".to_owned(),
+                    dim3_key: "provider".to_owned(),
+                    dim3_value: provider,
+                    event_count: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_event_count_daily_dim3_in_tx(&mut tx, &deltas)
+            .await
+            .expect("cross-chunk dim3 conflict upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*)::BIGINT AS row_count, COALESCE(SUM(event_count), 0)::BIGINT AS total_count
+            FROM event_metric_buckets_dim3
+            WHERE project_id = $1
+              AND granularity = $2
+              AND bucket_start = $3
+              AND event_name = $4
+              AND dim1_key = $5
+              AND dim1_value = $6
+              AND dim2_key = $7
+              AND dim2_value = $8
+              AND dim3_key = $9
+              AND dim3_value = $10
+            "#,
+        )
+        .bind(project_id())
+        .bind(MetricGranularity::Hour.as_str())
+        .bind(timestamp(60))
+        .bind("app_open")
+        .bind("app_version")
+        .bind("1.0.0")
+        .bind("plan")
+        .bind("pro")
+        .bind("provider")
+        .bind("strava")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch dim3 conflict counts");
+
+        assert_eq!(row.try_get::<i64, _>("row_count").expect("row_count"), 1);
+        assert_eq!(
+            row.try_get::<i64, _>("total_count").expect("total_count"),
+            2
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_metric_total_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let deltas = (0..10_923)
+            .map(|index| SessionMetricTotalDelta {
+                project_id: project_id(),
+                granularity: MetricGranularity::Hour,
+                bucket_start: timestamp(index as i64 * 60),
+                session_count: 1,
+                duration_total_seconds: 60,
+                new_installs: 1,
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_session_metric_totals_in_tx(&mut tx, &deltas)
+            .await
+            .expect("large session total upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS row_count,
+                COALESCE(SUM(session_count), 0)::BIGINT AS total_sessions,
+                COALESCE(SUM(duration_total_seconds), 0)::BIGINT AS total_duration,
+                COALESCE(SUM(new_installs), 0)::BIGINT AS total_new_installs
+            FROM session_metric_buckets_total
+            WHERE project_id = $1
+              AND granularity = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(MetricGranularity::Hour.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session total counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            10_923
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_sessions")
+                .expect("total_sessions"),
+            10_923
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_duration")
+                .expect("total_duration"),
+            655_380
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_new_installs")
+                .expect("total_new_installs"),
+            10_923
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_metric_dim1_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let deltas = (0..8_192)
+            .map(|index| SessionMetricDim1Delta {
+                project_id: project_id(),
+                granularity: MetricGranularity::Hour,
+                bucket_start: timestamp(60),
+                dim1_key: "app_version".to_owned(),
+                dim1_value: format!("1.{index}.0"),
+                session_count: 1,
+                duration_total_seconds: 60,
+                new_installs: 1,
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_session_metric_dim1_in_tx(&mut tx, &deltas)
+            .await
+            .expect("large session dim1 upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS row_count,
+                COALESCE(SUM(session_count), 0)::BIGINT AS total_sessions,
+                COALESCE(SUM(duration_total_seconds), 0)::BIGINT AS total_duration,
+                COALESCE(SUM(new_installs), 0)::BIGINT AS total_new_installs
+            FROM session_metric_buckets_dim1
+            WHERE project_id = $1
+              AND granularity = $2
+              AND bucket_start = $3
+            "#,
+        )
+        .bind(project_id())
+        .bind(MetricGranularity::Hour.as_str())
+        .bind(timestamp(60))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session dim1 counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            8_192
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_sessions")
+                .expect("total_sessions"),
+            8_192
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_duration")
+                .expect("total_duration"),
+            491_520
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_new_installs")
+                .expect("total_new_installs"),
+            8_192
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_metric_dim2_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let deltas = (0..6_554)
+            .map(|index| SessionMetricDim2Delta {
+                project_id: project_id(),
+                granularity: MetricGranularity::Hour,
+                bucket_start: timestamp(60),
+                dim1_key: "app_version".to_owned(),
+                dim1_value: "1.0.0".to_owned(),
+                dim2_key: "platform".to_owned(),
+                dim2_value: format!("platform-{index:04}"),
+                session_count: 1,
+                duration_total_seconds: 60,
+                new_installs: 1,
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_session_metric_dim2_in_tx(&mut tx, &deltas)
+            .await
+            .expect("large session dim2 upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS row_count,
+                COALESCE(SUM(session_count), 0)::BIGINT AS total_sessions,
+                COALESCE(SUM(duration_total_seconds), 0)::BIGINT AS total_duration,
+                COALESCE(SUM(new_installs), 0)::BIGINT AS total_new_installs
+            FROM session_metric_buckets_dim2
+            WHERE project_id = $1
+              AND granularity = $2
+              AND bucket_start = $3
+            "#,
+        )
+        .bind(project_id())
+        .bind(MetricGranularity::Hour.as_str())
+        .bind(timestamp(60))
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session dim2 counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            6_554
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_sessions")
+                .expect("total_sessions"),
+            6_554
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_duration")
+                .expect("total_duration"),
+            393_240
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_new_installs")
+                .expect("total_new_installs"),
+            6_554
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_metric_dim2_conflicts_accumulate_across_chunk_boundaries(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let chunk_rows = max_rows_per_batched_statement(10);
+        let deltas = (0..(chunk_rows + 1))
+            .map(|index| {
+                let app_version = if index == 0 || index == chunk_rows {
+                    "1.0.0".to_owned()
+                } else {
+                    format!("1.{index}.0")
+                };
+
+                SessionMetricDim2Delta {
+                    project_id: project_id(),
+                    granularity: MetricGranularity::Hour,
+                    bucket_start: timestamp(60),
+                    dim1_key: "app_version".to_owned(),
+                    dim1_value: app_version,
+                    dim2_key: "platform".to_owned(),
+                    dim2_value: "ios".to_owned(),
+                    session_count: 1,
+                    duration_total_seconds: 60,
+                    new_installs: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_session_metric_dim2_in_tx(&mut tx, &deltas)
+            .await
+            .expect("cross-chunk session dim2 conflict upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS row_count,
+                COALESCE(SUM(session_count), 0)::BIGINT AS total_sessions,
+                COALESCE(SUM(duration_total_seconds), 0)::BIGINT AS total_duration,
+                COALESCE(SUM(new_installs), 0)::BIGINT AS total_new_installs
+            FROM session_metric_buckets_dim2
+            WHERE project_id = $1
+              AND granularity = $2
+              AND bucket_start = $3
+              AND dim1_key = $4
+              AND dim1_value = $5
+              AND dim2_key = $6
+              AND dim2_value = $7
+            "#,
+        )
+        .bind(project_id())
+        .bind(MetricGranularity::Hour.as_str())
+        .bind(timestamp(60))
+        .bind("app_version")
+        .bind("1.0.0")
+        .bind("platform")
+        .bind("ios")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session dim2 conflict counts");
+
+        assert_eq!(row.try_get::<i64, _>("row_count").expect("row_count"), 1);
+        assert_eq!(
+            row.try_get::<i64, _>("total_sessions")
+                .expect("total_sessions"),
+            2
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_duration")
+                .expect("total_duration"),
+            120
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_new_installs")
+                .expect("total_new_installs"),
+            2
         );
     }
 

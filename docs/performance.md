@@ -234,6 +234,66 @@ Interpretation:
 - `append-90d` still stays well under the suite's `20m` visibility timeout with a `41.116s` session-lane readiness result
 - `append-180d` publishes as visibility-only context in this suite; it landed at `74.275s`, above the `30d` hard target but still far below the `40m` visibility timeout
 
+## Repair And Reads Follow-Up
+
+Fresh follow-up artifacts:
+
+- [summary.json](/Users/ruiperes/Code/fantasma/artifacts/performance/2026-03-13-session-repair-and-reads/summary.json) for the original failing repair sweep
+- [summary.json](/Users/ruiperes/Code/fantasma/artifacts/performance/2026-03-13-repair-event-ready-batch-fix/summary.json) for the repaired `repair-30d` median
+- [summary.json](/Users/ruiperes/Code/fantasma/artifacts/performance/2026-03-13-repair-event-ready-batch-fix-large/summary.json) for the repaired `repair-90d` and `repair-180d` publication
+- [summary.json](/Users/ruiperes/Code/fantasma/artifacts/performance/2026-03-13-repair-bind-follow-up/summary.json) for the post-follow-up repair publication after the session-lane validation pass
+- [summary.json](/Users/ruiperes/Code/fantasma/artifacts/performance/2026-03-13-session-reads/summary.json) for the read-only sweep
+
+Repair root cause:
+
+- the failing benchmark was not a repair math bug or readiness-expectation mismatch; the repair workload and expected totals were internally consistent
+- the real failure was in the event worker: repair bursts could generate enough dim3 event-metric deltas to build one `INSERT ... VALUES ... ON CONFLICT` above the Postgres/sqlx bind-argument limit
+- the worker logs on the failing run showed repeated `PgConnection::run(): too many arguments for query: 100320`, which kept the `event_metrics` lane retrying the same batch until `repair-30d` timed out waiting for event readiness
+- the fix keeps the same set-based write path but chunks event-metric total/dim1/dim2/dim3 upserts by bind-count budget before executing them
+
+Fresh repair publication after the fix:
+
+| Scenario | Seed Ingest | Repair Ingest | `event_metrics_ready_ms` | `session_metrics_ready_ms` | `derived_metrics_ready_ms` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `repair-30d` | `31.959s` | `115ms` | `486` | `1_553` | `1_553` |
+| `repair-90d` | `95.391s` | `411ms` | `827` | `5_315` | `5_315` |
+| `repair-180d` | `190.000s` | `807ms` | `1_626` | `12_686` | `12_686` |
+
+Repair interpretation:
+
+- the intermittent event-lane timeout is gone; all three repair windows now publish cleanly through the normal SLO harness
+- repair-path event readiness is now comfortably sub-second at `30d` and still only `1.626s` at `180d`
+- with the event-lane crash removed, the next repair-path bottleneck is the session rebuild lane rather than event readiness
+- a follow-up store fix on March 13, 2026 extended the same bind-budget chunking to session metric total/dim1/dim2 upserts and added oversized-batch regressions for event total/dim1/dim2/dim3 plus session total/dim1/dim2, so the earlier event-lane ceiling is no longer mirrored by an unguarded session-lane variant
+- a second follow-up on March 13, 2026 added focused cross-chunk conflict regressions for event dim3 and session dim2, proving that repeated keys still accumulate correctly when the shared key lands once per chunk boundary rather than only in unique-key batches
+
+Fresh repair publication after the validation follow-up:
+
+| Scenario | Seed Ingest | Repair Ingest | `event_metrics_ready_ms` | `session_metrics_ready_ms` | `derived_metrics_ready_ms` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `repair-30d` | `30.673s` | `122ms` | `382` | `1_432` | `1_432` |
+| `repair-90d` | `104.320s` | `413ms` | `962` | `6_059` | `6_059` |
+| `repair-180d` | `187.273s` | `760ms` | `1_849` | `11_714` | `11_714` |
+
+Validation follow-up interpretation:
+
+- the store-level bind-limit fix now has direct regression coverage for the chunk-boundary accumulation path as well as the oversized unique-key path
+- the fresh repair-only publication confirms the post-follow-up code still publishes all three repair windows cleanly end to end
+- session readiness remains the slower lane, but it stays comfortably inside the suite budgets in this publication
+
+Grouped session hour reads:
+
+| Scenario | `sessions_count_hour_grouped` p95 | `sessions_duration_total_hour_grouped` p95 | `sessions_new_installs_hour_grouped` p95 |
+| --- | ---: | ---: | ---: |
+| `reads-30d` | `16ms` | `15ms` | `15ms` |
+| `reads-90d` | `39ms` | `39ms` | `38ms` |
+| `reads-180d` | `75ms` | `76ms` | `75ms` |
+
+Read interpretation:
+
+- grouped session hour reads stay well inside the published budgets even at `180d`
+- the read path does not look like the next bottleneck; after removing the repair event-lane failure mode, the next visible repair bottleneck is the session rebuild lane
+
 ## Legacy Commands
 
 The older manual commands still exist for focused investigation:
