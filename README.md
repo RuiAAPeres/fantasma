@@ -43,3 +43,7 @@ Technical and operational details belong in the docs below.
 - Architecture: [`docs/architecture.md`](docs/architecture.md)
 - Project status: [`docs/STATUS.md`](docs/STATUS.md)
 - Contributor rules: [`AGENTS.md`](AGENTS.md)
+
+## License
+
+Fantasma is available under the [MIT License](LICENSE).
