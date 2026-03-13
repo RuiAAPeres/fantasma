@@ -1,0 +1,53 @@
+{
+  "scenario": "scale-path",
+  "profile": "heavy",
+  "phases": [
+    {
+      "name": "ingest",
+      "events_sent": 180000,
+      "elapsed_ms": 5182,
+      "events_per_second": 34732.84173498263
+    }
+  ],
+  "readiness": [
+    {
+      "name": "derived_metrics_ready",
+      "elapsed_ms": 96051
+    }
+  ],
+  "queries": [
+    {
+      "name": "events_day_dim2",
+      "iterations": 100,
+      "min_ms": 8,
+      "p50_ms": 9,
+      "p95_ms": 9,
+      "max_ms": 10
+    },
+    {
+      "name": "events_hour_dim2",
+      "iterations": 100,
+      "min_ms": 48,
+      "p50_ms": 50,
+      "p95_ms": 51,
+      "max_ms": 55
+    },
+    {
+      "name": "sessions_count_day",
+      "iterations": 100,
+      "min_ms": 0,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    {
+      "name": "sessions_duration_total_day",
+      "iterations": 100,
+      "min_ms": 0,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    }
+  ],
+  "budget": null
+}

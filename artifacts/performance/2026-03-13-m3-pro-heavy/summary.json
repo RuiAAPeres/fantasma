@@ -1,0 +1,183 @@
+{
+  "profile": "heavy",
+  "repetitions": 5,
+  "host": {
+    "cpu_model": "Apple M3 Pro",
+    "memory_bytes": 38654705664,
+    "memory_gib": 36.0,
+    "os_kernel": "Darwin 25.1.0",
+    "architecture": "aarch64",
+    "benchmarked_at": "2026-03-13T12:28:14.835239+00:00"
+  },
+  "scenarios": [
+    {
+      "scenario": "hot-path",
+      "profile": "heavy",
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 9000,
+          "elapsed_ms": 305,
+          "events_per_second": 29490.69172353993
+        }
+      ],
+      "readiness": [
+        {
+          "name": "derived_metrics_ready",
+          "elapsed_ms": 4252
+        }
+      ],
+      "queries": [
+        {
+          "name": "events_day_dim2",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "events_hour_dim2",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 2,
+          "p95_ms": 2,
+          "max_ms": 2
+        },
+        {
+          "name": "sessions_count_day",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "sessions_duration_total_day",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        }
+      ],
+      "budget": null
+    },
+    {
+      "scenario": "repair-path",
+      "profile": "heavy",
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 3000,
+          "elapsed_ms": 105,
+          "events_per_second": 28516.09377042168
+        },
+        {
+          "name": "repair_ingest",
+          "events_sent": 1200,
+          "elapsed_ms": 44,
+          "events_per_second": 26810.974652435372
+        }
+      ],
+      "readiness": [
+        {
+          "name": "seed_ready",
+          "elapsed_ms": 1690
+        },
+        {
+          "name": "repair_ready",
+          "elapsed_ms": 1146
+        }
+      ],
+      "queries": [
+        {
+          "name": "events_day_dim2",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 1,
+          "p95_ms": 2,
+          "max_ms": 2
+        },
+        {
+          "name": "events_hour_dim2",
+          "iterations": 100,
+          "min_ms": 3,
+          "p50_ms": 4,
+          "p95_ms": 5,
+          "max_ms": 6
+        },
+        {
+          "name": "sessions_count_day",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "sessions_duration_total_day",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 1
+        }
+      ],
+      "budget": null
+    },
+    {
+      "scenario": "scale-path",
+      "profile": "heavy",
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 180000,
+          "elapsed_ms": 5350,
+          "events_per_second": 33641.39270599939
+        }
+      ],
+      "readiness": [
+        {
+          "name": "derived_metrics_ready",
+          "elapsed_ms": 96352
+        }
+      ],
+      "queries": [
+        {
+          "name": "events_day_dim2",
+          "iterations": 100,
+          "min_ms": 8,
+          "p50_ms": 9,
+          "p95_ms": 10,
+          "max_ms": 10
+        },
+        {
+          "name": "events_hour_dim2",
+          "iterations": 100,
+          "min_ms": 48,
+          "p50_ms": 51,
+          "p95_ms": 52,
+          "max_ms": 55
+        },
+        {
+          "name": "sessions_count_day",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "sessions_duration_total_day",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        }
+      ],
+      "budget": null
+    }
+  ]
+}

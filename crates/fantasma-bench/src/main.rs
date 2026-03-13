@@ -56,11 +56,31 @@ impl Scenario {
 enum Profile {
     Ci,
     Extended,
+    Heavy,
+}
+
+impl Profile {
+    fn key(self) -> &'static str {
+        match self {
+            Profile::Ci => "ci",
+            Profile::Extended => "extended",
+            Profile::Heavy => "heavy",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Profile::Ci => "CI",
+            Profile::Extended => "Extended",
+            Profile::Heavy => "Heavy",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BenchCommand {
     Stack(StackArgs),
+    Series(SeriesArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +88,13 @@ struct StackArgs {
     scenario: Scenario,
     profile: Profile,
     output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeriesArgs {
+    profile: Profile,
+    repetitions: usize,
+    output_dir: PathBuf,
 }
 
 #[derive(Debug, Parser)]
@@ -86,6 +113,14 @@ enum CliCommand {
         profile: Profile,
         #[arg(long)]
         output: PathBuf,
+    },
+    Series {
+        #[arg(long, value_enum, default_value_t = Profile::Ci)]
+        profile: Profile,
+        #[arg(long, default_value_t = 1)]
+        repetitions: usize,
+        #[arg(long)]
+        output_dir: PathBuf,
     },
 }
 
@@ -144,6 +179,24 @@ struct ScenarioResult {
     readiness: Vec<ReadinessMeasurement>,
     queries: Vec<QueryMeasurement>,
     budget: Option<BudgetEvaluation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct HostMetadata {
+    cpu_model: String,
+    memory_bytes: u64,
+    memory_gib: f64,
+    os_kernel: String,
+    architecture: String,
+    benchmarked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SeriesSummary {
+    profile: Profile,
+    repetitions: usize,
+    host: HostMetadata,
+    scenarios: Vec<ScenarioResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,6 +274,15 @@ impl ProfileConfig {
                 measured_queries: 40,
                 settle_timeout: Duration::from_secs(60),
             },
+            Profile::Heavy => Self {
+                hot_path_install_count: 3_000,
+                repair_group_count: 600,
+                scale_day_count: 60,
+                scale_install_count_per_day: 1_000,
+                warmup_queries: 10,
+                measured_queries: 100,
+                settle_timeout: Duration::from_secs(180),
+            },
         }
     }
 }
@@ -261,6 +323,15 @@ where
             profile,
             output,
         }),
+        CliCommand::Series {
+            profile,
+            repetitions,
+            output_dir,
+        } => BenchCommand::Series(SeriesArgs {
+            profile,
+            repetitions,
+            output_dir,
+        }),
     })
 }
 
@@ -268,12 +339,57 @@ where
 async fn main() -> Result<()> {
     match parse_args(std::env::args_os())? {
         BenchCommand::Stack(args) => run_stack(args).await,
+        BenchCommand::Series(args) => run_series(args).await,
     }
 }
 
 async fn run_stack(args: StackArgs) -> Result<()> {
-    let profile_config = ProfileConfig::for_profile(args.profile);
-    let budget = load_budget(args.scenario, args.profile)?;
+    let result = execute_scenario(args.scenario, args.profile).await?;
+    write_result(&args.output, &result)?;
+    println!("{}", render_markdown_summary(&result));
+    enforce_budget(&result)
+}
+
+async fn run_series(args: SeriesArgs) -> Result<()> {
+    if args.repetitions == 0 {
+        bail!("series repetitions must be at least 1");
+    }
+
+    let host = collect_host_metadata()?;
+    write_pretty_json(&host_metadata_output_path(&args.output_dir), &host)?;
+
+    let mut scenarios = Vec::new();
+    for scenario in [Scenario::Hot, Scenario::Repair, Scenario::Scale] {
+        let paths = series_paths(&args.output_dir, scenario);
+        let mut runs = Vec::with_capacity(args.repetitions);
+
+        for run_number in 1..=args.repetitions {
+            let result = execute_scenario(scenario, args.profile).await?;
+            write_result(&paths.run_output(run_number), &result)?;
+            enforce_budget(&result)?;
+            runs.push(result);
+        }
+
+        let aggregated = aggregate_scenario_runs(scenario, args.profile, &runs)?;
+        write_result(&paths.median_output(), &aggregated)?;
+        scenarios.push(aggregated);
+    }
+
+    let summary = SeriesSummary {
+        profile: args.profile,
+        repetitions: args.repetitions,
+        host,
+        scenarios,
+    };
+    write_series_summary(&args.output_dir, &summary)?;
+    println!("{}", render_series_markdown_summary(&summary));
+
+    Ok(())
+}
+
+async fn execute_scenario(scenario: Scenario, profile: Profile) -> Result<ScenarioResult> {
+    let profile_config = ProfileConfig::for_profile(profile);
+    let budget = load_budget(scenario, profile)?;
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -284,20 +400,18 @@ async fn run_stack(args: StackArgs) -> Result<()> {
     wait_for_health(&client).await?;
     let project = provision_project(&client).await?;
 
-    let mut result = match args.scenario {
-        Scenario::Hot => run_hot_path(&client, &project, args.profile, profile_config).await?,
-        Scenario::Repair => {
-            run_repair_path(&client, &project, args.profile, profile_config).await?
-        }
-        Scenario::Scale => run_scale_path(&client, &project, args.profile, profile_config).await?,
+    let mut result = match scenario {
+        Scenario::Hot => run_hot_path(&client, &project, profile, profile_config).await?,
+        Scenario::Repair => run_repair_path(&client, &project, profile, profile_config).await?,
+        Scenario::Scale => run_scale_path(&client, &project, profile, profile_config).await?,
     };
     result.budget = budget
         .as_ref()
         .map(|budget| evaluate_budget(budget, &result));
+    Ok(result)
+}
 
-    write_result(&args.output, &result)?;
-    println!("{}", render_markdown_summary(&result));
-
+fn enforce_budget(result: &ScenarioResult) -> Result<()> {
     if let Some(evaluation) = &result.budget
         && !evaluation.passed
     {
@@ -1195,7 +1309,190 @@ fn evaluate_budget(budget: &ScenarioBudget, result: &ScenarioResult) -> BudgetEv
     }
 }
 
+#[derive(Debug, Clone)]
+struct ScenarioSeriesPaths {
+    scenario_dir: PathBuf,
+}
+
+impl ScenarioSeriesPaths {
+    fn run_output(&self, run_number: usize) -> PathBuf {
+        self.scenario_dir.join(format!("run-{run_number:02}.json"))
+    }
+
+    fn median_output(&self) -> PathBuf {
+        self.scenario_dir.join("median.json")
+    }
+}
+
+fn series_paths(output_dir: &Path, scenario: Scenario) -> ScenarioSeriesPaths {
+    ScenarioSeriesPaths {
+        scenario_dir: output_dir.join(scenario.key()),
+    }
+}
+
+fn summary_output_path(output_dir: &Path) -> PathBuf {
+    output_dir.join("summary.json")
+}
+
+fn host_metadata_output_path(output_dir: &Path) -> PathBuf {
+    output_dir.join("host.json")
+}
+
+fn aggregate_scenario_runs(
+    scenario: Scenario,
+    profile: Profile,
+    runs: &[ScenarioResult],
+) -> Result<ScenarioResult> {
+    let first = runs
+        .first()
+        .ok_or_else(|| anyhow!("cannot aggregate empty benchmark run list"))?;
+
+    for run in runs {
+        if run.scenario != scenario {
+            bail!(
+                "scenario mismatch while aggregating {}: expected {}, got {}",
+                scenario.key(),
+                scenario.key(),
+                run.scenario.key()
+            );
+        }
+        if run.profile != profile {
+            bail!(
+                "profile mismatch while aggregating {}: expected {}, got {}",
+                scenario.key(),
+                profile.key(),
+                run.profile.key()
+            );
+        }
+    }
+
+    let phases = first
+        .phases
+        .iter()
+        .map(|phase| {
+            let mut elapsed_samples = Vec::with_capacity(runs.len());
+            let mut throughput_samples = Vec::with_capacity(runs.len());
+
+            for run in runs {
+                let candidate = run
+                    .phases
+                    .iter()
+                    .find(|measurement| measurement.name == phase.name)
+                    .ok_or_else(|| anyhow!("missing phase measurement for {}", phase.name))?;
+                if candidate.events_sent != phase.events_sent {
+                    bail!("phase {} changed events_sent across runs", phase.name);
+                }
+                elapsed_samples.push(candidate.elapsed_ms);
+                throughput_samples.push(candidate.events_per_second);
+            }
+
+            Ok(PhaseMeasurement {
+                name: phase.name.clone(),
+                events_sent: phase.events_sent,
+                elapsed_ms: median_u64(&elapsed_samples),
+                events_per_second: median_f64(&throughput_samples),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let readiness = first
+        .readiness
+        .iter()
+        .map(|measurement| {
+            let mut samples = Vec::with_capacity(runs.len());
+            for run in runs {
+                let candidate = run
+                    .readiness
+                    .iter()
+                    .find(|entry| entry.name == measurement.name)
+                    .ok_or_else(|| {
+                        anyhow!("missing readiness measurement for {}", measurement.name)
+                    })?;
+                samples.push(candidate.elapsed_ms);
+            }
+
+            Ok(ReadinessMeasurement {
+                name: measurement.name.clone(),
+                elapsed_ms: median_u64(&samples),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let queries = first
+        .queries
+        .iter()
+        .map(|query| {
+            let mut min_samples = Vec::with_capacity(runs.len());
+            let mut p50_samples = Vec::with_capacity(runs.len());
+            let mut p95_samples = Vec::with_capacity(runs.len());
+            let mut max_samples = Vec::with_capacity(runs.len());
+
+            for run in runs {
+                let candidate = run
+                    .queries
+                    .iter()
+                    .find(|entry| entry.name == query.name)
+                    .ok_or_else(|| anyhow!("missing query measurement for {}", query.name))?;
+                if candidate.iterations != query.iterations {
+                    bail!("query {} changed iteration count across runs", query.name);
+                }
+                min_samples.push(candidate.min_ms);
+                p50_samples.push(candidate.p50_ms);
+                p95_samples.push(candidate.p95_ms);
+                max_samples.push(candidate.max_ms);
+            }
+
+            Ok(QueryMeasurement {
+                name: query.name.clone(),
+                iterations: query.iterations,
+                min_ms: median_u64(&min_samples),
+                p50_ms: median_u64(&p50_samples),
+                p95_ms: median_u64(&p95_samples),
+                max_ms: median_u64(&max_samples),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ScenarioResult {
+        scenario,
+        profile,
+        phases,
+        readiness,
+        queries,
+        budget: None,
+    })
+}
+
+fn median_u64(samples: &[u64]) -> u64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
+fn median_f64(samples: &[f64]) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    sorted[sorted.len() / 2]
+}
+
 fn write_result(output: &Path, result: &ScenarioResult) -> Result<()> {
+    write_pretty_json(output, result)?;
+    write_markdown(output.with_extension("md"), render_markdown_summary(result))?;
+
+    Ok(())
+}
+
+fn write_series_summary(output_dir: &Path, summary: &SeriesSummary) -> Result<()> {
+    let output = summary_output_path(output_dir);
+    write_pretty_json(&output, summary)?;
+    write_markdown(
+        output.with_extension("md"),
+        render_series_markdown_summary(summary),
+    )?;
+    Ok(())
+}
+
+fn write_pretty_json<T: Serialize>(output: &Path, value: &T) -> Result<()> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create output directory {}", parent.display()))?;
@@ -1203,13 +1500,19 @@ fn write_result(output: &Path, result: &ScenarioResult) -> Result<()> {
 
     fs::write(
         output,
-        serde_json::to_string_pretty(result).context("serialize benchmark result")?,
+        serde_json::to_string_pretty(value)
+            .with_context(|| format!("serialize {}", output.display()))?,
     )
-    .with_context(|| format!("write {}", output.display()))?;
-    fs::write(output.with_extension("md"), render_markdown_summary(result))
-        .with_context(|| format!("write {}", output.with_extension("md").display()))?;
+    .with_context(|| format!("write {}", output.display()))
+}
 
-    Ok(())
+fn write_markdown(output: PathBuf, markdown: String) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create output directory {}", parent.display()))?;
+    }
+
+    fs::write(&output, markdown).with_context(|| format!("write {}", output.display()))
 }
 
 fn render_markdown_summary(result: &ScenarioResult) -> String {
@@ -1217,10 +1520,7 @@ fn render_markdown_summary(result: &ScenarioResult) -> String {
         format!(
             "# Fantasma Benchmark: {} ({})",
             result.scenario.key(),
-            match result.profile {
-                Profile::Ci => "ci",
-                Profile::Extended => "extended",
-            }
+            result.profile.key()
         ),
         String::new(),
     ];
@@ -1254,6 +1554,127 @@ fn render_markdown_summary(result: &ScenarioResult) -> String {
     }
 
     lines.join("\n")
+}
+
+fn render_series_markdown_summary(summary: &SeriesSummary) -> String {
+    let mut lines = vec![
+        format!("# Fantasma {} Benchmark Series", summary.profile.title()),
+        String::new(),
+        format!("- Profile: {}", summary.profile.key()),
+        format!("- Repetitions per scenario: {}", summary.repetitions),
+        format!(
+            "- Host: {} / {} GiB / {} / {}",
+            summary.host.cpu_model,
+            format_memory_gib(summary.host.memory_gib),
+            summary.host.os_kernel,
+            summary.host.architecture
+        ),
+        format!("- Benchmarked at: {}", summary.host.benchmarked_at),
+        String::new(),
+    ];
+
+    for scenario in &summary.scenarios {
+        lines.push(format!("## {}", scenario.scenario.key()));
+        lines.push(String::new());
+
+        for phase in &scenario.phases {
+            lines.push(format!(
+                "- {}: {} events in {}ms ({:.2} events/s)",
+                phase.name, phase.events_sent, phase.elapsed_ms, phase.events_per_second
+            ));
+        }
+        for readiness in &scenario.readiness {
+            lines.push(format!("- {}: {}ms", readiness.name, readiness.elapsed_ms));
+        }
+        lines.push(String::new());
+        lines.push("| Query | p50 (ms) | p95 (ms) | min (ms) | max (ms) |".to_owned());
+        lines.push("| --- | ---: | ---: | ---: | ---: |".to_owned());
+        for query in &scenario.queries {
+            lines.push(format!(
+                "| {} | {} | {} | {} | {} |",
+                query.name, query.p50_ms, query.p95_ms, query.min_ms, query.max_ms
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    lines.join("\n").trim_end().to_owned()
+}
+
+fn format_memory_gib(memory_gib: f64) -> String {
+    if (memory_gib.fract()).abs() < f64::EPSILON {
+        format!("{}", memory_gib as u64)
+    } else {
+        format!("{memory_gib:.1}")
+    }
+}
+
+fn collect_host_metadata() -> Result<HostMetadata> {
+    let memory_bytes = detect_memory_bytes();
+
+    Ok(HostMetadata {
+        cpu_model: detect_cpu_model(),
+        memory_bytes,
+        memory_gib: memory_bytes as f64 / 1024_f64.powi(3),
+        os_kernel: detect_os_kernel(),
+        architecture: std::env::consts::ARCH.to_owned(),
+        benchmarked_at: Utc::now().to_rfc3339(),
+    })
+}
+
+fn detect_cpu_model() -> String {
+    command_stdout("sysctl", ["-n", "machdep.cpu.brand_string"])
+        .or_else(|| read_linux_cpu_model())
+        .unwrap_or_else(|| "unknown cpu".to_owned())
+}
+
+fn read_linux_cpu_model() -> Option<String> {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
+    cpuinfo
+        .lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(key, _)| key.trim() == "model name")
+        })
+        .map(|(_, value)| value.trim().to_owned())
+}
+
+fn detect_memory_bytes() -> u64 {
+    command_stdout("sysctl", ["-n", "hw.memsize"])
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(read_linux_memory_bytes)
+        .unwrap_or_default()
+}
+
+fn read_linux_memory_bytes() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    let kibibytes = meminfo.lines().find_map(|line| {
+        line.split_once(':')
+            .filter(|(key, _)| key.trim() == "MemTotal")
+            .and_then(|(_, value)| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+    })?;
+    Some(kibibytes * 1024)
+}
+
+fn detect_os_kernel() -> String {
+    command_stdout("uname", ["-sr"])
+        .unwrap_or_else(|| format!("{} {}", std::env::consts::OS, std::env::consts::ARCH))
+}
+
+fn command_stdout<const N: usize>(program: &str, args: [&str; N]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 fn compose_file_path() -> PathBuf {
@@ -1552,6 +1973,257 @@ mod tests {
                 output: PathBuf::from("artifacts/scale-path.json"),
             })
         );
+    }
+
+    #[test]
+    fn parse_series_command_reads_profile_repetitions_and_output_dir() {
+        let command = parse_args([
+            "fantasma-bench",
+            "series",
+            "--profile",
+            "heavy",
+            "--repetitions",
+            "5",
+            "--output-dir",
+            "artifacts/performance/2026-03-13-m3-pro-heavy",
+        ])
+        .expect("parse series command");
+
+        assert_eq!(
+            command,
+            BenchCommand::Series(SeriesArgs {
+                profile: Profile::Heavy,
+                repetitions: 5,
+                output_dir: PathBuf::from("artifacts/performance/2026-03-13-m3-pro-heavy"),
+            })
+        );
+    }
+
+    #[test]
+    fn heavy_profile_uses_publishable_local_workload_sizes() {
+        let config = ProfileConfig::for_profile(Profile::Heavy);
+
+        assert_eq!(config.hot_path_install_count, 3_000);
+        assert_eq!(config.repair_group_count, 600);
+        assert_eq!(config.scale_day_count, 60);
+        assert_eq!(config.scale_install_count_per_day, 1_000);
+        assert_eq!(config.warmup_queries, 10);
+        assert_eq!(config.measured_queries, 100);
+        assert_eq!(config.settle_timeout, Duration::from_secs(180));
+    }
+
+    #[test]
+    fn aggregate_scenario_runs_uses_medians_for_each_measurement() {
+        let aggregated = aggregate_scenario_runs(
+            Scenario::Hot,
+            Profile::Heavy,
+            &[
+                ScenarioResult {
+                    scenario: Scenario::Hot,
+                    profile: Profile::Heavy,
+                    phases: vec![PhaseMeasurement {
+                        name: "ingest".to_owned(),
+                        events_sent: 9_000,
+                        elapsed_ms: 1_100,
+                        events_per_second: 8_181.82,
+                    }],
+                    readiness: vec![ReadinessMeasurement {
+                        name: "derived_metrics_ready".to_owned(),
+                        elapsed_ms: 420,
+                    }],
+                    queries: vec![QueryMeasurement {
+                        name: "events_day_dim2".to_owned(),
+                        iterations: 100,
+                        min_ms: 4,
+                        p50_ms: 7,
+                        p95_ms: 10,
+                        max_ms: 14,
+                    }],
+                    budget: None,
+                },
+                ScenarioResult {
+                    scenario: Scenario::Hot,
+                    profile: Profile::Heavy,
+                    phases: vec![PhaseMeasurement {
+                        name: "ingest".to_owned(),
+                        events_sent: 9_000,
+                        elapsed_ms: 1_000,
+                        events_per_second: 9_000.0,
+                    }],
+                    readiness: vec![ReadinessMeasurement {
+                        name: "derived_metrics_ready".to_owned(),
+                        elapsed_ms: 400,
+                    }],
+                    queries: vec![QueryMeasurement {
+                        name: "events_day_dim2".to_owned(),
+                        iterations: 100,
+                        min_ms: 3,
+                        p50_ms: 6,
+                        p95_ms: 9,
+                        max_ms: 12,
+                    }],
+                    budget: None,
+                },
+                ScenarioResult {
+                    scenario: Scenario::Hot,
+                    profile: Profile::Heavy,
+                    phases: vec![PhaseMeasurement {
+                        name: "ingest".to_owned(),
+                        events_sent: 9_000,
+                        elapsed_ms: 900,
+                        events_per_second: 10_000.0,
+                    }],
+                    readiness: vec![ReadinessMeasurement {
+                        name: "derived_metrics_ready".to_owned(),
+                        elapsed_ms: 390,
+                    }],
+                    queries: vec![QueryMeasurement {
+                        name: "events_day_dim2".to_owned(),
+                        iterations: 100,
+                        min_ms: 2,
+                        p50_ms: 5,
+                        p95_ms: 8,
+                        max_ms: 11,
+                    }],
+                    budget: None,
+                },
+                ScenarioResult {
+                    scenario: Scenario::Hot,
+                    profile: Profile::Heavy,
+                    phases: vec![PhaseMeasurement {
+                        name: "ingest".to_owned(),
+                        events_sent: 9_000,
+                        elapsed_ms: 1_050,
+                        events_per_second: 8_571.43,
+                    }],
+                    readiness: vec![ReadinessMeasurement {
+                        name: "derived_metrics_ready".to_owned(),
+                        elapsed_ms: 410,
+                    }],
+                    queries: vec![QueryMeasurement {
+                        name: "events_day_dim2".to_owned(),
+                        iterations: 100,
+                        min_ms: 3,
+                        p50_ms: 6,
+                        p95_ms: 9,
+                        max_ms: 13,
+                    }],
+                    budget: None,
+                },
+                ScenarioResult {
+                    scenario: Scenario::Hot,
+                    profile: Profile::Heavy,
+                    phases: vec![PhaseMeasurement {
+                        name: "ingest".to_owned(),
+                        events_sent: 9_000,
+                        elapsed_ms: 980,
+                        events_per_second: 9_183.67,
+                    }],
+                    readiness: vec![ReadinessMeasurement {
+                        name: "derived_metrics_ready".to_owned(),
+                        elapsed_ms: 405,
+                    }],
+                    queries: vec![QueryMeasurement {
+                        name: "events_day_dim2".to_owned(),
+                        iterations: 100,
+                        min_ms: 3,
+                        p50_ms: 6,
+                        p95_ms: 9,
+                        max_ms: 12,
+                    }],
+                    budget: None,
+                },
+            ],
+        )
+        .expect("aggregate scenario runs");
+
+        assert_eq!(aggregated.scenario, Scenario::Hot);
+        assert_eq!(aggregated.profile, Profile::Heavy);
+        assert_eq!(aggregated.phases[0].elapsed_ms, 1_000);
+        assert_eq!(aggregated.phases[0].events_per_second, 9_000.0);
+        assert_eq!(aggregated.readiness[0].elapsed_ms, 405);
+        assert_eq!(aggregated.queries[0].min_ms, 3);
+        assert_eq!(aggregated.queries[0].p50_ms, 6);
+        assert_eq!(aggregated.queries[0].p95_ms, 9);
+        assert_eq!(aggregated.queries[0].max_ms, 12);
+    }
+
+    #[test]
+    fn series_output_paths_match_the_published_layout() {
+        let paths = series_paths(
+            Path::new("artifacts/performance/2026-03-13-m3-pro-heavy"),
+            Scenario::Repair,
+        );
+
+        assert_eq!(
+            paths.run_output(1),
+            PathBuf::from("artifacts/performance/2026-03-13-m3-pro-heavy/repair-path/run-01.json")
+        );
+        assert_eq!(
+            paths.run_output(5),
+            PathBuf::from("artifacts/performance/2026-03-13-m3-pro-heavy/repair-path/run-05.json")
+        );
+        assert_eq!(
+            paths.median_output(),
+            PathBuf::from("artifacts/performance/2026-03-13-m3-pro-heavy/repair-path/median.json")
+        );
+        assert_eq!(
+            summary_output_path(Path::new("artifacts/performance/2026-03-13-m3-pro-heavy")),
+            PathBuf::from("artifacts/performance/2026-03-13-m3-pro-heavy/summary.json")
+        );
+        assert_eq!(
+            host_metadata_output_path(Path::new("artifacts/performance/2026-03-13-m3-pro-heavy")),
+            PathBuf::from("artifacts/performance/2026-03-13-m3-pro-heavy/host.json")
+        );
+    }
+
+    #[test]
+    fn render_series_markdown_summary_includes_host_and_median_results() {
+        let summary = SeriesSummary {
+            profile: Profile::Heavy,
+            repetitions: 5,
+            host: HostMetadata {
+                cpu_model: "Apple M3 Pro".to_owned(),
+                memory_bytes: 38_654_705_664,
+                memory_gib: 36.0,
+                os_kernel: "Darwin 25.1.0".to_owned(),
+                architecture: "arm64".to_owned(),
+                benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
+            },
+            scenarios: vec![ScenarioResult {
+                scenario: Scenario::Scale,
+                profile: Profile::Heavy,
+                phases: vec![PhaseMeasurement {
+                    name: "ingest".to_owned(),
+                    events_sent: 180_000,
+                    elapsed_ms: 19_000,
+                    events_per_second: 9_473.68,
+                }],
+                readiness: vec![ReadinessMeasurement {
+                    name: "derived_metrics_ready".to_owned(),
+                    elapsed_ms: 18_500,
+                }],
+                queries: vec![QueryMeasurement {
+                    name: "events_hour_dim2".to_owned(),
+                    iterations: 100,
+                    min_ms: 9,
+                    p50_ms: 14,
+                    p95_ms: 19,
+                    max_ms: 31,
+                }],
+                budget: None,
+            }],
+        };
+
+        let markdown = render_series_markdown_summary(&summary);
+
+        assert!(markdown.contains("# Fantasma Heavy Benchmark Series"));
+        assert!(markdown.contains("- Profile: heavy"));
+        assert!(markdown.contains("- Repetitions per scenario: 5"));
+        assert!(markdown.contains("- Host: Apple M3 Pro / 36 GiB / Darwin 25.1.0 / arm64"));
+        assert!(markdown.contains("## scale-path"));
+        assert!(markdown.contains("- ingest: 180000 events in 19000ms (9473.68 events/s)"));
+        assert!(markdown.contains("| events_hour_dim2 | 14 | 19 | 9 | 31 |"));
     }
 
     #[test]

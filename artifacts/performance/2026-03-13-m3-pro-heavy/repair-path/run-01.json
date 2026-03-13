@@ -1,0 +1,63 @@
+{
+  "scenario": "repair-path",
+  "profile": "heavy",
+  "phases": [
+    {
+      "name": "seed_ingest",
+      "events_sent": 3000,
+      "elapsed_ms": 111,
+      "events_per_second": 26932.843117284112
+    },
+    {
+      "name": "repair_ingest",
+      "events_sent": 1200,
+      "elapsed_ms": 44,
+      "events_per_second": 27105.040706350133
+    }
+  ],
+  "readiness": [
+    {
+      "name": "seed_ready",
+      "elapsed_ms": 1690
+    },
+    {
+      "name": "repair_ready",
+      "elapsed_ms": 1145
+    }
+  ],
+  "queries": [
+    {
+      "name": "events_day_dim2",
+      "iterations": 100,
+      "min_ms": 1,
+      "p50_ms": 1,
+      "p95_ms": 2,
+      "max_ms": 2
+    },
+    {
+      "name": "events_hour_dim2",
+      "iterations": 100,
+      "min_ms": 3,
+      "p50_ms": 4,
+      "p95_ms": 5,
+      "max_ms": 7
+    },
+    {
+      "name": "sessions_count_day",
+      "iterations": 100,
+      "min_ms": 0,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    },
+    {
+      "name": "sessions_duration_total_day",
+      "iterations": 100,
+      "min_ms": 0,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 1
+    }
+  ],
+  "budget": null
+}
