@@ -109,6 +109,7 @@ Fantasma now expects Codex agents to use the installed `superpowers` skills when
 - Do not call a bug fixed unless the reproducing test passes after the change.
 - Use `systematic-debugging` for defects, flaky tests, or unexpected runtime behavior instead of guessing at fixes.
 - Use `verification-before-completion` before claiming work is done, fixed, or passing. Do not report success without fresh command output.
+- Before pushing, run the same CI-scope checks your change can affect. At minimum, workspace-affecting Rust changes must run `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`, not just package-scoped checks; new scripts must at least pass `bash -n`.
 - Use `requesting-code-review` or `receiving-code-review` when preparing or responding to substantive review cycles.
 - Use `finishing-a-development-branch` before final handoff when the task includes branch cleanup, verification, and merge-readiness work.
 - Do not use git worktrees in this repository. Work in the current checkout even if a generic skill suggests creating a worktree.

@@ -1518,11 +1518,8 @@ async fn list_projects(
     original_uri: OriginalUri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    match auth_status(&state, &headers) {
-        Some(status) => {
-            return (status, Json(json!({ "error": status_error(status) }))).into_response();
-        }
-        None => {}
+    if let Some(status) = auth_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
     }
     record_request(
         &state,
@@ -1553,11 +1550,8 @@ async fn create_project(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    match auth_status(&state, &headers) {
-        Some(status) => {
-            return (status, Json(json!({ "error": status_error(status) }))).into_response();
-        }
-        None => {}
+    if let Some(status) = auth_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
     }
     record_request(
         &state,
@@ -1596,11 +1590,8 @@ async fn create_key(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    match auth_status(&state, &headers) {
-        Some(status) => {
-            return (status, Json(json!({ "error": status_error(status) }))).into_response();
-        }
-        None => {}
+    if let Some(status) = auth_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
     }
     record_request(
         &state,
@@ -1642,11 +1633,8 @@ async fn list_keys(
     original_uri: OriginalUri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    match auth_status(&state, &headers) {
-        Some(status) => {
-            return (status, Json(json!({ "error": status_error(status) }))).into_response();
-        }
-        None => {}
+    if let Some(status) = auth_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
     }
     record_request(
         &state,
@@ -1679,11 +1667,8 @@ async fn session_metrics(
     original_uri: OriginalUri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    match project_key_status(&state, &headers) {
-        Some(status) => {
-            return (status, Json(json!({ "error": status_error(status) }))).into_response();
-        }
-        None => {}
+    if let Some(status) = project_key_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
     }
     record_request(
         &state,
@@ -1720,11 +1705,8 @@ async fn event_metrics(
     original_uri: OriginalUri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    match project_key_status(&state, &headers) {
-        Some(status) => {
-            return (status, Json(json!({ "error": status_error(status) }))).into_response();
-        }
-        None => {}
+    if let Some(status) = project_key_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
     }
     record_request(
         &state,
@@ -1764,11 +1746,8 @@ async fn revoke_key(
     original_uri: OriginalUri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    match auth_status(&state, &headers) {
-        Some(status) => {
-            return (status, Json(json!({ "error": status_error(status) }))).into_response();
-        }
-        None => {}
+    if let Some(status) = auth_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
     }
     record_request(
         &state,

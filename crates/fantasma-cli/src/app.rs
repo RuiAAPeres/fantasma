@@ -573,47 +573,37 @@ impl App {
         sessions: SessionMetricsArgs,
     ) -> anyhow::Result<CommandOutput> {
         let body = self
-            .metrics_request(
-                "/v1/metrics/sessions",
-                sessions.metric.as_str(),
-                sessions.granularity.as_str(),
-                &sessions.start,
-                &sessions.end,
-                None,
-                &sessions.filters,
-                &sessions.group_by,
-            )
+            .metrics_request(MetricsRequest {
+                path: "/v1/metrics/sessions",
+                metric: sessions.metric.as_str(),
+                granularity: sessions.granularity.as_str(),
+                start: &sessions.start,
+                end: &sessions.end,
+                event: None,
+                filters: &sessions.filters,
+                group_by: &sessions.group_by,
+            })
             .await?;
         render_metrics_output(body, sessions.output.json)
     }
 
     async fn metrics_events(&self, events: EventMetricsArgs) -> anyhow::Result<CommandOutput> {
         let body = self
-            .metrics_request(
-                "/v1/metrics/events",
-                events.metric.as_str(),
-                events.granularity.as_str(),
-                &events.start,
-                &events.end,
-                Some(events.event),
-                &events.filters,
-                &events.group_by,
-            )
+            .metrics_request(MetricsRequest {
+                path: "/v1/metrics/events",
+                metric: events.metric.as_str(),
+                granularity: events.granularity.as_str(),
+                start: &events.start,
+                end: &events.end,
+                event: Some(events.event),
+                filters: &events.filters,
+                group_by: &events.group_by,
+            })
             .await?;
         render_metrics_output(body, events.output.json)
     }
 
-    async fn metrics_request(
-        &self,
-        path: &str,
-        metric: &str,
-        granularity: &str,
-        start: &str,
-        end: &str,
-        event: Option<String>,
-        filters: &[String],
-        group_by: &[String],
-    ) -> anyhow::Result<String> {
+    async fn metrics_request(&self, request: MetricsRequest<'_>) -> anyhow::Result<String> {
         let config = load_config(&self.config_path)?;
         let profile = active_instance(&config)?;
         let project_id = profile
@@ -627,23 +617,23 @@ impl App {
             .context(
                 "read key is not configured for the active project; run `fantasma keys create --kind read --name <key-name>`",
             )?;
-        let mut url = api_url(&profile.api_base_url, path).context("build metrics url")?;
+        let mut url = api_url(&profile.api_base_url, request.path).context("build metrics url")?;
         {
             let mut query = url.query_pairs_mut();
-            query.append_pair("metric", metric);
-            query.append_pair("granularity", granularity);
-            query.append_pair("start", start);
-            query.append_pair("end", end);
-            if let Some(event) = event.as_deref() {
+            query.append_pair("metric", request.metric);
+            query.append_pair("granularity", request.granularity);
+            query.append_pair("start", request.start);
+            query.append_pair("end", request.end);
+            if let Some(event) = request.event.as_deref() {
                 query.append_pair("event", event);
             }
-            for filter in filters {
+            for filter in request.filters {
                 let (key, value) = filter
                     .split_once('=')
                     .with_context(|| format!("invalid filter '{filter}', expected key=value"))?;
                 query.append_pair(key, value);
             }
-            for dimension in group_by {
+            for dimension in request.group_by {
                 query.append_pair("group_by", dimension);
             }
         }
@@ -657,6 +647,17 @@ impl App {
         ensure_success(response.status(), "load metrics")?;
         response.text().await.context("read metrics body")
     }
+}
+
+struct MetricsRequest<'a> {
+    path: &'a str,
+    metric: &'a str,
+    granularity: &'a str,
+    start: &'a str,
+    end: &'a str,
+    event: Option<String>,
+    filters: &'a [String],
+    group_by: &'a [String],
 }
 
 fn active_instance_name(config: &CliConfig) -> anyhow::Result<&str> {
