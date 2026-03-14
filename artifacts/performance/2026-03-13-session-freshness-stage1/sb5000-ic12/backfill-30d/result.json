@@ -1,0 +1,39 @@
+{
+  "scenario": "backfill-30d",
+  "run_config": {
+    "repetitions_30d": 1,
+    "worker_config": {
+      "session_batch_size": 5000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 12,
+      "session_repair_concurrency": 2
+    }
+  },
+  "phases": [
+    {
+      "name": "ingest",
+      "events_sent": 900000,
+      "elapsed_ms": 32341,
+      "events_per_second": 27828.053973939932
+    }
+  ],
+  "readiness": [
+    {
+      "name": "event_metrics_ready_ms",
+      "elapsed_ms": 265
+    },
+    {
+      "name": "session_metrics_ready_ms",
+      "elapsed_ms": 21396
+    },
+    {
+      "name": "derived_metrics_ready_ms",
+      "elapsed_ms": 21396
+    }
+  ],
+  "queries": [],
+  "budget": {
+    "passed": true,
+    "failures": []
+  }
+}

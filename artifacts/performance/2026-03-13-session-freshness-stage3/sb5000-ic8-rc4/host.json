@@ -1,0 +1,8 @@
+{
+  "cpu_model": "Apple M3 Pro",
+  "memory_bytes": 38654705664,
+  "memory_gib": 36.0,
+  "os_kernel": "Darwin 25.1.0",
+  "architecture": "aarch64",
+  "benchmarked_at": "2026-03-14T00:07:58.587629+00:00"
+}

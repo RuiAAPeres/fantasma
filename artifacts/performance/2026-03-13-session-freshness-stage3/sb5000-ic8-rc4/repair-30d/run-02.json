@@ -1,0 +1,45 @@
+{
+  "scenario": "repair-30d",
+  "run_config": {
+    "repetitions_30d": 3,
+    "worker_config": {
+      "session_batch_size": 5000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 4
+    }
+  },
+  "phases": [
+    {
+      "name": "seed_ingest",
+      "events_sent": 900000,
+      "elapsed_ms": 37673,
+      "events_per_second": 23889.68761552489
+    },
+    {
+      "name": "repair_ingest",
+      "events_sent": 3000,
+      "elapsed_ms": 149,
+      "events_per_second": 20098.291902446428
+    }
+  ],
+  "readiness": [
+    {
+      "name": "event_metrics_ready_ms",
+      "elapsed_ms": 978
+    },
+    {
+      "name": "session_metrics_ready_ms",
+      "elapsed_ms": 2399
+    },
+    {
+      "name": "derived_metrics_ready_ms",
+      "elapsed_ms": 2399
+    }
+  ],
+  "queries": [],
+  "budget": {
+    "passed": true,
+    "failures": []
+  }
+}

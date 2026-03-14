@@ -1,0 +1,99 @@
+{
+  "host": {
+    "cpu_model": "Apple M3 Pro",
+    "memory_bytes": 38654705664,
+    "memory_gib": 36.0,
+    "os_kernel": "Darwin 25.1.0",
+    "architecture": "aarch64",
+    "benchmarked_at": "2026-03-13T23:51:31.440150+00:00"
+  },
+  "run_config": {
+    "repetitions_30d": 3,
+    "worker_config": {
+      "session_batch_size": 5000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2
+    }
+  },
+  "scenarios": [
+    {
+      "scenario": "append-90d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 2700000,
+          "elapsed_ms": 94848,
+          "events_per_second": 28466.512253192424
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 417
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 30167
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 30167
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "backfill-90d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 2700000,
+          "elapsed_ms": 106969,
+          "events_per_second": 25240.78403087029
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 413
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 78087
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 78087
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    }
+  ]
+}

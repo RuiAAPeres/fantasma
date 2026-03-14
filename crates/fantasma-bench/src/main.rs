@@ -34,6 +34,11 @@ const SLO_REPAIR_INSTALL_MODULUS: usize = 20;
 const SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY: usize = 2;
 const SLO_WARMUP_QUERIES: usize = 10;
 const SLO_MEASURED_QUERIES: usize = 100;
+const DEFAULT_SLO_REPETITIONS_30D: usize = 3;
+const DEFAULT_SLO_SESSION_BATCH_SIZE: i64 = 1_000;
+const DEFAULT_SLO_EVENT_BATCH_SIZE: i64 = 5_000;
+const DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY: usize = 8;
+const DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -110,6 +115,7 @@ struct SeriesArgs {
 struct SloArgs {
     output_dir: PathBuf,
     scenarios: Vec<String>,
+    run_config: SloRunConfig,
 }
 
 #[derive(Debug, Parser)]
@@ -142,6 +148,16 @@ enum CliCommand {
         output_dir: PathBuf,
         #[arg(long = "scenario")]
         scenarios: Vec<String>,
+        #[arg(long, default_value_t = DEFAULT_SLO_REPETITIONS_30D)]
+        repetitions_30d: usize,
+        #[arg(long, default_value_t = DEFAULT_SLO_SESSION_BATCH_SIZE)]
+        worker_session_batch_size: i64,
+        #[arg(long, default_value_t = DEFAULT_SLO_EVENT_BATCH_SIZE)]
+        worker_event_batch_size: i64,
+        #[arg(long, default_value_t = DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY)]
+        worker_session_incremental_concurrency: usize,
+        #[arg(long, default_value_t = DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY)]
+        worker_session_repair_concurrency: usize,
     },
 }
 
@@ -248,8 +264,12 @@ impl SloWindow {
         self.days() * SLO_INSTALL_COUNT_PER_DAY * SLO_EVENTS_PER_INSTALL_PER_DAY
     }
 
-    fn repetitions(self) -> usize {
-        if matches!(self, Self::Days30) { 3 } else { 1 }
+    fn repetitions(self, repetitions_30d: usize) -> usize {
+        if matches!(self, Self::Days30) {
+            repetitions_30d.max(1)
+        } else {
+            1
+        }
     }
 
     fn readiness_timeout(self) -> Duration {
@@ -369,6 +389,7 @@ async fn wait_for_full_readiness_before_query_benchmark(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SloScenarioResult {
     scenario: String,
+    run_config: SloRunConfig,
     phases: Vec<PhaseMeasurement>,
     readiness: Vec<ReadinessMeasurement>,
     queries: Vec<QueryMeasurement>,
@@ -380,7 +401,42 @@ struct SloScenarioResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SloSummary {
     host: HostMetadata,
+    run_config: SloRunConfig,
     scenarios: Vec<SloScenarioResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SloRunConfig {
+    repetitions_30d: usize,
+    worker_config: BenchWorkerConfig,
+}
+
+impl Default for SloRunConfig {
+    fn default() -> Self {
+        Self {
+            repetitions_30d: DEFAULT_SLO_REPETITIONS_30D,
+            worker_config: BenchWorkerConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BenchWorkerConfig {
+    session_batch_size: i64,
+    event_batch_size: i64,
+    session_incremental_concurrency: usize,
+    session_repair_concurrency: usize,
+}
+
+impl Default for BenchWorkerConfig {
+    fn default() -> Self {
+        Self {
+            session_batch_size: DEFAULT_SLO_SESSION_BATCH_SIZE,
+            event_batch_size: DEFAULT_SLO_EVENT_BATCH_SIZE,
+            session_incremental_concurrency: DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY,
+            session_repair_concurrency: DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -545,9 +601,23 @@ where
         CliCommand::Slo {
             output_dir,
             scenarios,
+            repetitions_30d,
+            worker_session_batch_size,
+            worker_event_batch_size,
+            worker_session_incremental_concurrency,
+            worker_session_repair_concurrency,
         } => BenchCommand::Slo(SloArgs {
             output_dir,
             scenarios,
+            run_config: SloRunConfig {
+                repetitions_30d,
+                worker_config: BenchWorkerConfig {
+                    session_batch_size: worker_session_batch_size.max(1),
+                    event_batch_size: worker_event_batch_size.max(1),
+                    session_incremental_concurrency: worker_session_incremental_concurrency.max(1),
+                    session_repair_concurrency: worker_session_repair_concurrency.max(1),
+                },
+            },
         }),
     })
 }
@@ -636,11 +706,18 @@ impl SloScenarioPaths {
 
 async fn run_slo(args: SloArgs) -> Result<()> {
     let host = collect_host_metadata()?;
-    let scenarios = select_slo_scenarios(&args.scenarios)?;
+    let scenarios = select_slo_scenarios(&args.scenarios, &args.run_config)?;
 
-    run_slo_with_executor(&args.output_dir, host, &scenarios, |scenario| async move {
-        execute_slo_scenario(&scenario).await
-    })
+    run_slo_with_executor(
+        &args.output_dir,
+        host,
+        &args.run_config,
+        &scenarios,
+        |scenario| {
+            let run_config = args.run_config.clone();
+            async move { execute_slo_scenario(&scenario, &run_config).await }
+        },
+    )
     .await
 }
 
@@ -648,14 +725,15 @@ async fn run_slo(args: SloArgs) -> Result<()> {
 async fn run_slo_suite<Execute, ExecuteFut>(
     output_dir: &Path,
     host: HostMetadata,
+    run_config: SloRunConfig,
     mut execute: Execute,
 ) -> Result<()>
 where
     Execute: FnMut(SloScenarioDefinition) -> ExecuteFut,
     ExecuteFut: std::future::Future<Output = Result<SloScenarioResult>>,
 {
-    let scenarios = slo_scenario_definitions();
-    run_slo_with_executor(output_dir, host, &scenarios, move |scenario| {
+    let scenarios = slo_scenario_definitions(&run_config);
+    run_slo_with_executor(output_dir, host, &run_config, &scenarios, move |scenario| {
         execute(scenario)
     })
     .await
@@ -664,6 +742,7 @@ where
 async fn run_slo_with_executor<Execute, ExecuteFut>(
     output_dir: &Path,
     host: HostMetadata,
+    run_config: &SloRunConfig,
     scenarios: &[SloScenarioDefinition],
     mut execute: Execute,
 ) -> Result<()>
@@ -686,7 +765,8 @@ where
                 Ok(result) => result,
                 Err(error) => {
                     let failure = format!("scenario execution failed: {error:#}");
-                    let failed_result = slo_execution_failure_result(&scenario, failure.clone());
+                    let failed_result =
+                        slo_execution_failure_result(&scenario, run_config, failure.clone());
                     write_slo_result(&paths.run_output(run_number), &failed_result)?;
                     suite_failures.push(format!("{}: {}", scenario.key(), failure));
                     summary_results.push(failed_result);
@@ -724,6 +804,7 @@ where
 
     let summary = SloSummary {
         host,
+        run_config: run_config.clone(),
         scenarios: summary_results,
     };
     write_slo_summary(output_dir, &summary)?;
@@ -763,10 +844,12 @@ fn prepare_clean_output_dir(output_dir: &Path) -> Result<()> {
 
 fn slo_execution_failure_result(
     scenario: &SloScenarioDefinition,
+    run_config: &SloRunConfig,
     failure: String,
 ) -> SloScenarioResult {
     SloScenarioResult {
         scenario: scenario.key(),
+        run_config: run_config.clone(),
         phases: Vec::new(),
         readiness: Vec::new(),
         queries: Vec::new(),
@@ -778,27 +861,31 @@ fn slo_execution_failure_result(
     }
 }
 
-async fn execute_slo_scenario(scenario: &SloScenarioDefinition) -> Result<SloScenarioResult> {
+async fn execute_slo_scenario(
+    scenario: &SloScenarioDefinition,
+    run_config: &SloRunConfig,
+) -> Result<SloScenarioResult> {
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .context("build SLO HTTP client")?;
 
-    let mut stack = StackGuard::new(compose_file_path());
+    let rendered_compose_file = render_slo_compose_file(run_config)?;
+    let mut stack = StackGuard::with_cleanup(rendered_compose_file, true);
     stack.start()?;
     wait_for_health(&client).await?;
     let project = provision_project(&client).await?;
 
     match scenario.kind {
         SloScenarioKind::Append => {
-            run_slo_append_like(&client, &project, scenario, false, false).await
+            run_slo_append_like(&client, &project, scenario, run_config, false, false).await
         }
         SloScenarioKind::Backfill => {
-            run_slo_append_like(&client, &project, scenario, true, false).await
+            run_slo_append_like(&client, &project, scenario, run_config, true, false).await
         }
-        SloScenarioKind::Repair => run_slo_repair(&client, &project, scenario).await,
+        SloScenarioKind::Repair => run_slo_repair(&client, &project, scenario, run_config).await,
         SloScenarioKind::Reads => {
-            run_slo_append_like(&client, &project, scenario, false, true).await
+            run_slo_append_like(&client, &project, scenario, run_config, false, true).await
         }
     }
 }
@@ -807,6 +894,7 @@ async fn run_slo_append_like(
     client: &Client,
     project: &ProvisionedProject,
     scenario: &SloScenarioDefinition,
+    run_config: &SloRunConfig,
     reverse_day_order: bool,
     benchmark_reads: bool,
 ) -> Result<SloScenarioResult> {
@@ -859,6 +947,7 @@ async fn run_slo_append_like(
 
     Ok(SloScenarioResult {
         scenario: scenario.key(),
+        run_config: run_config.clone(),
         phases: vec![ingest_phase],
         readiness,
         queries,
@@ -871,6 +960,7 @@ async fn run_slo_repair(
     client: &Client,
     project: &ProvisionedProject,
     scenario: &SloScenarioDefinition,
+    run_config: &SloRunConfig,
 ) -> Result<SloScenarioResult> {
     let seed_phase =
         ingest_slo_window(client, project, scenario.window, false, "seed_ingest").await?;
@@ -904,6 +994,7 @@ async fn run_slo_repair(
 
     Ok(SloScenarioResult {
         scenario: scenario.key(),
+        run_config: run_config.clone(),
         phases: vec![seed_phase, repair_phase],
         readiness,
         queries: Vec::new(),
@@ -929,7 +1020,7 @@ where
     Ok((phase_output, readiness))
 }
 
-fn slo_scenario_definitions() -> Vec<SloScenarioDefinition> {
+fn slo_scenario_definitions(run_config: &SloRunConfig) -> Vec<SloScenarioDefinition> {
     let mut scenarios = Vec::with_capacity(12);
     for window in [SloWindow::Days30, SloWindow::Days90, SloWindow::Days180] {
         for kind in [
@@ -941,15 +1032,18 @@ fn slo_scenario_definitions() -> Vec<SloScenarioDefinition> {
             scenarios.push(SloScenarioDefinition {
                 kind,
                 window,
-                repetitions: window.repetitions(),
+                repetitions: window.repetitions(run_config.repetitions_30d),
             });
         }
     }
     scenarios
 }
 
-fn select_slo_scenarios(requested: &[String]) -> Result<Vec<SloScenarioDefinition>> {
-    let scenarios = slo_scenario_definitions();
+fn select_slo_scenarios(
+    requested: &[String],
+    run_config: &SloRunConfig,
+) -> Result<Vec<SloScenarioDefinition>> {
+    let scenarios = slo_scenario_definitions(run_config);
     if requested.is_empty() {
         return Ok(scenarios);
     }
@@ -1776,6 +1870,7 @@ fn aggregate_slo_runs(
 
     Ok(SloScenarioResult {
         scenario: scenario.key(),
+        run_config: first.run_config.clone(),
         phases,
         readiness,
         queries,
@@ -1821,6 +1916,8 @@ fn render_slo_markdown_summary(summary: &SloSummary) -> String {
         format!("- Benchmarked at: {}", summary.host.benchmarked_at),
         String::new(),
     ];
+    lines.extend(render_slo_run_config_lines(&summary.run_config));
+    lines.push(String::new());
 
     for scenario in &summary.scenarios {
         lines.push(render_slo_scenario_section(scenario, Some("##")));
@@ -1843,6 +1940,8 @@ fn render_slo_scenario_section(result: &SloScenarioResult, heading_prefix: Optio
         ));
         lines.push(String::new());
     }
+    lines.extend(render_slo_run_config_lines(&result.run_config));
+    lines.push(String::new());
 
     for phase in &result.phases {
         lines.push(format!(
@@ -1879,6 +1978,29 @@ fn render_slo_scenario_section(result: &SloScenarioResult, heading_prefix: Optio
     }
 
     lines.join("\n")
+}
+
+fn render_slo_run_config_lines(run_config: &SloRunConfig) -> Vec<String> {
+    vec![
+        "- Run config:".to_owned(),
+        format!("  - repetitions_30d: {}", run_config.repetitions_30d),
+        format!(
+            "  - worker_session_batch_size: {}",
+            run_config.worker_config.session_batch_size
+        ),
+        format!(
+            "  - worker_event_batch_size: {}",
+            run_config.worker_config.event_batch_size
+        ),
+        format!(
+            "  - worker_session_incremental_concurrency: {}",
+            run_config.worker_config.session_incremental_concurrency
+        ),
+        format!(
+            "  - worker_session_repair_concurrency: {}",
+            run_config.worker_config.session_repair_concurrency
+        ),
+    ]
 }
 
 async fn execute_scenario(scenario: Scenario, profile: Profile) -> Result<ScenarioResult> {
@@ -3197,6 +3319,73 @@ fn compose_file_path() -> PathBuf {
     repo_root().join("infra/docker/compose.bench.yaml")
 }
 
+fn render_slo_compose_file(run_config: &SloRunConfig) -> Result<PathBuf> {
+    let template_path = compose_file_path();
+    let template = fs::read_to_string(&template_path).with_context(|| {
+        format!(
+            "read benchmark compose template {}",
+            template_path.display()
+        )
+    })?;
+    let rendered = render_benchmark_compose_template(&template, &run_config.worker_config);
+    let output = template_path
+        .parent()
+        .expect("benchmark compose template lives in a directory")
+        .join(format!(
+            "fantasma-bench-{}.yaml",
+            Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000)
+        ));
+    fs::write(&output, rendered)
+        .with_context(|| format!("write rendered benchmark compose file {}", output.display()))?;
+    Ok(output)
+}
+
+fn render_benchmark_compose_template(template: &str, worker_config: &BenchWorkerConfig) -> String {
+    let mut rendered_lines = Vec::new();
+
+    for line in template.lines() {
+        if line
+            .trim_start()
+            .starts_with("FANTASMA_WORKER_SESSION_BATCH_SIZE:")
+        {
+            rendered_lines.push(format!(
+                "      FANTASMA_WORKER_SESSION_BATCH_SIZE: {}",
+                worker_config.session_batch_size
+            ));
+        } else if line
+            .trim_start()
+            .starts_with("FANTASMA_WORKER_EVENT_BATCH_SIZE:")
+        {
+            rendered_lines.push(format!(
+                "      FANTASMA_WORKER_EVENT_BATCH_SIZE: {}",
+                worker_config.event_batch_size
+            ));
+        } else if line
+            .trim_start()
+            .starts_with("FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY:")
+        {
+            rendered_lines.push(format!(
+                "      FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY: {}",
+                worker_config.session_incremental_concurrency
+            ));
+        } else if line
+            .trim_start()
+            .starts_with("FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY:")
+        {
+            rendered_lines.push(format!(
+                "      FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY: {}",
+                worker_config.session_repair_concurrency
+            ));
+        } else {
+            rendered_lines.push(line.to_owned());
+        }
+    }
+
+    rendered_lines.join("\n")
+}
+
 fn benchmark_compose_project_name() -> &'static str {
     BENCHMARK_COMPOSE_PROJECT_NAME
 }
@@ -3227,13 +3416,19 @@ fn repo_root() -> PathBuf {
 
 struct StackGuard {
     compose_file: PathBuf,
+    cleanup_compose_file: bool,
     started: bool,
 }
 
 impl StackGuard {
     fn new(compose_file: PathBuf) -> Self {
+        Self::with_cleanup(compose_file, false)
+    }
+
+    fn with_cleanup(compose_file: PathBuf, cleanup_compose_file: bool) -> Self {
         Self {
             compose_file,
+            cleanup_compose_file,
             started: false,
         }
     }
@@ -3252,6 +3447,9 @@ impl Drop for StackGuard {
                 &self.compose_file,
                 ["down", "--volumes", "--remove-orphans"],
             ));
+        }
+        if self.cleanup_compose_file {
+            let _ = fs::remove_file(&self.compose_file);
         }
     }
 }
@@ -3376,6 +3574,10 @@ mod tests {
             architecture: "arm64".to_owned(),
             benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
         }
+    }
+
+    fn dummy_slo_run_config() -> SloRunConfig {
+        SloRunConfig::default()
     }
 
     fn recent_main_runner_samples() -> Vec<(ScenarioBudget, ScenarioResult)> {
@@ -3545,6 +3747,7 @@ mod tests {
             BenchCommand::Slo(SloArgs {
                 output_dir: PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo"),
                 scenarios: Vec::new(),
+                run_config: dummy_slo_run_config(),
             })
         );
     }
@@ -3568,14 +3771,56 @@ mod tests {
             BenchCommand::Slo(SloArgs {
                 output_dir: PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo"),
                 scenarios: vec!["append-30d".to_owned(), "reads-90d".to_owned()],
+                run_config: dummy_slo_run_config(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_slo_command_reads_worker_overrides_and_repetition_override() {
+        let command = parse_args([
+            "fantasma-bench",
+            "slo",
+            "--output-dir",
+            "artifacts/performance/2026-03-13-derived-metrics-slo",
+            "--repetitions-30d",
+            "1",
+            "--worker-session-batch-size",
+            "2000",
+            "--worker-event-batch-size",
+            "7000",
+            "--worker-session-incremental-concurrency",
+            "12",
+            "--worker-session-repair-concurrency",
+            "4",
+        ])
+        .expect("parse slo override command");
+
+        assert_eq!(
+            command,
+            BenchCommand::Slo(SloArgs {
+                output_dir: PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo"),
+                scenarios: Vec::new(),
+                run_config: SloRunConfig {
+                    repetitions_30d: 1,
+                    worker_config: BenchWorkerConfig {
+                        session_batch_size: 2_000,
+                        event_batch_size: 7_000,
+                        session_incremental_concurrency: 12,
+                        session_repair_concurrency: 4,
+                    },
+                },
             })
         );
     }
 
     #[test]
     fn select_slo_scenarios_filters_requested_keys() {
-        let scenarios = select_slo_scenarios(&["append-30d".to_owned(), "reads-90d".to_owned()])
-            .expect("select requested scenarios");
+        let scenarios = select_slo_scenarios(
+            &["append-30d".to_owned(), "reads-90d".to_owned()],
+            &dummy_slo_run_config(),
+        )
+        .expect("select requested scenarios");
 
         assert_eq!(
             scenarios
@@ -3588,7 +3833,7 @@ mod tests {
 
     #[test]
     fn select_slo_scenarios_rejects_unknown_keys() {
-        let error = select_slo_scenarios(&["unknown".to_owned()])
+        let error = select_slo_scenarios(&["unknown".to_owned()], &dummy_slo_run_config())
             .expect_err("unknown scenario should fail");
 
         assert!(error.to_string().contains("unknown slo scenario"));
@@ -3596,7 +3841,8 @@ mod tests {
 
     #[test]
     fn select_slo_scenarios_returns_all_when_no_filter_is_supplied() {
-        let scenarios = select_slo_scenarios(&[]).expect("load default scenarios");
+        let run_config = dummy_slo_run_config();
+        let scenarios = select_slo_scenarios(&[], &run_config).expect("load default scenarios");
 
         assert_eq!(scenarios.len(), 12);
         assert_eq!(
@@ -3604,7 +3850,7 @@ mod tests {
                 .iter()
                 .map(|scenario| scenario.key())
                 .collect::<Vec<_>>(),
-            slo_scenario_definitions()
+            slo_scenario_definitions(&run_config)
                 .iter()
                 .map(|scenario| scenario.key())
                 .collect::<Vec<_>>()
@@ -3613,7 +3859,7 @@ mod tests {
 
     #[test]
     fn slo_scenarios_lock_workload_sizes_and_repetition_policy() {
-        let scenarios = slo_scenario_definitions();
+        let scenarios = slo_scenario_definitions(&dummy_slo_run_config());
 
         assert_eq!(scenarios.len(), 12);
         assert_eq!(
@@ -3656,6 +3902,31 @@ mod tests {
                 .iter()
                 .find(|scenario| scenario.key() == "reads-180d")
                 .expect("reads-180d")
+                .repetitions,
+            1
+        );
+    }
+
+    #[test]
+    fn slo_scenarios_honor_30d_repetition_override() {
+        let scenarios = slo_scenario_definitions(&SloRunConfig {
+            repetitions_30d: 1,
+            worker_config: BenchWorkerConfig::default(),
+        });
+
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.key() == "append-30d")
+                .expect("append-30d")
+                .repetitions,
+            1
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.key() == "append-90d")
+                .expect("append-90d")
                 .repetitions,
             1
         );
@@ -3765,7 +4036,7 @@ mod tests {
 
     #[test]
     fn filtered_dim4_event_hard_gates_do_not_expect_the_full_event_total() {
-        let scenario = slo_scenario_definitions()
+        let scenario = slo_scenario_definitions(&dummy_slo_run_config())
             .into_iter()
             .find(|scenario| scenario.key() == "append-30d")
             .expect("append-30d scenario");
@@ -3783,7 +4054,7 @@ mod tests {
 
     #[test]
     fn repair_seed_filtered_dim4_event_hard_gates_do_not_include_late_events() {
-        let scenario = slo_scenario_definitions()
+        let scenario = slo_scenario_definitions(&dummy_slo_run_config())
             .into_iter()
             .find(|scenario| scenario.key() == "repair-30d")
             .expect("repair-30d scenario");
@@ -3803,6 +4074,7 @@ mod tests {
     fn slo_budget_evaluation_only_gates_30d_freshness_and_grouped_reads() {
         let append_90 = SloScenarioResult {
             scenario: "append-90d".to_owned(),
+            run_config: dummy_slo_run_config(),
             phases: vec![],
             readiness: vec![
                 ReadinessMeasurement {
@@ -3824,6 +4096,7 @@ mod tests {
         };
         let reads_180 = SloScenarioResult {
             scenario: "reads-180d".to_owned(),
+            run_config: dummy_slo_run_config(),
             phases: vec![],
             readiness: vec![],
             queries: vec![QueryMeasurement {
@@ -3839,14 +4112,14 @@ mod tests {
         };
 
         let append_90_budget = evaluate_slo_budget(
-            &slo_scenario_definitions()
+            &slo_scenario_definitions(&dummy_slo_run_config())
                 .into_iter()
                 .find(|scenario| scenario.key() == "append-90d")
                 .expect("append-90d"),
             &append_90,
         );
         let reads_180_budget = evaluate_slo_budget(
-            &slo_scenario_definitions()
+            &slo_scenario_definitions(&dummy_slo_run_config())
                 .into_iter()
                 .find(|scenario| scenario.key() == "reads-180d")
                 .expect("reads-180d"),
@@ -3945,12 +4218,17 @@ mod tests {
         fs::create_dir_all(output_dir.join("stale-scenario")).expect("create stale subtree");
         fs::write(output_dir.join("summary.json"), "stale").expect("write stale summary");
 
-        let error = run_slo_suite(&output_dir, dummy_slo_host(), |scenario| async move {
-            let scenario_key = scenario.key();
-            Err::<SloScenarioResult, anyhow::Error>(anyhow!(
-                "intentional failure for {scenario_key}"
-            ))
-        })
+        let error = run_slo_suite(
+            &output_dir,
+            dummy_slo_host(),
+            dummy_slo_run_config(),
+            |scenario: SloScenarioDefinition| async move {
+                let scenario_key = scenario.key();
+                Err::<SloScenarioResult, anyhow::Error>(anyhow!(
+                    "intentional failure for {scenario_key}"
+                ))
+            },
+        )
         .await
         .expect_err("suite should fail");
 
@@ -3976,6 +4254,8 @@ mod tests {
         .expect("parse summary json");
         assert_eq!(summary.scenarios.len(), 1);
         assert_eq!(summary.scenarios[0].scenario, "append-30d");
+        assert_eq!(summary.run_config, dummy_slo_run_config());
+        assert_eq!(summary.scenarios[0].run_config, dummy_slo_run_config());
         assert_eq!(
             summary.scenarios[0].budget,
             Some(BudgetEvaluation {
@@ -3984,6 +4264,20 @@ mod tests {
                     "scenario execution failed: intentional failure for append-30d".to_owned()
                 ],
             })
+        );
+        let host: HostMetadata = serde_json::from_str(
+            &fs::read_to_string(host_metadata_output_path(&output_dir)).expect("read host json"),
+        )
+        .expect("parse host json");
+        assert_eq!(host, dummy_slo_host());
+        let scenario_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(output_dir.join("append-30d").join("run-01.json"))
+                .expect("read scenario json"),
+        )
+        .expect("parse scenario json");
+        assert_eq!(
+            scenario_json["run_config"]["worker_config"]["session_batch_size"],
+            serde_json::json!(DEFAULT_SLO_SESSION_BATCH_SIZE)
         );
     }
 
@@ -3998,8 +4292,10 @@ mod tests {
                 architecture: "arm64".to_owned(),
                 benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
             },
+            run_config: dummy_slo_run_config(),
             scenarios: vec![SloScenarioResult {
                 scenario: "append-30d".to_owned(),
+                run_config: dummy_slo_run_config(),
                 phases: vec![PhaseMeasurement {
                     name: "ingest".to_owned(),
                     events_sent: 900_000,
@@ -4039,6 +4335,7 @@ mod tests {
         let markdown = render_slo_markdown_summary(&summary);
 
         assert!(markdown.contains("# Fantasma Derived Metrics SLO Suite"));
+        assert!(markdown.contains("- Run config:"));
         assert!(markdown.contains("## append-30d"));
         assert!(markdown.contains("- event_metrics_ready_ms: 20000ms"));
         assert!(markdown.contains("- session_metrics_ready_ms: 40000ms"));
@@ -4058,8 +4355,10 @@ mod tests {
                 architecture: "arm64".to_owned(),
                 benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
             },
+            run_config: dummy_slo_run_config(),
             scenarios: vec![SloScenarioResult {
                 scenario: "reads-30d".to_owned(),
+                run_config: dummy_slo_run_config(),
                 phases: vec![],
                 readiness: vec![
                     ReadinessMeasurement {
@@ -4098,6 +4397,10 @@ mod tests {
         assert_eq!(
             rendered["scenarios"][0]["readiness"][2]["name"],
             "derived_metrics_ready_ms"
+        );
+        assert_eq!(
+            rendered["run_config"]["worker_config"]["session_batch_size"],
+            serde_json::json!(DEFAULT_SLO_SESSION_BATCH_SIZE)
         );
     }
 
@@ -4465,6 +4768,37 @@ mod tests {
         );
         assert_eq!(benchmark_ingest_base_url(), "http://127.0.0.1:18081");
         assert_eq!(benchmark_api_base_url(), "http://127.0.0.1:18082");
+    }
+
+    #[test]
+    fn render_benchmark_compose_template_rewrites_worker_env_values() {
+        let rendered = render_benchmark_compose_template(
+            include_str!("../../../infra/docker/compose.bench.yaml"),
+            &BenchWorkerConfig {
+                session_batch_size: 2_000,
+                event_batch_size: 7_000,
+                session_incremental_concurrency: 12,
+                session_repair_concurrency: 4,
+            },
+        );
+
+        assert!(rendered.contains("FANTASMA_WORKER_SESSION_BATCH_SIZE: 2000"));
+        assert!(rendered.contains("FANTASMA_WORKER_EVENT_BATCH_SIZE: 7000"));
+        assert!(rendered.contains("FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY: 12"));
+        assert!(rendered.contains("FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY: 4"));
+    }
+
+    #[test]
+    fn checked_in_compose_defaults_match_worker_defaults() {
+        for compose in [
+            include_str!("../../../infra/docker/compose.yaml"),
+            include_str!("../../../infra/docker/compose.bench.yaml"),
+        ] {
+            assert!(compose.contains("FANTASMA_WORKER_SESSION_BATCH_SIZE: 1000"));
+            assert!(compose.contains("FANTASMA_WORKER_EVENT_BATCH_SIZE: 5000"));
+            assert!(compose.contains("FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY: 8"));
+            assert!(compose.contains("FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY: 2"));
+        }
     }
 
     #[test]
