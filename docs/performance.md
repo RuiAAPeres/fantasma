@@ -17,6 +17,19 @@ cargo run -p fantasma-bench -- \
   --scenario append-30d
 ```
 
+The SLO suite now also accepts explicit run-shape overrides when you are screening worker settings for a freshness pass:
+
+```bash
+cargo run -p fantasma-bench -- \
+  slo \
+  --output-dir artifacts/performance/2026-03-13-derived-metrics-slo \
+  --scenario append-30d \
+  --repetitions-30d 1 \
+  --worker-session-batch-size 5000 \
+  --worker-session-incremental-concurrency 8 \
+  --worker-session-repair-concurrency 4
+```
+
 This slice separates two questions that were previously mixed together:
 
 - freshness: how long it takes the worker to make derived data queryable after raw ingest completes
@@ -54,11 +67,21 @@ cargo run -p fantasma-bench -- \
 
 Use repeated `--scenario <key>` flags when you want to run only a subset of the fixed suite during iteration. The selected scenarios still use the same workload model, readiness measurements, per-scenario artifact format, and top-level summary schema as the full suite.
 
-The harness starts the benchmark stack in its own Compose project, provisions a blank-database project plus scoped ingest/read keys, clears the target output directory before each run, drives the fixed workload, and writes:
+Supported SLO-specific overrides:
+
+- `--repetitions-30d` to override the default `30d` repetition count during screening
+- `--worker-session-batch-size`
+- `--worker-session-incremental-concurrency`
+- `--worker-session-repair-concurrency`
+- `--worker-event-batch-size`
+
+The harness starts the benchmark stack in its own Compose project, renders a temporary benchmark Compose file with the selected worker settings, provisions a blank-database project plus scoped ingest/read keys, clears the target output directory before each run, drives the fixed workload, and writes:
 
 - `host.json`
+- additive `run_config` in every per-scenario JSON artifact
 - one JSON and one Markdown file per scenario run
 - `median.json` and `median.md` for repeated `30d` scenarios
+- additive `run_config` in top-level `summary.json` and `summary.md`
 - top-level `summary.json`
 - top-level `summary.md`
 
@@ -197,6 +220,44 @@ Use the published results like this:
 - If freshness passes but `reads-*` misses grouped-read budgets, the derived tables are ready fast enough and the problem is on the query/read path.
 - If event readiness is fast but session readiness is slow, the session lane is the limiter.
 - If session readiness is fast but event readiness is slow, the event cuboid lane is the limiter.
+
+## Session Freshness Retune
+
+March 14, 2026 landed the SLO tuning harness changes, not a new worker default tuple.
+
+What changed:
+
+- the SLO runner accepts explicit worker overrides plus `--repetitions-30d`
+- every scenario artifact and top-level summary now carries additive `run_config`
+- the benchmark stack renders a temporary Compose file so screening runs and published runs use the same path
+
+What did not change:
+
+- the checked-in worker defaults remain `session_batch_size = 1000`
+- `event_batch_size = 5000`
+- `session_incremental_concurrency = 8`
+- `session_repair_concurrency = 2`
+
+Why defaults were not promoted:
+
+- the screened `session_batch_size = 5000` candidates materially improved append and backfill freshness
+- none of the screened tuples satisfied the slice acceptance rule for repair freshness, so the tuning-only pass did not earn a default change
+- the next optimization step, if resumed, should start from the harness improvements and then target the repair-safe structural bottleneck instead of claiming a tuning-only promotion
+
+Repair acceptance rule for this slice:
+
+- no repair scenario may regress by more than `10%` unless the absolute regression is under `1000ms`
+
+## Session Apply/Repair Split
+
+The March 14, 2026 repair-lane refactor keeps the public metrics API, current dimensions, and current 4D event rollups unchanged and only restructures internal worker execution:
+
+- `session_apply` owns the raw `"sessions"` offset, claims larger raw batches, and decides per install between incremental append and durable repair-frontier widening
+- `session_repair` is queue-driven, owns repair rewrites plus touched day/hour rebuild finalization, and no longer shares the raw-offset coordinator critical path
+- `install_session_state.last_processed_event_id` remains the only authoritative applied replay frontier; queued repair state routes work but does not count as finalized progress
+- `session_repair` claims jobs in a short transaction and releases those row locks before replay so `session_apply` does not block on long repair commits while holding the raw `"sessions"` offset lock
+- shared project hour/day bucket rebuilds are requeued into `session_rebuild_queue` and finalized after repair-batch commits so overlapping install repairs cannot race the same aggregate buckets
+- screening for default promotion still uses the same concrete gates: `append-30d` and `backfill-30d` must each improve by at least `10%`, at least one of `append-90d` or `backfill-90d` must improve by at least `10%`, and repair must satisfy the rule above
 
 ## Session Append Rewrite
 

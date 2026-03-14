@@ -335,6 +335,23 @@ pub struct PendingSessionRebuildBucketRecord {
     pub bucket_start: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRepairJobRecord {
+    pub project_id: Uuid,
+    pub install_id: String,
+    pub target_event_id: i64,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRepairJobUpsert {
+    pub project_id: Uuid,
+    pub install_id: String,
+    pub target_event_id: i64,
+}
+
 pub async fn connect(config: &DatabaseConfig) -> Result<PgPool, StoreError> {
     let pool = PgPoolOptions::new()
         .max_connections(config.max_connections)
@@ -1528,6 +1545,34 @@ where
     rows.into_iter().map(raw_event_from_row).collect()
 }
 
+pub async fn fetch_events_for_install_after_id_through_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+    last_processed_event_id: i64,
+    target_event_id: i64,
+) -> Result<Vec<RawEventRecord>, StoreError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties
+        FROM events_raw
+        WHERE project_id = $1
+          AND install_id = $2
+          AND id > $3
+          AND id <= $4
+        ORDER BY id ASC
+        "#,
+    )
+    .bind(project_id)
+    .bind(install_id)
+    .bind(last_processed_event_id)
+    .bind(target_event_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    rows.into_iter().map(raw_event_from_row).collect()
+}
+
 pub async fn fetch_latest_session_for_install(
     pool: &PgPool,
     project_id: Uuid,
@@ -1695,6 +1740,190 @@ pub async fn load_tail_sessions_for_installs_in_tx(
     }
 
     Ok(sessions)
+}
+
+pub async fn load_session_repair_jobs_for_installs_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    installs: &[(Uuid, String)],
+) -> Result<BTreeMap<(Uuid, String), SessionRepairJobRecord>, StoreError> {
+    if installs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new("WITH requested(project_id, install_id) AS (");
+    builder.push_values(installs, |mut row, (project_id, install_id)| {
+        row.push_bind(project_id).push_bind(install_id);
+    });
+    builder.push(
+        ") SELECT \
+            j.project_id, \
+            j.install_id, \
+            j.target_event_id, \
+            j.claimed_at, \
+            j.created_at, \
+            j.updated_at \
+          FROM session_repair_jobs j \
+          INNER JOIN requested r \
+            ON j.project_id = r.project_id \
+           AND j.install_id = r.install_id",
+    );
+
+    let rows = builder.build().fetch_all(&mut **tx).await?;
+    let mut jobs = BTreeMap::new();
+    for row in rows {
+        let job = session_repair_job_from_row(row)?;
+        jobs.insert((job.project_id, job.install_id.clone()), job);
+    }
+
+    Ok(jobs)
+}
+
+pub async fn upsert_session_repair_job_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+    target_event_id: i64,
+) -> Result<u64, StoreError> {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO session_repair_jobs (project_id, install_id, target_event_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (project_id, install_id) DO UPDATE SET
+            target_event_id = GREATEST(
+                session_repair_jobs.target_event_id,
+                EXCLUDED.target_event_id
+            ),
+            updated_at = now()
+        "#,
+    )
+    .bind(project_id)
+    .bind(install_id)
+    .bind(target_event_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn upsert_session_repair_jobs_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    jobs: &[SessionRepairJobUpsert],
+) -> Result<(), StoreError> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in jobs.chunks(max_rows_per_batched_statement(3)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_repair_jobs (project_id, install_id, target_event_id) ",
+        );
+        builder.push_values(chunk, |mut separated, job| {
+            separated
+                .push_bind(job.project_id)
+                .push_bind(&job.install_id)
+                .push_bind(job.target_event_id);
+        });
+        builder.push(
+            " ON CONFLICT (project_id, install_id) DO UPDATE SET \
+              target_event_id = GREATEST(session_repair_jobs.target_event_id, EXCLUDED.target_event_id), \
+              updated_at = now()",
+        );
+        builder.build().execute(&mut **tx).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn claim_pending_session_repair_jobs_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    limit: i64,
+) -> Result<Vec<SessionRepairJobRecord>, StoreError> {
+    let rows = sqlx::query(
+        r#"
+        WITH claimable AS (
+            SELECT project_id, install_id
+            FROM session_repair_jobs
+            WHERE claimed_at IS NULL
+            ORDER BY updated_at ASC, project_id ASC, install_id ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE session_repair_jobs AS jobs
+        SET claimed_at = now()
+        FROM claimable
+        WHERE jobs.project_id = claimable.project_id
+          AND jobs.install_id = claimable.install_id
+        RETURNING jobs.project_id, jobs.install_id, jobs.target_event_id, jobs.claimed_at, jobs.created_at, jobs.updated_at
+        "#,
+    )
+    .bind(limit.max(1))
+    .fetch_all(&mut **tx)
+    .await?;
+
+    rows.into_iter().map(session_repair_job_from_row).collect()
+}
+
+pub async fn complete_session_repair_job_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+    expected_target_event_id: i64,
+) -> Result<(), StoreError> {
+    let deleted = sqlx::query(
+        r#"
+        DELETE FROM session_repair_jobs
+        WHERE project_id = $1
+          AND install_id = $2
+          AND target_event_id = $3
+        "#,
+    )
+    .bind(project_id)
+    .bind(install_id)
+    .bind(expected_target_event_id)
+    .execute(&mut **tx)
+    .await?;
+
+    if deleted.rows_affected() == 0 {
+        sqlx::query(
+            r#"
+            UPDATE session_repair_jobs
+            SET claimed_at = NULL,
+                updated_at = now()
+            WHERE project_id = $1
+              AND install_id = $2
+              AND claimed_at IS NOT NULL
+            "#,
+        )
+        .bind(project_id)
+        .bind(install_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub async fn release_session_repair_job_claim_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        UPDATE session_repair_jobs
+        SET claimed_at = NULL,
+            updated_at = now()
+        WHERE project_id = $1
+          AND install_id = $2
+          AND claimed_at IS NOT NULL
+        "#,
+    )
+    .bind(project_id)
+    .bind(install_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
 }
 
 async fn load_install_session_state_in_executor<'a, E>(
@@ -1872,6 +2101,42 @@ pub async fn load_pending_session_rebuild_buckets_in_tx(
         .collect()
 }
 
+pub async fn claim_pending_session_rebuild_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    limit: i64,
+) -> Result<Vec<PendingSessionRebuildBucketRecord>, StoreError> {
+    let rows = sqlx::query(
+        r#"
+        WITH claimable AS (
+            SELECT project_id, granularity, bucket_start
+            FROM session_rebuild_queue
+            ORDER BY project_id ASC, granularity ASC, bucket_start ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM session_rebuild_queue AS queue
+        USING claimable
+        WHERE queue.project_id = claimable.project_id
+          AND queue.granularity = claimable.granularity
+          AND queue.bucket_start = claimable.bucket_start
+        RETURNING queue.project_id, queue.granularity, queue.bucket_start
+        "#,
+    )
+    .bind(limit.max(1))
+    .fetch_all(&mut **tx)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(PendingSessionRebuildBucketRecord {
+                project_id: row.try_get("project_id")?,
+                granularity: metric_granularity_from_str(row.try_get::<&str, _>("granularity")?)?,
+                bucket_start: row.try_get("bucket_start")?,
+            })
+        })
+        .collect()
+}
+
 pub async fn delete_pending_session_rebuild_buckets_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_ids: &[Uuid],
@@ -1902,6 +2167,19 @@ fn metric_granularity_from_str(value: &str) -> Result<MetricGranularity, StoreEr
             "unknown metric granularity {other}"
         ))),
     }
+}
+
+fn session_repair_job_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<SessionRepairJobRecord, StoreError> {
+    Ok(SessionRepairJobRecord {
+        project_id: row.try_get("project_id")?,
+        install_id: row.try_get("install_id")?,
+        target_event_id: row.try_get("target_event_id")?,
+        claimed_at: row.try_get("claimed_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
 }
 
 pub async fn insert_session_in_tx(
@@ -5863,6 +6141,374 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[sqlx::test]
+    async fn run_migrations_creates_session_repair_jobs_table(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let repair_queue_tables = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_name = 'session_repair_jobs'
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch repair queue tables");
+
+        assert_eq!(repair_queue_tables, vec!["session_repair_jobs".to_owned()]);
+    }
+
+    #[sqlx::test]
+    async fn session_repair_jobs_widen_install_frontier(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        for frontier in [10_i64, 12_i64, 11_i64] {
+            sqlx::query(
+                r#"
+                INSERT INTO session_repair_jobs (project_id, install_id, target_event_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (project_id, install_id) DO UPDATE SET
+                    target_event_id = GREATEST(
+                        session_repair_jobs.target_event_id,
+                        EXCLUDED.target_event_id
+                    ),
+                    updated_at = now()
+                "#,
+            )
+            .bind(project_id())
+            .bind("install-1")
+            .bind(frontier)
+            .execute(&pool)
+            .await
+            .expect("upsert repair frontier");
+        }
+
+        let widened = sqlx::query(
+            r#"
+            SELECT target_event_id
+            FROM session_repair_jobs
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .fetch_one(&pool)
+        .await
+        .expect("load widened repair frontier");
+
+        assert_eq!(widened.try_get::<i64, _>("target_event_id").unwrap(), 12);
+
+        let row_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM session_repair_jobs
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .fetch_one(&pool)
+        .await
+        .expect("count repair frontier rows");
+
+        assert_eq!(row_count, 1);
+    }
+
+    #[sqlx::test]
+    async fn load_session_repair_jobs_for_installs_returns_requested_rows(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let mut seed_tx = pool.begin().await.expect("begin repair frontier seed tx");
+        upsert_session_repair_job_in_tx(&mut seed_tx, project_id(), "install-1", 12)
+            .await
+            .expect("save first repair frontier");
+        upsert_session_repair_job_in_tx(&mut seed_tx, project_id(), "install-2", 77)
+            .await
+            .expect("save second repair frontier");
+        seed_tx
+            .commit()
+            .await
+            .expect("commit repair frontier seed tx");
+
+        let mut load_tx = pool.begin().await.expect("begin repair frontier load tx");
+        let jobs = load_session_repair_jobs_for_installs_in_tx(
+            &mut load_tx,
+            &[
+                (project_id(), "install-1".to_owned()),
+                (project_id(), "install-2".to_owned()),
+                (project_id(), "missing".to_owned()),
+            ],
+        )
+        .await
+        .expect("load repair frontiers");
+        load_tx
+            .commit()
+            .await
+            .expect("commit repair frontier load tx");
+
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            jobs.get(&(project_id(), "install-1".to_owned()))
+                .expect("install-1 frontier")
+                .target_event_id,
+            12
+        );
+        assert_eq!(
+            jobs.get(&(project_id(), "install-2".to_owned()))
+                .expect("install-2 frontier")
+                .target_event_id,
+            77
+        );
+    }
+
+    #[sqlx::test]
+    async fn claimed_session_repair_jobs_round_trip_and_complete_by_target(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let other_project = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects (id, name) VALUES ($1, $2)")
+            .bind(other_project)
+            .bind("Other")
+            .execute(&pool)
+            .await
+            .expect("insert other project");
+
+        let mut seed_tx = pool.begin().await.expect("begin repair frontier seed tx");
+        upsert_session_repair_job_in_tx(&mut seed_tx, project_id(), "install-1", 12)
+            .await
+            .expect("save first repair frontier");
+        upsert_session_repair_job_in_tx(&mut seed_tx, project_id(), "install-2", 77)
+            .await
+            .expect("save second repair frontier");
+        upsert_session_repair_job_in_tx(&mut seed_tx, other_project, "install-3", 99)
+            .await
+            .expect("save other project repair frontier");
+        seed_tx
+            .commit()
+            .await
+            .expect("commit repair frontier seed tx");
+
+        let mut load_tx = pool.begin().await.expect("begin repair frontier load tx");
+        let pending = claim_pending_session_repair_jobs_in_tx(&mut load_tx, 10)
+            .await
+            .expect("claim pending repair frontiers");
+        assert_eq!(pending.len(), 3);
+        assert!(pending.iter().all(|job| job.claimed_at.is_some()));
+        assert!(pending.iter().any(|job| {
+            job.project_id == project_id()
+                && job.install_id == "install-1"
+                && job.target_event_id == 12
+        }));
+        assert!(pending.iter().any(|job| {
+            job.project_id == project_id()
+                && job.install_id == "install-2"
+                && job.target_event_id == 77
+        }));
+        assert!(pending.iter().any(|job| {
+            job.project_id == other_project
+                && job.install_id == "install-3"
+                && job.target_event_id == 99
+        }));
+
+        complete_session_repair_job_in_tx(&mut load_tx, project_id(), "install-1", 12)
+            .await
+            .expect("complete matching repair frontier");
+        complete_session_repair_job_in_tx(&mut load_tx, project_id(), "install-2", 12)
+            .await
+            .expect("release non-matching repair frontier");
+        complete_session_repair_job_in_tx(&mut load_tx, other_project, "install-3", 99)
+            .await
+            .expect("complete other project repair frontier");
+        load_tx
+            .commit()
+            .await
+            .expect("commit repair frontier load tx");
+
+        let mut verify_tx = pool.begin().await.expect("begin repair frontier verify tx");
+        let remaining = load_session_repair_jobs_for_installs_in_tx(
+            &mut verify_tx,
+            &[
+                (project_id(), "install-2".to_owned()),
+                (other_project, "install-3".to_owned()),
+            ],
+        )
+        .await
+        .expect("load remaining repair frontiers");
+        let reclaimed = claim_pending_session_repair_jobs_in_tx(&mut verify_tx, 10)
+            .await
+            .expect("claim remaining repair frontiers");
+        verify_tx
+            .commit()
+            .await
+            .expect("commit repair frontier verify tx");
+
+        assert_eq!(remaining.len(), 1);
+        let install_2 = remaining
+            .get(&(project_id(), "install-2".to_owned()))
+            .expect("install-2 remains queued");
+        assert_eq!(install_2.target_event_id, 77);
+        assert_eq!(install_2.claimed_at, None);
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].project_id, project_id());
+        assert_eq!(reclaimed[0].install_id, "install-2");
+        assert_eq!(reclaimed[0].target_event_id, 77);
+        assert!(reclaimed[0].claimed_at.is_some());
+    }
+
+    #[sqlx::test]
+    async fn claimed_session_repair_job_releases_newer_frontier_for_later_repair(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let mut seed_tx = pool.begin().await.expect("begin repair frontier seed tx");
+        upsert_session_repair_job_in_tx(&mut seed_tx, project_id(), "install-1", 12)
+            .await
+            .expect("save repair frontier");
+        seed_tx
+            .commit()
+            .await
+            .expect("commit repair frontier seed tx");
+
+        let mut claim_tx = pool.begin().await.expect("begin claim tx");
+        let claimed = claim_pending_session_repair_jobs_in_tx(&mut claim_tx, 1)
+            .await
+            .expect("claim repair frontier");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].target_event_id, 12);
+        claim_tx.commit().await.expect("commit claim tx");
+
+        let mut widen_tx = pool.begin().await.expect("begin widen tx");
+        upsert_session_repair_job_in_tx(&mut widen_tx, project_id(), "install-1", 15)
+            .await
+            .expect("widen claimed repair frontier");
+        widen_tx.commit().await.expect("commit widen tx");
+
+        let mut complete_tx = pool.begin().await.expect("begin complete tx");
+        complete_session_repair_job_in_tx(&mut complete_tx, project_id(), "install-1", 12)
+            .await
+            .expect("release claimed frontier after widen");
+        let widened = load_session_repair_jobs_for_installs_in_tx(
+            &mut complete_tx,
+            &[(project_id(), "install-1".to_owned())],
+        )
+        .await
+        .expect("load widened frontier");
+        let reclaimed = claim_pending_session_repair_jobs_in_tx(&mut complete_tx, 1)
+            .await
+            .expect("reclaim widened frontier");
+        complete_tx.commit().await.expect("commit complete tx");
+
+        let widened = widened
+            .get(&(project_id(), "install-1".to_owned()))
+            .expect("widened frontier exists");
+        assert_eq!(widened.target_event_id, 15);
+        assert_eq!(widened.claimed_at, None);
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].target_event_id, 15);
+        assert!(reclaimed[0].claimed_at.is_some());
+    }
+
+    #[sqlx::test]
+    async fn release_session_repair_job_claim_keeps_frontier_claimable(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let mut seed_tx = pool.begin().await.expect("begin repair frontier seed tx");
+        upsert_session_repair_job_in_tx(&mut seed_tx, project_id(), "install-1", 12)
+            .await
+            .expect("save repair frontier");
+        seed_tx
+            .commit()
+            .await
+            .expect("commit repair frontier seed tx");
+
+        let mut claim_tx = pool.begin().await.expect("begin claim tx");
+        let claimed = claim_pending_session_repair_jobs_in_tx(&mut claim_tx, 1)
+            .await
+            .expect("claim repair frontier");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].target_event_id, 12);
+        claim_tx.commit().await.expect("commit claim tx");
+
+        let mut release_tx = pool.begin().await.expect("begin release tx");
+        release_session_repair_job_claim_in_tx(&mut release_tx, project_id(), "install-1")
+            .await
+            .expect("release claimed repair frontier");
+        let released = load_session_repair_jobs_for_installs_in_tx(
+            &mut release_tx,
+            &[(project_id(), "install-1".to_owned())],
+        )
+        .await
+        .expect("load released frontier");
+        let reclaimed = claim_pending_session_repair_jobs_in_tx(&mut release_tx, 1)
+            .await
+            .expect("reclaim released frontier");
+        release_tx.commit().await.expect("commit release tx");
+
+        let released = released
+            .get(&(project_id(), "install-1".to_owned()))
+            .expect("released frontier exists");
+        assert_eq!(released.target_event_id, 12);
+        assert_eq!(released.claimed_at, None);
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].target_event_id, 12);
+        assert!(reclaimed[0].claimed_at.is_some());
+    }
+
+    #[sqlx::test]
+    async fn fetch_events_for_install_after_id_through_orders_by_id(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        insert_events(
+            &pool,
+            project_id(),
+            &[
+                event("install-1", 10),
+                event("install-2", 5),
+                event("install-1", 0),
+                event("install-1", 20),
+            ],
+        )
+        .await
+        .expect("insert events");
+
+        let mut tx = pool.begin().await.expect("begin install frontier fetch tx");
+        let stored = fetch_events_for_install_after_id_through_in_tx(
+            &mut tx,
+            project_id(),
+            "install-1",
+            0,
+            4,
+        )
+        .await
+        .expect("fetch install frontier events");
+        tx.commit().await.expect("commit install frontier fetch tx");
+
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0].timestamp, timestamp(10));
+        assert_eq!(stored[1].timestamp, timestamp(0));
+        assert_eq!(stored[2].timestamp, timestamp(20));
     }
 
     #[sqlx::test]

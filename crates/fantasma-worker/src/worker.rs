@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Timelike, Utc};
 use fantasma_core::MetricGranularity;
@@ -7,20 +9,23 @@ use fantasma_store::{
     EventMetricBucketDim4Delta, EventMetricBucketTotalDelta, InstallFirstSeenRecord,
     InstallSessionStateRecord, PgPool, RawEventRecord, SessionDailyActiveInstallDelta,
     SessionDailyDelta, SessionDailyDurationDelta, SessionDailyInstallDelta, SessionMetricDim1Delta,
-    SessionMetricDim2Delta, SessionMetricTotalDelta, SessionRecord, SessionTailUpdate, StoreError,
-    add_session_daily_duration_deltas_in_tx, delete_pending_session_rebuild_buckets_in_tx,
-    delete_sessions_overlapping_window_in_tx, enqueue_session_rebuild_buckets_in_tx,
-    fetch_events_after_in_tx, fetch_events_for_install_between_in_tx,
+    SessionMetricDim2Delta, SessionMetricTotalDelta, SessionRecord, SessionRepairJobRecord,
+    SessionRepairJobUpsert, SessionTailUpdate, StoreError, add_session_daily_duration_deltas_in_tx,
+    claim_pending_session_rebuild_buckets_in_tx, claim_pending_session_repair_jobs_in_tx,
+    complete_session_repair_job_in_tx, delete_sessions_overlapping_window_in_tx,
+    enqueue_session_rebuild_buckets_in_tx, fetch_events_after_in_tx,
+    fetch_events_for_install_after_id_through_in_tx, fetch_events_for_install_between_in_tx,
     fetch_latest_session_for_install_in_tx, fetch_sessions_overlapping_window_in_tx,
     insert_install_first_seen_in_tx, insert_session_in_tx, insert_sessions_in_tx,
-    load_install_session_states_in_tx, load_pending_session_rebuild_buckets_in_tx,
+    load_install_session_states_in_tx, load_session_repair_jobs_for_installs_in_tx,
     load_tail_sessions_for_installs_in_tx, lock_worker_offset, rebuild_session_daily_days_in_tx,
-    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_event_metric_buckets_dim1_in_tx,
-    upsert_event_metric_buckets_dim2_in_tx, upsert_event_metric_buckets_dim3_in_tx,
-    upsert_event_metric_buckets_dim4_in_tx, upsert_event_metric_buckets_total_in_tx,
-    upsert_install_session_state_in_tx, upsert_session_daily_deltas_in_tx,
-    upsert_session_daily_install_deltas_in_tx, upsert_session_metric_dim1_in_tx,
-    upsert_session_metric_dim2_in_tx, upsert_session_metric_totals_in_tx,
+    release_session_repair_job_claim_in_tx, save_worker_offset_in_tx, update_session_tail_in_tx,
+    upsert_event_metric_buckets_dim1_in_tx, upsert_event_metric_buckets_dim2_in_tx,
+    upsert_event_metric_buckets_dim3_in_tx, upsert_event_metric_buckets_dim4_in_tx,
+    upsert_event_metric_buckets_total_in_tx, upsert_install_session_state_in_tx,
+    upsert_session_daily_deltas_in_tx, upsert_session_daily_install_deltas_in_tx,
+    upsert_session_metric_dim1_in_tx, upsert_session_metric_dim2_in_tx,
+    upsert_session_metric_totals_in_tx, upsert_session_repair_jobs_in_tx,
 };
 use sqlx::{Postgres, Row, Transaction};
 use tokio::task::JoinSet;
@@ -61,18 +66,6 @@ impl SessionRepairBuckets {
 
     fn is_empty(&self) -> bool {
         self.days.is_empty() && self.hours.is_empty()
-    }
-
-    fn day_bucket_starts(&self) -> Vec<DateTime<Utc>> {
-        self.days
-            .iter()
-            .copied()
-            .map(bucket_start_for_day)
-            .collect()
-    }
-
-    fn hour_bucket_starts(&self) -> Vec<DateTime<Utc>> {
-        self.hours.iter().copied().collect()
     }
 }
 
@@ -280,16 +273,15 @@ impl SessionMetricDeltaValue {
 }
 
 pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usize, StoreError> {
-    Ok(process_session_batch_with_config(
-        pool,
-        SessionBatchConfig {
-            batch_size,
-            incremental_concurrency: DEFAULT_SESSION_INCREMENTAL_CONCURRENCY,
-            repair_concurrency: DEFAULT_SESSION_REPAIR_CONCURRENCY,
-        },
-    )
-    .await?
-    .processed_events)
+    let config = SessionBatchConfig {
+        batch_size,
+        incremental_concurrency: DEFAULT_SESSION_INCREMENTAL_CONCURRENCY,
+        repair_concurrency: DEFAULT_SESSION_REPAIR_CONCURRENCY,
+    };
+    let outcome = process_session_batch_with_config(pool, config).await?;
+    drain_session_repair_jobs(pool, config.repair_concurrency).await?;
+
+    Ok(outcome.processed_events)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -316,20 +308,24 @@ impl SessionBatchConfig {
 }
 
 #[derive(Debug)]
-struct SessionWorkItem {
+struct IncrementalSessionWorkItem {
     project_id: Uuid,
     install_id: String,
     events: Vec<RawEventRecord>,
     tail_state: Option<InstallSessionStateRecord>,
     tail_session: Option<SessionRecord>,
-    highest_processed_event_id: i64,
-    kind: SessionWorkKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionWorkKind {
-    Incremental,
-    Repair,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionRepairEnqueueItem {
+    project_id: Uuid,
+    install_id: String,
+    target_event_id: i64,
+}
+
+#[derive(Debug, Default)]
+struct SessionRepairTaskResult {
+    processed: bool,
 }
 
 pub(crate) async fn process_session_batch_with_config(
@@ -365,18 +361,13 @@ async fn process_session_batch_inner(
     let mut incremental_items = Vec::new();
     let mut repair_items = Vec::new();
     let grouped = group_events(batch);
-    let project_ids = grouped
-        .keys()
-        .map(|(project_id, _)| *project_id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
     let install_keys = grouped
         .keys()
         .map(|(project_id, install_id)| (*project_id, install_id.clone()))
         .collect::<Vec<_>>();
     let tail_states = load_install_session_states_in_tx(&mut tx, &install_keys).await?;
     let tail_sessions = load_tail_sessions_for_installs_in_tx(&mut tx, &install_keys).await?;
+    let repair_jobs = load_session_repair_jobs_for_installs_in_tx(&mut tx, &install_keys).await?;
 
     for ((project_id, install_id), events) in grouped {
         let tail_state = tail_states.get(&(project_id, install_id.clone())).cloned();
@@ -394,46 +385,49 @@ async fn process_session_batch_inner(
             .map(|event| event.id)
             .max()
             .expect("non-empty install batch has last event");
-        let kind = if needs_exact_day_repair(tail_state.as_ref(), &events) {
-            SessionWorkKind::Repair
-        } else {
-            SessionWorkKind::Incremental
-        };
-        let item = SessionWorkItem {
-            project_id,
-            install_id,
-            events,
-            tail_state,
-            tail_session,
-            highest_processed_event_id,
-            kind,
-        };
+        let pending_repair = repair_jobs
+            .get(&(project_id, install_id.clone()))
+            .map(|job| job.target_event_id);
+        let has_pending_repair = pending_repair.is_some_and(|target_event_id| {
+            tail_state
+                .as_ref()
+                .is_none_or(|state| target_event_id > state.last_processed_event_id)
+        });
 
-        match kind {
-            SessionWorkKind::Incremental => incremental_items.push(item),
-            SessionWorkKind::Repair => repair_items.push(item),
+        if has_pending_repair || needs_exact_day_repair(tail_state.as_ref(), &events) {
+            repair_items.push(SessionRepairEnqueueItem {
+                project_id,
+                install_id,
+                target_event_id: highest_processed_event_id,
+            });
+        } else {
+            incremental_items.push(IncrementalSessionWorkItem {
+                project_id,
+                install_id,
+                events,
+                tail_state,
+                tail_session,
+            });
         }
     }
 
-    let (incremental_queue, repair_queue) = tokio::join!(
-        run_session_work_queue(
-            pool.clone(),
-            incremental_items,
-            config.incremental_concurrency
-        ),
-        run_session_work_queue(pool.clone(), repair_items, config.repair_concurrency),
-    );
-    let incremental_queue = incremental_queue?;
-    let repair_queue = repair_queue?;
-
-    rebuild_pending_session_buckets_in_tx(&mut tx, &project_ids).await?;
-    hooks.fail_before_coordinator_finalize()?;
-
-    if let Some(error) = merge_session_queue_errors(incremental_queue.error, repair_queue.error) {
+    let incremental_queue = run_session_incremental_queue(
+        pool.clone(),
+        incremental_items,
+        config.incremental_concurrency,
+    )
+    .await?;
+    if let Some(error) = incremental_queue.error {
         tx.commit().await.map_err(StoreError::from)?;
         return Err(error);
     }
 
+    if let Err(error) = enqueue_session_repair_items_in_tx(&mut tx, repair_items).await {
+        tx.commit().await.map_err(StoreError::from)?;
+        return Err(error);
+    }
+
+    hooks.fail_before_coordinator_finalize()?;
     save_worker_offset_in_tx(&mut tx, SESSION_WORKER_NAME, next_offset).await?;
     tx.commit().await.map_err(StoreError::from)?;
 
@@ -447,9 +441,9 @@ struct SessionWorkQueueResult {
     error: Option<StoreError>,
 }
 
-async fn run_session_work_queue(
+async fn run_session_incremental_queue(
     pool: PgPool,
-    items: Vec<SessionWorkItem>,
+    items: Vec<IncrementalSessionWorkItem>,
     concurrency: usize,
 ) -> Result<SessionWorkQueueResult, StoreError> {
     if items.is_empty() {
@@ -466,7 +460,7 @@ async fn run_session_work_queue(
             break;
         };
         let pool = pool.clone();
-        work_set.spawn(async move { process_session_work_item(&pool, item).await });
+        work_set.spawn(async move { process_incremental_session_work_item(&pool, item).await });
     }
 
     while let Some(join_result) = work_set.join_next().await {
@@ -476,7 +470,9 @@ async fn run_session_work_queue(
                     && let Some(item) = work_items.next()
                 {
                     let pool = pool.clone();
-                    work_set.spawn(async move { process_session_work_item(&pool, item).await });
+                    work_set.spawn(async move {
+                        process_incremental_session_work_item(&pool, item).await
+                    });
                 }
             }
             Ok(Err(join_error)) => {
@@ -500,99 +496,38 @@ async fn run_session_work_queue(
     Ok(SessionWorkQueueResult { error })
 }
 
-async fn process_session_work_item(pool: &PgPool, item: SessionWorkItem) -> Result<(), StoreError> {
+async fn process_incremental_session_work_item(
+    pool: &PgPool,
+    item: IncrementalSessionWorkItem,
+) -> Result<(), StoreError> {
     let mut tx = pool.begin().await.map_err(StoreError::from)?;
-    let touched_buckets = match item.kind {
-        SessionWorkKind::Incremental => {
-            process_install_batch_incremental(
-                &mut tx,
-                item.project_id,
-                &item.install_id,
-                item.events,
-                item.tail_state,
-                item.tail_session,
-            )
-            .await?
-        }
-        SessionWorkKind::Repair => {
-            repair_install_batch(
-                &mut tx,
-                item.project_id,
-                &item.install_id,
-                item.events,
-                item.highest_processed_event_id,
-            )
-            .await?
-        }
-    };
-    if item.kind == SessionWorkKind::Repair {
-        enqueue_session_rebuild_buckets_in_tx(
-            &mut tx,
-            item.project_id,
-            &touched_buckets.day_bucket_starts(),
-            &touched_buckets.hour_bucket_starts(),
-        )
-        .await?;
-    }
+    process_install_batch_incremental(
+        &mut tx,
+        item.project_id,
+        &item.install_id,
+        item.events,
+        item.tail_state,
+        item.tail_session,
+    )
+    .await?;
     tx.commit().await.map_err(StoreError::from)?;
 
     Ok(())
 }
 
-async fn rebuild_pending_session_buckets_in_tx(
+async fn enqueue_session_repair_items_in_tx(
     tx: &mut Transaction<'_, Postgres>,
-    project_ids: &[Uuid],
+    items: Vec<SessionRepairEnqueueItem>,
 ) -> Result<(), StoreError> {
-    let pending_buckets = load_pending_session_rebuild_buckets_in_tx(tx, project_ids).await?;
-    let mut touched_buckets_by_project = BTreeMap::<Uuid, SessionRepairBuckets>::new();
-
-    for bucket in pending_buckets {
-        let touched_buckets = touched_buckets_by_project
-            .entry(bucket.project_id)
-            .or_default();
-        match bucket.granularity {
-            MetricGranularity::Day => {
-                touched_buckets
-                    .days
-                    .insert(bucket.bucket_start.date_naive());
-            }
-            MetricGranularity::Hour => {
-                touched_buckets.hours.insert(bucket.bucket_start);
-            }
-        }
-    }
-
-    for (project_id, touched_buckets) in touched_buckets_by_project {
-        if !touched_buckets.is_empty() {
-            let days = touched_buckets.days.iter().copied().collect::<Vec<_>>();
-            if !days.is_empty() {
-                rebuild_session_daily_days_in_tx(tx, project_id, &days).await?;
-                rebuild_session_metric_buckets_in_tx(
-                    tx,
-                    project_id,
-                    MetricGranularity::Day,
-                    &days
-                        .iter()
-                        .map(|day| bucket_start_for_day(*day))
-                        .collect::<Vec<_>>(),
-                )
-                .await?;
-            }
-
-            let hours = touched_buckets.hours.into_iter().collect::<Vec<_>>();
-            if !hours.is_empty() {
-                rebuild_session_metric_buckets_in_tx(
-                    tx,
-                    project_id,
-                    MetricGranularity::Hour,
-                    &hours,
-                )
-                .await?;
-            }
-        }
-    }
-
-    delete_pending_session_rebuild_buckets_in_tx(tx, project_ids).await?;
+    let jobs = items
+        .into_iter()
+        .map(|item| SessionRepairJobUpsert {
+            project_id: item.project_id,
+            install_id: item.install_id,
+            target_event_id: item.target_event_id,
+        })
+        .collect::<Vec<_>>();
+    upsert_session_repair_jobs_in_tx(tx, &jobs).await?;
 
     Ok(())
 }
@@ -636,18 +571,458 @@ async fn process_session_batch_with_hooks(
     process_session_batch_inner(pool, config, hooks.0).await
 }
 
-fn merge_session_queue_errors(
-    left: Option<StoreError>,
-    right: Option<StoreError>,
-) -> Option<StoreError> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(StoreError::InvariantViolation(format!(
-            "{left}; secondary session queue failure: {right}"
-        ))),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RepairClaimBlocker {
+    claimed: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct SessionRepairBatchHooks {
+    claim_blocker: Option<std::sync::Arc<RepairClaimBlocker>>,
+    blocked_install_id: Option<String>,
+    panic_install_id: Option<String>,
+    fail_join_error_release_once_install_id: Option<String>,
+    join_error_release_failed_once: Option<std::sync::Arc<AtomicBool>>,
+}
+
+#[cfg(test)]
+impl SessionRepairBatchHooks {
+    fn disabled() -> Self {
+        Self::default()
     }
+
+    fn block_after_claim(claim_blocker: std::sync::Arc<RepairClaimBlocker>) -> Self {
+        Self {
+            claim_blocker: Some(claim_blocker),
+            blocked_install_id: None,
+            panic_install_id: None,
+            fail_join_error_release_once_install_id: None,
+            join_error_release_failed_once: None,
+        }
+    }
+
+    fn block_after_claim_for_install(
+        install_id: &str,
+        claim_blocker: std::sync::Arc<RepairClaimBlocker>,
+    ) -> Self {
+        Self {
+            claim_blocker: Some(claim_blocker),
+            blocked_install_id: Some(install_id.to_owned()),
+            panic_install_id: None,
+            fail_join_error_release_once_install_id: None,
+            join_error_release_failed_once: None,
+        }
+    }
+
+    fn panic_after_claim_for_install(install_id: &str) -> Self {
+        Self {
+            claim_blocker: None,
+            blocked_install_id: None,
+            panic_install_id: Some(install_id.to_owned()),
+            fail_join_error_release_once_install_id: None,
+            join_error_release_failed_once: None,
+        }
+    }
+
+    fn panic_after_claim_and_fail_join_error_release_once_for_install(install_id: &str) -> Self {
+        Self {
+            claim_blocker: None,
+            blocked_install_id: None,
+            panic_install_id: Some(install_id.to_owned()),
+            fail_join_error_release_once_install_id: Some(install_id.to_owned()),
+            join_error_release_failed_once: Some(std::sync::Arc::new(AtomicBool::new(false))),
+        }
+    }
+
+    async fn after_claim(&self, install_id: &str) {
+        if self
+            .panic_install_id
+            .as_deref()
+            .is_some_and(|panic_install_id| panic_install_id == install_id)
+        {
+            panic!("session repair test hook forced panic after claim");
+        }
+
+        if let Some(claim_blocker) = &self.claim_blocker {
+            if self
+                .blocked_install_id
+                .as_deref()
+                .is_some_and(|blocked_install_id| blocked_install_id != install_id)
+            {
+                return;
+            }
+            claim_blocker.claimed.notify_one();
+            claim_blocker.resume.notified().await;
+        }
+    }
+
+    fn before_join_error_claim_release(&self, install_id: &str) -> Result<(), StoreError> {
+        if self
+            .fail_join_error_release_once_install_id
+            .as_deref()
+            .is_some_and(|failed_install_id| failed_install_id == install_id)
+            && self
+                .join_error_release_failed_once
+                .as_ref()
+                .is_some_and(|flag| !flag.swap(true, Ordering::SeqCst))
+        {
+            return Err(StoreError::InvariantViolation(
+                "session repair test hook forced one join-error claim release failure".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Clone, Default)]
+struct SessionRepairBatchHooks;
+
+#[cfg(not(test))]
+impl SessionRepairBatchHooks {
+    fn disabled() -> Self {
+        Self
+    }
+
+    async fn after_claim(&self, _install_id: &str) {}
+
+    fn before_join_error_claim_release(&self, _install_id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionRepairTaskContext {
+    claimed_job: std::sync::Mutex<Option<SessionRepairJobRecord>>,
+}
+
+impl SessionRepairTaskContext {
+    fn set_claimed_job(&self, job: SessionRepairJobRecord) {
+        *self
+            .claimed_job
+            .lock()
+            .expect("session repair task context lock poisoned") = Some(job);
+    }
+
+    fn clear_claimed_job(&self) {
+        *self
+            .claimed_job
+            .lock()
+            .expect("session repair task context lock poisoned") = None;
+    }
+
+    fn claimed_job(&self) -> Option<SessionRepairJobRecord> {
+        self.claimed_job
+            .lock()
+            .expect("session repair task context lock poisoned")
+            .clone()
+    }
+}
+
+pub async fn process_session_repair_batch(
+    pool: &PgPool,
+    concurrency: usize,
+) -> Result<usize, StoreError> {
+    process_session_repair_batch_with_config(pool, concurrency).await
+}
+
+pub(crate) async fn process_session_repair_batch_with_config(
+    pool: &PgPool,
+    concurrency: usize,
+) -> Result<usize, StoreError> {
+    process_session_repair_batch_inner(pool, concurrency, SessionRepairBatchHooks::disabled()).await
+}
+
+async fn process_session_repair_batch_inner(
+    pool: &PgPool,
+    concurrency: usize,
+    hooks: SessionRepairBatchHooks,
+) -> Result<usize, StoreError> {
+    let mut work_set = JoinSet::new();
+    let mut task_contexts = HashMap::new();
+    for _ in 0..concurrency.max(1) {
+        let pool = pool.clone();
+        let hooks = hooks.clone();
+        let task_context = std::sync::Arc::new(SessionRepairTaskContext::default());
+        let spawned_context = task_context.clone();
+        let abort_handle = work_set.spawn(async move {
+            process_next_session_repair_job(&pool, hooks, spawned_context).await
+        });
+        task_contexts.insert(abort_handle.id(), task_context);
+    }
+
+    let mut processed = 0_usize;
+    let mut batch_error = None;
+    while let Some(join_result) = work_set.join_next_with_id().await {
+        match join_result {
+            Ok((task_id, Ok(result))) => {
+                task_contexts.remove(&task_id);
+                processed += usize::from(result.processed);
+            }
+            Ok((task_id, Err(error))) => {
+                if let Err(cleanup_error) = release_join_error_session_repair_claim(
+                    pool,
+                    &mut task_contexts,
+                    task_id,
+                    &hooks,
+                )
+                .await
+                {
+                    if batch_error.is_none() {
+                        batch_error = Some(StoreError::InvariantViolation(format!(
+                            "session repair task returned {error}; releasing any unresolved claim also failed with {cleanup_error}"
+                        )));
+                    }
+                    continue;
+                }
+                if batch_error.is_none() {
+                    batch_error = Some(error);
+                }
+            }
+            Err(join_error) if join_error.is_cancelled() => {
+                let task_id = join_error.id();
+                if let Err(cleanup_error) = release_join_error_session_repair_claim(
+                    pool,
+                    &mut task_contexts,
+                    task_id,
+                    &hooks,
+                )
+                .await
+                {
+                    if batch_error.is_none() {
+                        batch_error = Some(StoreError::InvariantViolation(format!(
+                            "session repair job task {task_id} was cancelled; releasing its claim also failed with {cleanup_error}"
+                        )));
+                    }
+                    continue;
+                }
+                if batch_error.is_none() {
+                    batch_error = Some(StoreError::InvariantViolation(
+                        "session repair job task cancelled before resolving its claim".to_owned(),
+                    ));
+                }
+            }
+            Err(join_error) => {
+                let task_id = join_error.id();
+                if let Err(cleanup_error) = release_join_error_session_repair_claim(
+                    pool,
+                    &mut task_contexts,
+                    task_id,
+                    &hooks,
+                )
+                .await
+                {
+                    if batch_error.is_none() {
+                        batch_error = Some(StoreError::InvariantViolation(format!(
+                            "session repair job task {task_id} failed with {join_error}; releasing its claim also failed with {cleanup_error}"
+                        )));
+                    }
+                    continue;
+                }
+                if batch_error.is_none() {
+                    batch_error = Some(StoreError::InvariantViolation(format!(
+                        "session repair job task failed: {join_error}"
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Err(cleanup_error) =
+        drain_join_error_session_repair_claims(pool, &mut task_contexts, &hooks).await
+    {
+        if let Some(batch_error) = batch_error {
+            return Err(StoreError::InvariantViolation(format!(
+                "session repair batch failed with {batch_error}; releasing unresolved join-error claims also failed with {cleanup_error}"
+            )));
+        }
+
+        return Err(cleanup_error);
+    }
+
+    if let Err(drain_error) = drain_pending_session_rebuild_buckets(pool).await {
+        if let Some(batch_error) = batch_error {
+            return Err(StoreError::InvariantViolation(format!(
+                "session repair batch failed with {batch_error}; draining queued rebuilds also failed with {drain_error}"
+            )));
+        }
+
+        return Err(drain_error);
+    }
+
+    if let Some(batch_error) = batch_error {
+        return Err(batch_error);
+    }
+
+    Ok(processed)
+}
+
+#[cfg(test)]
+async fn process_session_repair_batch_with_hooks(
+    pool: &PgPool,
+    concurrency: usize,
+    hooks: SessionRepairBatchHooks,
+) -> Result<usize, StoreError> {
+    process_session_repair_batch_inner(pool, concurrency, hooks).await
+}
+
+async fn drain_session_repair_jobs(pool: &PgPool, concurrency: usize) -> Result<(), StoreError> {
+    while process_session_repair_batch_with_config(pool, concurrency).await? > 0 {}
+
+    Ok(())
+}
+
+async fn process_next_session_repair_job(
+    pool: &PgPool,
+    hooks: SessionRepairBatchHooks,
+    task_context: std::sync::Arc<SessionRepairTaskContext>,
+) -> Result<SessionRepairTaskResult, StoreError> {
+    let mut claim_tx = pool.begin().await.map_err(StoreError::from)?;
+    let Some(job) = claim_pending_session_repair_jobs_in_tx(&mut claim_tx, 1)
+        .await?
+        .into_iter()
+        .next()
+    else {
+        claim_tx.commit().await.map_err(StoreError::from)?;
+        return Ok(SessionRepairTaskResult::default());
+    };
+    claim_tx.commit().await.map_err(StoreError::from)?;
+    task_context.set_claimed_job(job.clone());
+
+    hooks.after_claim(&job.install_id).await;
+    let repair_result = async {
+        let mut tx = pool.begin().await.map_err(StoreError::from)?;
+        process_session_repair_job(&mut tx, job.clone()).await?;
+        tx.commit().await.map_err(StoreError::from)
+    }
+    .await;
+    if let Err(error) = repair_result {
+        if let Err(cleanup_error) = release_failed_session_repair_claim(pool, &job).await {
+            return Err(StoreError::InvariantViolation(format!(
+                "repair job for project {} install {} failed with {error}; releasing the claim also failed with {cleanup_error}",
+                job.project_id, job.install_id
+            )));
+        }
+
+        task_context.clear_claimed_job();
+        return Err(error);
+    }
+
+    task_context.clear_claimed_job();
+    Ok(SessionRepairTaskResult { processed: true })
+}
+
+async fn release_join_error_session_repair_claim(
+    pool: &PgPool,
+    task_contexts: &mut HashMap<tokio::task::Id, std::sync::Arc<SessionRepairTaskContext>>,
+    task_id: tokio::task::Id,
+    hooks: &SessionRepairBatchHooks,
+) -> Result<(), StoreError> {
+    let Some(task_context) = task_contexts.get(&task_id) else {
+        return Ok(());
+    };
+    let Some(job) = task_context.claimed_job() else {
+        task_contexts.remove(&task_id);
+        return Ok(());
+    };
+
+    hooks.before_join_error_claim_release(&job.install_id)?;
+    release_failed_session_repair_claim(pool, &job).await?;
+    task_context.clear_claimed_job();
+    task_contexts.remove(&task_id);
+
+    Ok(())
+}
+
+async fn drain_join_error_session_repair_claims(
+    pool: &PgPool,
+    task_contexts: &mut HashMap<tokio::task::Id, std::sync::Arc<SessionRepairTaskContext>>,
+    hooks: &SessionRepairBatchHooks,
+) -> Result<(), StoreError> {
+    while !task_contexts.is_empty() {
+        let task_ids: Vec<_> = task_contexts.keys().copied().collect();
+        let mut progress = false;
+        let mut last_error = None;
+
+        for task_id in task_ids {
+            match release_join_error_session_repair_claim(pool, task_contexts, task_id, hooks).await
+            {
+                Ok(()) => {
+                    progress = true;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        if task_contexts.is_empty() {
+            return Ok(());
+        }
+
+        if !progress {
+            return Err(last_error.unwrap_or_else(|| {
+                StoreError::InvariantViolation(
+                    "session repair join-error claim cleanup made no progress".to_owned(),
+                )
+            }));
+        }
+    }
+
+    Ok(())
+}
+
+async fn release_failed_session_repair_claim(
+    pool: &PgPool,
+    job: &SessionRepairJobRecord,
+) -> Result<(), StoreError> {
+    let mut cleanup_tx = pool.begin().await.map_err(StoreError::from)?;
+    release_session_repair_job_claim_in_tx(&mut cleanup_tx, job.project_id, &job.install_id)
+        .await?;
+    cleanup_tx.commit().await.map_err(StoreError::from)?;
+
+    Ok(())
+}
+
+async fn process_session_repair_job(
+    tx: &mut Transaction<'_, Postgres>,
+    job: SessionRepairJobRecord,
+) -> Result<(), StoreError> {
+    let install_key = vec![(job.project_id, job.install_id.clone())];
+    let tail_states = load_install_session_states_in_tx(tx, &install_key).await?;
+    let Some(tail_state) = tail_states
+        .get(&(job.project_id, job.install_id.clone()))
+        .cloned()
+    else {
+        return Err(StoreError::InvariantViolation(format!(
+            "repair frontier for project {} install {} has no install_session_state",
+            job.project_id, job.install_id
+        )));
+    };
+
+    if tail_state.last_processed_event_id >= job.target_event_id {
+        complete_session_repair_job_in_tx(tx, job.project_id, &job.install_id, job.target_event_id)
+            .await?;
+        return Ok(());
+    }
+
+    let touched_buckets = repair_install_batch(
+        tx,
+        job.project_id,
+        &job.install_id,
+        tail_state.last_processed_event_id,
+        job.target_event_id,
+    )
+    .await?;
+    enqueue_repair_bucket_finalization_in_tx(tx, job.project_id, &touched_buckets).await?;
+    complete_session_repair_job_in_tx(tx, job.project_id, &job.install_id, job.target_event_id)
+        .await?;
+
+    Ok(())
 }
 
 pub async fn process_event_metrics_batch(
@@ -1308,17 +1683,34 @@ async fn repair_install_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     project_id: Uuid,
     install_id: &str,
-    batch_events: Vec<RawEventRecord>,
-    highest_processed_event_id: i64,
+    last_processed_event_id: i64,
+    target_event_id: i64,
 ) -> Result<SessionRepairBuckets, StoreError> {
-    let batch_min_ts = batch_events
-        .first()
-        .map(|event| event.timestamp)
-        .expect("install batch contains at least one event");
-    let batch_max_ts = batch_events
-        .last()
-        .map(|event| event.timestamp)
-        .expect("install batch contains at least one event");
+    let pending_events = fetch_events_for_install_after_id_through_in_tx(
+        tx,
+        project_id,
+        install_id,
+        last_processed_event_id,
+        target_event_id,
+    )
+    .await?;
+    let mut pending_events_iter = pending_events.iter();
+    let first_pending_event = pending_events_iter.next().ok_or_else(|| {
+            StoreError::InvariantViolation(format!(
+                "repair frontier for project {project_id} install {install_id} had no raw events in ({last_processed_event_id}, {target_event_id}]"
+            ))
+        })?;
+    let first_pending_event_ts = first_pending_event.timestamp.to_owned();
+    let (batch_min_ts, batch_max_ts) = pending_events_iter.fold(
+        (
+            first_pending_event_ts.to_owned(),
+            first_pending_event_ts.to_owned(),
+        ),
+        |(batch_min_ts, batch_max_ts), event| {
+            let timestamp = event.timestamp.to_owned();
+            (batch_min_ts.min(timestamp), batch_max_ts.max(timestamp))
+        },
+    );
 
     let recompute_window =
         load_recompute_window_in_tx(tx, project_id, install_id, batch_min_ts, batch_max_ts).await?;
@@ -1365,10 +1757,94 @@ async fn repair_install_batch(
         )));
     };
 
-    let next_state = install_state_from_session(&latest_session, highest_processed_event_id);
+    let next_state = install_state_from_session(&latest_session, target_event_id);
     upsert_install_session_state_in_tx(tx, &next_state).await?;
 
     Ok(touched_buckets)
+}
+
+async fn rebuild_touched_session_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    touched_buckets: &SessionRepairBuckets,
+) -> Result<(), StoreError> {
+    if touched_buckets.is_empty() {
+        return Ok(());
+    }
+
+    let days = touched_buckets.days.iter().copied().collect::<Vec<_>>();
+    if !days.is_empty() {
+        rebuild_session_daily_days_in_tx(tx, project_id, &days).await?;
+        rebuild_session_metric_buckets_in_tx(
+            tx,
+            project_id,
+            MetricGranularity::Day,
+            &days
+                .iter()
+                .map(|day| bucket_start_for_day(*day))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+    }
+
+    let hours = touched_buckets.hours.iter().copied().collect::<Vec<_>>();
+    if !hours.is_empty() {
+        rebuild_session_metric_buckets_in_tx(tx, project_id, MetricGranularity::Hour, &hours)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn enqueue_repair_bucket_finalization_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    touched_buckets: &SessionRepairBuckets,
+) -> Result<(), StoreError> {
+    let day_bucket_starts = touched_buckets
+        .days
+        .iter()
+        .copied()
+        .map(bucket_start_for_day)
+        .collect::<Vec<_>>();
+    let hour_bucket_starts = touched_buckets.hours.iter().copied().collect::<Vec<_>>();
+
+    enqueue_session_rebuild_buckets_in_tx(tx, project_id, &day_bucket_starts, &hour_bucket_starts)
+        .await
+}
+
+async fn drain_pending_session_rebuild_buckets(pool: &PgPool) -> Result<(), StoreError> {
+    loop {
+        let mut tx = pool.begin().await.map_err(StoreError::from)?;
+        let claimed = claim_pending_session_rebuild_buckets_in_tx(&mut tx, 512).await?;
+        if claimed.is_empty() {
+            tx.commit().await.map_err(StoreError::from)?;
+            break;
+        }
+
+        let mut buckets_by_project = BTreeMap::<Uuid, SessionRepairBuckets>::new();
+        for bucket in claimed {
+            let touched_buckets = buckets_by_project.entry(bucket.project_id).or_default();
+            match bucket.granularity {
+                MetricGranularity::Day => {
+                    touched_buckets
+                        .days
+                        .insert(bucket.bucket_start.date_naive());
+                }
+                MetricGranularity::Hour => {
+                    touched_buckets.hours.insert(bucket.bucket_start);
+                }
+            }
+        }
+
+        for (project_id, touched_buckets) in buckets_by_project {
+            rebuild_touched_session_buckets_in_tx(&mut tx, project_id, &touched_buckets).await?;
+        }
+
+        tx.commit().await.map_err(StoreError::from)?;
+    }
+
+    Ok(())
 }
 
 async fn load_recompute_window_in_tx(
@@ -1911,7 +2387,7 @@ async fn rebuild_session_metric_buckets_in_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use fantasma_core::{EventPayload, Platform};
@@ -1922,6 +2398,7 @@ mod tests {
         save_worker_offset,
     };
     use sqlx::Row;
+    use tokio::sync::Notify;
 
     fn project_id() -> Uuid {
         Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a)
@@ -2048,6 +2525,28 @@ mod tests {
             .expect("load pending session rebuild buckets");
         tx.commit().await.expect("commit pending rebuild bucket tx");
         pending
+    }
+
+    async fn pending_session_repair_frontier(pool: &PgPool, install_id: &str) -> Option<i64> {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT target_event_id
+            FROM session_repair_jobs
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(install_id)
+        .fetch_optional(pool)
+        .await
+        .expect("fetch pending repair frontier")
+    }
+
+    async fn run_session_repair_batch(pool: &PgPool, concurrency: usize) -> usize {
+        process_session_repair_batch(pool, concurrency)
+            .await
+            .expect("run session repair batch")
     }
 
     #[test]
@@ -2345,9 +2844,17 @@ mod tests {
         insert_events(&pool, project_id(), &[event("install-1", 1, 0, 20)])
             .await
             .expect("insert older event");
-        process_session_batch(&pool, 100)
-            .await
-            .expect("process older event batch");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue older event repair");
+        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
 
         assert_eq!(
             count_sessions(
@@ -2427,9 +2934,17 @@ mod tests {
         )
         .await
         .expect("insert late event");
-        process_session_batch(&pool, 100)
-            .await
-            .expect("process late batch");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue late repair batch");
+        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
 
         let repaired_session = fetch_latest_session_for_install(&pool, project_id(), "install-1")
             .await
@@ -2440,6 +2955,522 @@ mod tests {
         assert_eq!(repaired_session.session_end, timestamp(1, 1, 10));
         assert_eq!(repaired_session.duration_seconds, 20 * 60);
         assert_eq!(repaired_session.app_version, None);
+    }
+
+    #[sqlx::test]
+    async fn repair_window_uses_timestamp_extrema_for_out_of_order_pending_events(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 1, 10), event("install-1", 1, 1, 20)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 2, 0), event("install-1", 1, 0, 50)],
+        )
+        .await
+        .expect("insert out-of-order late events");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue late repair batch");
+        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
+
+        let sessions = sqlx::query(
+            r#"
+            SELECT session_start, session_end, duration_seconds
+            FROM sessions
+            WHERE project_id = $1
+              AND install_id = $2
+            ORDER BY session_start ASC
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .fetch_all(&pool)
+        .await
+        .expect("fetch repaired sessions");
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions[0]
+                .try_get::<chrono::DateTime<Utc>, _>("session_start")
+                .unwrap(),
+            timestamp(1, 0, 50)
+        );
+        assert_eq!(
+            sessions[0]
+                .try_get::<chrono::DateTime<Utc>, _>("session_end")
+                .unwrap(),
+            timestamp(1, 1, 20)
+        );
+        assert_eq!(
+            sessions[0].try_get::<i32, _>("duration_seconds").unwrap(),
+            30 * 60
+        );
+        assert_eq!(
+            sessions[1]
+                .try_get::<chrono::DateTime<Utc>, _>("session_start")
+                .unwrap(),
+            timestamp(1, 2, 0)
+        );
+        assert_eq!(
+            sessions[1]
+                .try_get::<chrono::DateTime<Utc>, _>("session_end")
+                .unwrap(),
+            timestamp(1, 2, 0)
+        );
+        assert_eq!(
+            sessions[1].try_get::<i32, _>("duration_seconds").unwrap(),
+            0
+        );
+    }
+
+    #[sqlx::test]
+    async fn repair_job_defers_project_bucket_rebuild_until_batch_finalization(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 1, 0), event("install-1", 1, 1, 10)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 10 * 60))
+        );
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 50)])
+            .await
+            .expect("insert late event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue repair frontier");
+
+        let mut tx = pool.begin().await.expect("begin repair job tx");
+        let job = claim_pending_session_repair_jobs_in_tx(&mut tx, 1)
+            .await
+            .expect("claim repair job")
+            .into_iter()
+            .next()
+            .expect("repair job exists");
+        process_session_repair_job(&mut tx, job)
+            .await
+            .expect("process repair job");
+
+        let duration = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT total_duration_seconds
+            FROM session_daily
+            WHERE project_id = $1
+              AND day = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("fetch inline rebuilt duration");
+
+        assert_eq!(
+            duration,
+            10 * 60,
+            "repair jobs should leave shared project buckets for batch finalization"
+        );
+    }
+
+    #[sqlx::test]
+    async fn mixed_repair_batch_still_drains_shared_bucket_finalization_before_returning_error(
+        pool: PgPool,
+    ) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 1, 0), event("install-1", 1, 1, 10)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 10 * 60))
+        );
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 50)])
+            .await
+            .expect("insert late event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 2,
+            },
+        )
+        .await
+        .expect("enqueue repair frontier");
+
+        sqlx::query(
+            r#"
+            INSERT INTO session_repair_jobs (project_id, install_id, target_event_id)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(project_id())
+        .bind("missing-install-state")
+        .bind(7_i64)
+        .execute(&pool)
+        .await
+        .expect("insert failing repair frontier");
+
+        let claim_blocker = Arc::new(RepairClaimBlocker {
+            claimed: Notify::new(),
+            resume: Notify::new(),
+        });
+        let repair_pool = pool.clone();
+        let repair_claim_blocker = claim_blocker.clone();
+        let repair_task = tokio::spawn(async move {
+            process_session_repair_batch_with_hooks(
+                &repair_pool,
+                2,
+                SessionRepairBatchHooks::block_after_claim_for_install(
+                    "missing-install-state",
+                    repair_claim_blocker,
+                ),
+            )
+            .await
+        });
+        claim_blocker.claimed.notified().await;
+
+        let mut saw_queued_rebuilds = false;
+        for _ in 0..20 {
+            let queued_buckets = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM session_rebuild_queue WHERE project_id = $1",
+            )
+            .bind(project_id())
+            .fetch_one(&pool)
+            .await
+            .expect("count pending rebuild buckets");
+            if queued_buckets > 0 {
+                saw_queued_rebuilds = true;
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            saw_queued_rebuilds,
+            "successful repair work should enqueue shared-bucket finalization before the blocked failure resumes"
+        );
+
+        claim_blocker.resume.notify_waiters();
+        let error = repair_task
+            .await
+            .expect("repair task joins")
+            .expect_err("mixed repair batch should still return the failing install error");
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 20 * 60)),
+            "queued shared-bucket finalization should still drain before the batch returns an error"
+        );
+    }
+
+    #[sqlx::test]
+    async fn repair_batch_waits_for_claimed_jobs_to_finish_before_returning_error(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 1, 0), event("install-1", 1, 1, 10)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 50)])
+            .await
+            .expect("insert late event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 2,
+            },
+        )
+        .await
+        .expect("enqueue repair frontier");
+
+        sqlx::query(
+            r#"
+            INSERT INTO session_repair_jobs (project_id, install_id, target_event_id)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(project_id())
+        .bind("missing-install-state")
+        .bind(7_i64)
+        .execute(&pool)
+        .await
+        .expect("insert failing repair frontier");
+
+        let claim_blocker = Arc::new(RepairClaimBlocker {
+            claimed: Notify::new(),
+            resume: Notify::new(),
+        });
+        let repair_pool = pool.clone();
+        let repair_claim_blocker = claim_blocker.clone();
+        let repair_task = tokio::spawn(async move {
+            process_session_repair_batch_with_hooks(
+                &repair_pool,
+                2,
+                SessionRepairBatchHooks::block_after_claim_for_install(
+                    "install-1",
+                    repair_claim_blocker,
+                ),
+            )
+            .await
+        });
+        claim_blocker.claimed.notified().await;
+
+        let mut saw_failed_peer_released = false;
+        for _ in 0..20 {
+            let mut verify_tx = pool.begin().await.expect("begin failed peer verify tx");
+            let failed_peer = load_session_repair_jobs_for_installs_in_tx(
+                &mut verify_tx,
+                &[(project_id(), "missing-install-state".to_owned())],
+            )
+            .await
+            .expect("load failed peer frontier");
+            verify_tx
+                .commit()
+                .await
+                .expect("commit failed peer verify tx");
+
+            if failed_peer
+                .get(&(project_id(), "missing-install-state".to_owned()))
+                .is_some_and(|job| job.claimed_at.is_none())
+            {
+                saw_failed_peer_released = true;
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            saw_failed_peer_released,
+            "the failing peer should release its own claim while the blocked claimed job is still in flight"
+        );
+        assert!(
+            !repair_task.is_finished(),
+            "repair batch should wait for already-claimed peer jobs to finish instead of cancelling them"
+        );
+
+        claim_blocker.resume.notify_waiters();
+        let error = repair_task
+            .await
+            .expect("repair task joins")
+            .expect_err("repair batch should still return the failing peer error");
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+
+        let mut verify_tx = pool.begin().await.expect("begin final verify tx");
+        let jobs = load_session_repair_jobs_for_installs_in_tx(
+            &mut verify_tx,
+            &[
+                (project_id(), "install-1".to_owned()),
+                (project_id(), "missing-install-state".to_owned()),
+            ],
+        )
+        .await
+        .expect("load repair frontiers after batch");
+        let reclaimed = claim_pending_session_repair_jobs_in_tx(&mut verify_tx, 10)
+            .await
+            .expect("claim remaining repair frontiers");
+        verify_tx.commit().await.expect("commit final verify tx");
+
+        assert!(
+            !jobs.contains_key(&(project_id(), "install-1".to_owned())),
+            "the blocked claimed repair should complete and clear its frontier instead of staying stranded"
+        );
+        let failed_peer = jobs
+            .get(&(project_id(), "missing-install-state".to_owned()))
+            .expect("failed peer frontier remains queued");
+        assert_eq!(failed_peer.claimed_at, None);
+        assert!(reclaimed.iter().any(|job| {
+            job.project_id == project_id()
+                && job.install_id == "missing-install-state"
+                && job.claimed_at.is_some()
+        }));
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 20 * 60))
+        );
+    }
+
+    #[sqlx::test]
+    async fn panicked_repair_worker_releases_claim_for_retry(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 1, 0), event("install-1", 1, 1, 10)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 50)])
+            .await
+            .expect("insert late event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue repair frontier");
+
+        let error = process_session_repair_batch_with_hooks(
+            &pool,
+            1,
+            SessionRepairBatchHooks::panic_after_claim_for_install("install-1"),
+        )
+        .await
+        .expect_err("repair batch should surface the panicking worker");
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+
+        let mut verify_tx = pool.begin().await.expect("begin panic verify tx");
+        let queued = load_session_repair_jobs_for_installs_in_tx(
+            &mut verify_tx,
+            &[(project_id(), "install-1".to_owned())],
+        )
+        .await
+        .expect("load queued repair frontier");
+        let reclaimed = claim_pending_session_repair_jobs_in_tx(&mut verify_tx, 1)
+            .await
+            .expect("reclaim panic-released frontier");
+        verify_tx.commit().await.expect("commit panic verify tx");
+
+        let queued = queued
+            .get(&(project_id(), "install-1".to_owned()))
+            .expect("repair frontier remains queued");
+        assert_eq!(queued.claimed_at, None);
+        assert_eq!(queued.target_event_id, 3);
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].install_id, "install-1");
+        assert_eq!(reclaimed[0].target_event_id, 3);
+        assert!(reclaimed[0].claimed_at.is_some());
+    }
+
+    #[sqlx::test]
+    async fn join_error_claim_cleanup_retries_before_dropping_task_context(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 1, 0), event("install-1", 1, 1, 10)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 50)])
+            .await
+            .expect("insert late event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue repair frontier");
+
+        let error = process_session_repair_batch_with_hooks(
+            &pool,
+            1,
+            SessionRepairBatchHooks::panic_after_claim_and_fail_join_error_release_once_for_install(
+                "install-1",
+            ),
+        )
+        .await
+        .expect_err("repair batch should surface the panicking worker");
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+
+        let mut verify_tx = pool.begin().await.expect("begin retry verify tx");
+        let queued = load_session_repair_jobs_for_installs_in_tx(
+            &mut verify_tx,
+            &[(project_id(), "install-1".to_owned())],
+        )
+        .await
+        .expect("load queued repair frontier");
+        let reclaimed = claim_pending_session_repair_jobs_in_tx(&mut verify_tx, 1)
+            .await
+            .expect("reclaim retry-released frontier");
+        verify_tx.commit().await.expect("commit retry verify tx");
+
+        let queued = queued
+            .get(&(project_id(), "install-1".to_owned()))
+            .expect("repair frontier remains queued");
+        assert_eq!(queued.claimed_at, None);
+        assert_eq!(queued.target_event_id, 3);
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].install_id, "install-1");
+        assert_eq!(reclaimed[0].target_event_id, 3);
+        assert!(reclaimed[0].claimed_at.is_some());
     }
 
     #[sqlx::test]
@@ -2471,9 +3502,17 @@ mod tests {
         insert_events(&pool, project_id(), &[event("install-1", 2, 0, 25)])
             .await
             .expect("insert late cross-midnight event");
-        process_session_batch(&pool, 100)
-            .await
-            .expect("process repair batch");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue repair batch");
+        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
 
         let tail = load_install_session_state(&pool, project_id(), "install-1")
             .await
@@ -2524,9 +3563,17 @@ mod tests {
         )
         .await
         .expect("insert late repair events");
-        process_session_batch(&pool, 100)
-            .await
-            .expect("process repair batch");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 2,
+            },
+        )
+        .await
+        .expect("enqueue repair batch");
+        assert_eq!(run_session_repair_batch(&pool, 2).await, 2);
 
         assert_eq!(
             session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
@@ -2841,6 +3888,376 @@ mod tests {
 
         assert_eq!(hour_zero_duration, 20 * 60);
         assert_eq!(day_duration, 20 * 60);
+    }
+
+    #[sqlx::test]
+    async fn replayed_repair_enqueue_only_advances_raw_offset_after_coordinator_failure(
+        pool: PgPool,
+    ) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 0, 0), event("install-1", 1, 0, 45)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 20)])
+            .await
+            .expect("insert late repair event");
+
+        let error = process_session_batch_with_hooks(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+            SessionBatchTestHooks::fail_before_coordinator_finalize(),
+        )
+        .await
+        .expect_err("coordinator finalize should fail after repair enqueue");
+
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+        assert_eq!(
+            load_worker_offset(&pool, SESSION_WORKER_NAME)
+                .await
+                .expect("load worker offset"),
+            2
+        );
+        assert_eq!(
+            pending_session_repair_frontier(&pool, "install-1").await,
+            None
+        );
+
+        let tail = load_install_session_state(&pool, project_id(), "install-1")
+            .await
+            .expect("load install state")
+            .expect("install state exists");
+        assert_eq!(tail.last_processed_event_id, 2);
+
+        let replayed = process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("replay repair enqueue batch");
+
+        assert!(replayed.advanced_offset);
+        assert_eq!(
+            load_worker_offset(&pool, SESSION_WORKER_NAME)
+                .await
+                .expect("load replayed worker offset"),
+            3
+        );
+        assert_eq!(
+            pending_session_repair_frontier(&pool, "install-1").await,
+            Some(3)
+        );
+        let replay_tail = load_install_session_state(&pool, project_id(), "install-1")
+            .await
+            .expect("load replay install state")
+            .expect("install state exists");
+        assert_eq!(replay_tail.last_processed_event_id, 2);
+    }
+
+    #[sqlx::test]
+    async fn apply_lane_does_not_hold_raw_offset_lock_while_waiting_on_claimed_repair(
+        pool: PgPool,
+    ) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 0, 0), event("install-1", 1, 0, 45)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 20)])
+            .await
+            .expect("insert late repair event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue repair frontier");
+
+        let claim_blocker = Arc::new(RepairClaimBlocker {
+            claimed: Notify::new(),
+            resume: Notify::new(),
+        });
+        let repair_pool = pool.clone();
+        let repair_claim_blocker = claim_blocker.clone();
+        let repair_task = tokio::spawn(async move {
+            process_session_repair_batch_with_hooks(
+                &repair_pool,
+                1,
+                SessionRepairBatchHooks::block_after_claim(repair_claim_blocker),
+            )
+            .await
+        });
+        claim_blocker.claimed.notified().await;
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 1, 10)])
+            .await
+            .expect("insert newer event while repair is claimed");
+
+        let apply_pool = pool.clone();
+        let apply_task = tokio::spawn(async move {
+            process_session_batch_with_config(
+                &apply_pool,
+                SessionBatchConfig {
+                    batch_size: 100,
+                    incremental_concurrency: 1,
+                    repair_concurrency: 1,
+                },
+            )
+            .await
+        });
+
+        let mut saw_offset_lock_timeout = false;
+        for _ in 0..10 {
+            if apply_task.is_finished() {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let mut verify_tx = pool.begin().await.expect("begin offset verify tx");
+            sqlx::query("SET LOCAL lock_timeout = '50ms'")
+                .execute(&mut *verify_tx)
+                .await
+                .expect("set local lock timeout");
+
+            if lock_worker_offset(&mut verify_tx, SESSION_WORKER_NAME)
+                .await
+                .is_err()
+            {
+                saw_offset_lock_timeout = true;
+                verify_tx
+                    .rollback()
+                    .await
+                    .expect("rollback timed out verify tx");
+                break;
+            }
+
+            verify_tx.rollback().await.expect("rollback verify tx");
+        }
+
+        claim_blocker.resume.notify_waiters();
+        let repair_processed = repair_task
+            .await
+            .expect("repair task joins")
+            .expect("repair task succeeds");
+        let apply_result = apply_task.await.expect("apply task joins");
+
+        assert_eq!(repair_processed, 1);
+        assert!(
+            !saw_offset_lock_timeout,
+            "apply lane should not keep the raw offset lock while a claimed repair frontier is blocked"
+        );
+        assert!(
+            apply_result.is_ok(),
+            "apply batch should finish after repair resumes"
+        );
+    }
+
+    #[sqlx::test]
+    async fn repair_job_failure_releases_claim_for_retry(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+
+        sqlx::query(
+            r#"
+            INSERT INTO session_repair_jobs (project_id, install_id, target_event_id)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(project_id())
+        .bind("missing-install-state")
+        .bind(7_i64)
+        .execute(&pool)
+        .await
+        .expect("insert repair frontier without install state");
+
+        let error = process_session_repair_batch_with_config(&pool, 1)
+            .await
+            .expect_err("repair batch should fail");
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+
+        let mut verify_tx = pool.begin().await.expect("begin verify tx");
+        let queued = load_session_repair_jobs_for_installs_in_tx(
+            &mut verify_tx,
+            &[(project_id(), "missing-install-state".to_owned())],
+        )
+        .await
+        .expect("load queued repair frontier");
+        let reclaimed = claim_pending_session_repair_jobs_in_tx(&mut verify_tx, 1)
+            .await
+            .expect("reclaim repair frontier");
+        verify_tx.commit().await.expect("commit verify tx");
+
+        let queued = queued
+            .get(&(project_id(), "missing-install-state".to_owned()))
+            .expect("repair frontier remains queued");
+        assert_eq!(queued.target_event_id, 7);
+        assert_eq!(
+            queued.claimed_at, None,
+            "failed repair jobs should release their claim for retry"
+        );
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].install_id, "missing-install-state");
+        assert_eq!(reclaimed[0].target_event_id, 7);
+        assert!(reclaimed[0].claimed_at.is_some());
+    }
+
+    #[sqlx::test]
+    async fn pending_repair_frontier_widens_for_newer_events_without_advancing_install_progress(
+        pool: PgPool,
+    ) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 0, 0), event("install-1", 1, 0, 45)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 20)])
+            .await
+            .expect("insert late event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue repair frontier");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 1, 10)])
+            .await
+            .expect("insert newer event while repair is pending");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("widen repair frontier");
+
+        assert_eq!(
+            pending_session_repair_frontier(&pool, "install-1").await,
+            Some(4)
+        );
+        assert_eq!(
+            load_worker_offset(&pool, SESSION_WORKER_NAME)
+                .await
+                .expect("load worker offset"),
+            4
+        );
+
+        let tail = load_install_session_state(&pool, project_id(), "install-1")
+            .await
+            .expect("load install state")
+            .expect("install state exists");
+        assert_eq!(tail.last_processed_event_id, 2);
+    }
+
+    #[sqlx::test]
+    async fn repair_lane_commit_leaves_daily_and_metric_state_final_without_rebuild_queue(
+        pool: PgPool,
+    ) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 0, 0), event("install-1", 1, 0, 45)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 20)])
+            .await
+            .expect("insert late repair event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue repair frontier");
+
+        let processed = process_session_repair_batch(&pool, 1)
+            .await
+            .expect("run repair lane");
+
+        assert_eq!(processed, 1);
+        assert!(
+            pending_session_rebuild_buckets(&pool).await.is_empty(),
+            "repair lane should finalize directly without leaving rebuild queue work behind"
+        );
+        assert_eq!(
+            pending_session_repair_frontier(&pool, "install-1").await,
+            None
+        );
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 45 * 60))
+        );
+
+        let tail = load_install_session_state(&pool, project_id(), "install-1")
+            .await
+            .expect("load install state")
+            .expect("install state exists");
+        assert_eq!(tail.last_processed_event_id, 3);
+
+        let repaired_session = fetch_latest_session_for_install(&pool, project_id(), "install-1")
+            .await
+            .expect("fetch repaired session")
+            .expect("session exists");
+        assert_eq!(repaired_session.event_count, 3);
+        assert_eq!(repaired_session.duration_seconds, 45 * 60);
     }
 
     #[sqlx::test]
@@ -3243,9 +4660,17 @@ mod tests {
             .await
             .expect("insert late event");
 
-        process_session_batch(&pool, 100)
-            .await
-            .expect("process late batch");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue late repair batch");
+        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
 
         let first_seen_bucket = sqlx::query_scalar::<_, DateTime<Utc>>(
             r#"

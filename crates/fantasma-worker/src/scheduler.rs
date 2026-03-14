@@ -9,6 +9,7 @@ use tracing::{error, info};
 use crate::worker::{
     EVENT_METRICS_WORKER_NAME, SESSION_WORKER_NAME, SessionBatchConfig,
     process_event_metrics_batch, process_session_batch_with_config,
+    process_session_repair_batch_with_config,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +38,7 @@ impl WorkerConfig {
         let required = self
             .session_incremental_concurrency
             .saturating_add(self.session_repair_concurrency)
-            .saturating_add(4);
+            .saturating_add(5);
         required as u32
     }
 }
@@ -56,17 +57,32 @@ pub(crate) struct LaneRunStats {
 }
 
 pub async fn run_worker(pool: PgPool, config: WorkerConfig) -> Result<(), StoreError> {
-    let session_pool = pool.clone();
+    let session_apply_pool = pool.clone();
+    let session_repair_pool = pool.clone();
     let event_pool = pool;
-    let session_config = config.clone();
+    let session_apply_config = config.clone();
+    let session_repair_config = config.clone();
     let event_config = config;
 
     tokio::try_join!(
-        run_lane_forever("session", session_config.idle_poll_interval, move || {
-            let pool = session_pool.clone();
-            let config = session_config.clone();
-            async move { session_lane_tick(&pool, &config).await }
-        }),
+        run_lane_forever(
+            "session_apply",
+            session_apply_config.idle_poll_interval,
+            move || {
+                let pool = session_apply_pool.clone();
+                let config = session_apply_config.clone();
+                async move { session_apply_lane_tick(&pool, &config).await }
+            }
+        ),
+        run_lane_forever(
+            "session_repair",
+            session_repair_config.idle_poll_interval,
+            move || {
+                let pool = session_repair_pool.clone();
+                let config = session_repair_config.clone();
+                async move { session_repair_lane_tick(&pool, &config).await }
+            }
+        ),
         run_lane_forever(
             "event_metrics",
             event_config.idle_poll_interval,
@@ -183,6 +199,27 @@ async fn session_lane_tick(
     })
 }
 
+async fn session_apply_lane_tick(
+    pool: &PgPool,
+    config: &WorkerConfig,
+) -> Result<LaneTickResult, StoreError> {
+    session_lane_tick(pool, config).await
+}
+
+async fn session_repair_lane_tick(
+    pool: &PgPool,
+    config: &WorkerConfig,
+) -> Result<LaneTickResult, StoreError> {
+    let processed_jobs =
+        process_session_repair_batch_with_config(pool, config.session_repair_concurrency).await?;
+
+    Ok(LaneTickResult {
+        processed_events: processed_jobs,
+        backlog_events: 0,
+        made_progress: processed_jobs > 0,
+    })
+}
+
 async fn event_metrics_lane_tick(
     pool: &PgPool,
     config: &WorkerConfig,
@@ -217,7 +254,19 @@ mod tests {
 
     use fantasma_store::StoreError;
 
-    use super::{LaneRunStats, LaneTickResult, drive_lane_until};
+    use super::{LaneRunStats, LaneTickResult, WorkerConfig, drive_lane_until};
+
+    #[test]
+    fn worker_config_defaults_match_repo_defaults() {
+        let config = WorkerConfig::default();
+
+        assert_eq!(config.idle_poll_interval, Duration::from_millis(250));
+        assert_eq!(config.session_batch_size, 1_000);
+        assert_eq!(config.event_batch_size, 5_000);
+        assert_eq!(config.session_incremental_concurrency, 8);
+        assert_eq!(config.session_repair_concurrency, 2);
+        assert_eq!(config.required_db_connections(), 15);
+    }
 
     #[tokio::test]
     async fn lane_sleeps_only_after_idle_ticks() {

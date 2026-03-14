@@ -38,10 +38,10 @@ HTTP service variables:
 Worker variables:
 
 - `FANTASMA_WORKER_IDLE_POLL_INTERVAL_MS`: idle-only sleep interval in milliseconds; defaults to `250`
-- `FANTASMA_WORKER_SESSION_BATCH_SIZE`: raw-event batch size for the session lane; defaults to `1000`
+- `FANTASMA_WORKER_SESSION_BATCH_SIZE`: raw-event batch size for the `session_apply` lane; defaults to `1000`
 - `FANTASMA_WORKER_EVENT_BATCH_SIZE`: raw-event batch size for the event-metrics lane; defaults to `5000`
-- `FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY`: bounded parallelism for append-like per-install session work; defaults to `8`
-- `FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY`: bounded parallelism for repair-like per-install session work; defaults to `2`
+- `FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY`: bounded parallelism for append-like per-install `session_apply` work; defaults to `8`
+- `FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY`: bounded parallelism for queue-driven `session_repair` work; defaults to `2`
 
 Current Compose defaults:
 
@@ -62,9 +62,11 @@ through the operator management API after the stack is healthy.
 
 There is no separate migration job in the default stack. The dashboard, when
 enabled, serves static files from `apps/dashboard-web/public` through Nginx.
-The worker keeps one process but runs independent `sessions` and
-`event_metrics` lanes internally; each lane repolls immediately after useful
-work and only sleeps after an idle tick.
+The worker keeps one process but runs independent `session_apply`,
+`session_repair`, and `event_metrics` lanes internally. `session_apply` is the
+only owner of the raw `"sessions"` offset, while `session_repair` drains the
+durable install-scoped repair frontier independently of that raw offset. Each
+lane repolls immediately after useful work and only sleeps after an idle tick.
 
 ## Operator Workflow
 

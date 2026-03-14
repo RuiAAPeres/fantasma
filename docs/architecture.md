@@ -72,11 +72,11 @@ Current derived metric:
 
 Current worker behavior:
 
-- run one `sessions` lane and one `event_metrics` lane concurrently inside the same worker process
-- keep a separate `worker_offsets` checkpoint per lane and hold the claimed offset-row lock for the full batch window until the final offset save commits
+- run `session_apply`, `session_repair`, and `event_metrics` lanes concurrently inside the same worker process
+- keep a separate `worker_offsets` checkpoint for the raw-offset lanes and hold the claimed offset-row lock for the full batch window until the final offset save commits
 - repoll immediately after progress and sleep only after an idle tick, so busy lanes stay work-conserving
 - poll `events_raw` in batches ordered by raw event id
-- group session-lane batches by `project_id` and `install_id`
+- group `session_apply` batches by `project_id` and `install_id`
 - load one persisted state row per `(project_id, install_id)` from `install_session_state` plus the referenced tail session row when append work needs it
 - sort each install batch by `(timestamp, id)` and process forward only
 - infer sessions from event timestamps with a 30-minute inactivity rule
@@ -86,8 +86,15 @@ Current worker behavior:
 - insert new immutable session rows for later derived sessions and replace tail state once per install batch
 - keep `last_processed_event_id` in `install_session_state` so per-install replay becomes a no-op even if the lane offset is rewound after some install work already committed
 - treat `install_session_state` as durable worker state and never delete or reset it during ordinary append, repair, or session rewrites
-- classify session-lane work items into incremental vs repair and run those queues with separate bounded concurrency so repair load cannot consume append slots
-- switch an install into a bounded repair path when a batch contains older-than-tail events
+- treat `install_session_state.last_processed_event_id` as the only authoritative applied replay frontier; pending repair state is routing state only
+- widen an install-scoped durable repair frontier when `session_apply` sees older-than-tail work or any newer work for an install that already has repair pending
+- let `session_apply` persist incremental append results and repair-frontier updates before it advances the raw `"sessions"` offset
+- keep `session_repair` queue-driven and independent from the raw `"sessions"` offset
+- claim `session_repair_jobs` in a short transaction and release those row locks before the full replay transaction starts so append work never waits on long repair commits while holding the raw offset lock
+- if replay or commit fails after a short claim commit, release that install's repair claim back to the queue in a fresh transaction so later retries can still reclaim the frontier
+- track each spawned repair worker's claimed job until it resolves so the coordinator can also release that claim if the worker panics or is externally cancelled after the short claim commit, and retain that task context until claim release actually succeeds so transient cleanup failures can retry without discarding the last handle to the claimed row
+- let `session_repair` claim install-scoped repair work safely, fetch raw events by `(project_id, install_id, raw_event_id frontier)`, and no-op stale claims when `last_processed_event_id` already covers the claimed frontier
+- if one repair in a batch fails, let any already-claimed peer repairs finish their normal success or cleanup paths before surfacing the first error so those peer claims do not get stranded by coordinator-side cancellation
 - derive replacement sessions from raw events inside the overlapping repair window and rewrite only those derived rows
 - leave append-derived state final at child-transaction commit time: `sessions`, `install_first_seen`, `install_session_state`, `session_daily_installs`, `session_daily`, and the session metric bucket tables are already correct before the coordinator advances offsets
 - persist append outcomes with set-based helpers wherever practical so hot-path writes stay batched instead of reintroducing per-event SQL churn
@@ -97,9 +104,8 @@ Current worker behavior:
 - rebuild only the exact touched UTC days for `session_daily` and `session_daily_installs` after a repair
 - rebuild only the exact touched hourly and daily session metric buckets after repair/backfill session changes
 - keep append and repair intentionally different maintenance paths in this slice: append commits direct deltas, repair/backfill recomputes exact touched windows from source tables
-- if a later repair install in the claimed batch fails after earlier repair work already committed, rebuild the successful installs' touched buckets before releasing the lane lock or surfacing the error so replay filtering cannot strand stale aggregates
-- enqueue touched session day/hour buckets durably only for repair/backfill child transactions
-- drain the pending session bucket queue only for repair/backfill work inside the coordinator transaction before deleting those queue rows and advancing the lane offset
+- let `session_repair` own the install-scoped repair commit: rewritten sessions, `install_session_state`, exact touched-day rebuilds, queued touched hour/day bucket finalization, and repair-frontier completion all commit together
+- queue shared project hour/day session bucket rebuilds through `session_rebuild_queue` and drain that queue after repair claims finish, even if a later install in the same batch fails, so overlapping installs rebuild each bucket on one serialized path without stranding already-committed repairs behind a later error
 - preserve grouped session dimensions from the pre-repair session assignment so late events do not rebucket `platform` or `app_version`
 - keep the normal append path incremental and delta-based: direct session metric bucket deltas replace append-path delete-and-rescan maintenance
 - derive event-count cuboids incrementally from raw events into bounded hourly and daily totals, single-dimension rollups, two-dimension rollups, and three-dimension rollups
@@ -111,6 +117,7 @@ Current aggregate ownership:
 
 - `sessions` stores immutable closed sessions plus one mutable tail session per install
 - `install_session_state` is the worker's durable per-install sessionization and replay-progress state
+- `session_repair_jobs` stores install-scoped durable repair frontier state for the queue-driven repair lane
 - `session_daily` stores UTC `DATE` buckets used by bounded session repair and incremental session-count / duration maintenance
 - `session_daily_installs` stores per-day install membership so internal install bookkeeping stays incremental without `COUNT(DISTINCT ...)` rebuilds
 - bounded event metric cuboids store worker-derived hourly and daily series for event counts
