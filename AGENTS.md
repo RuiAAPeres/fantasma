@@ -56,6 +56,7 @@ Do not add scope beyond the product vision without an explicit decision:
 - Scope all persisted data by `project_id`.
 - DB-backed Rust tests should run fully in Docker through the repository workflow rather than host Postgres or ad hoc host `DATABASE_URL` setup.
 - Keep `cargo test --workspace` on the Docker Postgres path limited to tests satisfied by containerized Postgres alone; stack-level checks belong in dedicated smoke workflows.
+- When changing metric bucket schemas or replacing metric tables, preserve equivalent bounded read indexes for later-dimension filters and update the EXPLAIN-backed store tests in the same change.
 
 ## SDK Rules
 

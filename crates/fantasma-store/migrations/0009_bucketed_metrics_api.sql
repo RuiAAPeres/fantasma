@@ -76,6 +76,28 @@ CREATE INDEX IF NOT EXISTS idx_event_metric_buckets_dim2_project_event_bucket
         bucket_start
     );
 
+CREATE INDEX IF NOT EXISTS idx_event_metric_buckets_dim2_project_event_dim1_value_bucket
+    ON event_metric_buckets_dim2(
+        project_id,
+        granularity,
+        event_name,
+        dim1_key,
+        dim2_key,
+        dim1_value,
+        bucket_start
+    );
+
+CREATE INDEX IF NOT EXISTS idx_event_metric_buckets_dim2_project_event_dim2_value_bucket
+    ON event_metric_buckets_dim2(
+        project_id,
+        granularity,
+        event_name,
+        dim1_key,
+        dim2_key,
+        dim2_value,
+        bucket_start
+    );
+
 CREATE TABLE IF NOT EXISTS event_metric_buckets_dim3 (
     project_id UUID NOT NULL REFERENCES projects(id),
     granularity TEXT NOT NULL CHECK (granularity IN ('hour', 'day')),
@@ -113,6 +135,42 @@ CREATE INDEX IF NOT EXISTS idx_event_metric_buckets_dim3_project_event_bucket
         dim1_value,
         dim2_key,
         dim2_value,
+        dim3_key,
+        dim3_value,
+        bucket_start
+    );
+
+CREATE INDEX IF NOT EXISTS idx_event_metric_buckets_dim3_project_event_dim1_value_bucket
+    ON event_metric_buckets_dim3(
+        project_id,
+        granularity,
+        event_name,
+        dim1_key,
+        dim2_key,
+        dim3_key,
+        dim1_value,
+        bucket_start
+    );
+
+CREATE INDEX IF NOT EXISTS idx_event_metric_buckets_dim3_project_event_dim2_value_bucket
+    ON event_metric_buckets_dim3(
+        project_id,
+        granularity,
+        event_name,
+        dim1_key,
+        dim2_key,
+        dim3_key,
+        dim2_value,
+        bucket_start
+    );
+
+CREATE INDEX IF NOT EXISTS idx_event_metric_buckets_dim3_project_event_dim3_value_bucket
+    ON event_metric_buckets_dim3(
+        project_id,
+        granularity,
+        event_name,
+        dim1_key,
+        dim2_key,
         dim3_key,
         dim3_value,
         bucket_start
