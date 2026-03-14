@@ -1,0 +1,39 @@
+{
+  "scenario": "append-90d",
+  "run_config": {
+    "repetitions_30d": 3,
+    "worker_config": {
+      "session_batch_size": 5000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2
+    }
+  },
+  "phases": [
+    {
+      "name": "ingest",
+      "events_sent": 2700000,
+      "elapsed_ms": 98147,
+      "events_per_second": 27509.58145792676
+    }
+  ],
+  "readiness": [
+    {
+      "name": "event_metrics_ready_ms",
+      "elapsed_ms": 472
+    },
+    {
+      "name": "session_metrics_ready_ms",
+      "elapsed_ms": 23716
+    },
+    {
+      "name": "derived_metrics_ready_ms",
+      "elapsed_ms": 23716
+    }
+  ],
+  "queries": [],
+  "budget": {
+    "passed": true,
+    "failures": []
+  }
+}

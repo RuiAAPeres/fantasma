@@ -1,0 +1,948 @@
+{
+  "host": {
+    "cpu_model": "Apple M3 Pro",
+    "memory_bytes": 38654705664,
+    "memory_gib": 36.0,
+    "os_kernel": "Darwin 25.1.0",
+    "architecture": "aarch64",
+    "benchmarked_at": "2026-03-14T17:22:06.680670+00:00"
+  },
+  "run_config": {
+    "repetitions_30d": 3,
+    "worker_config": {
+      "session_batch_size": 5000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2
+    }
+  },
+  "scenarios": [
+    {
+      "scenario": "append-30d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 900000,
+          "elapsed_ms": 31374,
+          "events_per_second": 28685.740945848516
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 242
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 9150
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 9150
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "backfill-30d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 900000,
+          "elapsed_ms": 32046,
+          "events_per_second": 28084.24843906577
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 234
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 113217
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 113217
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": false,
+        "failures": [
+          "session_metrics_ready_ms readiness 113217ms exceeded budget 60000ms",
+          "derived_metrics_ready_ms readiness 113217ms exceeded budget 60000ms"
+        ]
+      }
+    },
+    {
+      "scenario": "repair-30d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 900000,
+          "elapsed_ms": 30637,
+          "events_per_second": 29375.922880296792
+        },
+        {
+          "name": "repair_ingest",
+          "events_sent": 3000,
+          "elapsed_ms": 122,
+          "events_per_second": 24499.995916667347
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 841
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 101151
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 101151
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": false,
+        "failures": [
+          "session_metrics_ready_ms readiness 101151ms exceeded budget 60000ms",
+          "derived_metrics_ready_ms readiness 101151ms exceeded budget 60000ms"
+        ]
+      }
+    },
+    {
+      "scenario": "reads-30d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 900000,
+          "elapsed_ms": 32101,
+          "events_per_second": 28036.330140870654
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 240
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 8756
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 8756
+        }
+      ],
+      "queries": [
+        {
+          "name": "events_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 3,
+          "p50_ms": 4,
+          "p95_ms": 5,
+          "max_ms": 5
+        },
+        {
+          "name": "events_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 29,
+          "p50_ms": 30,
+          "p95_ms": 31,
+          "max_ms": 36
+        },
+        {
+          "name": "events_count_day_dim4_grouped",
+          "iterations": 100,
+          "min_ms": 8,
+          "p50_ms": 9,
+          "p95_ms": 10,
+          "max_ms": 14
+        },
+        {
+          "name": "events_count_hour_dim4_grouped",
+          "iterations": 100,
+          "min_ms": 32,
+          "p50_ms": 33,
+          "p95_ms": 34,
+          "max_ms": 35
+        },
+        {
+          "name": "sessions_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 2,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 13,
+          "p95_ms": 14,
+          "max_ms": 15
+        },
+        {
+          "name": "sessions_duration_total_day_grouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 2,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_duration_total_hour_grouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 13,
+          "p95_ms": 14,
+          "max_ms": 16
+        },
+        {
+          "name": "sessions_new_installs_day_grouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_new_installs_hour_grouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 14,
+          "p95_ms": 15,
+          "max_ms": 17
+        },
+        {
+          "name": "events_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 1
+        },
+        {
+          "name": "events_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 2,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "sessions_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_duration_total_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "sessions_duration_total_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_new_installs_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "sessions_new_installs_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        }
+      ],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "append-90d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 2700000,
+          "elapsed_ms": 98147,
+          "events_per_second": 27509.58145792676
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 472
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 23716
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 23716
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "backfill-90d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 2700000,
+          "elapsed_ms": 109849,
+          "events_per_second": 24578.973599403045
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 377
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 327066
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 327066
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "repair-90d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 2700000,
+          "elapsed_ms": 110800,
+          "events_per_second": 24368.176018839484
+        },
+        {
+          "name": "repair_ingest",
+          "events_sent": 9000,
+          "elapsed_ms": 380,
+          "events_per_second": 23677.16706757986
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 2343
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 568298
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 568298
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "reads-90d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 2700000,
+          "elapsed_ms": 92015,
+          "events_per_second": 29343.04027440446
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 372
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 31471
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 31471
+        }
+      ],
+      "queries": [
+        {
+          "name": "events_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 8,
+          "p50_ms": 8,
+          "p95_ms": 9,
+          "max_ms": 9
+        },
+        {
+          "name": "events_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 85,
+          "p50_ms": 87,
+          "p95_ms": 88,
+          "max_ms": 90
+        },
+        {
+          "name": "events_count_day_dim4_grouped",
+          "iterations": 100,
+          "min_ms": 6,
+          "p50_ms": 7,
+          "p95_ms": 8,
+          "max_ms": 10
+        },
+        {
+          "name": "events_count_hour_dim4_grouped",
+          "iterations": 100,
+          "min_ms": 71,
+          "p50_ms": 74,
+          "p95_ms": 81,
+          "max_ms": 89
+        },
+        {
+          "name": "sessions_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 4,
+          "p50_ms": 4,
+          "p95_ms": 6,
+          "max_ms": 8
+        },
+        {
+          "name": "sessions_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 38,
+          "p50_ms": 42,
+          "p95_ms": 50,
+          "max_ms": 54
+        },
+        {
+          "name": "sessions_duration_total_day_grouped",
+          "iterations": 100,
+          "min_ms": 4,
+          "p50_ms": 4,
+          "p95_ms": 6,
+          "max_ms": 7
+        },
+        {
+          "name": "sessions_duration_total_hour_grouped",
+          "iterations": 100,
+          "min_ms": 36,
+          "p50_ms": 41,
+          "p95_ms": 46,
+          "max_ms": 49
+        },
+        {
+          "name": "sessions_new_installs_day_grouped",
+          "iterations": 100,
+          "min_ms": 4,
+          "p50_ms": 4,
+          "p95_ms": 6,
+          "max_ms": 8
+        },
+        {
+          "name": "sessions_new_installs_hour_grouped",
+          "iterations": 100,
+          "min_ms": 36,
+          "p50_ms": 40,
+          "p95_ms": 47,
+          "max_ms": 51
+        },
+        {
+          "name": "events_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "events_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 5,
+          "p50_ms": 6,
+          "p95_ms": 7,
+          "max_ms": 8
+        },
+        {
+          "name": "sessions_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 5,
+          "p50_ms": 6,
+          "p95_ms": 7,
+          "max_ms": 10
+        },
+        {
+          "name": "sessions_duration_total_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_duration_total_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 5,
+          "p50_ms": 6,
+          "p95_ms": 7,
+          "max_ms": 8
+        },
+        {
+          "name": "sessions_new_installs_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_new_installs_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 5,
+          "p50_ms": 6,
+          "p95_ms": 7,
+          "max_ms": 9
+        }
+      ],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "append-180d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 5400000,
+          "elapsed_ms": 190528,
+          "events_per_second": 28342.159997950814
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 734
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 51136
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 51136
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "backfill-180d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "ingest",
+          "events_sent": 5400000,
+          "elapsed_ms": 227259,
+          "events_per_second": 23761.432193360983
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 450
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 657273
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 657273
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "repair-180d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 5400000,
+          "elapsed_ms": 287250,
+          "events_per_second": 18798.942810989774
+        },
+        {
+          "name": "repair_ingest",
+          "events_sent": 18000,
+          "elapsed_ms": 859,
+          "events_per_second": 20936.568304536344
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 6384
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 1331810
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 1331810
+        }
+      ],
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "reads-180d",
+      "run_config": {
+        "repetitions_30d": 3,
+        "worker_config": {
+          "session_batch_size": 5000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2
+        }
+      },
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 5400000,
+          "elapsed_ms": 245157,
+          "events_per_second": 22026.642822445105
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 730
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 45562
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 45562
+        }
+      ],
+      "queries": [
+        {
+          "name": "events_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 15,
+          "p50_ms": 16,
+          "p95_ms": 17,
+          "max_ms": 19
+        },
+        {
+          "name": "events_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 169,
+          "p50_ms": 173,
+          "p95_ms": 183,
+          "max_ms": 196
+        },
+        {
+          "name": "events_count_day_dim4_grouped",
+          "iterations": 100,
+          "min_ms": 12,
+          "p50_ms": 14,
+          "p95_ms": 18,
+          "max_ms": 21
+        },
+        {
+          "name": "events_count_hour_dim4_grouped",
+          "iterations": 100,
+          "min_ms": 138,
+          "p50_ms": 142,
+          "p95_ms": 149,
+          "max_ms": 155
+        },
+        {
+          "name": "sessions_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 6,
+          "p50_ms": 7,
+          "p95_ms": 8,
+          "max_ms": 9
+        },
+        {
+          "name": "sessions_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 73,
+          "p50_ms": 74,
+          "p95_ms": 83,
+          "max_ms": 84
+        },
+        {
+          "name": "sessions_duration_total_day_grouped",
+          "iterations": 100,
+          "min_ms": 6,
+          "p50_ms": 7,
+          "p95_ms": 7,
+          "max_ms": 7
+        },
+        {
+          "name": "sessions_duration_total_hour_grouped",
+          "iterations": 100,
+          "min_ms": 73,
+          "p50_ms": 78,
+          "p95_ms": 90,
+          "max_ms": 112
+        },
+        {
+          "name": "sessions_new_installs_day_grouped",
+          "iterations": 100,
+          "min_ms": 6,
+          "p50_ms": 8,
+          "p95_ms": 14,
+          "max_ms": 17
+        },
+        {
+          "name": "sessions_new_installs_hour_grouped",
+          "iterations": 100,
+          "min_ms": 74,
+          "p50_ms": 79,
+          "p95_ms": 104,
+          "max_ms": 129
+        },
+        {
+          "name": "events_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 3
+        },
+        {
+          "name": "events_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 23,
+          "p95_ms": 32,
+          "max_ms": 97
+        },
+        {
+          "name": "sessions_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 3,
+          "p95_ms": 6,
+          "max_ms": 9
+        },
+        {
+          "name": "sessions_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 14,
+          "p50_ms": 23,
+          "p95_ms": 32,
+          "max_ms": 37
+        },
+        {
+          "name": "sessions_duration_total_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 3,
+          "p95_ms": 4,
+          "max_ms": 5
+        },
+        {
+          "name": "sessions_duration_total_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 21,
+          "p95_ms": 28,
+          "max_ms": 31
+        },
+        {
+          "name": "sessions_new_installs_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 4
+        },
+        {
+          "name": "sessions_new_installs_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 12,
+          "p50_ms": 17,
+          "p95_ms": 29,
+          "max_ms": 41
+        }
+      ],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    }
+  ]
+}

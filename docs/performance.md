@@ -259,6 +259,34 @@ The March 14, 2026 repair-lane refactor keeps the public metrics API, current di
 - shared project hour/day bucket rebuilds are requeued into `session_rebuild_queue` and finalized after repair-batch commits so overlapping install repairs cannot race the same aggregate buckets
 - screening for default promotion still uses the same concrete gates: `append-30d` and `backfill-30d` must each improve by at least `10%`, at least one of `append-90d` or `backfill-90d` must improve by at least `10%`, and repair must satisfy the rule above
 
+Fresh full-suite candidate publication from `artifacts/performance/2026-03-14-session-apply-repair-split-promote-candidate/` on this machine:
+
+| Scenario | Baseline `derived_metrics_ready_ms` | Candidate `derived_metrics_ready_ms` |
+| --- | ---: | ---: |
+| `append-30d` | `29_336` | `9_150` |
+| `backfill-30d` | `53_903` | `113_217` |
+| `repair-30d` | `1_706` | `101_151` |
+| `append-90d` | `76_530` | `23_716` |
+| `backfill-90d` | `284_560` | `327_066` |
+| `repair-90d` | `5_192` | `568_298` |
+| `append-180d` | `176_019` | `51_136` |
+| `backfill-180d` | `750_595` | `657_273` |
+| `repair-180d` | `11_993` | `1_331_810` |
+
+Artifacts:
+
+- [summary.json](/Users/ruiperes/Code/fantasma/artifacts/performance/2026-03-14-session-apply-repair-split-promote-candidate/summary.json) for the completed split-worker candidate publication
+- [summary.json](/Users/ruiperes/Code/fantasma/artifacts/performance/2026-03-13-dim4-impact-full-r2/summary.json) for the pinned March 13, 2026 promotion baseline
+
+Interpretation:
+
+- this rerun confirmed rather than overturned the earlier March 14 non-promotion outcome: the split worker did not make `5000 / 5000 / 8 / 2` promotable, so the checked-in defaults remain `1000 / 5000 / 8 / 2`
+- the candidate still produced a full 12-scenario publication, but it failed the hard `30d` freshness budgets at `backfill-30d` (`113.217s`) and `repair-30d` (`101.151s`)
+- append freshness materially improved at every published window, but `backfill-30d` regressed sharply against baseline and `backfill-90d` also regressed instead of clearing the required `10%` improvement gate
+- the split worker made repair materially worse instead of repair-safe: `repair-30d`, `repair-90d`, and `repair-180d` all regressed far beyond the March 14 repair guardrail
+- grouped reads remained comfortably green across `30d`, `90d`, and `180d`, so the failed candidate decision is a session-lane freshness problem rather than a read-path regression
+- the next diagnostic step, if this slice resumes, should be a same-code full-suite rebaseline on the split worker with the current defaults `1000 / 5000 / 8 / 2`
+
 ## Session Append Rewrite
 
 The March 13, 2026 append-delta slice keeps the public metrics API unchanged and changes only internal session-lane maintenance:
