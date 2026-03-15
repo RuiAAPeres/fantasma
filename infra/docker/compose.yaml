@@ -49,14 +49,5 @@ services:
       FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY: 8
       FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY: 2
 
-  dashboard:
-    image: nginx:1.29-alpine
-    ports:
-      - "8080:80"
-    volumes:
-      - ../../apps/dashboard-web/public:/usr/share/nginx/html:ro
-    profiles:
-      - dashboard
-
 volumes:
   postgres-data:

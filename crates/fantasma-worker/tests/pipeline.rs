@@ -96,7 +96,7 @@ async fn provision_project(api: axum::Router) -> ProvisionedProject {
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "name": "dashboard",
+                        "name": "local-read",
                         "kind": "read"
                     })
                     .to_string(),

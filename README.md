@@ -33,8 +33,7 @@ Today Fantasma is centered on:
 - simple self-hosted deployment
 
 The API remains the primary interface. The CLI is the primary operator
-workflow for self-hosted instances. Any future dashboard or hosted experience
-is secondary and should consume the same public API rather than bypassing it.
+workflow for self-hosted instances.
 
 Run `cargo run -p fantasma-cli -- --help` for the operator CLI entry point.
 

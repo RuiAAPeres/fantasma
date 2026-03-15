@@ -12,7 +12,6 @@ The default stack includes:
 - `fantasma-ingest`
 - `fantasma-api`
 - `fantasma-worker`
-- optional `dashboard` under the Compose `dashboard` profile
 
 Repository files:
 
@@ -81,9 +80,8 @@ On startup, `fantasma-ingest`, `fantasma-api`, and `fantasma-worker` all:
 They do not seed a project or create API keys at startup. Provisioning happens
 through the operator management API after the stack is healthy.
 
-There is no separate migration job in the default stack. The dashboard, when
-enabled, serves static files from `apps/dashboard-web/public` through Nginx.
-The worker keeps one process but runs independent `session_apply`,
+There is no separate migration job in the default stack. The worker keeps one
+process but runs independent `session_apply`,
 `session_repair`, and `event_metrics` lanes internally. `session_apply` is the
 only owner of the raw `"sessions"` offset, while `session_repair` drains the
 durable install-scoped repair frontier independently of that raw offset. Each
@@ -116,18 +114,11 @@ Start the default stack:
 docker compose -f infra/docker/compose.yaml up --build
 ```
 
-Enable the dashboard profile:
-
-```bash
-docker compose -f infra/docker/compose.yaml --profile dashboard up --build
-```
-
 Default host ports:
 
 - `5432`: Postgres
 - `8081`: ingest
 - `8082`: API
-- `8080`: dashboard when enabled
 
 Stop the stack and remove volumes:
 
@@ -204,7 +195,7 @@ key:
 PROVISIONED="$(./scripts/provision-project.sh \
   --project-name "Local Development" \
   --ingest-key-name "ios-sdk" \
-  --read-key-name "dashboard")"
+  --read-key-name "local-read")"
 printf '%s\n' "$PROVISIONED"
 ```
 

@@ -13,7 +13,7 @@ This repository is for building Fantasma, a privacy-first, self-hosted mobile an
 ## Product Rules
 
 - Keep Fantasma simple, API-first, mobile-first, self-hosted, and privacy-first.
-- The API is the primary interface. The dashboard is secondary.
+- The API is the primary interface.
 - Everything is an event.
 - Events are immutable.
 - Client-side durability is required.
@@ -27,7 +27,6 @@ Until the repository says otherwise, assume the following:
 - Postgres-only v1
 - project-scoped multi-tenant model
 - backend + public API + durable iOS SDK are the MVP
-- dashboard is optional and must consume the public API
 - no Redis, Kafka, or extra operational dependencies in v1
 
 ## Explicit Non-Goals
@@ -130,7 +129,6 @@ When starting from a thin repository, follow this order unless there is a clear 
 5. worker and aggregates
 6. query API
 7. iOS SDK
-8. optional dashboard
 
 ## Engineering Rules
 

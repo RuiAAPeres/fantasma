@@ -6052,7 +6052,7 @@ mod tests {
         let read_key = create_api_key(
             &pool,
             project.id,
-            "dashboard",
+            "local-read",
             ApiKeyKind::Read,
             read_secret,
         )

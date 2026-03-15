@@ -49,7 +49,6 @@ Non-responsibilities:
 
 - synchronous aggregation
 - hidden identity mutation
-- dashboard-specific responses
 
 ### Worker
 

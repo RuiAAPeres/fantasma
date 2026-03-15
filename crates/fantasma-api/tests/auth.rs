@@ -67,7 +67,7 @@ async fn provision_project(api: axum::Router) -> (String, String, String) {
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "name": "dashboard",
+                        "name": "local-read",
                         "kind": "read"
                     })
                     .to_string(),
@@ -276,7 +276,7 @@ async fn management_missing_resources_return_not_found(pool: PgPool) {
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "name": "dashboard",
+                        "name": "local-read",
                         "kind": "read"
                     })
                     .to_string(),
@@ -408,7 +408,7 @@ async fn management_create_routes_reject_unknown_json_fields(pool: PgPool) {
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "name": "dashboard",
+                        "name": "local-read",
                         "kind": "read",
                         "extra": "nope"
                     })
