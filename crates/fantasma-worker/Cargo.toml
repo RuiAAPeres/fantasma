@@ -10,6 +10,7 @@ version.workspace = true
 chrono.workspace = true
 fantasma-core = { path = "../fantasma-core" }
 fantasma-store = { path = "../fantasma-store" }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true

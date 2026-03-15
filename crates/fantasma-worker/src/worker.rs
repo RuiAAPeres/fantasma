@@ -1,6 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::{LazyLock, Mutex},
+    time::Instant,
+};
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Timelike, Utc};
 use fantasma_core::MetricGranularity;
@@ -11,24 +15,27 @@ use fantasma_store::{
     SessionDailyDelta, SessionDailyDurationDelta, SessionDailyInstallDelta, SessionMetricDim1Delta,
     SessionMetricDim2Delta, SessionMetricTotalDelta, SessionRecord, SessionRepairJobRecord,
     SessionRepairJobUpsert, SessionTailUpdate, StoreError, add_session_daily_duration_deltas_in_tx,
-    claim_pending_session_rebuild_buckets_in_tx, claim_pending_session_repair_jobs_in_tx,
+    claim_and_sweep_pending_session_rebuild_buckets_in_tx, claim_pending_session_repair_jobs_in_tx,
     complete_session_repair_job_in_tx, delete_sessions_overlapping_window_in_tx,
     enqueue_session_rebuild_buckets_in_tx, fetch_events_after_in_tx,
     fetch_events_for_install_after_id_through_in_tx, fetch_events_for_install_between_in_tx,
     fetch_latest_session_for_install_in_tx, fetch_sessions_overlapping_window_in_tx,
     insert_install_first_seen_in_tx, insert_session_in_tx, insert_sessions_in_tx,
     load_install_session_states_in_tx, load_session_repair_jobs_for_installs_in_tx,
-    load_tail_sessions_for_installs_in_tx, lock_worker_offset, rebuild_session_daily_days_in_tx,
-    release_session_repair_job_claim_in_tx, save_worker_offset_in_tx, update_session_tail_in_tx,
-    upsert_event_metric_buckets_dim1_in_tx, upsert_event_metric_buckets_dim2_in_tx,
-    upsert_event_metric_buckets_dim3_in_tx, upsert_event_metric_buckets_dim4_in_tx,
-    upsert_event_metric_buckets_total_in_tx, upsert_install_session_state_in_tx,
-    upsert_session_daily_deltas_in_tx, upsert_session_daily_install_deltas_in_tx,
-    upsert_session_metric_dim1_in_tx, upsert_session_metric_dim2_in_tx,
-    upsert_session_metric_totals_in_tx, upsert_session_repair_jobs_in_tx,
+    load_tail_sessions_for_installs_in_tx, lock_worker_offset,
+    rebuild_session_daily_days_with_telemetry_in_tx, release_session_repair_job_claim_in_tx,
+    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_event_metric_buckets_dim1_in_tx,
+    upsert_event_metric_buckets_dim2_in_tx, upsert_event_metric_buckets_dim3_in_tx,
+    upsert_event_metric_buckets_dim4_in_tx, upsert_event_metric_buckets_total_in_tx,
+    upsert_install_session_state_in_tx, upsert_session_daily_deltas_in_tx,
+    upsert_session_daily_install_deltas_in_tx, upsert_session_metric_dim1_in_tx,
+    upsert_session_metric_dim2_in_tx, upsert_session_metric_totals_in_tx,
+    upsert_session_repair_jobs_in_tx,
 };
+use serde::Serialize;
 use sqlx::{Postgres, Row, Transaction};
 use tokio::task::JoinSet;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::sessionization;
@@ -38,6 +45,129 @@ pub(crate) const SESSION_WORKER_NAME: &str = "sessions";
 pub(crate) const EVENT_METRICS_WORKER_NAME: &str = "event_metrics";
 const DEFAULT_SESSION_INCREMENTAL_CONCURRENCY: usize = 8;
 const DEFAULT_SESSION_REPAIR_CONCURRENCY: usize = 2;
+const STAGE_B_TRACE_PATH_ENV: &str = "FANTASMA_WORKER_STAGE_B_TRACE_PATH";
+const STAGE_B_TRACE_REPAIR_JOB: &str = "repair_job";
+const STAGE_B_TRACE_REBUILD_FINALIZE: &str = "rebuild_finalize";
+static STAGE_B_TRACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct StageBTraceRecord {
+    record_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_event_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    phases_ms: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    finalization_subphases_ms: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    session_daily_subphases_ms: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    counts: BTreeMap<String, u64>,
+}
+
+impl StageBTraceRecord {
+    fn repair_job(install_id: &str, target_event_id: i64) -> Self {
+        Self {
+            record_type: STAGE_B_TRACE_REPAIR_JOB.to_owned(),
+            install_id: Some(install_id.to_owned()),
+            target_event_id: Some(target_event_id),
+            phases_ms: BTreeMap::new(),
+            finalization_subphases_ms: BTreeMap::new(),
+            session_daily_subphases_ms: BTreeMap::new(),
+            counts: BTreeMap::new(),
+        }
+    }
+
+    fn rebuild_finalize() -> Self {
+        Self {
+            record_type: STAGE_B_TRACE_REBUILD_FINALIZE.to_owned(),
+            install_id: None,
+            target_event_id: None,
+            phases_ms: BTreeMap::new(),
+            finalization_subphases_ms: BTreeMap::new(),
+            session_daily_subphases_ms: BTreeMap::new(),
+            counts: BTreeMap::new(),
+        }
+    }
+
+    fn add_phase_duration(&mut self, phase: &str, elapsed: std::time::Duration) {
+        self.add_phase_ms(phase, duration_ms(elapsed));
+    }
+
+    fn add_phase_ms(&mut self, phase: &str, elapsed_ms: u64) {
+        *self.phases_ms.entry(phase.to_owned()).or_default() += elapsed_ms;
+    }
+
+    fn add_finalization_subphase_duration(&mut self, phase: &str, elapsed: std::time::Duration) {
+        self.add_finalization_subphase_ms(phase, duration_ms(elapsed));
+    }
+
+    fn add_finalization_subphase_ms(&mut self, phase: &str, elapsed_ms: u64) {
+        *self
+            .finalization_subphases_ms
+            .entry(phase.to_owned())
+            .or_default() += elapsed_ms;
+    }
+
+    fn add_session_daily_subphase_ms(&mut self, phase: &str, elapsed_ms: u64) {
+        *self
+            .session_daily_subphases_ms
+            .entry(phase.to_owned())
+            .or_default() += elapsed_ms;
+    }
+
+    fn add_count(&mut self, name: &str, value: usize) {
+        self.add_count_u64(name, value as u64);
+    }
+
+    fn add_count_u64(&mut self, name: &str, value: u64) {
+        *self.counts.entry(name.to_owned()).or_default() += value;
+    }
+}
+
+fn duration_ms(elapsed: std::time::Duration) -> u64 {
+    elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn row_mutation_lag_before_claim_ms(
+    job: &SessionRepairJobRecord,
+    claim_elapsed: std::time::Duration,
+) -> u64 {
+    let row_mutation_lag_ms = job
+        .claimed_at
+        .unwrap_or(job.updated_at)
+        .signed_duration_since(job.updated_at)
+        .num_milliseconds()
+        .max(0) as u64;
+    row_mutation_lag_ms.saturating_add(duration_ms(claim_elapsed))
+}
+
+fn record_stage_b_trace(record: &StageBTraceRecord) -> Result<(), StoreError> {
+    let Ok(path) = std::env::var(STAGE_B_TRACE_PATH_ENV) else {
+        return Ok(());
+    };
+    let _guard = STAGE_B_TRACE_WRITE_LOCK.lock().map_err(|error| {
+        StoreError::InvariantViolation(format!("lock Stage B trace file {path}: {error}"))
+    })?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| {
+            StoreError::InvariantViolation(format!("open Stage B trace file {path}: {error}"))
+        })?;
+    serde_json::to_writer(&mut file, record).map_err(|error| {
+        StoreError::InvariantViolation(format!("serialize Stage B trace record: {error}"))
+    })?;
+    use std::io::Write as _;
+    file.write_all(b"\n").map_err(|error| {
+        StoreError::InvariantViolation(format!("append Stage B trace newline to {path}: {error}"))
+    })?;
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecomputeWindow {
@@ -112,89 +242,112 @@ impl SessionMetricAccumulator {
         duration_delta: i64,
     ) {
         for granularity in [MetricGranularity::Day, MetricGranularity::Hour] {
-            let bucket_start = bucket_start_for_granularity(session.session_start, granularity);
-            self.totals
-                .entry((granularity, bucket_start))
-                .or_default()
-                .add(session_count_delta, duration_delta, 0);
+            self.add_session_delta_for_granularity(
+                session,
+                granularity,
+                session_count_delta,
+                duration_delta,
+            );
+        }
+    }
 
-            let platform_value = platform_dimension_value(&session.platform);
+    fn add_session_delta_for_granularity(
+        &mut self,
+        session: &SessionRecord,
+        granularity: MetricGranularity,
+        session_count_delta: i64,
+        duration_delta: i64,
+    ) {
+        let bucket_start = bucket_start_for_granularity(session.session_start, granularity);
+        self.totals
+            .entry((granularity, bucket_start))
+            .or_default()
+            .add(session_count_delta, duration_delta, 0);
+
+        let platform_value = platform_dimension_value(&session.platform);
+        self.dim1
+            .entry((
+                granularity,
+                bucket_start,
+                "platform".to_owned(),
+                platform_value.clone(),
+            ))
+            .or_default()
+            .add(session_count_delta, duration_delta, 0);
+
+        if let Some(app_version) = session.app_version.as_ref() {
             self.dim1
                 .entry((
                     granularity,
                     bucket_start,
+                    "app_version".to_owned(),
+                    app_version.clone(),
+                ))
+                .or_default()
+                .add(session_count_delta, duration_delta, 0);
+            self.dim2
+                .entry((
+                    granularity,
+                    bucket_start,
+                    "app_version".to_owned(),
+                    app_version.clone(),
                     "platform".to_owned(),
                     platform_value.clone(),
                 ))
                 .or_default()
                 .add(session_count_delta, duration_delta, 0);
-
-            if let Some(app_version) = session.app_version.as_ref() {
-                self.dim1
-                    .entry((
-                        granularity,
-                        bucket_start,
-                        "app_version".to_owned(),
-                        app_version.clone(),
-                    ))
-                    .or_default()
-                    .add(session_count_delta, duration_delta, 0);
-                self.dim2
-                    .entry((
-                        granularity,
-                        bucket_start,
-                        "app_version".to_owned(),
-                        app_version.clone(),
-                        "platform".to_owned(),
-                        platform_value.clone(),
-                    ))
-                    .or_default()
-                    .add(session_count_delta, duration_delta, 0);
-            }
         }
     }
 
     fn add_new_install_delta(&mut self, first_seen: &InstallFirstSeenRecord) {
         for granularity in [MetricGranularity::Day, MetricGranularity::Hour] {
-            let bucket_start = bucket_start_for_granularity(first_seen.first_seen_at, granularity);
-            self.totals
-                .entry((granularity, bucket_start))
-                .or_default()
-                .add(0, 0, 1);
+            self.add_new_install_delta_for_granularity(first_seen, granularity);
+        }
+    }
 
-            let platform_value = platform_dimension_value(&first_seen.platform);
+    fn add_new_install_delta_for_granularity(
+        &mut self,
+        first_seen: &InstallFirstSeenRecord,
+        granularity: MetricGranularity,
+    ) {
+        let bucket_start = bucket_start_for_granularity(first_seen.first_seen_at, granularity);
+        self.totals
+            .entry((granularity, bucket_start))
+            .or_default()
+            .add(0, 0, 1);
+
+        let platform_value = platform_dimension_value(&first_seen.platform);
+        self.dim1
+            .entry((
+                granularity,
+                bucket_start,
+                "platform".to_owned(),
+                platform_value.clone(),
+            ))
+            .or_default()
+            .add(0, 0, 1);
+
+        if let Some(app_version) = first_seen.app_version.as_ref() {
             self.dim1
                 .entry((
                     granularity,
                     bucket_start,
+                    "app_version".to_owned(),
+                    app_version.clone(),
+                ))
+                .or_default()
+                .add(0, 0, 1);
+            self.dim2
+                .entry((
+                    granularity,
+                    bucket_start,
+                    "app_version".to_owned(),
+                    app_version.clone(),
                     "platform".to_owned(),
                     platform_value.clone(),
                 ))
                 .or_default()
                 .add(0, 0, 1);
-
-            if let Some(app_version) = first_seen.app_version.as_ref() {
-                self.dim1
-                    .entry((
-                        granularity,
-                        bucket_start,
-                        "app_version".to_owned(),
-                        app_version.clone(),
-                    ))
-                    .or_default()
-                    .add(0, 0, 1);
-                self.dim2
-                    .entry((
-                        granularity,
-                        bucket_start,
-                        "app_version".to_owned(),
-                        app_version.clone(),
-                        "platform".to_owned(),
-                        platform_value.clone(),
-                    ))
-                    .or_default()
-                    .add(0, 0, 1);
-            }
         }
     }
 
@@ -881,6 +1034,7 @@ async fn process_next_session_repair_job(
     hooks: SessionRepairBatchHooks,
     task_context: std::sync::Arc<SessionRepairTaskContext>,
 ) -> Result<SessionRepairTaskResult, StoreError> {
+    let claim_started_at = Instant::now();
     let mut claim_tx = pool.begin().await.map_err(StoreError::from)?;
     let Some(job) = claim_pending_session_repair_jobs_in_tx(&mut claim_tx, 1)
         .await?
@@ -892,11 +1046,16 @@ async fn process_next_session_repair_job(
     };
     claim_tx.commit().await.map_err(StoreError::from)?;
     task_context.set_claimed_job(job.clone());
+    let mut trace = StageBTraceRecord::repair_job(&job.install_id, job.target_event_id);
+    trace.add_phase_ms(
+        "row_mutation_lag_before_claim",
+        row_mutation_lag_before_claim_ms(&job, claim_started_at.elapsed()),
+    );
 
     hooks.after_claim(&job.install_id).await;
     let repair_result = async {
         let mut tx = pool.begin().await.map_err(StoreError::from)?;
-        process_session_repair_job(&mut tx, job.clone()).await?;
+        process_session_repair_job(&mut tx, job.clone(), &mut trace).await?;
         tx.commit().await.map_err(StoreError::from)
     }
     .await;
@@ -913,6 +1072,9 @@ async fn process_next_session_repair_job(
     }
 
     task_context.clear_claimed_job();
+    if let Err(error) = record_stage_b_trace(&trace) {
+        warn!(install_id = %job.install_id, target_event_id = job.target_event_id, %error, "failed to record Stage B repair trace");
+    }
     Ok(SessionRepairTaskResult { processed: true })
 }
 
@@ -991,6 +1153,7 @@ async fn release_failed_session_repair_claim(
 async fn process_session_repair_job(
     tx: &mut Transaction<'_, Postgres>,
     job: SessionRepairJobRecord,
+    trace: &mut StageBTraceRecord,
 ) -> Result<(), StoreError> {
     let install_key = vec![(job.project_id, job.install_id.clone())];
     let tail_states = load_install_session_states_in_tx(tx, &install_key).await?;
@@ -1016,9 +1179,14 @@ async fn process_session_repair_job(
         &job.install_id,
         tail_state.last_processed_event_id,
         job.target_event_id,
+        trace,
     )
     .await?;
+    let enqueue_started_at = Instant::now();
     enqueue_repair_bucket_finalization_in_tx(tx, job.project_id, &touched_buckets).await?;
+    trace.add_phase_duration("touched_bucket_enqueue", enqueue_started_at.elapsed());
+    trace.add_count("touched_day_buckets", touched_buckets.days.len());
+    trace.add_count("touched_hour_buckets", touched_buckets.hours.len());
     complete_session_repair_job_in_tx(tx, job.project_id, &job.install_id, job.target_event_id)
         .await?;
 
@@ -1685,7 +1853,9 @@ async fn repair_install_batch(
     install_id: &str,
     last_processed_event_id: i64,
     target_event_id: i64,
+    trace: &mut StageBTraceRecord,
 ) -> Result<SessionRepairBuckets, StoreError> {
+    let frontier_fetch_started_at = Instant::now();
     let pending_events = fetch_events_for_install_after_id_through_in_tx(
         tx,
         project_id,
@@ -1694,6 +1864,8 @@ async fn repair_install_batch(
         target_event_id,
     )
     .await?;
+    trace.add_phase_duration("frontier_fetch", frontier_fetch_started_at.elapsed());
+    trace.add_count("pending_frontier_events", pending_events.len());
     let mut pending_events_iter = pending_events.iter();
     let first_pending_event = pending_events_iter.next().ok_or_else(|| {
             StoreError::InvariantViolation(format!(
@@ -1712,6 +1884,7 @@ async fn repair_install_batch(
         },
     );
 
+    let recompute_window_started_at = Instant::now();
     let recompute_window =
         load_recompute_window_in_tx(tx, project_id, install_id, batch_min_ts, batch_max_ts).await?;
     let raw_events = fetch_events_for_install_between_in_tx(
@@ -1730,6 +1903,13 @@ async fn repair_install_batch(
         recompute_window.end,
     )
     .await?;
+    trace.add_phase_duration(
+        "recompute_window_load",
+        recompute_window_started_at.elapsed(),
+    );
+    trace.add_count("window_raw_events", raw_events.len());
+    trace.add_count("overlapping_sessions", overlapping_sessions.len());
+    let session_rewrite_started_at = Instant::now();
     let mut repaired_sessions = derive_sessions_for_window(&raw_events);
     preserve_repaired_session_dimensions(&mut repaired_sessions, &overlapping_sessions);
     let mut touched_buckets = SessionRepairBuckets::default();
@@ -1759,6 +1939,8 @@ async fn repair_install_batch(
 
     let next_state = install_state_from_session(&latest_session, target_event_id);
     upsert_install_session_state_in_tx(tx, &next_state).await?;
+    trace.add_phase_duration("session_rewrite", session_rewrite_started_at.elapsed());
+    trace.add_count("repaired_sessions_written", repaired_sessions.len());
 
     Ok(touched_buckets)
 }
@@ -1767,6 +1949,7 @@ async fn rebuild_touched_session_buckets_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     touched_buckets: &SessionRepairBuckets,
+    trace: &mut StageBTraceRecord,
 ) -> Result<(), StoreError> {
     if touched_buckets.is_empty() {
         return Ok(());
@@ -1774,7 +1957,30 @@ async fn rebuild_touched_session_buckets_in_tx(
 
     let days = touched_buckets.days.iter().copied().collect::<Vec<_>>();
     if !days.is_empty() {
-        rebuild_session_daily_days_in_tx(tx, project_id, &days).await?;
+        let session_daily_started_at = Instant::now();
+        let session_daily_telemetry =
+            rebuild_session_daily_days_with_telemetry_in_tx(tx, project_id, &days).await?;
+        trace.add_finalization_subphase_duration(
+            "finalization_session_daily_rebuild",
+            session_daily_started_at.elapsed(),
+        );
+        if session_daily_telemetry.installs_write_ms > 0 {
+            trace.add_session_daily_subphase_ms(
+                "session_daily_installs_write",
+                session_daily_telemetry.installs_write_ms,
+            );
+        }
+        if session_daily_telemetry.aggregate_write_ms > 0 {
+            trace.add_session_daily_subphase_ms(
+                "session_daily_aggregate_write",
+                session_daily_telemetry.aggregate_write_ms,
+            );
+        }
+        if let Some(cleanup_ms) = session_daily_telemetry.cleanup_ms
+            && cleanup_ms > 0
+        {
+            trace.add_session_daily_subphase_ms("session_daily_cleanup", cleanup_ms);
+        }
         rebuild_session_metric_buckets_in_tx(
             tx,
             project_id,
@@ -1783,14 +1989,21 @@ async fn rebuild_touched_session_buckets_in_tx(
                 .iter()
                 .map(|day| bucket_start_for_day(*day))
                 .collect::<Vec<_>>(),
+            trace,
         )
         .await?;
     }
 
     let hours = touched_buckets.hours.iter().copied().collect::<Vec<_>>();
     if !hours.is_empty() {
-        rebuild_session_metric_buckets_in_tx(tx, project_id, MetricGranularity::Hour, &hours)
-            .await?;
+        rebuild_session_metric_buckets_in_tx(
+            tx,
+            project_id,
+            MetricGranularity::Hour,
+            &hours,
+            trace,
+        )
+        .await?;
     }
 
     Ok(())
@@ -1816,14 +2029,18 @@ async fn enqueue_repair_bucket_finalization_in_tx(
 async fn drain_pending_session_rebuild_buckets(pool: &PgPool) -> Result<(), StoreError> {
     loop {
         let mut tx = pool.begin().await.map_err(StoreError::from)?;
-        let claimed = claim_pending_session_rebuild_buckets_in_tx(&mut tx, 512).await?;
-        if claimed.is_empty() {
+        let swept = claim_and_sweep_pending_session_rebuild_buckets_in_tx(&mut tx, 512).await?;
+        if swept.is_empty() {
             tx.commit().await.map_err(StoreError::from)?;
             break;
         }
+        let finalize_started_at = Instant::now();
+        let drain_setup_started_at = Instant::now();
+        let mut trace = StageBTraceRecord::rebuild_finalize();
+        trace.add_count("claimed_rebuild_bucket_rows", swept.len());
 
         let mut buckets_by_project = BTreeMap::<Uuid, SessionRepairBuckets>::new();
-        for bucket in claimed {
+        for bucket in swept {
             let touched_buckets = buckets_by_project.entry(bucket.project_id).or_default();
             match bucket.granularity {
                 MetricGranularity::Day => {
@@ -1837,11 +2054,42 @@ async fn drain_pending_session_rebuild_buckets(pool: &PgPool) -> Result<(), Stor
             }
         }
 
+        trace.add_count("drain_projects", buckets_by_project.len());
+        let touched_day_buckets = buckets_by_project
+            .values()
+            .map(|buckets| buckets.days.len())
+            .sum::<usize>();
+        let touched_hour_buckets = buckets_by_project
+            .values()
+            .map(|buckets| buckets.hours.len())
+            .sum::<usize>();
+        trace.add_count("touched_day_buckets", touched_day_buckets);
+        trace.add_count("touched_hour_buckets", touched_hour_buckets);
+        trace.add_finalization_subphase_duration(
+            "finalization_drain_setup",
+            drain_setup_started_at.elapsed(),
+        );
+
         for (project_id, touched_buckets) in buckets_by_project {
-            rebuild_touched_session_buckets_in_tx(&mut tx, project_id, &touched_buckets).await?;
+            rebuild_touched_session_buckets_in_tx(
+                &mut tx,
+                project_id,
+                &touched_buckets,
+                &mut trace,
+            )
+            .await?;
         }
 
+        let commit_started_at = Instant::now();
         tx.commit().await.map_err(StoreError::from)?;
+        trace.add_finalization_subphase_duration(
+            "finalization_drain_setup",
+            commit_started_at.elapsed(),
+        );
+        trace.add_phase_duration("shared_bucket_finalize", finalize_started_at.elapsed());
+        if let Err(error) = record_stage_b_trace(&trace) {
+            warn!(%error, "failed to record Stage B rebuild-finalize trace");
+        }
     }
 
     Ok(())
@@ -2080,6 +2328,7 @@ async fn rebuild_session_metric_buckets_in_tx(
     project_id: Uuid,
     granularity: MetricGranularity,
     bucket_starts: &[DateTime<Utc>],
+    trace: &mut StageBTraceRecord,
 ) -> Result<(), StoreError> {
     let bucket_starts = bucket_starts
         .iter()
@@ -2094,6 +2343,7 @@ async fn rebuild_session_metric_buckets_in_tx(
     let bucket_expr = bucket_sql(granularity, "session_start");
     let first_seen_bucket_expr = bucket_sql(granularity, "first_seen_at");
 
+    let scope_delete_started_at = Instant::now();
     for table in [
         "session_metric_buckets_total",
         "session_metric_buckets_dim1",
@@ -2108,7 +2358,12 @@ async fn rebuild_session_metric_buckets_in_tx(
         .execute(&mut **tx)
         .await?;
     }
+    trace.add_finalization_subphase_duration(
+        "finalization_scope_delete",
+        scope_delete_started_at.elapsed(),
+    );
 
+    let totals_started_at = Instant::now();
     let session_total_rows = sqlx::query(&format!(
         r#"
         SELECT
@@ -2141,6 +2396,40 @@ async fn rebuild_session_metric_buckets_in_tx(
         .collect::<Vec<_>>();
     upsert_session_metric_totals_in_tx(tx, &session_total_deltas).await?;
 
+    let first_seen_total_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            {first_seen_bucket_expr} AS bucket_start,
+            COUNT(*)::BIGINT AS new_installs
+        FROM install_first_seen
+        WHERE project_id = $1
+          AND {first_seen_bucket_expr} = ANY($2)
+        GROUP BY bucket_start
+        ORDER BY bucket_start ASC
+        "#
+    ))
+    .bind(project_id)
+    .bind(&bucket_starts)
+    .fetch_all(&mut **tx)
+    .await?;
+    let first_seen_total_deltas = first_seen_total_rows
+        .into_iter()
+        .map(|row| SessionMetricTotalDelta {
+            project_id,
+            granularity,
+            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
+            session_count: 0,
+            duration_total_seconds: 0,
+            new_installs: row.try_get("new_installs").expect("new_installs"),
+        })
+        .collect::<Vec<_>>();
+    upsert_session_metric_totals_in_tx(tx, &first_seen_total_deltas).await?;
+    trace.add_finalization_subphase_duration(
+        "finalization_metric_total_rebuild",
+        totals_started_at.elapsed(),
+    );
+
+    let dim1_started_at = Instant::now();
     let session_platform_rows = sqlx::query(&format!(
         r#"
         SELECT
@@ -2212,74 +2501,6 @@ async fn rebuild_session_metric_buckets_in_tx(
         .collect::<Vec<_>>();
     upsert_session_metric_dim1_in_tx(tx, &session_app_version_deltas).await?;
 
-    let session_dim2_rows = sqlx::query(&format!(
-        r#"
-        SELECT
-            {bucket_expr} AS bucket_start,
-            platform,
-            app_version,
-            COUNT(*)::BIGINT AS session_count,
-            COALESCE(SUM(duration_seconds), 0)::BIGINT AS duration_total_seconds
-        FROM sessions
-        WHERE project_id = $1
-          AND {bucket_expr} = ANY($2)
-          AND app_version IS NOT NULL
-        GROUP BY bucket_start, platform, app_version
-        ORDER BY bucket_start ASC, platform ASC, app_version ASC
-        "#
-    ))
-    .bind(project_id)
-    .bind(&bucket_starts)
-    .fetch_all(&mut **tx)
-    .await?;
-    let session_dim2_deltas = session_dim2_rows
-        .into_iter()
-        .map(|row| SessionMetricDim2Delta {
-            project_id,
-            granularity,
-            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
-            dim1_key: "app_version".to_owned(),
-            dim1_value: row.try_get("app_version").expect("app_version"),
-            dim2_key: "platform".to_owned(),
-            dim2_value: row.try_get("platform").expect("platform"),
-            session_count: row.try_get("session_count").expect("session_count"),
-            duration_total_seconds: row
-                .try_get("duration_total_seconds")
-                .expect("duration_total_seconds"),
-            new_installs: 0,
-        })
-        .collect::<Vec<_>>();
-    upsert_session_metric_dim2_in_tx(tx, &session_dim2_deltas).await?;
-
-    let first_seen_total_rows = sqlx::query(&format!(
-        r#"
-        SELECT
-            {first_seen_bucket_expr} AS bucket_start,
-            COUNT(*)::BIGINT AS new_installs
-        FROM install_first_seen
-        WHERE project_id = $1
-          AND {first_seen_bucket_expr} = ANY($2)
-        GROUP BY bucket_start
-        ORDER BY bucket_start ASC
-        "#
-    ))
-    .bind(project_id)
-    .bind(&bucket_starts)
-    .fetch_all(&mut **tx)
-    .await?;
-    let first_seen_total_deltas = first_seen_total_rows
-        .into_iter()
-        .map(|row| SessionMetricTotalDelta {
-            project_id,
-            granularity,
-            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
-            session_count: 0,
-            duration_total_seconds: 0,
-            new_installs: row.try_get("new_installs").expect("new_installs"),
-        })
-        .collect::<Vec<_>>();
-    upsert_session_metric_totals_in_tx(tx, &first_seen_total_deltas).await?;
-
     let first_seen_platform_rows = sqlx::query(&format!(
         r#"
         SELECT
@@ -2344,6 +2565,50 @@ async fn rebuild_session_metric_buckets_in_tx(
         })
         .collect::<Vec<_>>();
     upsert_session_metric_dim1_in_tx(tx, &first_seen_app_version_deltas).await?;
+    trace.add_finalization_subphase_duration(
+        "finalization_metric_dim1_rebuild",
+        dim1_started_at.elapsed(),
+    );
+
+    let dim2_started_at = Instant::now();
+    let session_dim2_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            {bucket_expr} AS bucket_start,
+            platform,
+            app_version,
+            COUNT(*)::BIGINT AS session_count,
+            COALESCE(SUM(duration_seconds), 0)::BIGINT AS duration_total_seconds
+        FROM sessions
+        WHERE project_id = $1
+          AND {bucket_expr} = ANY($2)
+          AND app_version IS NOT NULL
+        GROUP BY bucket_start, platform, app_version
+        ORDER BY bucket_start ASC, platform ASC, app_version ASC
+        "#
+    ))
+    .bind(project_id)
+    .bind(&bucket_starts)
+    .fetch_all(&mut **tx)
+    .await?;
+    let session_dim2_deltas = session_dim2_rows
+        .into_iter()
+        .map(|row| SessionMetricDim2Delta {
+            project_id,
+            granularity,
+            bucket_start: row.try_get("bucket_start").expect("bucket_start"),
+            dim1_key: "app_version".to_owned(),
+            dim1_value: row.try_get("app_version").expect("app_version"),
+            dim2_key: "platform".to_owned(),
+            dim2_value: row.try_get("platform").expect("platform"),
+            session_count: row.try_get("session_count").expect("session_count"),
+            duration_total_seconds: row
+                .try_get("duration_total_seconds")
+                .expect("duration_total_seconds"),
+            new_installs: 0,
+        })
+        .collect::<Vec<_>>();
+    upsert_session_metric_dim2_in_tx(tx, &session_dim2_deltas).await?;
 
     let first_seen_dim2_rows = sqlx::query(&format!(
         r#"
@@ -2380,6 +2645,10 @@ async fn rebuild_session_metric_buckets_in_tx(
         })
         .collect::<Vec<_>>();
     upsert_session_metric_dim2_in_tx(tx, &first_seen_dim2_deltas).await?;
+    trace.add_finalization_subphase_duration(
+        "finalization_metric_dim2_rebuild",
+        dim2_started_at.elapsed(),
+    );
 
     Ok(())
 }
@@ -2387,9 +2656,9 @@ async fn rebuild_session_metric_buckets_in_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use std::{collections::BTreeMap, fs, sync::Arc, sync::LazyLock, sync::Mutex, time::Duration};
 
-    use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+    use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
     use fantasma_core::{EventPayload, Platform};
     use fantasma_store::{
         BootstrapConfig, RawEventRecord, average_session_duration_seconds, count_active_installs,
@@ -2399,6 +2668,14 @@ mod tests {
     };
     use sqlx::Row;
     use tokio::sync::Notify;
+
+    static TRACE_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn lock_trace_env() -> std::sync::MutexGuard<'static, ()> {
+        TRACE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn project_id() -> Uuid {
         Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a)
@@ -2547,6 +2824,217 @@ mod tests {
         process_session_repair_batch(pool, concurrency)
             .await
             .expect("run session repair batch")
+    }
+
+    fn sample_stage_b_trace_record() -> StageBTraceRecord {
+        StageBTraceRecord {
+            record_type: "repair_job".to_owned(),
+            install_id: Some("install-1".to_owned()),
+            target_event_id: Some(77),
+            phases_ms: BTreeMap::from([
+                ("row_mutation_lag_before_claim".to_owned(), 5),
+                ("frontier_fetch".to_owned(), 7),
+                ("recompute_window_load".to_owned(), 11),
+                ("session_rewrite".to_owned(), 17),
+                ("touched_bucket_enqueue".to_owned(), 3),
+            ]),
+            finalization_subphases_ms: BTreeMap::new(),
+            session_daily_subphases_ms: BTreeMap::new(),
+            counts: BTreeMap::from([
+                ("pending_frontier_events".to_owned(), 4),
+                ("window_raw_events".to_owned(), 9),
+            ]),
+        }
+    }
+
+    #[test]
+    fn stage_b_trace_writer_emits_jsonl_when_trace_path_is_set() {
+        let _guard = lock_trace_env();
+        let path = std::env::temp_dir().join(format!("stage-b-trace-{}.jsonl", Uuid::new_v4()));
+        unsafe {
+            std::env::set_var("FANTASMA_WORKER_STAGE_B_TRACE_PATH", &path);
+        }
+
+        record_stage_b_trace(&sample_stage_b_trace_record()).expect("write trace");
+
+        let contents = fs::read_to_string(&path).expect("read trace file");
+        let line = contents.lines().next().expect("trace line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("parse trace record as json");
+
+        assert_eq!(parsed["record_type"], "repair_job");
+        assert_eq!(parsed["install_id"], "install-1");
+        assert_eq!(parsed["target_event_id"], 77);
+        assert_eq!(parsed["phases_ms"]["session_rewrite"], 17);
+        assert_eq!(parsed["counts"]["window_raw_events"], 9);
+
+        let _ = fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("FANTASMA_WORKER_STAGE_B_TRACE_PATH");
+        }
+    }
+
+    #[test]
+    fn stage_b_trace_writer_is_noop_when_trace_path_is_unset() {
+        let _guard = lock_trace_env();
+        unsafe {
+            std::env::remove_var("FANTASMA_WORKER_STAGE_B_TRACE_PATH");
+        }
+        let path = std::env::temp_dir().join(format!("stage-b-trace-{}.jsonl", Uuid::new_v4()));
+
+        record_stage_b_trace(&sample_stage_b_trace_record()).expect("skip trace write");
+
+        assert!(
+            !path.exists(),
+            "trace writer should not create files when the env var is unset"
+        );
+    }
+
+    #[test]
+    fn stage_b_trace_writer_emits_finalization_subphases_for_rebuild_finalize_records() {
+        let _guard = lock_trace_env();
+        let path = std::env::temp_dir().join(format!("stage-b-trace-{}.jsonl", Uuid::new_v4()));
+        unsafe {
+            std::env::set_var("FANTASMA_WORKER_STAGE_B_TRACE_PATH", &path);
+        }
+
+        let mut record = StageBTraceRecord::rebuild_finalize();
+        record.add_phase_ms("shared_bucket_finalize", 31);
+        record.add_finalization_subphase_ms("finalization_metric_dim1_rebuild", 12);
+        record.add_session_daily_subphase_ms("session_daily_source_build", 7);
+        record.add_count("claimed_rebuild_bucket_rows", 12);
+        record.add_count("touched_day_buckets", 2);
+
+        record_stage_b_trace(&record).expect("write rebuild finalize trace");
+
+        let contents = fs::read_to_string(&path).expect("read trace file");
+        let line = contents.lines().next().expect("trace line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("parse trace record as json");
+
+        assert_eq!(parsed["record_type"], "rebuild_finalize");
+        assert_eq!(
+            parsed["finalization_subphases_ms"]["finalization_metric_dim1_rebuild"],
+            serde_json::json!(12),
+            "rebuild-finalize traces should carry nested finalization timing"
+        );
+        assert_eq!(
+            parsed["session_daily_subphases_ms"]["session_daily_source_build"],
+            serde_json::json!(7),
+            "rebuild-finalize traces should carry nested session_daily timing"
+        );
+
+        let _ = fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("FANTASMA_WORKER_STAGE_B_TRACE_PATH");
+        }
+    }
+
+    #[test]
+    fn stage_b_trace_writer_serializes_concurrent_records() {
+        let _guard = lock_trace_env();
+        let path = std::env::temp_dir().join(format!("stage-b-trace-{}.jsonl", Uuid::new_v4()));
+        unsafe {
+            std::env::set_var("FANTASMA_WORKER_STAGE_B_TRACE_PATH", &path);
+        }
+
+        let threads = (0..8)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    for offset in 0..16 {
+                        let mut record = sample_stage_b_trace_record();
+                        record.install_id = Some(format!("install-{index}-{offset}"));
+                        record.target_event_id = Some((index * 100 + offset) as i64);
+                        record_stage_b_trace(&record).expect("write concurrent trace");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread.join().expect("join concurrent trace writer");
+        }
+
+        let contents = fs::read_to_string(&path).expect("read concurrent trace file");
+        let lines = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 128);
+        for line in lines {
+            let parsed: serde_json::Value =
+                serde_json::from_str(line).expect("parse concurrent trace record");
+            assert_eq!(parsed["record_type"], "repair_job");
+        }
+
+        let _ = fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("FANTASMA_WORKER_STAGE_B_TRACE_PATH");
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[sqlx::test]
+    async fn rebuild_finalization_sweeps_visible_project_queue_in_one_pass(pool: PgPool) {
+        let _guard = lock_trace_env();
+        let path = std::env::temp_dir().join(format!("stage-b-trace-{}.jsonl", Uuid::new_v4()));
+        unsafe {
+            std::env::set_var("FANTASMA_WORKER_STAGE_B_TRACE_PATH", &path);
+        }
+
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+
+        let hour_bucket_starts = (0..513_i64)
+            .map(|offset| timestamp(1, 0, 0) + ChronoDuration::hours(offset))
+            .collect::<Vec<_>>();
+        let mut seed_tx = pool.begin().await.expect("begin queue seed tx");
+        enqueue_session_rebuild_buckets_in_tx(&mut seed_tx, project_id(), &[], &hour_bucket_starts)
+            .await
+            .expect("enqueue rebuild buckets");
+        seed_tx.commit().await.expect("commit queue seed tx");
+
+        drain_pending_session_rebuild_buckets(&pool)
+            .await
+            .expect("drain swept rebuild queue");
+
+        assert!(
+            pending_session_rebuild_buckets(&pool).await.is_empty(),
+            "project sweep should drain the visible queue in one call"
+        );
+
+        let contents = fs::read_to_string(&path).expect("read rebuild trace");
+        let rebuild_records = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse trace"))
+            .filter(|record| record["record_type"] == "rebuild_finalize")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rebuild_records.len(),
+            1,
+            "project sweep should collapse visible queue work into one rebuild-finalize pass"
+        );
+        assert_eq!(
+            rebuild_records[0]["counts"]["claimed_rebuild_bucket_rows"],
+            serde_json::json!(513)
+        );
+        assert!(
+            rebuild_records[0]["finalization_subphases_ms"].is_object(),
+            "rebuild-finalize trace records should carry nested finalization timing"
+        );
+        assert!(
+            rebuild_records[0]["finalization_subphases_ms"]
+                .get("finalization_drain_setup")
+                .is_some(),
+            "drain setup timing should be recorded inside rebuild-finalize traces"
+        );
+
+        let _ = fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("FANTASMA_WORKER_STAGE_B_TRACE_PATH");
+        }
     }
 
     #[test]
@@ -3083,9 +3571,13 @@ mod tests {
             .into_iter()
             .next()
             .expect("repair job exists");
-        process_session_repair_job(&mut tx, job)
-            .await
-            .expect("process repair job");
+        process_session_repair_job(
+            &mut tx,
+            job,
+            &mut StageBTraceRecord::repair_job("install-1", 0),
+        )
+        .await
+        .expect("process repair job");
 
         let duration = sqlx::query_scalar::<_, i64>(
             r#"

@@ -1,6 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use fantasma_auth::{derive_key_prefix, hash_ingest_key};
@@ -2137,6 +2140,65 @@ pub async fn claim_pending_session_rebuild_buckets_in_tx(
         .collect()
 }
 
+pub async fn claim_and_sweep_pending_session_rebuild_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    limit: i64,
+) -> Result<Vec<PendingSessionRebuildBucketRecord>, StoreError> {
+    let mut swept = claim_pending_session_rebuild_buckets_in_tx(tx, limit).await?;
+    if swept.is_empty() {
+        return Ok(swept);
+    }
+
+    let project_ids = swept
+        .iter()
+        .map(|bucket| bucket.project_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut builder = QueryBuilder::<Postgres>::new("WITH requested(project_id) AS (");
+    builder.push_values(&project_ids, |mut row, project_id| {
+        row.push_bind(project_id);
+    });
+    builder.push(
+        ") , sweepable AS ( \
+            SELECT q.project_id, q.granularity, q.bucket_start \
+            FROM session_rebuild_queue q \
+            INNER JOIN requested r \
+              ON q.project_id = r.project_id \
+            ORDER BY q.project_id ASC, q.granularity ASC, q.bucket_start ASC \
+            FOR UPDATE SKIP LOCKED \
+        ) DELETE FROM session_rebuild_queue q \
+          USING sweepable s \
+          WHERE q.project_id = s.project_id \
+            AND q.granularity = s.granularity \
+            AND q.bucket_start = s.bucket_start \
+          RETURNING q.project_id, q.granularity, q.bucket_start",
+    );
+
+    let rows = builder.build().fetch_all(&mut **tx).await?;
+    swept.extend(
+        rows.into_iter()
+            .map(|row| {
+                Ok(PendingSessionRebuildBucketRecord {
+                    project_id: row.try_get("project_id")?,
+                    granularity: metric_granularity_from_str(
+                        row.try_get::<&str, _>("granularity")?,
+                    )?,
+                    bucket_start: row.try_get("bucket_start")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?,
+    );
+    swept.sort_by(|left, right| {
+        left.project_id
+            .cmp(&right.project_id)
+            .then_with(|| left.granularity.as_str().cmp(right.granularity.as_str()))
+            .then_with(|| left.bucket_start.cmp(&right.bucket_start))
+    });
+
+    Ok(swept)
+}
+
 pub async fn delete_pending_session_rebuild_buckets_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_ids: &[Uuid],
@@ -2569,6 +2631,23 @@ pub async fn rebuild_session_daily_days_in_tx(
     project_id: Uuid,
     days: &[NaiveDate],
 ) -> Result<(), StoreError> {
+    rebuild_session_daily_days_with_telemetry_in_tx(tx, project_id, days)
+        .await
+        .map(|_| ())
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SessionDailyRebuildTelemetry {
+    pub installs_write_ms: u64,
+    pub aggregate_write_ms: u64,
+    pub cleanup_ms: Option<u64>,
+}
+
+pub async fn rebuild_session_daily_days_with_telemetry_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    days: &[NaiveDate],
+) -> Result<SessionDailyRebuildTelemetry, StoreError> {
     let days = days
         .iter()
         .copied()
@@ -2577,11 +2656,16 @@ pub async fn rebuild_session_daily_days_in_tx(
         .collect::<Vec<_>>();
 
     if days.is_empty() {
-        return Ok(());
+        return Ok(SessionDailyRebuildTelemetry::default());
     }
 
-    rebuild_session_daily_installs_days_in_tx(tx, project_id, &days).await?;
+    let mut telemetry = SessionDailyRebuildTelemetry::default();
 
+    let installs_write_started_at = std::time::Instant::now();
+    rebuild_session_daily_installs_days_in_tx(tx, project_id, &days).await?;
+    telemetry.installs_write_ms = installs_write_started_at.elapsed().as_millis() as u64;
+
+    let cleanup_started_at = std::time::Instant::now();
     sqlx::query(
         r#"
         DELETE FROM session_daily
@@ -2594,6 +2678,12 @@ pub async fn rebuild_session_daily_days_in_tx(
     .execute(&mut **tx)
     .await?;
 
+    let cleanup_elapsed_ms = cleanup_started_at.elapsed().as_millis() as u64;
+    if cleanup_elapsed_ms > 0 {
+        telemetry.cleanup_ms = Some(cleanup_elapsed_ms);
+    }
+
+    let aggregate_write_started_at = std::time::Instant::now();
     sqlx::query(
         r#"
         WITH session_rollups AS (
@@ -2640,8 +2730,9 @@ pub async fn rebuild_session_daily_days_in_tx(
     .bind(&days)
     .execute(&mut **tx)
     .await?;
+    telemetry.aggregate_write_ms = aggregate_write_started_at.elapsed().as_millis() as u64;
 
-    Ok(())
+    Ok(telemetry)
 }
 
 async fn rebuild_session_daily_installs_days_in_tx(
@@ -6056,7 +6147,7 @@ mod tests {
         ensure_local_project(&pool, Some(&bootstrap_config()))
             .await
             .expect("ensure local project succeeds");
-        let other_project = Uuid::new_v4();
+        let other_project = Uuid::from_u128(u128::MAX);
         sqlx::query("INSERT INTO projects (id, name) VALUES ($1, $2)")
             .bind(other_project)
             .bind("Other")
@@ -6128,6 +6219,93 @@ mod tests {
         assert!(primary_pending.is_empty());
         assert_eq!(
             other_pending,
+            vec![
+                PendingSessionRebuildBucketRecord {
+                    project_id: other_project,
+                    granularity: MetricGranularity::Day,
+                    bucket_start: timestamp(24 * 60),
+                },
+                PendingSessionRebuildBucketRecord {
+                    project_id: other_project,
+                    granularity: MetricGranularity::Hour,
+                    bucket_start: timestamp(24 * 60),
+                },
+            ]
+        );
+    }
+
+    #[sqlx::test]
+    async fn claim_and_sweep_pending_session_rebuild_buckets_sweeps_visible_project_scope(
+        pool: PgPool,
+    ) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+        let other_project = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects (id, name) VALUES ($1, $2)")
+            .bind(other_project)
+            .bind("Other")
+            .execute(&pool)
+            .await
+            .expect("insert other project");
+
+        let mut seed_tx = pool.begin().await.expect("begin queue seed tx");
+        enqueue_session_rebuild_buckets_in_tx(
+            &mut seed_tx,
+            project_id(),
+            &[timestamp(0)],
+            &[timestamp(0), timestamp(60)],
+        )
+        .await
+        .expect("enqueue primary project buckets");
+        enqueue_session_rebuild_buckets_in_tx(
+            &mut seed_tx,
+            other_project,
+            &[timestamp(24 * 60)],
+            &[timestamp(24 * 60)],
+        )
+        .await
+        .expect("enqueue other project buckets");
+        seed_tx.commit().await.expect("commit queue seed tx");
+
+        let mut sweep_tx = pool.begin().await.expect("begin queue sweep tx");
+        let swept = claim_and_sweep_pending_session_rebuild_buckets_in_tx(&mut sweep_tx, 1)
+            .await
+            .expect("claim and sweep pending buckets");
+        let remaining_primary =
+            load_pending_session_rebuild_buckets_in_tx(&mut sweep_tx, &[project_id()])
+                .await
+                .expect("load remaining primary buckets");
+        let remaining_other =
+            load_pending_session_rebuild_buckets_in_tx(&mut sweep_tx, &[other_project])
+                .await
+                .expect("load remaining other buckets");
+        sweep_tx.commit().await.expect("commit queue sweep tx");
+
+        assert_eq!(
+            swept,
+            vec![
+                PendingSessionRebuildBucketRecord {
+                    project_id: project_id(),
+                    granularity: MetricGranularity::Day,
+                    bucket_start: timestamp(0),
+                },
+                PendingSessionRebuildBucketRecord {
+                    project_id: project_id(),
+                    granularity: MetricGranularity::Hour,
+                    bucket_start: timestamp(0),
+                },
+                PendingSessionRebuildBucketRecord {
+                    project_id: project_id(),
+                    granularity: MetricGranularity::Hour,
+                    bucket_start: timestamp(60),
+                },
+            ]
+        );
+        assert!(remaining_primary.is_empty());
+        assert_eq!(
+            remaining_other,
             vec![
                 PendingSessionRebuildBucketRecord {
                     project_id: other_project,
@@ -6980,6 +7158,20 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("fetch middle day row");
+        let middle_day_installs_before = sqlx::query(
+            r#"
+            SELECT install_id, session_count, updated_at
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = $2
+            ORDER BY install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_2)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch middle day install rows");
 
         sqlx::query("SELECT pg_sleep(0.01)")
             .execute(&pool)
@@ -7054,6 +7246,20 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("fetch middle day row after rebuild");
+        let day_1_installs_after = sqlx::query(
+            r#"
+            SELECT install_id, session_count
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = $2
+            ORDER BY install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_1)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch day 1 install rows after rebuild");
         let day_3_row = sqlx::query(
             r#"
             SELECT sessions_count, active_installs, total_duration_seconds
@@ -7067,6 +7273,20 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("fetch day 3 row");
+        let middle_day_installs_after = sqlx::query(
+            r#"
+            SELECT install_id, session_count, updated_at
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = $2
+            ORDER BY install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_2)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch middle day install rows after rebuild");
 
         assert_eq!(day_1_row.try_get::<i64, _>("sessions_count").unwrap(), 1);
         assert_eq!(day_1_row.try_get::<i64, _>("active_installs").unwrap(), 1);
@@ -7108,6 +7328,37 @@ mod tests {
                 .try_get::<DateTime<Utc>, _>("updated_at")
                 .unwrap()
         );
+        assert_eq!(
+            day_1_installs_after
+                .iter()
+                .map(|row| (
+                    row.try_get::<String, _>("install_id").unwrap(),
+                    row.try_get::<i32, _>("session_count").unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("install-1".to_owned(), 1)]
+        );
+        assert_eq!(
+            middle_day_installs_after.len(),
+            middle_day_installs_before.len()
+        );
+        for (after, before) in middle_day_installs_after
+            .iter()
+            .zip(middle_day_installs_before.iter())
+        {
+            assert_eq!(
+                after.try_get::<String, _>("install_id").unwrap(),
+                before.try_get::<String, _>("install_id").unwrap()
+            );
+            assert_eq!(
+                after.try_get::<i32, _>("session_count").unwrap(),
+                before.try_get::<i32, _>("session_count").unwrap()
+            );
+            assert_eq!(
+                after.try_get::<DateTime<Utc>, _>("updated_at").unwrap(),
+                before.try_get::<DateTime<Utc>, _>("updated_at").unwrap()
+            );
+        }
         assert_eq!(day_3_row.try_get::<i64, _>("sessions_count").unwrap(), 1);
         assert_eq!(day_3_row.try_get::<i64, _>("active_installs").unwrap(), 1);
         assert_eq!(
@@ -7115,6 +7366,181 @@ mod tests {
                 .try_get::<i64, _>("total_duration_seconds")
                 .unwrap(),
             45 * 60
+        );
+    }
+
+    #[sqlx::test]
+    async fn rebuild_session_daily_days_in_tx_rollback_preserves_existing_rows(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
+        let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date");
+
+        let mut seed_tx = pool.begin().await.expect("begin seed transaction");
+        insert_session_in_tx(&mut seed_tx, &session("install-1", 0, 10))
+            .await
+            .expect("insert install-1 day 1 session");
+        insert_session_in_tx(&mut seed_tx, &session("install-2", 24 * 60, 24 * 60 + 10))
+            .await
+            .expect("insert install-2 day 2 session");
+        rebuild_session_daily_days_in_tx(&mut seed_tx, project_id(), &[day_1, day_2])
+            .await
+            .expect("seed session_daily rows");
+        seed_tx.commit().await.expect("commit seed transaction");
+
+        let session_daily_before = sqlx::query(
+            r#"
+            SELECT day, sessions_count, active_installs, total_duration_seconds
+            FROM session_daily
+            WHERE project_id = $1
+            ORDER BY day ASC
+            "#,
+        )
+        .bind(project_id())
+        .fetch_all(&pool)
+        .await
+        .expect("fetch session_daily rows before rollback");
+        let session_daily_installs_before = sqlx::query(
+            r#"
+            SELECT day, install_id, session_count
+            FROM session_daily_installs
+            WHERE project_id = $1
+            ORDER BY day ASC, install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .fetch_all(&pool)
+        .await
+        .expect("fetch session_daily_installs rows before rollback");
+
+        sqlx::query(
+            r#"
+            UPDATE sessions
+            SET session_end = $3,
+                duration_seconds = $4
+            WHERE project_id = $1
+              AND install_id = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .bind(timestamp(45))
+        .bind(45 * 60)
+        .execute(&pool)
+        .await
+        .expect("update day 1 session");
+
+        let mut rebuild_tx = pool.begin().await.expect("begin rebuild transaction");
+        rebuild_session_daily_days_in_tx(&mut rebuild_tx, project_id(), &[day_1])
+            .await
+            .expect("rebuild day 1 inside rollback transaction");
+        rebuild_tx
+            .rollback()
+            .await
+            .expect("rollback rebuild transaction");
+
+        let session_daily_after = sqlx::query(
+            r#"
+            SELECT day, sessions_count, active_installs, total_duration_seconds
+            FROM session_daily
+            WHERE project_id = $1
+            ORDER BY day ASC
+            "#,
+        )
+        .bind(project_id())
+        .fetch_all(&pool)
+        .await
+        .expect("fetch session_daily rows after rollback");
+        let session_daily_installs_after = sqlx::query(
+            r#"
+            SELECT day, install_id, session_count
+            FROM session_daily_installs
+            WHERE project_id = $1
+            ORDER BY day ASC, install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .fetch_all(&pool)
+        .await
+        .expect("fetch session_daily_installs rows after rollback");
+
+        assert_eq!(session_daily_after.len(), session_daily_before.len());
+        for (after, before) in session_daily_after.iter().zip(session_daily_before.iter()) {
+            assert_eq!(
+                after.try_get::<NaiveDate, _>("day").unwrap(),
+                before.try_get::<NaiveDate, _>("day").unwrap()
+            );
+            assert_eq!(
+                after.try_get::<i64, _>("sessions_count").unwrap(),
+                before.try_get::<i64, _>("sessions_count").unwrap()
+            );
+            assert_eq!(
+                after.try_get::<i64, _>("active_installs").unwrap(),
+                before.try_get::<i64, _>("active_installs").unwrap()
+            );
+            assert_eq!(
+                after.try_get::<i64, _>("total_duration_seconds").unwrap(),
+                before.try_get::<i64, _>("total_duration_seconds").unwrap()
+            );
+        }
+
+        assert_eq!(
+            session_daily_installs_after.len(),
+            session_daily_installs_before.len()
+        );
+        for (after, before) in session_daily_installs_after
+            .iter()
+            .zip(session_daily_installs_before.iter())
+        {
+            assert_eq!(
+                after.try_get::<NaiveDate, _>("day").unwrap(),
+                before.try_get::<NaiveDate, _>("day").unwrap()
+            );
+            assert_eq!(
+                after.try_get::<String, _>("install_id").unwrap(),
+                before.try_get::<String, _>("install_id").unwrap()
+            );
+            assert_eq!(
+                after.try_get::<i32, _>("session_count").unwrap(),
+                before.try_get::<i32, _>("session_count").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_session_daily_days_helper_matches_attribution_reset_shape() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("pub async fn rebuild_session_daily_days_in_tx")
+            .expect("find rebuild_session_daily_days_in_tx");
+        let end = source
+            .find("pub async fn load_worker_offset")
+            .expect("find load_worker_offset");
+        let helper = &source[start..end];
+
+        assert!(
+            helper.contains("rebuild_session_daily_installs_days_in_tx"),
+            "attribution-reset baseline should rebuild session_daily_installs via the dedicated helper"
+        );
+        assert_eq!(
+            helper.matches("FROM sessions").count(),
+            2,
+            "attribution-reset baseline should scan sessions once for installs and once for the aggregate rollup"
+        );
+        assert!(
+            helper.contains("install_rollups AS"),
+            "attribution-reset baseline should keep the install_rollups CTE"
+        );
+        assert!(
+            helper.contains("FROM session_daily_installs"),
+            "session_daily aggregate rebuild should still derive active installs from session_daily_installs"
+        );
+        assert!(
+            !helper.contains("pg_temp.session_daily_rebuild_source"),
+            "failed temp-table rewrite must not remain in the restored baseline"
         );
     }
 }

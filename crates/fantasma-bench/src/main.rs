@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -39,6 +40,15 @@ const DEFAULT_SLO_SESSION_BATCH_SIZE: i64 = 1_000;
 const DEFAULT_SLO_EVENT_BATCH_SIZE: i64 = 5_000;
 const DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY: usize = 8;
 const DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY: usize = 2;
+const WORKER_STAGE_B_TRACE_ENV_VAR: &str = "FANTASMA_WORKER_STAGE_B_TRACE_PATH";
+const WORKER_STAGE_B_TRACE_CONTAINER_PATH: &str = "/tmp/stage-b-trace.jsonl";
+const STAGE_B_TRACE_FILENAME: &str = "stage-b-trace.jsonl";
+const STAGE_B_SUMMARY_FILENAME: &str = "stage-b.json";
+const STAGE_B_DOMINANT_MIN_SHARE: f64 = 0.40;
+const STAGE_B_DOMINANT_MIN_LEAD: f64 = 0.10;
+const STAGE_B_SLOW_RECORD_LIMIT: usize = 10;
+const STAGE_B_QUEUE_LAG_CONTEXT_NAMES: [&str; 2] =
+    ["queue_wait_claim", "row_mutation_lag_before_claim"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -439,6 +449,87 @@ impl Default for BenchWorkerConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StageBTraceRecord {
+    record_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_event_id: Option<i64>,
+    #[serde(default)]
+    phases_ms: BTreeMap<String, u64>,
+    #[serde(default)]
+    finalization_subphases_ms: BTreeMap<String, u64>,
+    #[serde(default)]
+    session_daily_subphases_ms: BTreeMap<String, u64>,
+    #[serde(default)]
+    counts: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct StageBSummary {
+    scenario: String,
+    run_config: SloRunConfig,
+    record_count: usize,
+    measured_stage_b_ms: u64,
+    record_type_counts: BTreeMap<String, usize>,
+    phases: Vec<StageBPhaseSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    finalization_subphases: Vec<StageBPhaseSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    session_daily_subphases: Vec<StageBPhaseSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    backlog_context: Vec<StageBContextSummary>,
+    total_counts: BTreeMap<String, u64>,
+    slowest_records_by_type: BTreeMap<String, Vec<StageBSlowRecord>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dominant_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dominant_finalization_subphase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dominant_session_daily_subphase: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct StageBPhaseSummary {
+    name: String,
+    total_ms: u64,
+    share: f64,
+    distribution: StageBDistributionStats,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct StageBContextSummary {
+    name: String,
+    total_ms: u64,
+    distribution: StageBDistributionStats,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct StageBDistributionStats {
+    count: usize,
+    min_ms: u64,
+    p50_ms: u64,
+    p95_ms: u64,
+    max_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct StageBSlowRecord {
+    record_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_event_id: Option<i64>,
+    total_ms: u64,
+    phases_ms: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    finalization_subphases_ms: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    session_daily_subphases_ms: BTreeMap<String, u64>,
+    counts: BTreeMap<String, u64>,
+}
+
 #[derive(Debug, Clone)]
 struct SloQuerySpec {
     name: String,
@@ -714,8 +805,9 @@ async fn run_slo(args: SloArgs) -> Result<()> {
         &args.run_config,
         &scenarios,
         |scenario| {
+            let output_dir = args.output_dir.clone();
             let run_config = args.run_config.clone();
-            async move { execute_slo_scenario(&scenario, &run_config).await }
+            async move { execute_slo_scenario(&output_dir, &scenario, &run_config).await }
         },
     )
     .await
@@ -862,6 +954,7 @@ fn slo_execution_failure_result(
 }
 
 async fn execute_slo_scenario(
+    output_dir: &Path,
     scenario: &SloScenarioDefinition,
     run_config: &SloRunConfig,
 ) -> Result<SloScenarioResult> {
@@ -876,7 +969,7 @@ async fn execute_slo_scenario(
     wait_for_health(&client).await?;
     let project = provision_project(&client).await?;
 
-    match scenario.kind {
+    let result = match scenario.kind {
         SloScenarioKind::Append => {
             run_slo_append_like(&client, &project, scenario, run_config, false, false).await
         }
@@ -886,6 +979,34 @@ async fn execute_slo_scenario(
         SloScenarioKind::Repair => run_slo_repair(&client, &project, scenario, run_config).await,
         SloScenarioKind::Reads => {
             run_slo_append_like(&client, &project, scenario, run_config, false, true).await
+        }
+    };
+
+    let trace_capture = copy_stage_b_trace_from_worker(&stack.compose_file);
+    match result {
+        Ok(result) => {
+            if let Some(trace_contents) = trace_capture? {
+                let scenario_dir = slo_paths(output_dir, scenario).scenario_dir;
+                write_stage_b_sidecars(
+                    &scenario_dir,
+                    &scenario.key(),
+                    run_config,
+                    &trace_contents,
+                )?;
+            }
+            Ok(result)
+        }
+        Err(error) => {
+            if let Ok(Some(trace_contents)) = trace_capture {
+                let scenario_dir = slo_paths(output_dir, scenario).scenario_dir;
+                let _ = write_stage_b_sidecars(
+                    &scenario_dir,
+                    &scenario.key(),
+                    run_config,
+                    &trace_contents,
+                );
+            }
+            Err(error)
         }
     }
 }
@@ -3153,6 +3274,350 @@ fn write_markdown(output: PathBuf, markdown: String) -> Result<()> {
     fs::write(&output, markdown).with_context(|| format!("write {}", output.display()))
 }
 
+fn write_stage_b_sidecars(
+    scenario_dir: &Path,
+    scenario: &str,
+    run_config: &SloRunConfig,
+    trace_contents: &str,
+) -> Result<bool> {
+    let records = parse_stage_b_trace_records(trace_contents)?;
+    if records.is_empty() {
+        return Ok(false);
+    }
+
+    fs::create_dir_all(scenario_dir)
+        .with_context(|| format!("create scenario directory {}", scenario_dir.display()))?;
+    fs::write(stage_b_trace_output_path(scenario_dir), trace_contents).with_context(|| {
+        format!(
+            "write {}",
+            stage_b_trace_output_path(scenario_dir).display()
+        )
+    })?;
+    let summary = summarize_stage_b_trace_records(scenario, run_config, &records);
+    write_pretty_json(&stage_b_summary_output_path(scenario_dir), &summary)?;
+    Ok(true)
+}
+
+fn parse_stage_b_trace_records(trace_contents: &str) -> Result<Vec<StageBTraceRecord>> {
+    trace_contents
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            Some(
+                serde_json::from_str(trimmed)
+                    .with_context(|| format!("parse Stage B trace record at line {}", index + 1)),
+            )
+        })
+        .collect()
+}
+
+fn summarize_stage_b_trace_records(
+    scenario: &str,
+    run_config: &SloRunConfig,
+    records: &[StageBTraceRecord],
+) -> StageBSummary {
+    let mut active_phase_totals = BTreeMap::<String, u64>::new();
+    let mut active_phase_samples = BTreeMap::<String, Vec<u64>>::new();
+    let mut finalization_subphase_totals = BTreeMap::<String, u64>::new();
+    let mut finalization_subphase_samples = BTreeMap::<String, Vec<u64>>::new();
+    let mut session_daily_subphase_totals = BTreeMap::<String, u64>::new();
+    let mut session_daily_subphase_samples = BTreeMap::<String, Vec<u64>>::new();
+    let mut backlog_totals = BTreeMap::<String, u64>::new();
+    let mut backlog_samples = BTreeMap::<String, Vec<u64>>::new();
+    let mut total_counts = BTreeMap::<String, u64>::new();
+    let mut record_type_counts = BTreeMap::<String, usize>::new();
+    let mut slowest_records_by_type = BTreeMap::<String, Vec<StageBSlowRecord>>::new();
+
+    for record in records {
+        *record_type_counts
+            .entry(record.record_type.clone())
+            .or_default() += 1;
+
+        let total_ms = record.phases_ms.values().copied().sum();
+        slowest_records_by_type
+            .entry(record.record_type.clone())
+            .or_default()
+            .push(StageBSlowRecord {
+                record_type: record.record_type.clone(),
+                install_id: record.install_id.clone(),
+                target_event_id: record.target_event_id,
+                total_ms,
+                phases_ms: record.phases_ms.clone(),
+                finalization_subphases_ms: record.finalization_subphases_ms.clone(),
+                session_daily_subphases_ms: record.session_daily_subphases_ms.clone(),
+                counts: record.counts.clone(),
+            });
+
+        for (phase, elapsed_ms) in &record.phases_ms {
+            if is_stage_b_backlog_context(phase) {
+                *backlog_totals.entry(phase.clone()).or_default() += *elapsed_ms;
+                backlog_samples
+                    .entry(phase.clone())
+                    .or_default()
+                    .push(*elapsed_ms);
+            } else {
+                *active_phase_totals.entry(phase.clone()).or_default() += *elapsed_ms;
+                active_phase_samples
+                    .entry(phase.clone())
+                    .or_default()
+                    .push(*elapsed_ms);
+            }
+        }
+
+        for (phase, elapsed_ms) in &record.finalization_subphases_ms {
+            *finalization_subphase_totals
+                .entry(phase.clone())
+                .or_default() += *elapsed_ms;
+            finalization_subphase_samples
+                .entry(phase.clone())
+                .or_default()
+                .push(*elapsed_ms);
+        }
+
+        for (phase, elapsed_ms) in &record.session_daily_subphases_ms {
+            *session_daily_subphase_totals
+                .entry(phase.clone())
+                .or_default() += *elapsed_ms;
+            session_daily_subphase_samples
+                .entry(phase.clone())
+                .or_default()
+                .push(*elapsed_ms);
+        }
+
+        for (count_name, count) in &record.counts {
+            *total_counts.entry(count_name.clone()).or_default() += *count;
+        }
+    }
+
+    for slowest_records in slowest_records_by_type.values_mut() {
+        slowest_records.sort_by(|left, right| {
+            right
+                .total_ms
+                .cmp(&left.total_ms)
+                .then_with(|| left.install_id.cmp(&right.install_id))
+                .then_with(|| left.target_event_id.cmp(&right.target_event_id))
+        });
+        slowest_records.truncate(STAGE_B_SLOW_RECORD_LIMIT);
+    }
+
+    let measured_stage_b_ms = active_phase_totals.values().copied().sum();
+    let mut phases = active_phase_totals
+        .into_iter()
+        .map(|(name, total_ms)| {
+            let mut samples = active_phase_samples
+                .remove(&name)
+                .expect("phase samples tracked alongside totals");
+            samples.sort_unstable();
+
+            StageBPhaseSummary {
+                name,
+                total_ms,
+                share: if measured_stage_b_ms == 0 {
+                    0.0
+                } else {
+                    total_ms as f64 / measured_stage_b_ms as f64
+                },
+                distribution: StageBDistributionStats {
+                    count: samples.len(),
+                    min_ms: *samples.first().unwrap_or(&0),
+                    p50_ms: percentile(&samples, 0.50),
+                    p95_ms: percentile(&samples, 0.95),
+                    max_ms: *samples.last().unwrap_or(&0),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    phases.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let mut backlog_context = backlog_totals
+        .into_iter()
+        .map(|(name, total_ms)| {
+            let mut samples = backlog_samples
+                .remove(&name)
+                .expect("backlog samples tracked alongside totals");
+            samples.sort_unstable();
+
+            StageBContextSummary {
+                name,
+                total_ms,
+                distribution: StageBDistributionStats {
+                    count: samples.len(),
+                    min_ms: *samples.first().unwrap_or(&0),
+                    p50_ms: percentile(&samples, 0.50),
+                    p95_ms: percentile(&samples, 0.95),
+                    max_ms: *samples.last().unwrap_or(&0),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    backlog_context.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let dominant_phase = dominant_stage_b_phase(&phases);
+    let measured_finalization_ms: u64 = finalization_subphase_totals.values().copied().sum();
+    let mut finalization_subphases = finalization_subphase_totals
+        .into_iter()
+        .map(|(name, total_ms)| {
+            let mut samples = finalization_subphase_samples
+                .remove(&name)
+                .expect("finalization subphase samples tracked alongside totals");
+            samples.sort_unstable();
+
+            StageBPhaseSummary {
+                name,
+                total_ms,
+                share: if measured_finalization_ms == 0 {
+                    0.0
+                } else {
+                    total_ms as f64 / measured_finalization_ms as f64
+                },
+                distribution: StageBDistributionStats {
+                    count: samples.len(),
+                    min_ms: *samples.first().unwrap_or(&0),
+                    p50_ms: percentile(&samples, 0.50),
+                    p95_ms: percentile(&samples, 0.95),
+                    max_ms: *samples.last().unwrap_or(&0),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    finalization_subphases.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let dominant_finalization_subphase = dominant_stage_b_phase(&finalization_subphases);
+    let measured_session_daily_ms: u64 = session_daily_subphase_totals.values().copied().sum();
+    let mut session_daily_subphases = session_daily_subphase_totals
+        .into_iter()
+        .map(|(name, total_ms)| {
+            let mut samples = session_daily_subphase_samples
+                .remove(&name)
+                .expect("session_daily subphase samples tracked alongside totals");
+            samples.sort_unstable();
+
+            StageBPhaseSummary {
+                name,
+                total_ms,
+                share: if measured_session_daily_ms == 0 {
+                    0.0
+                } else {
+                    total_ms as f64 / measured_session_daily_ms as f64
+                },
+                distribution: StageBDistributionStats {
+                    count: samples.len(),
+                    min_ms: *samples.first().unwrap_or(&0),
+                    p50_ms: percentile(&samples, 0.50),
+                    p95_ms: percentile(&samples, 0.95),
+                    max_ms: *samples.last().unwrap_or(&0),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    session_daily_subphases.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let dominant_session_daily_subphase = dominant_stage_b_phase(&session_daily_subphases);
+
+    StageBSummary {
+        scenario: scenario.to_owned(),
+        run_config: run_config.clone(),
+        record_count: records.len(),
+        measured_stage_b_ms,
+        record_type_counts,
+        phases,
+        finalization_subphases,
+        session_daily_subphases,
+        backlog_context,
+        total_counts,
+        slowest_records_by_type,
+        dominant_phase,
+        dominant_finalization_subphase,
+        dominant_session_daily_subphase,
+    }
+}
+
+fn is_stage_b_backlog_context(name: &str) -> bool {
+    STAGE_B_QUEUE_LAG_CONTEXT_NAMES.contains(&name)
+}
+
+fn dominant_stage_b_phase(phases: &[StageBPhaseSummary]) -> Option<String> {
+    let largest = phases.first()?;
+    let second_share = phases.get(1).map_or(0.0, |phase| phase.share);
+
+    if largest.share >= STAGE_B_DOMINANT_MIN_SHARE
+        && (largest.share - second_share) >= STAGE_B_DOMINANT_MIN_LEAD
+    {
+        Some(largest.name.clone())
+    } else {
+        None
+    }
+}
+
+fn stage_b_trace_output_path(scenario_dir: &Path) -> PathBuf {
+    scenario_dir.join(STAGE_B_TRACE_FILENAME)
+}
+
+fn stage_b_summary_output_path(scenario_dir: &Path) -> PathBuf {
+    scenario_dir.join(STAGE_B_SUMMARY_FILENAME)
+}
+
+fn copy_stage_b_trace_from_worker(compose_file: &Path) -> Result<Option<String>> {
+    let local_copy = std::env::temp_dir().join(format!(
+        "fantasma-stage-b-trace-{}-{}.jsonl",
+        std::process::id(),
+        Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000)
+    ));
+    let output = stage_b_trace_copy_command(compose_file, &local_copy)
+        .output()
+        .context("copy Stage B trace from worker container")?;
+
+    if !output.status.success() {
+        let _ = fs::remove_file(&local_copy);
+        return Ok(None);
+    }
+
+    let trace_contents = fs::read_to_string(&local_copy)
+        .with_context(|| format!("read copied Stage B trace {}", local_copy.display()))?;
+    let _ = fs::remove_file(&local_copy);
+
+    if trace_contents.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(trace_contents))
+}
+
+fn stage_b_trace_copy_command(compose_file: &Path, destination: &Path) -> Command {
+    let source = format!("fantasma-worker:{}", WORKER_STAGE_B_TRACE_CONTAINER_PATH);
+    docker_compose_command(
+        compose_file,
+        [
+            OsString::from("cp"),
+            OsString::from(source),
+            destination.as_os_str().to_os_string(),
+        ],
+    )
+}
+
 fn render_markdown_summary(result: &ScenarioResult) -> String {
     let mut lines = vec![
         format!(
@@ -3344,6 +3809,7 @@ fn render_slo_compose_file(run_config: &SloRunConfig) -> Result<PathBuf> {
 
 fn render_benchmark_compose_template(template: &str, worker_config: &BenchWorkerConfig) -> String {
     let mut rendered_lines = Vec::new();
+    let mut trace_path_rendered = false;
 
     for line in template.lines() {
         if line
@@ -3378,6 +3844,17 @@ fn render_benchmark_compose_template(template: &str, worker_config: &BenchWorker
                 "      FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY: {}",
                 worker_config.session_repair_concurrency
             ));
+            if !trace_path_rendered {
+                rendered_lines.push(format!(
+                    "      {WORKER_STAGE_B_TRACE_ENV_VAR}: {WORKER_STAGE_B_TRACE_CONTAINER_PATH}"
+                ));
+                trace_path_rendered = true;
+            }
+        } else if line.trim_start().starts_with(WORKER_STAGE_B_TRACE_ENV_VAR) {
+            rendered_lines.push(format!(
+                "      {WORKER_STAGE_B_TRACE_ENV_VAR}: {WORKER_STAGE_B_TRACE_CONTAINER_PATH}"
+            ));
+            trace_path_rendered = true;
         } else {
             rendered_lines.push(line.to_owned());
         }
@@ -3472,7 +3949,7 @@ where
 
 fn docker_compose_command(
     compose_file: &Path,
-    args: impl IntoIterator<Item = &'static str>,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> Command {
     let mut command = Command::new("docker");
     command
@@ -4786,6 +5263,217 @@ mod tests {
         assert!(rendered.contains("FANTASMA_WORKER_EVENT_BATCH_SIZE: 7000"));
         assert!(rendered.contains("FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY: 12"));
         assert!(rendered.contains("FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY: 4"));
+        assert!(rendered.contains("FANTASMA_WORKER_STAGE_B_TRACE_PATH: /tmp/stage-b-trace.jsonl"));
+    }
+
+    #[test]
+    fn write_stage_b_sidecars_summarizes_trace_records_without_touching_main_artifacts() {
+        let tempdir = tempdir().expect("create tempdir");
+        let scenario_dir = tempdir.path().join("backfill-30d");
+
+        let wrote_sidecars = write_stage_b_sidecars(
+            &scenario_dir,
+            "backfill-30d",
+            &dummy_slo_run_config(),
+            sample_stage_b_trace_contents(),
+        )
+        .expect("write stage-b sidecars");
+
+        assert!(wrote_sidecars, "expected trace data to produce sidecars");
+        assert!(!scenario_dir.join("result.json").exists());
+        assert!(!scenario_dir.join("summary.json").exists());
+        assert!(!scenario_dir.join("host.json").exists());
+
+        let trace = fs::read_to_string(scenario_dir.join("stage-b-trace.jsonl"))
+            .expect("read stage-b trace sidecar");
+        assert_eq!(trace, sample_stage_b_trace_contents());
+
+        let summary: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(scenario_dir.join("stage-b.json")).expect("read stage-b summary"),
+        )
+        .expect("parse stage-b summary");
+        assert_eq!(summary["scenario"], "backfill-30d");
+        assert_eq!(
+            summary["run_config"]["worker_config"]["session_batch_size"],
+            serde_json::json!(DEFAULT_SLO_SESSION_BATCH_SIZE)
+        );
+        assert_eq!(summary["dominant_phase"], "session_rewrite");
+        assert_eq!(summary["record_type_counts"]["repair_job"], 2);
+        assert_eq!(summary["record_type_counts"]["rebuild_finalize"], 1);
+        assert_eq!(summary["total_counts"]["window_raw_events"], 15);
+        assert_eq!(
+            summary["slowest_records_by_type"]["repair_job"][0]["install_id"],
+            "install-2"
+        );
+        assert_eq!(
+            summary["slowest_records_by_type"]["rebuild_finalize"][0]["record_type"],
+            "rebuild_finalize"
+        );
+    }
+
+    #[test]
+    fn write_stage_b_sidecars_skips_output_when_trace_records_are_empty() {
+        let tempdir = tempdir().expect("create tempdir");
+        let scenario_dir = tempdir.path().join("append-30d");
+
+        let wrote_sidecars =
+            write_stage_b_sidecars(&scenario_dir, "append-30d", &dummy_slo_run_config(), "\n")
+                .expect("skip empty stage-b trace");
+
+        assert!(!wrote_sidecars, "empty trace should not produce sidecars");
+        assert!(!scenario_dir.join("stage-b-trace.jsonl").exists());
+        assert!(!scenario_dir.join("stage-b.json").exists());
+    }
+
+    #[test]
+    fn summarize_stage_b_trace_records_reports_null_when_no_phase_is_dominant() {
+        let summary: serde_json::Value = serde_json::to_value(summarize_stage_b_trace_records(
+            "repair-30d",
+            &dummy_slo_run_config(),
+            &parse_stage_b_trace_records(
+                r#"{"record_type":"repair_job","install_id":"install-1","target_event_id":10,"phases_ms":{"row_mutation_lag_before_claim":40,"session_rewrite":45,"recompute_window_load":45},"counts":{"pending_frontier_events":2}}
+{"record_type":"repair_job","install_id":"install-2","target_event_id":20,"phases_ms":{"row_mutation_lag_before_claim":40,"session_rewrite":45,"recompute_window_load":45},"counts":{"pending_frontier_events":3}}
+"#,
+            )
+            .expect("parse stage-b trace"),
+        ))
+        .expect("serialize summary");
+
+        assert_eq!(summary["dominant_phase"], serde_json::Value::Null);
+        assert_eq!(
+            summary["dominant_finalization_subphase"],
+            serde_json::Value::Null
+        );
+        assert_eq!(summary["finalization_subphases"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn summarize_stage_b_trace_records_separates_claim_lag_backlog_from_active_work() {
+        let summary = summarize_stage_b_trace_records(
+            "repair-30d",
+            &dummy_slo_run_config(),
+            &parse_stage_b_trace_records(
+                r#"{"record_type":"repair_job","install_id":"install-1","target_event_id":10,"phases_ms":{"row_mutation_lag_before_claim":1000,"session_rewrite":25},"counts":{"pending_frontier_events":2}}
+{"record_type":"rebuild_finalize","phases_ms":{"shared_bucket_finalize":50},"counts":{"claimed_rebuild_bucket_rows":3}}
+"#,
+            )
+            .expect("parse stage-b trace"),
+        );
+
+        assert_eq!(summary.measured_stage_b_ms, 75);
+        assert_eq!(
+            summary.dominant_phase,
+            Some("shared_bucket_finalize".to_owned())
+        );
+        assert_eq!(summary.backlog_context.len(), 1);
+        assert_eq!(
+            summary.backlog_context[0].name,
+            "row_mutation_lag_before_claim"
+        );
+        assert_eq!(summary.backlog_context[0].total_ms, 1000);
+        assert_eq!(summary.backlog_context[0].distribution.p95_ms, 1000);
+    }
+
+    #[test]
+    fn summarize_stage_b_trace_records_reports_finalization_subphases_without_changing_top_level_accounting()
+     {
+        let summary: serde_json::Value = serde_json::to_value(summarize_stage_b_trace_records(
+            "backfill-30d",
+            &dummy_slo_run_config(),
+            &parse_stage_b_trace_records(
+                r#"{"record_type":"repair_job","install_id":"install-1","target_event_id":10,"phases_ms":{"session_rewrite":25},"counts":{"pending_frontier_events":2}}
+{"record_type":"rebuild_finalize","phases_ms":{"shared_bucket_finalize":90},"finalization_subphases_ms":{"finalization_drain_setup":10,"finalization_session_daily_rebuild":15,"finalization_metric_total_rebuild":15,"finalization_metric_dim1_rebuild":40,"finalization_metric_dim2_rebuild":10},"session_daily_subphases_ms":{"session_daily_source_build":4,"session_daily_installs_write":5,"session_daily_aggregate_write":6},"counts":{"claimed_rebuild_bucket_rows":3}}
+"#,
+            )
+            .expect("parse stage-b trace"),
+        ))
+        .expect("serialize summary");
+
+        assert_eq!(summary["dominant_phase"], "shared_bucket_finalize");
+        assert_eq!(
+            summary["dominant_finalization_subphase"],
+            "finalization_metric_dim1_rebuild"
+        );
+        assert_eq!(
+            summary["finalization_subphases"][0]["name"],
+            "finalization_metric_dim1_rebuild"
+        );
+        assert_eq!(
+            summary["finalization_subphases"][0]["total_ms"],
+            serde_json::json!(40)
+        );
+        assert_eq!(
+            summary["finalization_subphases"][0]["distribution"]["p95_ms"],
+            serde_json::json!(40)
+        );
+        assert_eq!(
+            summary["session_daily_subphases"][0]["name"],
+            "session_daily_aggregate_write"
+        );
+        assert_eq!(
+            summary["dominant_session_daily_subphase"],
+            serde_json::Value::Null
+        );
+        assert_eq!(summary["measured_stage_b_ms"], serde_json::json!(115));
+    }
+
+    #[test]
+    fn summarize_stage_b_trace_records_reports_session_daily_subphases_without_changing_finalization_shape()
+     {
+        let summary: serde_json::Value = serde_json::to_value(summarize_stage_b_trace_records(
+            "repair-30d",
+            &dummy_slo_run_config(),
+            &parse_stage_b_trace_records(
+                r#"{"record_type":"rebuild_finalize","phases_ms":{"shared_bucket_finalize":50},"finalization_subphases_ms":{"finalization_session_daily_rebuild":50},"session_daily_subphases_ms":{"session_daily_source_build":5,"session_daily_installs_write":10,"session_daily_aggregate_write":35},"counts":{"claimed_rebuild_bucket_rows":2}}
+"#,
+            )
+            .expect("parse stage-b trace"),
+        ))
+        .expect("serialize summary");
+
+        assert_eq!(
+            summary["dominant_finalization_subphase"],
+            "finalization_session_daily_rebuild"
+        );
+        assert_eq!(
+            summary["session_daily_subphases"][0]["name"],
+            "session_daily_aggregate_write"
+        );
+        assert_eq!(
+            summary["dominant_session_daily_subphase"],
+            "session_daily_aggregate_write"
+        );
+        assert_eq!(
+            summary["finalization_subphases"][0]["name"],
+            "finalization_session_daily_rebuild"
+        );
+    }
+
+    #[test]
+    fn summarize_stage_b_trace_records_does_not_fabricate_session_daily_subphases_when_absent() {
+        let summary: serde_json::Value = serde_json::to_value(summarize_stage_b_trace_records(
+            "append-30d",
+            &dummy_slo_run_config(),
+            &parse_stage_b_trace_records(
+                r#"{"record_type":"rebuild_finalize","phases_ms":{"shared_bucket_finalize":10},"finalization_subphases_ms":{"finalization_metric_total_rebuild":10},"counts":{"claimed_rebuild_bucket_rows":1}}
+"#,
+            )
+            .expect("parse stage-b trace"),
+        ))
+        .expect("serialize summary");
+
+        assert_eq!(summary["session_daily_subphases"], serde_json::Value::Null);
+        assert_eq!(
+            summary["dominant_session_daily_subphase"],
+            serde_json::Value::Null
+        );
+    }
+
+    fn sample_stage_b_trace_contents() -> &'static str {
+        r#"{"record_type":"repair_job","install_id":"install-1","target_event_id":11,"phases_ms":{"queue_wait_claim":5,"frontier_fetch":7,"recompute_window_load":12,"session_rewrite":44,"touched_bucket_enqueue":3},"counts":{"pending_frontier_events":4,"window_raw_events":9}}
+{"record_type":"repair_job","install_id":"install-2","target_event_id":22,"phases_ms":{"queue_wait_claim":6,"frontier_fetch":8,"recompute_window_load":14,"session_rewrite":51,"touched_bucket_enqueue":4},"counts":{"pending_frontier_events":5,"window_raw_events":6}}
+{"record_type":"rebuild_finalize","phases_ms":{"shared_bucket_finalize":31},"finalization_subphases_ms":{"finalization_drain_setup":3,"finalization_session_daily_rebuild":4,"finalization_metric_total_rebuild":5,"finalization_metric_dim1_rebuild":14,"finalization_metric_dim2_rebuild":5},"session_daily_subphases_ms":{"session_daily_source_build":1,"session_daily_installs_write":1,"session_daily_aggregate_write":2},"counts":{"claimed_rebuild_bucket_rows":12,"touched_day_buckets":2}}
+"#
     }
 
     #[test]
