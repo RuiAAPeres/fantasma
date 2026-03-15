@@ -600,6 +600,7 @@ struct FantasmaSDKBehaviorTests {
     func destinationDriftDuringBatchAssemblyDiscardsPreparedBatch() async throws {
         let transport = RecordingTransport()
         let gate = SuspensionGate()
+        let reconfigureStarted = TaskStartSignal()
         let harness = TestHarness()
         defer { harness.cleanup() }
 
@@ -623,10 +624,12 @@ struct FantasmaSDKBehaviorTests {
 
         let probe = CompletionProbe()
         let reconfigure = Task {
+            reconfigureStarted.markStarted()
             defer { Task { await probe.markCompleted() } }
             try await Fantasma.configure(serverURL: replacementURL(), writeKey: "fg_ing_next")
         }
 
+        await reconfigureStarted.waitUntilStarted()
         #expect(await probe.completed == false)
         #expect(await transport.requests().isEmpty)
 
@@ -801,6 +804,44 @@ private actor CompletionProbe {
 
     func markCompleted() {
         completed = true
+    }
+}
+
+private final class TaskStartSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func markStarted() {
+        let currentWaiters: [CheckedContinuation<Void, Never>]
+        lock.lock()
+        if started {
+            lock.unlock()
+            return
+        }
+
+        started = true
+        currentWaiters = waiters
+        waiters.removeAll(keepingCapacity: false)
+        lock.unlock()
+
+        for waiter in currentWaiters {
+            waiter.resume()
+        }
+    }
+
+    func waitUntilStarted() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if started {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+
+            waiters.append(continuation)
+            lock.unlock()
+        }
     }
 }
 
