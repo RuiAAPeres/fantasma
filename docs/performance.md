@@ -207,7 +207,7 @@ The pinned iterative baseline is checked in under `crates/fantasma-bench/baselin
 
 The harness starts the benchmark stack in its own Compose project, renders a temporary benchmark Compose file with the selected worker settings, provisions a blank-database project plus scoped ingest/read keys, clears the target output directory before each run, and writes:
 
-- `host.json`
+- `host.json` with coarse environment metadata only
 - additive `run_config` in each scenario artifact
 - one JSON and one Markdown file per scenario run
 - `summary.json`

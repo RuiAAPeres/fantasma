@@ -2,7 +2,7 @@
 set -euo pipefail
 
 API_URL="${FANTASMA_API_URL:-http://localhost:8082}"
-ADMIN_TOKEN="${FANTASMA_ADMIN_TOKEN:-fg_pat_dev}"
+ADMIN_TOKEN="${FANTASMA_ADMIN_TOKEN:-}"
 PROJECT_NAME="Fantasma Local Project"
 INGEST_KEY_NAME="default-ingest"
 READ_KEY_NAME=""
@@ -13,7 +13,7 @@ Usage: scripts/provision-project.sh [options]
 
 Options:
   --api-url URL           Fantasma API base URL (default: http://localhost:8082)
-  --admin-token TOKEN     Operator bearer token (default: FANTASMA_ADMIN_TOKEN or fg_pat_dev)
+  --admin-token TOKEN     Operator bearer token (default: FANTASMA_ADMIN_TOKEN)
   --project-name NAME     Project name to create
   --ingest-key-name NAME  Name for the initial ingest key
   --read-key-name NAME    Optional name for an additional read key
@@ -111,6 +111,11 @@ require_cmd curl
 require_cmd python3
 
 API_URL="${API_URL%/}"
+
+if [[ -z "$ADMIN_TOKEN" ]]; then
+  echo "operator bearer token required: pass --admin-token or set FANTASMA_ADMIN_TOKEN" >&2
+  exit 1
+fi
 
 create_project_response="$(
   curl -fsS \

@@ -1,7 +1,6 @@
 {
   "mode": "iterative",
   "source_artifact": "docs/STATUS.md benchmark usability reset entry (2026-03-15 representative + mixed-repair iterative smokes)",
-  "benchmarked_at": "2026-03-15T11:06:59.217006+00:00",
   "scenarios": {
     "live-append-small-blobs": {
       "checkpoint_sample_count": 225,

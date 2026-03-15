@@ -64,7 +64,7 @@ async fn provision_project(api: axum::Router) -> ProvisionedProject {
         .clone()
         .oneshot(
             Request::post("/v1/projects")
-                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -92,7 +92,7 @@ async fn provision_project(api: axum::Router) -> ProvisionedProject {
     let create_read_key_response = api
         .oneshot(
             Request::post(format!("/v1/projects/{project_id}/keys"))
-                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -126,7 +126,7 @@ async fn pipeline_provisions_project_and_scopes_ingest_and_read_keys(pool: PgPoo
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
-        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
 
@@ -220,7 +220,7 @@ async fn pipeline_provisions_project_and_scopes_ingest_and_read_keys(pool: PgPoo
             Request::get(
                 "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-02",
             )
-            .header(AUTHORIZATION, "Bearer fg_pat_dev")
+            .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
             .body(Body::empty())
             .expect("valid operator metrics request"),
         )
@@ -237,7 +237,7 @@ async fn pipeline_exposes_bucketed_session_metrics_after_worker_batch(pool: PgPo
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
-        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
 
@@ -394,7 +394,7 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
-        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
 
@@ -540,7 +540,7 @@ async fn pipeline_exposes_dim4_event_metrics_with_null_buckets(pool: PgPool) {
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
-        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
 
@@ -644,7 +644,7 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
-        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
     let events = (0..101)
@@ -729,7 +729,7 @@ async fn pipeline_rejects_dim4_event_metrics_queries_that_exceed_group_limit(poo
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
-        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
     let events = (0..101)
@@ -811,7 +811,7 @@ async fn pipeline_keeps_grouped_event_metrics_day_queries_200_during_worker_catc
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
-        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
     let events = scale_like_events("2026-04-01", 120);
@@ -891,7 +891,7 @@ async fn pipeline_exposes_grouped_session_metrics_and_rejects_unsupported_dimens
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
-        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
 
@@ -1045,7 +1045,7 @@ async fn pipeline_keeps_new_installs_fixed_on_first_seen_bucket_after_late_event
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
-        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
 
@@ -1149,7 +1149,7 @@ async fn pipeline_keeps_grouped_session_app_version_fixed_after_late_event_repai
     let ingest = fantasma_ingest::app(pool.clone());
     let api = fantasma_api::app(
         pool.clone(),
-        Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
 

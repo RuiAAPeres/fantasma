@@ -33,7 +33,7 @@ services:
     environment:
       FANTASMA_BIND_ADDRESS: 0.0.0.0:8082
       FANTASMA_DATABASE_URL: postgres://fantasma:fantasma@postgres:5432/fantasma
-      FANTASMA_ADMIN_TOKEN: ${FANTASMA_ADMIN_TOKEN:-fg_pat_dev}
+      FANTASMA_ADMIN_TOKEN: ${FANTASMA_ADMIN_TOKEN:?FANTASMA_ADMIN_TOKEN must be set}
     ports:
       - "18082:8082"
 

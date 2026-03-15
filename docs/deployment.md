@@ -32,7 +32,7 @@ Shared runtime variables:
 HTTP service variables:
 
 - `FANTASMA_BIND_ADDRESS`: bind address for `fantasma-ingest` and `fantasma-api`
-- `FANTASMA_ADMIN_TOKEN`: operator bearer token consumed only by `fantasma-api`; defaults to `fg_pat_dev`
+- `FANTASMA_ADMIN_TOKEN`: required operator bearer token consumed only by `fantasma-api`
 
 Worker variables:
 
@@ -46,7 +46,7 @@ Current Compose defaults:
 
 - all three services get `postgres://fantasma:fantasma@postgres:5432/fantasma`
 - `fantasma-ingest` gets `0.0.0.0:8081`
-- `fantasma-api` gets `0.0.0.0:8082` and `FANTASMA_ADMIN_TOKEN=fg_pat_dev`
+- `fantasma-api` gets `0.0.0.0:8082` and requires `FANTASMA_ADMIN_TOKEN`
 - `fantasma-worker` gets the lane-based defaults above
 
 ## Data Protection
@@ -111,6 +111,11 @@ Before bringing the stack up, confirm:
 Start the default stack:
 
 ```bash
+export FANTASMA_ADMIN_TOKEN="$(python3 - <<'PY'
+import secrets
+print(f"fg_pat_{secrets.token_urlsafe(24)}")
+PY
+)"
 docker compose -f infra/docker/compose.yaml up --build
 ```
 
@@ -140,7 +145,7 @@ behind a reverse proxy, for example `https://ops.example.com/fantasma/`.
 Save the install-time operator token for that instance:
 
 ```bash
-cargo run -p fantasma-cli -- auth login --instance local --token "${FANTASMA_ADMIN_TOKEN:-fg_pat_dev}"
+cargo run -p fantasma-cli -- auth login --instance local --token "${FANTASMA_ADMIN_TOKEN}"
 ```
 
 The CLI stores local state under an XDG-style config path:

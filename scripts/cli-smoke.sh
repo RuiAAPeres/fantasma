@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/infra/docker/compose.yaml"
 PROJECT_NAME="${FANTASMA_CLI_SMOKE_PROJECT_NAME:-fantasma-cli-smoke-$$}"
-ADMIN_TOKEN="${FANTASMA_ADMIN_TOKEN:-fg_pat_dev}"
+ADMIN_TOKEN=""
 INSTANCE_NAME="${FANTASMA_CLI_SMOKE_INSTANCE:-local}"
 API_URL="${FANTASMA_CLI_SMOKE_API_URL:-http://localhost:8082}"
 INGEST_URL="${FANTASMA_CLI_SMOKE_INGEST_URL:-http://localhost:8081}"
@@ -22,6 +22,14 @@ require_cmd() {
     echo "missing required command: $1" >&2
     exit 1
   }
+}
+
+generate_admin_token() {
+  python3 - <<'PY'
+import secrets
+
+print(f"fg_pat_{secrets.token_urlsafe(24)}")
+PY
 }
 
 cli() {
@@ -102,6 +110,8 @@ main() {
   require_cmd docker
   require_cmd mktemp
   require_cmd python3
+  ADMIN_TOKEN="${FANTASMA_ADMIN_TOKEN:-$(generate_admin_token)}"
+  export FANTASMA_ADMIN_TOKEN="$ADMIN_TOKEN"
 
   trap cleanup EXIT INT TERM
 

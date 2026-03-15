@@ -4,6 +4,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -16,9 +17,9 @@ use serde_json::Value;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
 
-const DEFAULT_ADMIN_TOKEN: &str = "fg_pat_dev";
 const BENCHMARK_COMPOSE_PROJECT_NAME: &str = "fantasma-bench";
 const BENCHMARK_PROJECT_NAME: &str = "Fantasma Benchmark";
+const BENCHMARK_ENVIRONMENT_LABEL: &str = "local";
 const INGEST_BASE_URL: &str = "http://127.0.0.1:18081";
 const API_BASE_URL: &str = "http://127.0.0.1:18082";
 const POST_BATCH_SIZE: usize = 100;
@@ -264,12 +265,7 @@ struct ScenarioResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct HostMetadata {
-    cpu_model: String,
-    memory_bytes: u64,
-    memory_gib: f64,
-    os_kernel: String,
-    architecture: String,
-    benchmarked_at: String,
+    environment: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -617,7 +613,6 @@ impl SloStageBPhaseVerdict {
 struct SloIterativeBaseline {
     mode: SloMode,
     source_artifact: String,
-    benchmarked_at: String,
     scenarios: BTreeMap<String, SloIterativeBaselineScenario>,
 }
 
@@ -3375,14 +3370,7 @@ fn render_slo_markdown_summary(summary: &SloSummary) -> String {
     let mut lines = vec![
         "# Fantasma Derived Metrics SLO Suite".to_owned(),
         String::new(),
-        format!(
-            "- Host: {} / {} GiB / {} / {}",
-            summary.host.cpu_model,
-            format_memory_gib(summary.host.memory_gib),
-            summary.host.os_kernel,
-            summary.host.architecture
-        ),
-        format!("- Benchmarked at: {}", summary.host.benchmarked_at),
+        format!("- Environment: {}", summary.host.environment),
         format!("- Published suites: {}", summary.suites.join(", ")),
         String::new(),
     ];
@@ -5506,14 +5494,7 @@ fn render_series_markdown_summary(summary: &SeriesSummary) -> String {
         String::new(),
         format!("- Profile: {}", summary.profile.key()),
         format!("- Repetitions per scenario: {}", summary.repetitions),
-        format!(
-            "- Host: {} / {} GiB / {} / {}",
-            summary.host.cpu_model,
-            format_memory_gib(summary.host.memory_gib),
-            summary.host.os_kernel,
-            summary.host.architecture
-        ),
-        format!("- Benchmarked at: {}", summary.host.benchmarked_at),
+        format!("- Environment: {}", summary.host.environment),
         String::new(),
     ];
 
@@ -5545,80 +5526,10 @@ fn render_series_markdown_summary(summary: &SeriesSummary) -> String {
     lines.join("\n").trim_end().to_owned()
 }
 
-fn format_memory_gib(memory_gib: f64) -> String {
-    if (memory_gib.fract()).abs() < f64::EPSILON {
-        format!("{}", memory_gib as u64)
-    } else {
-        format!("{memory_gib:.1}")
-    }
-}
-
 fn collect_host_metadata() -> Result<HostMetadata> {
-    let memory_bytes = detect_memory_bytes();
-
     Ok(HostMetadata {
-        cpu_model: detect_cpu_model(),
-        memory_bytes,
-        memory_gib: memory_bytes as f64 / 1024_f64.powi(3),
-        os_kernel: detect_os_kernel(),
-        architecture: std::env::consts::ARCH.to_owned(),
-        benchmarked_at: Utc::now().to_rfc3339(),
+        environment: BENCHMARK_ENVIRONMENT_LABEL.to_owned(),
     })
-}
-
-fn detect_cpu_model() -> String {
-    command_stdout("sysctl", ["-n", "machdep.cpu.brand_string"])
-        .or_else(read_linux_cpu_model)
-        .unwrap_or_else(|| "unknown cpu".to_owned())
-}
-
-fn read_linux_cpu_model() -> Option<String> {
-    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
-    cpuinfo
-        .lines()
-        .find_map(|line| {
-            line.split_once(':')
-                .filter(|(key, _)| key.trim() == "model name")
-        })
-        .map(|(_, value)| value.trim().to_owned())
-}
-
-fn detect_memory_bytes() -> u64 {
-    command_stdout("sysctl", ["-n", "hw.memsize"])
-        .and_then(|value| value.parse::<u64>().ok())
-        .or_else(read_linux_memory_bytes)
-        .unwrap_or_default()
-}
-
-fn read_linux_memory_bytes() -> Option<u64> {
-    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-    let kibibytes = meminfo.lines().find_map(|line| {
-        line.split_once(':')
-            .filter(|(key, _)| key.trim() == "MemTotal")
-            .and_then(|(_, value)| value.split_whitespace().next())
-            .and_then(|value| value.parse::<u64>().ok())
-    })?;
-    Some(kibibytes * 1024)
-}
-
-fn detect_os_kernel() -> String {
-    command_stdout("uname", ["-sr"])
-        .unwrap_or_else(|| format!("{} {}", std::env::consts::OS, std::env::consts::ARCH))
-}
-
-fn command_stdout<const N: usize>(program: &str, args: [&str; N]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
-    }
 }
 
 fn compose_file_path() -> PathBuf {
@@ -5740,7 +5651,13 @@ fn benchmark_api_base_url() -> &'static str {
 }
 
 fn benchmark_admin_token() -> String {
-    std::env::var("FANTASMA_ADMIN_TOKEN").unwrap_or_else(|_| DEFAULT_ADMIN_TOKEN.to_owned())
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            std::env::var("FANTASMA_ADMIN_TOKEN")
+                .unwrap_or_else(|_| format!("fg_pat_{}", Uuid::new_v4().simple()))
+        })
+        .clone()
 }
 
 fn budget_file_path() -> PathBuf {
@@ -5822,6 +5739,7 @@ fn docker_compose_command(
         .arg(benchmark_compose_project_name())
         .arg("-f")
         .arg(compose_file);
+    command.env("FANTASMA_ADMIN_TOKEN", benchmark_admin_token());
     command.args(args);
     command
 }
@@ -5908,12 +5826,7 @@ mod tests {
 
     fn dummy_slo_host() -> HostMetadata {
         HostMetadata {
-            cpu_model: "Test CPU".to_owned(),
-            memory_bytes: 8_589_934_592,
-            memory_gib: 8.0,
-            os_kernel: "TestOS 1.0".to_owned(),
-            architecture: "arm64".to_owned(),
-            benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
+            environment: "local".to_owned(),
         }
     }
 
@@ -6831,12 +6744,7 @@ mod tests {
     fn render_slo_markdown_summary_includes_family_readiness_and_budgets() {
         let summary: SloSummary = serde_json::from_value(serde_json::json!({
             "host": {
-                "cpu_model": "Apple M3 Pro",
-                "memory_bytes": 38654705664u64,
-                "memory_gib": 36.0,
-                "os_kernel": "Darwin 25.1.0",
-                "architecture": "arm64",
-                "benchmarked_at": "2026-03-13T12:12:00Z"
+                "environment": "local"
             },
             "suites": ["representative", "mixed-repair"],
             "run_config": {
@@ -7117,12 +7025,7 @@ mod tests {
     fn slo_summary_json_rendering_preserves_family_readiness_fields() {
         let summary = SloSummary {
             host: HostMetadata {
-                cpu_model: "Apple M3 Pro".to_owned(),
-                memory_bytes: 38_654_705_664,
-                memory_gib: 36.0,
-                os_kernel: "Darwin 25.1.0".to_owned(),
-                architecture: "arm64".to_owned(),
-                benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
+                environment: "local".to_owned(),
             },
             suites: vec!["reads-visibility".to_owned()],
             run_config: dummy_slo_run_config(),
@@ -7360,12 +7263,7 @@ mod tests {
             profile: Profile::Heavy,
             repetitions: 5,
             host: HostMetadata {
-                cpu_model: "Apple M3 Pro".to_owned(),
-                memory_bytes: 38_654_705_664,
-                memory_gib: 36.0,
-                os_kernel: "Darwin 25.1.0".to_owned(),
-                architecture: "arm64".to_owned(),
-                benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
+                environment: "local".to_owned(),
             },
             scenarios: vec![ScenarioResult {
                 scenario: Scenario::Scale,
@@ -7397,7 +7295,7 @@ mod tests {
         assert!(markdown.contains("# Fantasma Heavy Benchmark Series"));
         assert!(markdown.contains("- Profile: heavy"));
         assert!(markdown.contains("- Repetitions per scenario: 5"));
-        assert!(markdown.contains("- Host: Apple M3 Pro / 36 GiB / Darwin 25.1.0 / arm64"));
+        assert!(markdown.contains("- Environment: local"));
         assert!(markdown.contains("## scale-path"));
         assert!(markdown.contains("- ingest: 180000 events in 19000ms (9473.68 events/s)"));
         assert!(markdown.contains("| events_hour_dim2 | 14 | 19 | 9 | 31 |"));

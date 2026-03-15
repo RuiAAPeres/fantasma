@@ -27,7 +27,7 @@ async fn provision_project(api: axum::Router) -> (String, String, String) {
         .clone()
         .oneshot(
             Request::post("/v1/projects")
-                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -63,7 +63,7 @@ async fn provision_project(api: axum::Router) -> (String, String, String) {
     let create_read_key_response = api
         .oneshot(
             Request::post(format!("/v1/projects/{project_id}/keys"))
-                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -115,7 +115,10 @@ fn event_payload() -> Body {
 async fn management_routes_require_operator_bearer_auth(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
-    let api = fantasma_api::app(pool, Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")));
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
 
     let unauthorized_response = api
         .clone()
@@ -131,7 +134,7 @@ async fn management_routes_require_operator_bearer_auth(pool: PgPool) {
     let authorized_response = api
         .oneshot(
             Request::get("/v1/projects")
-                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -149,7 +152,10 @@ async fn ingest_and_metrics_routes_enforce_project_key_kinds(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
     let ingest = fantasma_ingest::app(pool.clone());
-    let api = fantasma_api::app(pool, Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")));
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
     let (_, ingest_key, read_key) = provision_project(api.clone()).await;
 
     let ingest_with_read_key = ingest
@@ -197,7 +203,7 @@ async fn ingest_and_metrics_routes_enforce_project_key_kinds(pool: PgPool) {
             Request::get(
                 "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-01",
             )
-            .header(AUTHORIZATION, "Bearer fg_pat_dev")
+            .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
             .body(Body::empty())
             .expect("request"),
         )
@@ -226,7 +232,10 @@ async fn ingest_and_metrics_routes_enforce_project_key_kinds(pool: PgPool) {
 async fn event_metrics_reject_public_project_id_query_params(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
-    let api = fantasma_api::app(pool, Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")));
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
     let (project_id, _, read_key) = provision_project(api.clone()).await;
 
     let response = api
@@ -252,7 +261,10 @@ async fn event_metrics_reject_public_project_id_query_params(pool: PgPool) {
 async fn management_missing_resources_return_not_found(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
-    let api = fantasma_api::app(pool, Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")));
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
     let missing_project_id = Uuid::new_v4();
     let missing_key_id = Uuid::new_v4();
 
@@ -260,7 +272,7 @@ async fn management_missing_resources_return_not_found(pool: PgPool) {
         .clone()
         .oneshot(
             Request::get(format!("/v1/projects/{missing_project_id}/keys"))
-                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -272,7 +284,7 @@ async fn management_missing_resources_return_not_found(pool: PgPool) {
         .clone()
         .oneshot(
             Request::post(format!("/v1/projects/{missing_project_id}/keys"))
-                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -292,7 +304,7 @@ async fn management_missing_resources_return_not_found(pool: PgPool) {
             Request::delete(format!(
                 "/v1/projects/{missing_project_id}/keys/{missing_key_id}"
             ))
-            .header(AUTHORIZATION, "Bearer fg_pat_dev")
+            .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
             .body(Body::empty())
             .expect("request"),
         )
@@ -305,7 +317,10 @@ async fn management_missing_resources_return_not_found(pool: PgPool) {
 async fn management_post_routes_authorize_before_body_validation(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
-    let api = fantasma_api::app(pool, Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")));
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
     let missing_project_id = Uuid::new_v4();
 
     let create_project_response = api
@@ -344,7 +359,10 @@ async fn management_post_routes_authorize_before_body_validation(pool: PgPool) {
 async fn session_metrics_reject_public_project_id_query_params(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
-    let api = fantasma_api::app(pool, Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")));
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
     let (project_id, _, read_key) = provision_project(api.clone()).await;
 
     let response = api
@@ -370,13 +388,16 @@ async fn session_metrics_reject_public_project_id_query_params(pool: PgPool) {
 async fn management_create_routes_reject_unknown_json_fields(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
-    let api = fantasma_api::app(pool, Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")));
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
 
     let create_project_response = api
         .clone()
         .oneshot(
             Request::post("/v1/projects")
-                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -404,7 +425,7 @@ async fn management_create_routes_reject_unknown_json_fields(pool: PgPool) {
     let create_key_response = api
         .oneshot(
             Request::post(format!("/v1/projects/{project_id}/keys"))
-                .header(AUTHORIZATION, "Bearer fg_pat_dev")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({

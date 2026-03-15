@@ -2,8 +2,7 @@
 
 - Profile: heavy
 - Repetitions per scenario: 5
-- Host: Apple M3 Pro / 36 GiB / Darwin 25.1.0 / aarch64
-- Benchmarked at: 2026-03-13T12:28:14.835239+00:00
+- Environment: local
 
 ## hot-path
 

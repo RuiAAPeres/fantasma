@@ -1658,7 +1658,10 @@ mod tests {
     #[tokio::test]
     async fn app_exposes_only_metrics_family_routes() {
         let pool = PgPool::connect_lazy("postgres://localhost/fantasma").expect("lazy pool");
-        let app = super::app(pool, Arc::new(StaticAdminAuthorizer::new("fg_pat_dev")));
+        let app = super::app(
+            pool,
+            Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+        );
 
         let events_family_response = app
             .clone()

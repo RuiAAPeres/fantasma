@@ -1,7 +1,6 @@
 # Fantasma Derived Metrics SLO Suite
 
-- Host: Apple M3 Pro / 36 GiB / Darwin 25.1.0 / aarch64
-- Benchmarked at: 2026-03-13T16:32:31.266302+00:00
+- Environment: local
 
 ## reads-30d
 

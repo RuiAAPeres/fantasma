@@ -40,12 +40,6 @@ impl StaticAdminAuthorizer {
     }
 }
 
-impl Default for StaticAdminAuthorizer {
-    fn default() -> Self {
-        Self::new("fg_pat_dev")
-    }
-}
-
 pub fn hash_ingest_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
