@@ -11,6 +11,73 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cli-dogfood-scope:
+    name: CLI Dogfood Scope
+    runs-on: ubuntu-latest
+    outputs:
+      run_cli_smoke: ${{ steps.scope.outputs.run_cli_smoke }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect CLI dogfood changes
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          head_sha="${GITHUB_SHA}"
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          else
+            base_sha="${{ github.event.before }}"
+          fi
+
+          if [[ -z "${base_sha}" || "${base_sha}" == "0000000000000000000000000000000000000000" ]]; then
+            echo "run_cli_smoke=true" >> "$GITHUB_OUTPUT"
+            echo "cli dogfood scope fallback: missing comparable base SHA"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${base_sha}" "${head_sha}")"
+          printf 'changed files for CLI dogfood scope:\n%s\n' "${changed_files:-<none>}"
+
+          if printf '%s\n' "$changed_files" | bash scripts/ci/should-run-cli-smoke.sh | grep -qx true; then
+            echo "run_cli_smoke=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_cli_smoke=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  cli-dogfood:
+    name: CLI Dogfood Smoke
+    runs-on: ubuntu-latest
+    needs: cli-dogfood-scope
+    if: needs.cli-dogfood-scope.outputs.run_cli_smoke == 'true'
+    env:
+      FANTASMA_ADMIN_TOKEN: ci-cli-smoke-token
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify CLI dogfood scripts
+        run: bash -n scripts/cli-smoke.sh scripts/provision-project.sh scripts/ci/should-run-cli-smoke.sh scripts/tests/cli-dogfood-gate.sh
+
+      - name: Verify CLI dogfood scope cases
+        run: bash scripts/tests/cli-dogfood-gate.sh
+
+      - name: Run CLI smoke
+        run: ./scripts/cli-smoke.sh
+
   rust:
     name: Rust Checks
     runs-on: ubuntu-latest

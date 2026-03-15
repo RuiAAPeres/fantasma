@@ -94,6 +94,11 @@ service URL. The CLI manages remote instance profiles, validates the operator
 token, provisions projects and keys, and runs metrics queries without dropping
 operators into raw curl by default.
 
+When changing operator-facing behavior, use the CLI as the dogfooding path
+during development. Keep direct HTTP checks for route-level correctness and use
+the CLI smoke flow as the manual and CI proof that the operator workflow still
+works end to end.
+
 The first operator bearer token still comes from deployment configuration such
 as `FANTASMA_ADMIN_TOKEN`. Fantasma does not expose a separate bootstrap or
 account-creation flow in this slice.
@@ -250,6 +255,10 @@ That helper uses a fresh `XDG_CONFIG_HOME`, provisions an instance/profile
 through the CLI, creates a project plus a local `read` key, ingests one sample
 event with the printed ingest key, and polls one CLI metrics query until the
 derived session count appears.
+
+For operator-facing changes, treat [`scripts/cli-smoke.sh`](../scripts/cli-smoke.sh)
+as the required dogfooding check. Keep [`scripts/compose-smoke.sh`](../scripts/compose-smoke.sh)
+as the lower-level stack smoke when you need direct HTTP visibility.
 
 ## Manual Checks
 

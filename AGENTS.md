@@ -110,6 +110,8 @@ Fantasma now expects Codex agents to use the installed `superpowers` skills when
 - Use `systematic-debugging` for defects, flaky tests, or unexpected runtime behavior instead of guessing at fixes.
 - Use `verification-before-completion` before claiming work is done, fixed, or passing. Do not report success without fresh command output.
 - Before pushing, run the same CI-scope checks your change can affect. At minimum, workspace-affecting Rust changes must run `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`, not just package-scoped checks; new scripts must at least pass `bash -n`.
+- Dogfood operator-facing development through `fantasma-cli`. For new or touched operator workflows, prefer the CLI for manual verification, keep `scripts/cli-smoke.sh` passing, and add or extend CLI coverage instead of relying only on raw HTTP checks.
+- Keep low-level service correctness checks direct when that is the right layer. The CLI is the required operator workflow proof, not a substitute for route-level ingest/API/worker tests.
 - Use `requesting-code-review` or `receiving-code-review` when preparing or responding to substantive review cycles.
 - Use `finishing-a-development-branch` before final handoff when the task includes branch cleanup, verification, and merge-readiness work.
 - Do not use git worktrees in this repository. Work in the current checkout even if a generic skill suggests creating a worktree.
