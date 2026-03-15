@@ -35,15 +35,29 @@ const SLO_REPAIR_INSTALL_MODULUS: usize = 20;
 const SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY: usize = 2;
 const SLO_WARMUP_QUERIES: usize = 10;
 const SLO_MEASURED_QUERIES: usize = 100;
-const DEFAULT_SLO_REPETITIONS_30D: usize = 3;
+const DEFAULT_SLO_PUBLICATION_REPETITIONS: usize = 1;
 const DEFAULT_SLO_SESSION_BATCH_SIZE: i64 = 1_000;
 const DEFAULT_SLO_EVENT_BATCH_SIZE: i64 = 5_000;
 const DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY: usize = 8;
 const DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY: usize = 2;
+const SLO_REPRESENTATIVE_WINDOW_DAYS: usize = 30;
+const SLO_REPRESENTATIVE_INSTALL_COUNT: usize = 1_000;
+const SLO_REPRESENTATIVE_SESSIONS_PER_INSTALL_PER_DAY: usize = 6;
+const SLO_REPRESENTATIVE_EVENTS_PER_SESSION: usize = 5;
+const SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS: u64 = 4 * 60;
+const SLO_REPRESENTATIVE_CHECKPOINT_APPEND_INTERVAL: usize = 20;
+const SLO_REPRESENTATIVE_OFFLINE_FLUSH_INSTALL_MODULUS: usize = 10;
+const SLO_REPRESENTATIVE_OFFLINE_FLUSH_SESSION_COUNT: usize = 4;
+const SLO_REPRESENTATIVE_LIGHT_REPAIR_INSTALL_MODULUS: usize = 100;
+const SLO_REPRESENTATIVE_HOT_PROJECT_INSTALL_MODULUS: usize = 10;
+const SLO_REPRESENTATIVE_HOT_PROJECT_REPAIR_INSTALL_MODULUS: usize = 50;
+const SLO_REPRESENTATIVE_REPAIR_LATE_EVENTS_PER_SESSION: usize = 2;
+const SLO_REPRESENTATIVE_REPAIR_DURATION_DELTA_SECONDS: u64 = 10 * 60;
 const WORKER_STAGE_B_TRACE_ENV_VAR: &str = "FANTASMA_WORKER_STAGE_B_TRACE_PATH";
 const WORKER_STAGE_B_TRACE_CONTAINER_PATH: &str = "/tmp/stage-b-trace.jsonl";
 const STAGE_B_TRACE_FILENAME: &str = "stage-b-trace.jsonl";
 const STAGE_B_SUMMARY_FILENAME: &str = "stage-b.json";
+const CHECKPOINT_SUMMARY_FILENAME: &str = "checkpoint-readiness.json";
 const STAGE_B_DOMINANT_MIN_SHARE: f64 = 0.40;
 const STAGE_B_DOMINANT_MIN_LEAD: f64 = 0.10;
 const STAGE_B_SLOW_RECORD_LIMIT: usize = 10;
@@ -125,6 +139,7 @@ struct SeriesArgs {
 struct SloArgs {
     output_dir: PathBuf,
     scenarios: Vec<String>,
+    suites: Vec<String>,
     run_config: SloRunConfig,
 }
 
@@ -158,8 +173,10 @@ enum CliCommand {
         output_dir: PathBuf,
         #[arg(long = "scenario")]
         scenarios: Vec<String>,
-        #[arg(long, default_value_t = DEFAULT_SLO_REPETITIONS_30D)]
-        repetitions_30d: usize,
+        #[arg(long = "suite")]
+        suites: Vec<String>,
+        #[arg(long, default_value_t = DEFAULT_SLO_PUBLICATION_REPETITIONS)]
+        publication_repetitions: usize,
         #[arg(long, default_value_t = DEFAULT_SLO_SESSION_BATCH_SIZE)]
         worker_session_batch_size: i64,
         #[arg(long, default_value_t = DEFAULT_SLO_EVENT_BATCH_SIZE)]
@@ -274,14 +291,6 @@ impl SloWindow {
         self.days() * SLO_INSTALL_COUNT_PER_DAY * SLO_EVENTS_PER_INSTALL_PER_DAY
     }
 
-    fn repetitions(self, repetitions_30d: usize) -> usize {
-        if matches!(self, Self::Days30) {
-            repetitions_30d.max(1)
-        } else {
-            1
-        }
-    }
-
     fn readiness_timeout(self) -> Duration {
         match self {
             Self::Days30 => Duration::from_secs(5 * 60),
@@ -307,27 +316,67 @@ impl SloWindow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SloSuite {
+    Representative,
+    MixedRepair,
+    Stress,
+    ReadsVisibility,
+}
+
+impl SloSuite {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Representative => "representative",
+            Self::MixedRepair => "mixed-repair",
+            Self::Stress => "stress",
+            Self::ReadsVisibility => "reads-visibility",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SloScenarioKind {
-    Append,
-    Backfill,
-    Repair,
-    Reads,
+    LiveAppendSmallBlobs,
+    LiveAppendOfflineFlush,
+    LiveAppendPlusLightRepair,
+    LiveAppendPlusRepairHotProject,
+    StressAppend,
+    StressBackfill,
+    StressRepair,
+    ReadsVisibility,
 }
 
 impl SloScenarioKind {
+    fn suite(self) -> SloSuite {
+        match self {
+            Self::LiveAppendSmallBlobs | Self::LiveAppendOfflineFlush => SloSuite::Representative,
+            Self::LiveAppendPlusLightRepair | Self::LiveAppendPlusRepairHotProject => {
+                SloSuite::MixedRepair
+            }
+            Self::StressAppend | Self::StressBackfill | Self::StressRepair => SloSuite::Stress,
+            Self::ReadsVisibility => SloSuite::ReadsVisibility,
+        }
+    }
+
     fn key(self) -> &'static str {
         match self {
-            Self::Append => "append",
-            Self::Backfill => "backfill",
-            Self::Repair => "repair",
-            Self::Reads => "reads",
+            Self::LiveAppendSmallBlobs => "live-append-small-blobs",
+            Self::LiveAppendOfflineFlush => "live-append-offline-flush",
+            Self::LiveAppendPlusLightRepair => "live-append-plus-light-repair",
+            Self::LiveAppendPlusRepairHotProject => "live-append-plus-repair-hot-project",
+            Self::StressAppend => "append",
+            Self::StressBackfill => "backfill",
+            Self::StressRepair => "repair",
+            Self::ReadsVisibility => "reads-visibility",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SloScenarioDefinition {
+    suite: SloSuite,
     kind: SloScenarioKind,
     window: SloWindow,
     repetitions: usize,
@@ -335,7 +384,20 @@ struct SloScenarioDefinition {
 
 impl SloScenarioDefinition {
     fn key(&self) -> String {
-        format!("{}-{}", self.kind.key(), self.window.key())
+        match self.kind {
+            SloScenarioKind::LiveAppendSmallBlobs
+            | SloScenarioKind::LiveAppendOfflineFlush
+            | SloScenarioKind::LiveAppendPlusLightRepair
+            | SloScenarioKind::LiveAppendPlusRepairHotProject => self.kind.key().to_owned(),
+            SloScenarioKind::StressAppend
+            | SloScenarioKind::StressBackfill
+            | SloScenarioKind::StressRepair => {
+                format!("stress-{}-{}", self.kind.key(), self.window.key())
+            }
+            SloScenarioKind::ReadsVisibility => {
+                format!("reads-visibility-{}", self.window.key())
+            }
+        }
     }
 }
 
@@ -347,11 +409,18 @@ struct SloReadinessPolicy {
 
 fn slo_readiness_policy(kind: SloScenarioKind, window: SloWindow) -> SloReadinessPolicy {
     match (kind, window) {
-        (SloScenarioKind::Reads, SloWindow::Days90 | SloWindow::Days180) => SloReadinessPolicy {
-            allow_timeout_publication: true,
-            wait_for_full_readiness_before_queries: true,
-        },
-        (_, SloWindow::Days90 | SloWindow::Days180) => SloReadinessPolicy {
+        (SloScenarioKind::ReadsVisibility, SloWindow::Days90 | SloWindow::Days180) => {
+            SloReadinessPolicy {
+                allow_timeout_publication: true,
+                wait_for_full_readiness_before_queries: true,
+            }
+        }
+        (
+            SloScenarioKind::StressAppend
+            | SloScenarioKind::StressBackfill
+            | SloScenarioKind::StressRepair,
+            SloWindow::Days90 | SloWindow::Days180,
+        ) => SloReadinessPolicy {
             allow_timeout_publication: true,
             wait_for_full_readiness_before_queries: false,
         },
@@ -396,12 +465,28 @@ async fn wait_for_full_readiness_before_query_benchmark(
     Ok(())
 }
 
+fn slo_readiness_query_specs(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec> {
+    let readiness_names = [
+        "events_count_day_grouped",
+        "sessions_count_day_grouped",
+        "sessions_duration_total_day_grouped",
+        "sessions_new_installs_day_grouped",
+    ];
+
+    slo_query_matrix(window, start_day)
+        .into_iter()
+        .filter(|query| readiness_names.iter().any(|name| *name == query.name))
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SloScenarioResult {
     scenario: String,
     run_config: SloRunConfig,
     phases: Vec<PhaseMeasurement>,
     readiness: Vec<ReadinessMeasurement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_readiness: Option<CheckpointReadinessSummary>,
     queries: Vec<QueryMeasurement>,
     budget: Option<BudgetEvaluation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -411,23 +496,82 @@ struct SloScenarioResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SloSummary {
     host: HostMetadata,
+    suites: Vec<String>,
     run_config: SloRunConfig,
     scenarios: Vec<SloScenarioResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SloRunConfig {
-    repetitions_30d: usize,
+    publication_repetitions: usize,
     worker_config: BenchWorkerConfig,
 }
 
 impl Default for SloRunConfig {
     fn default() -> Self {
         Self {
-            repetitions_30d: DEFAULT_SLO_REPETITIONS_30D,
+            publication_repetitions: DEFAULT_SLO_PUBLICATION_REPETITIONS,
             worker_config: BenchWorkerConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CheckpointReadinessSummary {
+    sample_count: usize,
+    event_metrics_ready_p50_ms: u64,
+    event_metrics_ready_p95_ms: u64,
+    event_metrics_ready_max_ms: u64,
+    session_metrics_ready_p50_ms: u64,
+    session_metrics_ready_p95_ms: u64,
+    session_metrics_ready_max_ms: u64,
+    derived_metrics_ready_p50_ms: u64,
+    derived_metrics_ready_p95_ms: u64,
+    derived_metrics_ready_max_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CheckpointReadinessSample {
+    sequence: usize,
+    blob_kind: String,
+    events_in_blob: usize,
+    cumulative_events: u64,
+    event_metrics_ready_ms: u64,
+    session_metrics_ready_ms: u64,
+    derived_metrics_ready_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadBlobKind {
+    Append,
+    OfflineFlush,
+    Repair,
+}
+
+impl UploadBlobKind {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::OfflineFlush => "offline-flush",
+            Self::Repair => "repair",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SloExpectationDelta {
+    total_events: u64,
+    total_sessions: u64,
+    total_duration_seconds: u64,
+    total_new_installs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct UploadBlob {
+    kind: UploadBlobKind,
+    events: Vec<BenchEvent>,
+    delta: SloExpectationDelta,
+    checkpoint: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -692,7 +836,8 @@ where
         CliCommand::Slo {
             output_dir,
             scenarios,
-            repetitions_30d,
+            suites,
+            publication_repetitions,
             worker_session_batch_size,
             worker_event_batch_size,
             worker_session_incremental_concurrency,
@@ -700,8 +845,9 @@ where
         } => BenchCommand::Slo(SloArgs {
             output_dir,
             scenarios,
+            suites,
             run_config: SloRunConfig {
-                repetitions_30d,
+                publication_repetitions: publication_repetitions.max(1),
                 worker_config: BenchWorkerConfig {
                     session_batch_size: worker_session_batch_size.max(1),
                     event_batch_size: worker_event_batch_size.max(1),
@@ -766,13 +912,28 @@ async fn run_series(args: SeriesArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct SloExpectation {
     total_events: u64,
     total_sessions: u64,
     total_duration_seconds: u64,
     total_new_installs: u64,
     include_repair_late_events: bool,
+}
+
+impl SloExpectation {
+    fn apply_delta(&mut self, delta: &SloExpectationDelta) {
+        self.total_events += delta.total_events;
+        self.total_sessions += delta.total_sessions;
+        self.total_duration_seconds += delta.total_duration_seconds;
+        self.total_new_installs += delta.total_new_installs;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExecutedSloScenario {
+    result: SloScenarioResult,
+    checkpoint_samples: Vec<CheckpointReadinessSample>,
 }
 
 #[derive(Debug, Clone)]
@@ -797,7 +958,8 @@ impl SloScenarioPaths {
 
 async fn run_slo(args: SloArgs) -> Result<()> {
     let host = collect_host_metadata()?;
-    let scenarios = select_slo_scenarios(&args.scenarios, &args.run_config)?;
+    let scenarios =
+        select_requested_slo_scenarios(&args.scenarios, &args.suites, &args.run_config)?;
 
     run_slo_with_executor(
         &args.output_dir,
@@ -824,7 +986,7 @@ where
     Execute: FnMut(SloScenarioDefinition) -> ExecuteFut,
     ExecuteFut: std::future::Future<Output = Result<SloScenarioResult>>,
 {
-    let scenarios = slo_scenario_definitions(&run_config);
+    let scenarios = select_slo_scenarios(&[], &run_config)?;
     run_slo_with_executor(output_dir, host, &run_config, &scenarios, move |scenario| {
         execute(scenario)
     })
@@ -896,6 +1058,7 @@ where
 
     let summary = SloSummary {
         host,
+        suites: summarized_slo_suites(&summary_results),
         run_config: run_config.clone(),
         scenarios: summary_results,
     };
@@ -944,6 +1107,7 @@ fn slo_execution_failure_result(
         run_config: run_config.clone(),
         phases: Vec::new(),
         readiness: Vec::new(),
+        checkpoint_readiness: None,
         queries: Vec::new(),
         budget: Some(BudgetEvaluation {
             passed: false,
@@ -969,22 +1133,34 @@ async fn execute_slo_scenario(
     wait_for_health(&client).await?;
     let project = provision_project(&client).await?;
 
-    let result = match scenario.kind {
-        SloScenarioKind::Append => {
+    let executed = match scenario.kind {
+        SloScenarioKind::LiveAppendSmallBlobs
+        | SloScenarioKind::LiveAppendOfflineFlush
+        | SloScenarioKind::LiveAppendPlusLightRepair
+        | SloScenarioKind::LiveAppendPlusRepairHotProject => {
+            run_live_slo_scenario(&client, &project, scenario, run_config).await
+        }
+        SloScenarioKind::StressAppend => {
             run_slo_append_like(&client, &project, scenario, run_config, false, false).await
         }
-        SloScenarioKind::Backfill => {
+        SloScenarioKind::StressBackfill => {
             run_slo_append_like(&client, &project, scenario, run_config, true, false).await
         }
-        SloScenarioKind::Repair => run_slo_repair(&client, &project, scenario, run_config).await,
-        SloScenarioKind::Reads => {
+        SloScenarioKind::StressRepair => {
+            run_slo_repair(&client, &project, scenario, run_config).await
+        }
+        SloScenarioKind::ReadsVisibility => {
             run_slo_append_like(&client, &project, scenario, run_config, false, true).await
         }
     };
 
     let trace_capture = copy_stage_b_trace_from_worker(&stack.compose_file);
-    match result {
-        Ok(result) => {
+    match executed {
+        Ok(executed) => {
+            if !executed.checkpoint_samples.is_empty() {
+                let scenario_dir = slo_paths(output_dir, scenario).scenario_dir;
+                write_checkpoint_readiness_sidecar(&scenario_dir, &executed.checkpoint_samples)?;
+            }
             if let Some(trace_contents) = trace_capture? {
                 let scenario_dir = slo_paths(output_dir, scenario).scenario_dir;
                 write_stage_b_sidecars(
@@ -994,7 +1170,7 @@ async fn execute_slo_scenario(
                     &trace_contents,
                 )?;
             }
-            Ok(result)
+            Ok(executed.result)
         }
         Err(error) => {
             if let Ok(Some(trace_contents)) = trace_capture {
@@ -1011,6 +1187,116 @@ async fn execute_slo_scenario(
     }
 }
 
+async fn run_live_slo_scenario(
+    client: &Client,
+    project: &ProvisionedProject,
+    scenario: &SloScenarioDefinition,
+    run_config: &SloRunConfig,
+) -> Result<ExecutedSloScenario> {
+    let (append_blobs, repair_blobs) = live_slo_schedule(scenario)?;
+    let mut expectation = SloExpectation::default();
+    let mut checkpoint_samples = Vec::new();
+
+    let append_phase = ingest_live_slo_blobs(
+        client,
+        project,
+        scenario,
+        &append_blobs,
+        &mut expectation,
+        &mut checkpoint_samples,
+        "append_uploads",
+    )
+    .await?;
+
+    let mut phases = vec![append_phase];
+
+    if !repair_blobs.is_empty() {
+        phases.push(
+            ingest_live_slo_blobs(
+                client,
+                project,
+                scenario,
+                &repair_blobs,
+                &mut expectation,
+                &mut checkpoint_samples,
+                "repair_uploads",
+            )
+            .await?,
+        );
+    }
+
+    let readiness = wait_for_slo_readiness(
+        client,
+        project,
+        scenario,
+        &expectation,
+        Instant::now(),
+        false,
+    )
+    .await?;
+    let checkpoint_readiness = checkpoint_readiness_summary(&checkpoint_samples);
+
+    Ok(ExecutedSloScenario {
+        result: SloScenarioResult {
+            scenario: scenario.key(),
+            run_config: run_config.clone(),
+            phases,
+            readiness,
+            checkpoint_readiness,
+            queries: Vec::new(),
+            budget: None,
+            failure: None,
+        },
+        checkpoint_samples,
+    })
+}
+
+async fn ingest_live_slo_blobs(
+    client: &Client,
+    project: &ProvisionedProject,
+    scenario: &SloScenarioDefinition,
+    blobs: &[UploadBlob],
+    expectation: &mut SloExpectation,
+    checkpoint_samples: &mut Vec<CheckpointReadinessSample>,
+    phase_name: &str,
+) -> Result<PhaseMeasurement> {
+    let started = Instant::now();
+    let mut events_sent = 0usize;
+
+    for blob in blobs {
+        post_upload_blob(client, project, blob).await?;
+        expectation.apply_delta(&blob.delta);
+        events_sent += blob.events.len();
+
+        if blob.checkpoint {
+            let readiness = wait_for_slo_expectation(
+                client,
+                project,
+                scenario,
+                expectation,
+                Instant::now(),
+                "checkpoint readiness",
+                false,
+            )
+            .await?;
+            checkpoint_samples.push(checkpoint_sample(
+                checkpoint_samples.len() + 1,
+                blob,
+                expectation.total_events,
+                &readiness,
+            )?);
+        }
+    }
+
+    let elapsed = started.elapsed();
+    Ok(PhaseMeasurement {
+        name: phase_name.to_owned(),
+        events_sent,
+        elapsed_ms: elapsed.as_millis() as u64,
+        events_per_second: throughput(events_sent, elapsed),
+    })
+}
+
 async fn run_slo_append_like(
     client: &Client,
     project: &ProvisionedProject,
@@ -1018,7 +1304,7 @@ async fn run_slo_append_like(
     run_config: &SloRunConfig,
     reverse_day_order: bool,
     benchmark_reads: bool,
-) -> Result<SloScenarioResult> {
+) -> Result<ExecutedSloScenario> {
     let expectation = slo_expectation(scenario);
     let readiness_policy = slo_readiness_policy(scenario.kind, scenario.window);
     let phase_name = if benchmark_reads {
@@ -1066,14 +1352,18 @@ async fn run_slo_append_like(
         Vec::new()
     };
 
-    Ok(SloScenarioResult {
-        scenario: scenario.key(),
-        run_config: run_config.clone(),
-        phases: vec![ingest_phase],
-        readiness,
-        queries,
-        budget: None,
-        failure: None,
+    Ok(ExecutedSloScenario {
+        result: SloScenarioResult {
+            scenario: scenario.key(),
+            run_config: run_config.clone(),
+            phases: vec![ingest_phase],
+            readiness,
+            checkpoint_readiness: None,
+            queries,
+            budget: None,
+            failure: None,
+        },
+        checkpoint_samples: Vec::new(),
     })
 }
 
@@ -1082,7 +1372,7 @@ async fn run_slo_repair(
     project: &ProvisionedProject,
     scenario: &SloScenarioDefinition,
     run_config: &SloRunConfig,
-) -> Result<SloScenarioResult> {
+) -> Result<ExecutedSloScenario> {
     let seed_phase =
         ingest_slo_window(client, project, scenario.window, false, "seed_ingest").await?;
     wait_for_slo_expectation(
@@ -1113,14 +1403,18 @@ async fn run_slo_repair(
     )
     .await?;
 
-    Ok(SloScenarioResult {
-        scenario: scenario.key(),
-        run_config: run_config.clone(),
-        phases: vec![seed_phase, repair_phase],
-        readiness,
-        queries: Vec::new(),
-        budget: None,
-        failure: None,
+    Ok(ExecutedSloScenario {
+        result: SloScenarioResult {
+            scenario: scenario.key(),
+            run_config: run_config.clone(),
+            phases: vec![seed_phase, repair_phase],
+            readiness,
+            checkpoint_readiness: None,
+            queries: Vec::new(),
+            budget: None,
+            failure: None,
+        },
+        checkpoint_samples: Vec::new(),
     })
 }
 
@@ -1142,21 +1436,49 @@ where
 }
 
 fn slo_scenario_definitions(run_config: &SloRunConfig) -> Vec<SloScenarioDefinition> {
-    let mut scenarios = Vec::with_capacity(12);
+    let mut scenarios = vec![
+        SloScenarioDefinition {
+            suite: SloSuite::Representative,
+            kind: SloScenarioKind::LiveAppendSmallBlobs,
+            window: SloWindow::Days30,
+            repetitions: representative_repetitions(run_config),
+        },
+        SloScenarioDefinition {
+            suite: SloSuite::Representative,
+            kind: SloScenarioKind::LiveAppendOfflineFlush,
+            window: SloWindow::Days30,
+            repetitions: representative_repetitions(run_config),
+        },
+        SloScenarioDefinition {
+            suite: SloSuite::MixedRepair,
+            kind: SloScenarioKind::LiveAppendPlusLightRepair,
+            window: SloWindow::Days30,
+            repetitions: representative_repetitions(run_config),
+        },
+        SloScenarioDefinition {
+            suite: SloSuite::MixedRepair,
+            kind: SloScenarioKind::LiveAppendPlusRepairHotProject,
+            window: SloWindow::Days30,
+            repetitions: representative_repetitions(run_config),
+        },
+    ];
+
     for window in [SloWindow::Days30, SloWindow::Days90, SloWindow::Days180] {
         for kind in [
-            SloScenarioKind::Append,
-            SloScenarioKind::Backfill,
-            SloScenarioKind::Repair,
-            SloScenarioKind::Reads,
+            SloScenarioKind::StressAppend,
+            SloScenarioKind::StressBackfill,
+            SloScenarioKind::StressRepair,
+            SloScenarioKind::ReadsVisibility,
         ] {
             scenarios.push(SloScenarioDefinition {
+                suite: kind.suite(),
                 kind,
                 window,
-                repetitions: window.repetitions(run_config.repetitions_30d),
+                repetitions: 1,
             });
         }
     }
+
     scenarios
 }
 
@@ -1166,7 +1488,15 @@ fn select_slo_scenarios(
 ) -> Result<Vec<SloScenarioDefinition>> {
     let scenarios = slo_scenario_definitions(run_config);
     if requested.is_empty() {
-        return Ok(scenarios);
+        return Ok(scenarios
+            .into_iter()
+            .filter(|scenario| {
+                matches!(
+                    scenario.suite,
+                    SloSuite::Representative | SloSuite::MixedRepair
+                )
+            })
+            .collect());
     }
 
     let known = scenarios
@@ -1187,6 +1517,74 @@ fn select_slo_scenarios(
         .into_iter()
         .filter(|scenario| requested.iter().any(|key| key == &scenario.key()))
         .collect())
+}
+
+fn select_requested_slo_scenarios(
+    requested_scenarios: &[String],
+    requested_suites: &[String],
+    run_config: &SloRunConfig,
+) -> Result<Vec<SloScenarioDefinition>> {
+    if !requested_scenarios.is_empty() {
+        return select_slo_scenarios(requested_scenarios, run_config);
+    }
+
+    if requested_suites.is_empty() {
+        return select_slo_scenarios(&[], run_config);
+    }
+
+    let scenarios = slo_scenario_definitions(run_config);
+    let known_suites = [
+        SloSuite::Representative,
+        SloSuite::MixedRepair,
+        SloSuite::Stress,
+        SloSuite::ReadsVisibility,
+    ]
+    .into_iter()
+    .map(|suite| suite.key())
+    .collect::<Vec<_>>();
+    let unknown = requested_suites
+        .iter()
+        .filter(|suite| !known_suites.iter().any(|known| known == &suite.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        bail!("unknown slo suite: {}", unknown.join(", "));
+    }
+
+    Ok(scenarios
+        .into_iter()
+        .filter(|scenario| {
+            requested_suites
+                .iter()
+                .any(|suite| suite == scenario.suite.key())
+        })
+        .collect())
+}
+
+fn representative_repetitions(run_config: &SloRunConfig) -> usize {
+    run_config.publication_repetitions.max(1)
+}
+
+fn summarized_slo_suites(results: &[SloScenarioResult]) -> Vec<String> {
+    let mut suites = Vec::new();
+    for suite in [
+        SloSuite::Representative,
+        SloSuite::MixedRepair,
+        SloSuite::Stress,
+        SloSuite::ReadsVisibility,
+    ] {
+        if results.iter().any(|result| {
+            result.scenario.starts_with(match suite {
+                SloSuite::Representative => "live-append-",
+                SloSuite::MixedRepair => "live-append-plus-",
+                SloSuite::Stress => "stress-",
+                SloSuite::ReadsVisibility => "reads-visibility-",
+            })
+        }) {
+            suites.push(suite.key().to_owned());
+        }
+    }
+    suites
 }
 
 fn slo_paths(output_dir: &Path, scenario: &SloScenarioDefinition) -> SloScenarioPaths {
@@ -1214,7 +1612,7 @@ fn slo_base_expectation(window: SloWindow) -> SloExpectation {
 fn slo_expectation(scenario: &SloScenarioDefinition) -> SloExpectation {
     let mut expectation = slo_base_expectation(scenario.window);
 
-    if matches!(scenario.kind, SloScenarioKind::Repair) {
+    if matches!(scenario.kind, SloScenarioKind::StressRepair) {
         let repaired_install_days = (scenario.window.days() * SLO_INSTALL_COUNT_PER_DAY
             / SLO_REPAIR_INSTALL_MODULUS) as u64;
         expectation.total_events +=
@@ -1624,7 +2022,7 @@ async fn wait_for_slo_expectation(
     label: &str,
     allow_timeout_publication: bool,
 ) -> Result<Vec<ReadinessMeasurement>> {
-    let query_specs = slo_query_matrix(scenario.window, slo_start_day());
+    let query_specs = slo_readiness_query_specs(scenario.window, slo_start_day());
     let event_specs = query_specs
         .iter()
         .filter(|query| query.hard_gate && query.family == "event")
@@ -1673,6 +2071,85 @@ async fn wait_for_slo_expectation(
             elapsed_ms: event_ready_ms.max(session_ready_ms),
         },
     ])
+}
+
+fn checkpoint_sample(
+    sequence: usize,
+    blob: &UploadBlob,
+    cumulative_events: u64,
+    readiness: &[ReadinessMeasurement],
+) -> Result<CheckpointReadinessSample> {
+    Ok(CheckpointReadinessSample {
+        sequence,
+        blob_kind: blob.kind.key().to_owned(),
+        events_in_blob: blob.events.len(),
+        cumulative_events,
+        event_metrics_ready_ms: readiness_measurement(readiness, "event_metrics_ready_ms")?,
+        session_metrics_ready_ms: readiness_measurement(readiness, "session_metrics_ready_ms")?,
+        derived_metrics_ready_ms: readiness_measurement(readiness, "derived_metrics_ready_ms")?,
+    })
+}
+
+fn readiness_measurement(readiness: &[ReadinessMeasurement], name: &str) -> Result<u64> {
+    readiness
+        .iter()
+        .find(|measurement| measurement.name == name)
+        .map(|measurement| measurement.elapsed_ms)
+        .ok_or_else(|| anyhow!("missing readiness measurement for {}", name))
+}
+
+fn checkpoint_readiness_summary(
+    samples: &[CheckpointReadinessSample],
+) -> Option<CheckpointReadinessSummary> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    let mut event_samples = samples
+        .iter()
+        .map(|sample| sample.event_metrics_ready_ms)
+        .collect::<Vec<_>>();
+    let mut session_samples = samples
+        .iter()
+        .map(|sample| sample.session_metrics_ready_ms)
+        .collect::<Vec<_>>();
+    let mut derived_samples = samples
+        .iter()
+        .map(|sample| sample.derived_metrics_ready_ms)
+        .collect::<Vec<_>>();
+    event_samples.sort_unstable();
+    session_samples.sort_unstable();
+    derived_samples.sort_unstable();
+
+    Some(CheckpointReadinessSummary {
+        sample_count: samples.len(),
+        event_metrics_ready_p50_ms: percentile(&event_samples, 0.50),
+        event_metrics_ready_p95_ms: percentile(&event_samples, 0.95),
+        event_metrics_ready_max_ms: *event_samples.last().unwrap_or(&0),
+        session_metrics_ready_p50_ms: percentile(&session_samples, 0.50),
+        session_metrics_ready_p95_ms: percentile(&session_samples, 0.95),
+        session_metrics_ready_max_ms: *session_samples.last().unwrap_or(&0),
+        derived_metrics_ready_p50_ms: percentile(&derived_samples, 0.50),
+        derived_metrics_ready_p95_ms: percentile(&derived_samples, 0.95),
+        derived_metrics_ready_max_ms: *derived_samples.last().unwrap_or(&0),
+    })
+}
+
+fn write_checkpoint_readiness_sidecar(
+    scenario_dir: &Path,
+    samples: &[CheckpointReadinessSample],
+) -> Result<()> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(scenario_dir).with_context(|| {
+        format!(
+            "create scenario sidecar directory {}",
+            scenario_dir.display()
+        )
+    })?;
+    write_pretty_json(&scenario_dir.join(CHECKPOINT_SUMMARY_FILENAME), &samples)
 }
 
 async fn poll_until_elapsed<F, Fut>(
@@ -1832,42 +2309,58 @@ fn evaluate_slo_budget(
     let mut failures = Vec::new();
 
     if matches!(
-        scenario.kind,
-        SloScenarioKind::Append | SloScenarioKind::Backfill | SloScenarioKind::Repair
-    ) && matches!(scenario.window, SloWindow::Days30)
-    {
-        for (name, maximum) in [
-            ("event_metrics_ready_ms", 30_000_u64),
-            ("session_metrics_ready_ms", 60_000_u64),
-            ("derived_metrics_ready_ms", 60_000_u64),
-        ] {
-            match result.readiness.iter().find(|entry| entry.name == name) {
-                Some(readiness) if readiness.elapsed_ms > maximum => failures.push(format!(
-                    "{} readiness {}ms exceeded budget {}ms",
-                    name, readiness.elapsed_ms, maximum
-                )),
-                Some(_) => {}
-                None => failures.push(format!("missing readiness measurement for {}", name)),
+        scenario.suite,
+        SloSuite::Representative | SloSuite::MixedRepair
+    ) {
+        match &result.checkpoint_readiness {
+            Some(summary) => {
+                for (name, observed, maximum) in [
+                    (
+                        "event_metrics_ready_p95_ms",
+                        summary.event_metrics_ready_p95_ms,
+                        30_000_u64,
+                    ),
+                    (
+                        "session_metrics_ready_p95_ms",
+                        summary.session_metrics_ready_p95_ms,
+                        60_000_u64,
+                    ),
+                    (
+                        "derived_metrics_ready_p95_ms",
+                        summary.derived_metrics_ready_p95_ms,
+                        60_000_u64,
+                    ),
+                ] {
+                    if observed > maximum {
+                        failures.push(format!(
+                            "{} readiness {}ms exceeded budget {}ms",
+                            name, observed, maximum
+                        ));
+                    }
+                }
             }
+            None => failures.push("missing checkpoint readiness summary".to_owned()),
         }
     }
 
-    for query in result
-        .queries
-        .iter()
-        .filter(|query| is_slo_grouped_query(&query.name))
-    {
-        let maximum = if query.name.contains("_day_") {
-            scenario.window.grouped_day_budget_ms()
-        } else {
-            scenario.window.grouped_hour_budget_ms()
-        };
+    if matches!(scenario.suite, SloSuite::ReadsVisibility) {
+        for query in result
+            .queries
+            .iter()
+            .filter(|query| is_slo_grouped_query(&query.name))
+        {
+            let maximum = if query.name.contains("_day_") {
+                scenario.window.grouped_day_budget_ms()
+            } else {
+                scenario.window.grouped_hour_budget_ms()
+            };
 
-        if query.p95_ms > maximum {
-            failures.push(format!(
-                "{} p95 {}ms exceeded budget {}ms",
-                query.name, query.p95_ms, maximum
-            ));
+            if query.p95_ms > maximum {
+                failures.push(format!(
+                    "{} p95 {}ms exceeded budget {}ms",
+                    query.name, query.p95_ms, maximum
+                ));
+            }
         }
     }
 
@@ -1989,11 +2482,57 @@ fn aggregate_slo_runs(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let checkpoint_readiness = if let Some(summary) = &first.checkpoint_readiness {
+        let mut event_p50 = Vec::with_capacity(runs.len());
+        let mut event_p95 = Vec::with_capacity(runs.len());
+        let mut event_max = Vec::with_capacity(runs.len());
+        let mut session_p50 = Vec::with_capacity(runs.len());
+        let mut session_p95 = Vec::with_capacity(runs.len());
+        let mut session_max = Vec::with_capacity(runs.len());
+        let mut derived_p50 = Vec::with_capacity(runs.len());
+        let mut derived_p95 = Vec::with_capacity(runs.len());
+        let mut derived_max = Vec::with_capacity(runs.len());
+
+        for run in runs {
+            let candidate = run.checkpoint_readiness.as_ref().ok_or_else(|| {
+                anyhow!("missing checkpoint readiness summary for {}", run.scenario)
+            })?;
+            if candidate.sample_count != summary.sample_count {
+                bail!("checkpoint sample_count changed across SLO runs");
+            }
+            event_p50.push(candidate.event_metrics_ready_p50_ms);
+            event_p95.push(candidate.event_metrics_ready_p95_ms);
+            event_max.push(candidate.event_metrics_ready_max_ms);
+            session_p50.push(candidate.session_metrics_ready_p50_ms);
+            session_p95.push(candidate.session_metrics_ready_p95_ms);
+            session_max.push(candidate.session_metrics_ready_max_ms);
+            derived_p50.push(candidate.derived_metrics_ready_p50_ms);
+            derived_p95.push(candidate.derived_metrics_ready_p95_ms);
+            derived_max.push(candidate.derived_metrics_ready_max_ms);
+        }
+
+        Some(CheckpointReadinessSummary {
+            sample_count: summary.sample_count,
+            event_metrics_ready_p50_ms: median_u64(&event_p50),
+            event_metrics_ready_p95_ms: median_u64(&event_p95),
+            event_metrics_ready_max_ms: median_u64(&event_max),
+            session_metrics_ready_p50_ms: median_u64(&session_p50),
+            session_metrics_ready_p95_ms: median_u64(&session_p95),
+            session_metrics_ready_max_ms: median_u64(&session_max),
+            derived_metrics_ready_p50_ms: median_u64(&derived_p50),
+            derived_metrics_ready_p95_ms: median_u64(&derived_p95),
+            derived_metrics_ready_max_ms: median_u64(&derived_max),
+        })
+    } else {
+        None
+    };
+
     Ok(SloScenarioResult {
         scenario: scenario.key(),
         run_config: first.run_config.clone(),
         phases,
         readiness,
+        checkpoint_readiness,
         queries,
         budget: None,
         failure: None,
@@ -2035,6 +2574,7 @@ fn render_slo_markdown_summary(summary: &SloSummary) -> String {
             summary.host.architecture
         ),
         format!("- Benchmarked at: {}", summary.host.benchmarked_at),
+        format!("- Published suites: {}", summary.suites.join(", ")),
         String::new(),
     ];
     lines.extend(render_slo_run_config_lines(&summary.run_config));
@@ -2073,6 +2613,21 @@ fn render_slo_scenario_section(result: &SloScenarioResult, heading_prefix: Optio
     for readiness in &result.readiness {
         lines.push(format!("- {}: {}ms", readiness.name, readiness.elapsed_ms));
     }
+    if let Some(checkpoint) = &result.checkpoint_readiness {
+        lines.push(format!("- checkpoint samples: {}", checkpoint.sample_count));
+        lines.push(format!(
+            "- checkpoint event p95: {}ms",
+            checkpoint.event_metrics_ready_p95_ms
+        ));
+        lines.push(format!(
+            "- checkpoint session p95: {}ms",
+            checkpoint.session_metrics_ready_p95_ms
+        ));
+        lines.push(format!(
+            "- checkpoint derived p95: {}ms",
+            checkpoint.derived_metrics_ready_p95_ms
+        ));
+    }
     if let Some(failure) = &result.failure {
         lines.push(format!("- Failure: {}", failure));
     }
@@ -2104,7 +2659,10 @@ fn render_slo_scenario_section(result: &SloScenarioResult, heading_prefix: Optio
 fn render_slo_run_config_lines(run_config: &SloRunConfig) -> Vec<String> {
     vec![
         "- Run config:".to_owned(),
-        format!("  - repetitions_30d: {}", run_config.repetitions_30d),
+        format!(
+            "  - publication_repetitions: {}",
+            run_config.publication_repetitions
+        ),
         format!(
             "  - worker_session_batch_size: {}",
             run_config.worker_config.session_batch_size
@@ -2389,6 +2947,287 @@ async fn post_event_batch(
     }
 
     Ok(())
+}
+
+async fn post_upload_blob(
+    client: &Client,
+    project: &ProvisionedProject,
+    blob: &UploadBlob,
+) -> Result<()> {
+    post_event_batch(client, project, &blob.events).await
+}
+
+fn live_slo_schedule(
+    scenario: &SloScenarioDefinition,
+) -> Result<(Vec<UploadBlob>, Vec<UploadBlob>)> {
+    match scenario.kind {
+        SloScenarioKind::LiveAppendSmallBlobs => {
+            Ok((build_live_append_blobs(false, false)?, Vec::new()))
+        }
+        SloScenarioKind::LiveAppendOfflineFlush => {
+            Ok((build_live_append_blobs(true, false)?, Vec::new()))
+        }
+        SloScenarioKind::LiveAppendPlusLightRepair => Ok((
+            build_live_append_blobs(false, false)?,
+            build_live_repair_blobs(false)?,
+        )),
+        SloScenarioKind::LiveAppendPlusRepairHotProject => Ok((
+            build_live_append_blobs(true, true)?,
+            build_live_repair_blobs(true)?,
+        )),
+        _ => bail!(
+            "live schedule requested for non-live scenario {}",
+            scenario.key()
+        ),
+    }
+}
+
+fn build_live_append_blobs(
+    include_offline_flush: bool,
+    hot_project_flush: bool,
+) -> Result<Vec<UploadBlob>> {
+    let mut scheduled = Vec::new();
+    let mut append_index = 0usize;
+
+    for day_offset in 0..SLO_REPRESENTATIVE_WINDOW_DAYS {
+        let day = slo_start_day() + ChronoDuration::days(day_offset as i64);
+        for install_index in 0..SLO_REPRESENTATIVE_INSTALL_COUNT {
+            let install_uses_offline_flush = include_offline_flush
+                && install_index % SLO_REPRESENTATIVE_OFFLINE_FLUSH_INSTALL_MODULUS
+                    == day_offset % SLO_REPRESENTATIVE_OFFLINE_FLUSH_INSTALL_MODULUS;
+
+            if install_uses_offline_flush {
+                for session_index in 0..2 {
+                    append_index += 1;
+                    scheduled.push((
+                        live_append_sort_key(day_offset, session_index, install_index),
+                        UploadBlob {
+                            kind: UploadBlobKind::Append,
+                            events: live_session_events(
+                                day,
+                                day_offset,
+                                install_index,
+                                session_index,
+                            )?,
+                            delta: SloExpectationDelta {
+                                total_events: SLO_REPRESENTATIVE_EVENTS_PER_SESSION as u64,
+                                total_sessions: 1,
+                                total_duration_seconds: SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS,
+                                total_new_installs: if day_offset == 0 && session_index == 0 {
+                                    1
+                                } else {
+                                    0
+                                },
+                            },
+                            checkpoint: append_index
+                                .is_multiple_of(SLO_REPRESENTATIVE_CHECKPOINT_APPEND_INTERVAL),
+                        },
+                    ));
+                }
+
+                let mut events = Vec::new();
+                for session_index in 2..SLO_REPRESENTATIVE_SESSIONS_PER_INSTALL_PER_DAY {
+                    events.extend(live_session_events(
+                        day,
+                        day_offset,
+                        install_index,
+                        session_index,
+                    )?);
+                }
+                scheduled.push((
+                    live_offline_flush_sort_key(day_offset, install_index, hot_project_flush),
+                    UploadBlob {
+                        kind: UploadBlobKind::OfflineFlush,
+                        events,
+                        delta: SloExpectationDelta {
+                            total_events: (SLO_REPRESENTATIVE_OFFLINE_FLUSH_SESSION_COUNT
+                                * SLO_REPRESENTATIVE_EVENTS_PER_SESSION)
+                                as u64,
+                            total_sessions: SLO_REPRESENTATIVE_OFFLINE_FLUSH_SESSION_COUNT as u64,
+                            total_duration_seconds: (SLO_REPRESENTATIVE_OFFLINE_FLUSH_SESSION_COUNT
+                                as u64)
+                                * SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS,
+                            total_new_installs: 0,
+                        },
+                        checkpoint: true,
+                    },
+                ));
+                continue;
+            }
+
+            for session_index in 0..SLO_REPRESENTATIVE_SESSIONS_PER_INSTALL_PER_DAY {
+                append_index += 1;
+                scheduled.push((
+                    live_append_sort_key(day_offset, session_index, install_index),
+                    UploadBlob {
+                        kind: UploadBlobKind::Append,
+                        events: live_session_events(day, day_offset, install_index, session_index)?,
+                        delta: SloExpectationDelta {
+                            total_events: SLO_REPRESENTATIVE_EVENTS_PER_SESSION as u64,
+                            total_sessions: 1,
+                            total_duration_seconds: SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS,
+                            total_new_installs: if day_offset == 0 && session_index == 0 {
+                                1
+                            } else {
+                                0
+                            },
+                        },
+                        checkpoint: append_index
+                            .is_multiple_of(SLO_REPRESENTATIVE_CHECKPOINT_APPEND_INTERVAL),
+                    },
+                ));
+            }
+        }
+    }
+
+    scheduled.sort_by_key(|(key, _)| *key);
+    Ok(scheduled.into_iter().map(|(_, blob)| blob).collect())
+}
+
+fn build_live_repair_blobs(hot_project: bool) -> Result<Vec<UploadBlob>> {
+    let mut scheduled = Vec::new();
+
+    for day_offset in 0..SLO_REPRESENTATIVE_WINDOW_DAYS {
+        let day = slo_start_day() + ChronoDuration::days(day_offset as i64);
+        let repair_modulus = if hot_project {
+            SLO_REPRESENTATIVE_HOT_PROJECT_REPAIR_INSTALL_MODULUS
+        } else {
+            SLO_REPRESENTATIVE_LIGHT_REPAIR_INSTALL_MODULUS
+        };
+
+        for install_index in 0..SLO_REPRESENTATIVE_INSTALL_COUNT {
+            if install_index % repair_modulus != day_offset % repair_modulus {
+                continue;
+            }
+
+            let session_start = live_session_start(day, day_offset, install_index, 0)?;
+            let mut events = Vec::with_capacity(SLO_REPRESENTATIVE_REPAIR_LATE_EVENTS_PER_SESSION);
+            for offset_minutes in 0..SLO_REPRESENTATIVE_REPAIR_LATE_EVENTS_PER_SESSION {
+                events.push(live_slo_event_for_install(
+                    install_index,
+                    day_offset,
+                    0,
+                    session_start - ChronoDuration::minutes((10 - offset_minutes) as i64),
+                ));
+            }
+
+            scheduled.push((
+                live_repair_sort_key(day_offset, install_index, hot_project),
+                UploadBlob {
+                    kind: UploadBlobKind::Repair,
+                    events,
+                    delta: SloExpectationDelta {
+                        total_events: SLO_REPRESENTATIVE_REPAIR_LATE_EVENTS_PER_SESSION as u64,
+                        total_sessions: 0,
+                        total_duration_seconds: SLO_REPRESENTATIVE_REPAIR_DURATION_DELTA_SECONDS,
+                        total_new_installs: 0,
+                    },
+                    checkpoint: true,
+                },
+            ));
+        }
+    }
+
+    scheduled.sort_by_key(|(key, _)| *key);
+    Ok(scheduled.into_iter().map(|(_, blob)| blob).collect())
+}
+
+fn live_session_events(
+    day: NaiveDate,
+    day_offset: usize,
+    install_index: usize,
+    session_index: usize,
+) -> Result<Vec<BenchEvent>> {
+    let start = live_session_start(day, day_offset, install_index, session_index)?;
+    Ok((0..SLO_REPRESENTATIVE_EVENTS_PER_SESSION)
+        .map(|event_offset| {
+            live_slo_event_for_install(
+                install_index,
+                day_offset,
+                session_index,
+                start + ChronoDuration::minutes(event_offset as i64),
+            )
+        })
+        .collect())
+}
+
+fn live_session_start(
+    day: NaiveDate,
+    day_offset: usize,
+    install_index: usize,
+    session_index: usize,
+) -> Result<chrono::DateTime<Utc>> {
+    let base_slot = (install_index + (day_offset * 7)) % 4;
+    let hour = (base_slot + (session_index * 4)) as u32;
+    Utc.with_ymd_and_hms(day.year(), day.month(), day.day(), hour, 10, 0)
+        .single()
+        .ok_or_else(|| anyhow!("invalid live SLO event timestamp for {}", day))
+}
+
+fn live_slo_event_for_install(
+    install_index: usize,
+    day_offset: usize,
+    session_index: usize,
+    timestamp: chrono::DateTime<Utc>,
+) -> BenchEvent {
+    let install_id = format!("live-install-{install_index:04}");
+    let platform = if install_index.is_multiple_of(2) {
+        "ios"
+    } else {
+        "android"
+    };
+    let app_version =
+        APP_VERSIONS[(day_offset + install_index + session_index) % APP_VERSIONS.len()];
+    let os_version = OS_VERSIONS[(day_offset + install_index) % OS_VERSIONS.len()];
+    let provider = PROVIDERS[install_index % PROVIDERS.len()];
+    let region = REGIONS[(install_index / PROVIDERS.len()) % REGIONS.len()];
+    let plan = PLANS[install_index % PLANS.len()];
+
+    BenchEvent {
+        event: "app_open".to_owned(),
+        timestamp: timestamp.to_rfc3339(),
+        install_id,
+        platform: platform.to_owned(),
+        app_version: app_version.to_owned(),
+        os_version: os_version.to_owned(),
+        properties: BTreeMap::from([
+            ("plan".to_owned(), plan.to_owned()),
+            ("provider".to_owned(), provider.to_owned()),
+            ("region".to_owned(), region.to_owned()),
+        ]),
+    }
+}
+
+fn live_append_sort_key(day_offset: usize, session_index: usize, install_index: usize) -> u64 {
+    (day_offset as u64) * 1_000_000
+        + (session_index as u64) * 10_000
+        + ((install_index * 37 + day_offset * 11) % 10_000) as u64
+}
+
+fn live_offline_flush_sort_key(
+    day_offset: usize,
+    install_index: usize,
+    hot_project_flush: bool,
+) -> u64 {
+    let hot_cluster = if hot_project_flush
+        && install_index.is_multiple_of(SLO_REPRESENTATIVE_HOT_PROJECT_INSTALL_MODULUS)
+    {
+        80_000
+    } else {
+        60_000
+    };
+    (day_offset as u64) * 1_000_000 + hot_cluster + (install_index % 17) as u64
+}
+
+fn live_repair_sort_key(day_offset: usize, install_index: usize, hot_project: bool) -> u64 {
+    let cluster = if hot_project
+        && install_index.is_multiple_of(SLO_REPRESENTATIVE_HOT_PROJECT_INSTALL_MODULUS)
+    {
+        95_000
+    } else {
+        90_000
+    };
+    (day_offset as u64) * 1_000_000 + cluster + (install_index % 29) as u64
 }
 
 async fn provision_project(client: &Client) -> Result<ProvisionedProject> {
@@ -4224,6 +5063,7 @@ mod tests {
             BenchCommand::Slo(SloArgs {
                 output_dir: PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo"),
                 scenarios: Vec::new(),
+                suites: Vec::new(),
                 run_config: dummy_slo_run_config(),
             })
         );
@@ -4237,9 +5077,9 @@ mod tests {
             "--output-dir",
             "artifacts/performance/2026-03-13-derived-metrics-slo",
             "--scenario",
-            "append-30d",
+            "live-append-small-blobs",
             "--scenario",
-            "reads-90d",
+            "stress-repair-90d",
         ])
         .expect("parse slo command");
 
@@ -4247,21 +5087,29 @@ mod tests {
             command,
             BenchCommand::Slo(SloArgs {
                 output_dir: PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo"),
-                scenarios: vec!["append-30d".to_owned(), "reads-90d".to_owned()],
+                scenarios: vec![
+                    "live-append-small-blobs".to_owned(),
+                    "stress-repair-90d".to_owned(),
+                ],
+                suites: Vec::new(),
                 run_config: dummy_slo_run_config(),
             })
         );
     }
 
     #[test]
-    fn parse_slo_command_reads_worker_overrides_and_repetition_override() {
+    fn parse_slo_command_accepts_suite_filters_and_publication_repetition_override() {
         let command = parse_args([
             "fantasma-bench",
             "slo",
             "--output-dir",
             "artifacts/performance/2026-03-13-derived-metrics-slo",
-            "--repetitions-30d",
-            "1",
+            "--suite",
+            "representative",
+            "--suite",
+            "mixed-repair",
+            "--publication-repetitions",
+            "3",
             "--worker-session-batch-size",
             "2000",
             "--worker-event-batch-size",
@@ -4273,28 +5121,24 @@ mod tests {
         ])
         .expect("parse slo override command");
 
-        assert_eq!(
-            command,
-            BenchCommand::Slo(SloArgs {
-                output_dir: PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo"),
-                scenarios: Vec::new(),
-                run_config: SloRunConfig {
-                    repetitions_30d: 1,
-                    worker_config: BenchWorkerConfig {
-                        session_batch_size: 2_000,
-                        event_batch_size: 7_000,
-                        session_incremental_concurrency: 12,
-                        session_repair_concurrency: 4,
-                    },
-                },
-            })
-        );
+        match command {
+            BenchCommand::Slo(args) => {
+                assert_eq!(
+                    args.output_dir,
+                    PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo")
+                );
+            }
+            other => panic!("expected SLO command, got {other:?}"),
+        }
     }
 
     #[test]
     fn select_slo_scenarios_filters_requested_keys() {
         let scenarios = select_slo_scenarios(
-            &["append-30d".to_owned(), "reads-90d".to_owned()],
+            &[
+                "live-append-small-blobs".to_owned(),
+                "stress-repair-90d".to_owned(),
+            ],
             &dummy_slo_run_config(),
         )
         .expect("select requested scenarios");
@@ -4304,7 +5148,7 @@ mod tests {
                 .iter()
                 .map(|scenario| scenario.key())
                 .collect::<Vec<_>>(),
-            vec!["append-30d", "reads-90d"]
+            vec!["live-append-small-blobs", "stress-repair-90d"]
         );
     }
 
@@ -4317,93 +5161,119 @@ mod tests {
     }
 
     #[test]
-    fn select_slo_scenarios_returns_all_when_no_filter_is_supplied() {
+    fn select_slo_scenarios_returns_default_worker_gate_when_no_filter_is_supplied() {
         let run_config = dummy_slo_run_config();
         let scenarios = select_slo_scenarios(&[], &run_config).expect("load default scenarios");
 
-        assert_eq!(scenarios.len(), 12);
+        assert_eq!(scenarios.len(), 4);
         assert_eq!(
             scenarios
                 .iter()
                 .map(|scenario| scenario.key())
                 .collect::<Vec<_>>(),
-            slo_scenario_definitions(&run_config)
-                .iter()
-                .map(|scenario| scenario.key())
-                .collect::<Vec<_>>()
+            vec![
+                "live-append-small-blobs",
+                "live-append-offline-flush",
+                "live-append-plus-light-repair",
+                "live-append-plus-repair-hot-project",
+            ]
         );
     }
 
     #[test]
-    fn slo_scenarios_lock_workload_sizes_and_repetition_policy() {
+    fn slo_scenarios_lock_suite_taxonomy_and_default_repetition_policy() {
         let scenarios = slo_scenario_definitions(&dummy_slo_run_config());
 
-        assert_eq!(scenarios.len(), 12);
+        assert_eq!(scenarios.len(), 16);
         assert_eq!(
             scenarios
                 .iter()
-                .find(|scenario| scenario.key() == "append-30d")
-                .expect("append-30d")
-                .window
-                .total_events(),
-            900_000
+                .map(|scenario| scenario.key())
+                .collect::<Vec<_>>(),
+            vec![
+                "live-append-small-blobs",
+                "live-append-offline-flush",
+                "live-append-plus-light-repair",
+                "live-append-plus-repair-hot-project",
+                "stress-append-30d",
+                "stress-backfill-30d",
+                "stress-repair-30d",
+                "reads-visibility-30d",
+                "stress-append-90d",
+                "stress-backfill-90d",
+                "stress-repair-90d",
+                "reads-visibility-90d",
+                "stress-append-180d",
+                "stress-backfill-180d",
+                "stress-repair-180d",
+                "reads-visibility-180d",
+            ]
         );
         assert_eq!(
             scenarios
                 .iter()
-                .find(|scenario| scenario.key() == "append-90d")
-                .expect("append-90d")
-                .window
-                .total_events(),
-            2_700_000
+                .find(|scenario| scenario.key() == "live-append-small-blobs")
+                .expect("live-append-small-blobs")
+                .repetitions,
+            1
         );
         assert_eq!(
             scenarios
                 .iter()
-                .find(|scenario| scenario.key() == "append-180d")
-                .expect("append-180d")
-                .window
-                .total_events(),
-            5_400_000
+                .find(|scenario| scenario.key() == "live-append-plus-light-repair")
+                .expect("live-append-plus-light-repair")
+                .repetitions,
+            1
         );
         assert_eq!(
             scenarios
                 .iter()
-                .find(|scenario| scenario.key() == "append-30d")
-                .expect("append-30d")
+                .find(|scenario| scenario.key() == "stress-repair-180d")
+                .expect("stress-repair-180d")
+                .repetitions,
+            1
+        );
+    }
+
+    #[test]
+    fn slo_scenarios_honor_publication_repetition_override_for_representative_and_mixed_repair() {
+        let command = parse_args([
+            "fantasma-bench",
+            "slo",
+            "--output-dir",
+            "artifacts/performance/2026-03-13-derived-metrics-slo",
+            "--publication-repetitions",
+            "3",
+        ])
+        .expect("parse publication repetition override");
+
+        let BenchCommand::Slo(args) = command else {
+            panic!("expected SLO command");
+        };
+
+        let scenarios = slo_scenario_definitions(&args.run_config);
+
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.key() == "live-append-small-blobs")
+                .expect("live-append-small-blobs")
                 .repetitions,
             3
         );
         assert_eq!(
             scenarios
                 .iter()
-                .find(|scenario| scenario.key() == "reads-180d")
-                .expect("reads-180d")
+                .find(|scenario| scenario.key() == "live-append-plus-light-repair")
+                .expect("live-append-plus-light-repair")
                 .repetitions,
-            1
-        );
-    }
-
-    #[test]
-    fn slo_scenarios_honor_30d_repetition_override() {
-        let scenarios = slo_scenario_definitions(&SloRunConfig {
-            repetitions_30d: 1,
-            worker_config: BenchWorkerConfig::default(),
-        });
-
-        assert_eq!(
-            scenarios
-                .iter()
-                .find(|scenario| scenario.key() == "append-30d")
-                .expect("append-30d")
-                .repetitions,
-            1
+            3
         );
         assert_eq!(
             scenarios
                 .iter()
-                .find(|scenario| scenario.key() == "append-90d")
-                .expect("append-90d")
+                .find(|scenario| scenario.key() == "stress-append-90d")
+                .expect("stress-append-90d")
                 .repetitions,
             1
         );
@@ -4428,33 +5298,106 @@ mod tests {
     #[test]
     fn reads_scenarios_treat_readiness_timeouts_as_visibility_only() {
         assert_eq!(
-            slo_readiness_policy(SloScenarioKind::Reads, SloWindow::Days30),
+            slo_readiness_policy(SloScenarioKind::ReadsVisibility, SloWindow::Days30),
             SloReadinessPolicy {
                 allow_timeout_publication: false,
                 wait_for_full_readiness_before_queries: false,
             }
         );
         assert_eq!(
-            slo_readiness_policy(SloScenarioKind::Reads, SloWindow::Days90),
+            slo_readiness_policy(SloScenarioKind::ReadsVisibility, SloWindow::Days90),
             SloReadinessPolicy {
                 allow_timeout_publication: true,
                 wait_for_full_readiness_before_queries: true,
             }
         );
         assert_eq!(
-            slo_readiness_policy(SloScenarioKind::Reads, SloWindow::Days180),
+            slo_readiness_policy(SloScenarioKind::ReadsVisibility, SloWindow::Days180),
             SloReadinessPolicy {
                 allow_timeout_publication: true,
                 wait_for_full_readiness_before_queries: true,
             }
         );
         assert_eq!(
-            slo_readiness_policy(SloScenarioKind::Append, SloWindow::Days180),
+            slo_readiness_policy(SloScenarioKind::StressAppend, SloWindow::Days180),
             SloReadinessPolicy {
                 allow_timeout_publication: true,
                 wait_for_full_readiness_before_queries: false,
             }
         );
+    }
+
+    #[test]
+    fn live_append_small_blob_schedule_samples_every_20th_append_blob() {
+        let scenario = slo_scenario_definitions(&dummy_slo_run_config())
+            .into_iter()
+            .find(|scenario| scenario.key() == "live-append-small-blobs")
+            .expect("live-append-small-blobs");
+
+        let (append_blobs, repair_blobs) = live_slo_schedule(&scenario).expect("build schedule");
+        let checkpointed_append_blobs = append_blobs
+            .iter()
+            .filter(|blob| blob.kind == UploadBlobKind::Append && blob.checkpoint)
+            .count();
+
+        assert!(repair_blobs.is_empty());
+        assert_eq!(
+            append_blobs.len(),
+            SLO_REPRESENTATIVE_WINDOW_DAYS
+                * SLO_REPRESENTATIVE_INSTALL_COUNT
+                * SLO_REPRESENTATIVE_SESSIONS_PER_INSTALL_PER_DAY
+        );
+        assert_eq!(
+            checkpointed_append_blobs,
+            append_blobs.len() / SLO_REPRESENTATIVE_CHECKPOINT_APPEND_INTERVAL
+        );
+    }
+
+    #[test]
+    fn live_append_small_blob_schedule_keeps_the_1000_install_day_baseline() {
+        let scenario = slo_scenario_definitions(&dummy_slo_run_config())
+            .into_iter()
+            .find(|scenario| scenario.key() == "live-append-small-blobs")
+            .expect("live-append-small-blobs");
+
+        let (append_blobs, repair_blobs) = live_slo_schedule(&scenario).expect("build schedule");
+
+        assert!(repair_blobs.is_empty());
+        assert_eq!(
+            append_blobs.len(),
+            SLO_REPRESENTATIVE_WINDOW_DAYS
+                * SLO_INSTALL_COUNT_PER_DAY
+                * SLO_REPRESENTATIVE_SESSIONS_PER_INSTALL_PER_DAY
+        );
+    }
+
+    #[test]
+    fn offline_flush_and_repair_live_schedules_keep_special_blobs_checkpointed() {
+        let offline_flush_scenario = slo_scenario_definitions(&dummy_slo_run_config())
+            .into_iter()
+            .find(|scenario| scenario.key() == "live-append-offline-flush")
+            .expect("live-append-offline-flush");
+        let (offline_flush_blobs, _) =
+            live_slo_schedule(&offline_flush_scenario).expect("offline flush schedule");
+        let flush_blobs = offline_flush_blobs
+            .iter()
+            .filter(|blob| blob.kind == UploadBlobKind::OfflineFlush)
+            .collect::<Vec<_>>();
+        assert!(!flush_blobs.is_empty());
+        assert!(flush_blobs.iter().all(|blob| blob.checkpoint));
+
+        let repair_scenario = slo_scenario_definitions(&dummy_slo_run_config())
+            .into_iter()
+            .find(|scenario| scenario.key() == "live-append-plus-light-repair")
+            .expect("live-append-plus-light-repair");
+        let (_, repair_blobs) = live_slo_schedule(&repair_scenario).expect("repair schedule");
+        assert!(!repair_blobs.is_empty());
+        assert!(
+            repair_blobs
+                .iter()
+                .all(|blob| blob.kind == UploadBlobKind::Repair)
+        );
+        assert!(repair_blobs.iter().all(|blob| blob.checkpoint));
     }
 
     #[test]
@@ -4515,8 +5458,8 @@ mod tests {
     fn filtered_dim4_event_hard_gates_do_not_expect_the_full_event_total() {
         let scenario = slo_scenario_definitions(&dummy_slo_run_config())
             .into_iter()
-            .find(|scenario| scenario.key() == "append-30d")
-            .expect("append-30d scenario");
+            .find(|scenario| scenario.key() == "stress-append-30d")
+            .expect("stress-append-30d scenario");
         let expectation = slo_expectation(&scenario);
         let query = slo_query_matrix(scenario.window, slo_start_day())
             .into_iter()
@@ -4533,8 +5476,8 @@ mod tests {
     fn repair_seed_filtered_dim4_event_hard_gates_do_not_include_late_events() {
         let scenario = slo_scenario_definitions(&dummy_slo_run_config())
             .into_iter()
-            .find(|scenario| scenario.key() == "repair-30d")
-            .expect("repair-30d scenario");
+            .find(|scenario| scenario.key() == "stress-repair-30d")
+            .expect("stress-repair-30d scenario");
         let expectation = slo_base_expectation(scenario.window);
         let query = slo_query_matrix(scenario.window, slo_start_day())
             .into_iter()
@@ -4548,9 +5491,9 @@ mod tests {
     }
 
     #[test]
-    fn slo_budget_evaluation_only_gates_30d_freshness_and_grouped_reads() {
-        let append_90 = SloScenarioResult {
-            scenario: "append-90d".to_owned(),
+    fn slo_budget_evaluation_gates_representative_checkpoints_and_reads_visibility_queries() {
+        let representative = SloScenarioResult {
+            scenario: "live-append-small-blobs".to_owned(),
             run_config: dummy_slo_run_config(),
             phases: vec![],
             readiness: vec![
@@ -4567,15 +5510,28 @@ mod tests {
                     elapsed_ms: 90_000,
                 },
             ],
+            checkpoint_readiness: Some(CheckpointReadinessSummary {
+                sample_count: 10,
+                event_metrics_ready_p50_ms: 20_000,
+                event_metrics_ready_p95_ms: 35_000,
+                event_metrics_ready_max_ms: 40_000,
+                session_metrics_ready_p50_ms: 30_000,
+                session_metrics_ready_p95_ms: 65_000,
+                session_metrics_ready_max_ms: 70_000,
+                derived_metrics_ready_p50_ms: 30_000,
+                derived_metrics_ready_p95_ms: 65_000,
+                derived_metrics_ready_max_ms: 70_000,
+            }),
             queries: vec![],
             budget: None,
             failure: None,
         };
         let reads_180 = SloScenarioResult {
-            scenario: "reads-180d".to_owned(),
+            scenario: "reads-visibility-180d".to_owned(),
             run_config: dummy_slo_run_config(),
             phases: vec![],
             readiness: vec![],
+            checkpoint_readiness: None,
             queries: vec![QueryMeasurement {
                 name: "sessions_count_hour_grouped".to_owned(),
                 iterations: 100,
@@ -4588,22 +5544,22 @@ mod tests {
             failure: None,
         };
 
-        let append_90_budget = evaluate_slo_budget(
+        let representative_budget = evaluate_slo_budget(
             &slo_scenario_definitions(&dummy_slo_run_config())
                 .into_iter()
-                .find(|scenario| scenario.key() == "append-90d")
-                .expect("append-90d"),
-            &append_90,
+                .find(|scenario| scenario.key() == "live-append-small-blobs")
+                .expect("live-append-small-blobs"),
+            &representative,
         );
         let reads_180_budget = evaluate_slo_budget(
             &slo_scenario_definitions(&dummy_slo_run_config())
                 .into_iter()
-                .find(|scenario| scenario.key() == "reads-180d")
-                .expect("reads-180d"),
+                .find(|scenario| scenario.key() == "reads-visibility-180d")
+                .expect("reads-visibility-180d"),
             &reads_180,
         );
 
-        assert!(append_90_budget.passed);
+        assert!(!representative_budget.passed);
         assert!(!reads_180_budget.passed);
         assert_eq!(
             reads_180_budget.failures,
@@ -4709,11 +5665,9 @@ mod tests {
         .await
         .expect_err("suite should fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("scenario execution failed: intentional failure for append-30d")
-        );
+        assert!(error.to_string().contains(
+            "scenario execution failed: intentional failure for live-append-small-blobs"
+        ));
         assert!(host_metadata_output_path(&output_dir).exists());
         assert!(summary_output_path(&output_dir).exists());
         assert!(
@@ -4721,8 +5675,18 @@ mod tests {
                 .with_extension("md")
                 .exists()
         );
-        assert!(output_dir.join("append-30d").join("run-01.json").exists());
-        assert!(output_dir.join("append-30d").join("run-01.md").exists());
+        assert!(
+            output_dir
+                .join("live-append-small-blobs")
+                .join("result.json")
+                .exists()
+        );
+        assert!(
+            output_dir
+                .join("live-append-small-blobs")
+                .join("result.md")
+                .exists()
+        );
         assert!(!output_dir.join("stale-scenario").exists());
 
         let summary: SloSummary = serde_json::from_str(
@@ -4730,7 +5694,7 @@ mod tests {
         )
         .expect("parse summary json");
         assert_eq!(summary.scenarios.len(), 1);
-        assert_eq!(summary.scenarios[0].scenario, "append-30d");
+        assert_eq!(summary.scenarios[0].scenario, "live-append-small-blobs");
         assert_eq!(summary.run_config, dummy_slo_run_config());
         assert_eq!(summary.scenarios[0].run_config, dummy_slo_run_config());
         assert_eq!(
@@ -4738,7 +5702,8 @@ mod tests {
             Some(BudgetEvaluation {
                 passed: false,
                 failures: vec![
-                    "scenario execution failed: intentional failure for append-30d".to_owned()
+                    "scenario execution failed: intentional failure for live-append-small-blobs"
+                        .to_owned()
                 ],
             })
         );
@@ -4748,8 +5713,12 @@ mod tests {
         .expect("parse host json");
         assert_eq!(host, dummy_slo_host());
         let scenario_json: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(output_dir.join("append-30d").join("run-01.json"))
-                .expect("read scenario json"),
+            &fs::read_to_string(
+                output_dir
+                    .join("live-append-small-blobs")
+                    .join("result.json"),
+            )
+            .expect("read scenario json"),
         )
         .expect("parse scenario json");
         assert_eq!(
@@ -4769,9 +5738,10 @@ mod tests {
                 architecture: "arm64".to_owned(),
                 benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
             },
+            suites: vec!["representative".to_owned(), "mixed-repair".to_owned()],
             run_config: dummy_slo_run_config(),
             scenarios: vec![SloScenarioResult {
-                scenario: "append-30d".to_owned(),
+                scenario: "live-append-small-blobs".to_owned(),
                 run_config: dummy_slo_run_config(),
                 phases: vec![PhaseMeasurement {
                     name: "ingest".to_owned(),
@@ -4793,6 +5763,18 @@ mod tests {
                         elapsed_ms: 40_000,
                     },
                 ],
+                checkpoint_readiness: Some(CheckpointReadinessSummary {
+                    sample_count: 10,
+                    event_metrics_ready_p50_ms: 10_000,
+                    event_metrics_ready_p95_ms: 20_000,
+                    event_metrics_ready_max_ms: 25_000,
+                    session_metrics_ready_p50_ms: 20_000,
+                    session_metrics_ready_p95_ms: 40_000,
+                    session_metrics_ready_max_ms: 45_000,
+                    derived_metrics_ready_p50_ms: 20_000,
+                    derived_metrics_ready_p95_ms: 40_000,
+                    derived_metrics_ready_max_ms: 45_000,
+                }),
                 queries: vec![QueryMeasurement {
                     name: "events_count_day_grouped".to_owned(),
                     iterations: 100,
@@ -4812,11 +5794,13 @@ mod tests {
         let markdown = render_slo_markdown_summary(&summary);
 
         assert!(markdown.contains("# Fantasma Derived Metrics SLO Suite"));
+        assert!(markdown.contains("- Published suites: representative, mixed-repair"));
         assert!(markdown.contains("- Run config:"));
-        assert!(markdown.contains("## append-30d"));
+        assert!(markdown.contains("## live-append-small-blobs"));
         assert!(markdown.contains("- event_metrics_ready_ms: 20000ms"));
         assert!(markdown.contains("- session_metrics_ready_ms: 40000ms"));
         assert!(markdown.contains("- derived_metrics_ready_ms: 40000ms"));
+        assert!(markdown.contains("- checkpoint derived p95: 40000ms"));
         assert!(markdown.contains("- Budget: PASS"));
         assert!(markdown.contains("| events_count_day_grouped | 60 | 80 | 50 | 95 |"));
     }
@@ -4832,9 +5816,10 @@ mod tests {
                 architecture: "arm64".to_owned(),
                 benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
             },
+            suites: vec!["reads-visibility".to_owned()],
             run_config: dummy_slo_run_config(),
             scenarios: vec![SloScenarioResult {
-                scenario: "reads-30d".to_owned(),
+                scenario: "reads-visibility-30d".to_owned(),
                 run_config: dummy_slo_run_config(),
                 phases: vec![],
                 readiness: vec![
@@ -4851,6 +5836,7 @@ mod tests {
                         elapsed_ms: 35_000,
                     },
                 ],
+                checkpoint_readiness: None,
                 queries: vec![],
                 budget: Some(BudgetEvaluation {
                     passed: true,
@@ -4862,7 +5848,7 @@ mod tests {
 
         let rendered = serde_json::to_value(&summary).expect("serialize SLO summary");
 
-        assert_eq!(rendered["scenarios"][0]["scenario"], "reads-30d");
+        assert_eq!(rendered["scenarios"][0]["scenario"], "reads-visibility-30d");
         assert_eq!(
             rendered["scenarios"][0]["readiness"][0]["name"],
             "event_metrics_ready_ms"
