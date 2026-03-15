@@ -162,6 +162,7 @@ struct FantasmaDependencies: Sendable {
     let timerInterval: Duration
     let uploadBatchSize: Int
     let beforeEnqueue: @Sendable () async -> Void
+    let beforeUploadBoundary: @Sendable () async -> Void
 
     static func live() -> FantasmaDependencies {
         FantasmaDependencies(
@@ -183,7 +184,8 @@ struct FantasmaDependencies: Sendable {
             newIdentifier: { UUID().uuidString.lowercased() },
             timerInterval: .seconds(10),
             uploadBatchSize: 50,
-            beforeEnqueue: {}
+            beforeEnqueue: {},
+            beforeUploadBoundary: {}
         )
     }
 
@@ -450,6 +452,7 @@ actor FantasmaCore {
                     return
                 }
 
+                await dependencies.beforeUploadBoundary()
                 if try await applyPendingReconfigurationIfNeeded(allowWhileFlushing: true) {
                     resumeFlushWaiters()
                     return

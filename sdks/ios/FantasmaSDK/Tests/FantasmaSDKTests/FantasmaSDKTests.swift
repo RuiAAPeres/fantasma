@@ -607,7 +607,7 @@ struct FantasmaSDKBehaviorTests {
         await transport.enqueue(response: .success(successResponse(accepted: 1)))
         try await harness.installSharedCore(
             transport: transport,
-            afterBuildBatch: {
+            beforeUploadBoundary: {
                 await gate.markStarted()
                 await gate.waitUntilReleased()
             }
@@ -928,7 +928,8 @@ private struct TestHarness {
         transport: any FantasmaTransport,
         uploadBatchSize: Int = 50,
         beforeEnqueue: @escaping @Sendable () async -> Void = {},
-        afterBuildBatch: @escaping @Sendable () async -> Void = {}
+        afterBuildBatch: @escaping @Sendable () async -> Void = {},
+        beforeUploadBoundary: @escaping @Sendable () async -> Void = {}
     ) async throws {
         let userDefaults = try #require(UserDefaults(suiteName: defaultsName))
         userDefaults.removePersistentDomain(forName: defaultsName)
@@ -936,7 +937,8 @@ private struct TestHarness {
             transport: transport,
             uploadBatchSize: uploadBatchSize,
             beforeEnqueue: beforeEnqueue,
-            afterBuildBatch: afterBuildBatch
+            afterBuildBatch: afterBuildBatch,
+            beforeUploadBoundary: beforeUploadBoundary
         )
         await Fantasma.replaceSharedCoreForTesting(core)
     }
@@ -959,7 +961,8 @@ private struct TestHarness {
         transport: any FantasmaTransport,
         uploadBatchSize: Int,
         beforeEnqueue: @escaping @Sendable () async -> Void,
-        afterBuildBatch: @escaping @Sendable () async -> Void
+        afterBuildBatch: @escaping @Sendable () async -> Void,
+        beforeUploadBoundary: @escaping @Sendable () async -> Void
     ) throws -> FantasmaCore {
         let dependencies = FantasmaDependencies(
             databaseURL: databaseURL,
@@ -970,7 +973,8 @@ private struct TestHarness {
             newIdentifier: { identifiers.next() },
             timerInterval: .seconds(3_600),
             uploadBatchSize: uploadBatchSize,
-            beforeEnqueue: beforeEnqueue
+            beforeEnqueue: beforeEnqueue,
+            beforeUploadBoundary: beforeUploadBoundary
         )
         let identityStore = IdentityStore(
             provider: UserDefaultsProvider(suiteName: defaultsName),
