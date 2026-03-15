@@ -3,10 +3,16 @@ import Foundation
 struct EventUploader: Sendable {
     private let queue: SQLiteEventQueue
     private let transport: any FantasmaTransport
+    private let afterBuildBatch: @Sendable () async -> Void
 
-    init(queue: SQLiteEventQueue, transport: any FantasmaTransport) {
+    init(
+        queue: SQLiteEventQueue,
+        transport: any FantasmaTransport,
+        afterBuildBatch: @escaping @Sendable () async -> Void = {}
+    ) {
         self.queue = queue
         self.transport = transport
+        self.afterBuildBatch = afterBuildBatch
     }
 
     func makeBatch(limit: Int) async throws -> UploadBatch? {
@@ -25,6 +31,7 @@ struct EventUploader: Sendable {
         }
         body.append(Data("]}".utf8))
 
+        await afterBuildBatch()
         return UploadBatch(rowIDs: ids, body: body, count: rows.count)
     }
 
@@ -53,11 +60,15 @@ struct EventUploader: Sendable {
             throw FantasmaError.uploadFailed
         }
 
-        guard
-            let accepted = try? JSONDecoder().decode(AcceptedResponse.self, from: data),
-            accepted.accepted == batch.count
-        else {
-            throw FantasmaError.uploadFailed
+        let accepted: AcceptedResponse
+        do {
+            accepted = try JSONDecoder().decode(AcceptedResponse.self, from: data)
+        } catch {
+            throw FantasmaError.invalidResponse
+        }
+
+        guard accepted.accepted == batch.count else {
+            throw FantasmaError.invalidResponse
         }
 
         try await queue.delete(ids: batch.rowIDs)

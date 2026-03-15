@@ -10,7 +10,11 @@ struct FantasmaSDKInternalTests {
         defer { harness.cleanup() }
 
         let queue = try harness.makeQueue()
-        try await queue.enqueue(payload: try harness.payload(event: "app_open", installId: "install-a"), createdAt: 1)
+        try await queue.enqueue(
+            payload: try harness.payload(event: "app_open", installId: "install-a"),
+            createdAt: 1,
+            destinationSignature: localhostDestinationSignature()
+        )
 
         let reopenedQueue = try harness.makeQueue()
         let rows = try await reopenedQueue.peek(limit: 10)
@@ -28,7 +32,8 @@ struct FantasmaSDKInternalTests {
         for index in 0..<55 {
             try await queue.enqueue(
                 payload: try harness.payload(event: "button_pressed_\(index)", installId: "install-a"),
-                createdAt: Int64(index)
+                createdAt: Int64(index),
+                destinationSignature: localhostDestinationSignature()
             )
         }
 
@@ -169,6 +174,190 @@ struct FantasmaSDKBehaviorTests {
         }
     }
 
+    @Test("track rejects property maps larger than four keys before enqueue")
+    func trackRejectsTooManyProperties() async throws {
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: RecordingTransport())
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+
+        do {
+            try await Fantasma.track(
+                "screen_view",
+                properties: [
+                    "screen": "Home",
+                    "region": "EU",
+                    "plan": "pro",
+                    "provider": "appstore",
+                    "campaign": "launch"
+                ]
+            )
+            Issue.record("expected invalidPropertyCount error")
+        } catch let error as FantasmaError {
+            #expect(error == .invalidPropertyCount)
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+    }
+
+    @Test("track rejects property names that do not match the public contract before enqueue")
+    func trackRejectsInvalidPropertyName() async throws {
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: RecordingTransport())
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+
+        do {
+            try await Fantasma.track("screen_view", properties: ["Screen-Name": "Home"])
+            Issue.record("expected invalidPropertyName error")
+        } catch let error as FantasmaError {
+            #expect(error == .invalidPropertyName)
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+    }
+
+    @Test("track rejects reserved property names from the public contract before enqueue")
+    func trackRejectsReservedPropertyName() async throws {
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: RecordingTransport())
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+
+        do {
+            try await Fantasma.track("screen_view", properties: ["metric": "count"])
+            Issue.record("expected reservedPropertyName error")
+        } catch let error as FantasmaError {
+            #expect(error == .reservedPropertyName)
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+    }
+
+    @Test("reconfiguring with the same normalized destination preserves queued rows")
+    func sameDestinationReconfigurePreservesQueue() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: " fg_ing_test ")
+        try await Fantasma.track("screen_view")
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.flush()
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+
+        let request = try #require(await transport.requests().first)
+        #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_test")
+    }
+
+    @Test("reconfiguring with a different destination discards queued rows before future uploads")
+    func destinationDriftDiscardQueuedRows() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("old_event")
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+
+        try await Fantasma.configure(serverURL: replacementURL(), writeKey: "fg_ing_next")
+        #expect(try await queue.count() == 0)
+
+        try await Fantasma.track("new_event")
+        try await Fantasma.flush()
+
+        let request = try #require(await transport.requests().first)
+        #expect(request.url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
+        #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
+    }
+
+    @Test("configuring after restart with the same destination preserves persisted queued rows")
+    func restartPreservesQueuedRowsForSameDestination() async throws {
+        let firstTransport = RecordingTransport()
+        let secondTransport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: firstTransport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("old_event")
+
+        await Fantasma.resetSharedCoreForTesting()
+        await secondTransport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: secondTransport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.flush()
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+
+        let request = try #require(await secondTransport.requests().first)
+        let batch = try JSONDecoder().decode(EventBatch.self, from: try #require(request.httpBody))
+        #expect(batch.events.count == 1)
+        #expect(batch.events.first?.event == "old_event")
+        #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_test")
+    }
+
+    @Test("configuring after restart with a different destination discards persisted queued rows")
+    func restartDestinationDriftDiscardsQueuedRows() async throws {
+        let firstTransport = RecordingTransport()
+        let secondTransport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: firstTransport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("old_event")
+
+        await Fantasma.resetSharedCoreForTesting()
+        await secondTransport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: secondTransport)
+
+        try await Fantasma.configure(serverURL: replacementURL(), writeKey: "fg_ing_next")
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+
+        try await Fantasma.track("new_event")
+        try await Fantasma.flush()
+
+        let request = try #require(await secondTransport.requests().first)
+        let batch = try JSONDecoder().decode(EventBatch.self, from: try #require(request.httpBody))
+        #expect(batch.events.count == 1)
+        #expect(batch.events.first?.event == "new_event")
+        #expect(request.url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
+        #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
+    }
+
     @Test("flush removes queued rows after a 202 accepted response")
     func flushDeletesOnSuccess() async throws {
         let transport = RecordingTransport()
@@ -211,6 +400,54 @@ struct FantasmaSDKBehaviorTests {
             Issue.record("expected uploadFailed error")
         } catch let error as FantasmaError {
             #expect(error == .uploadFailed)
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+    }
+
+    @Test("flush throws invalidResponse when a 202 response body is malformed and keeps rows queued")
+    func flushRejectsMalformedAcceptedResponse() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(invalidAcceptedResponse(body: Data("not-json".utf8))))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected invalidResponse error")
+        } catch let error as FantasmaError {
+            #expect(error == .invalidResponse)
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+    }
+
+    @Test("flush throws invalidResponse when a 202 response accepts the wrong count and keeps rows queued")
+    func flushRejectsAcceptedCountMismatch() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(successResponse(accepted: 0)))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected invalidResponse error")
+        } catch let error as FantasmaError {
+            #expect(error == .invalidResponse)
         }
 
         let queue = try harness.makeQueue()
@@ -305,6 +542,155 @@ struct FantasmaSDKBehaviorTests {
 
         let queue = try harness.makeQueue()
         #expect(try await queue.count() == 0)
+    }
+
+    @Test("reconfiguring during an active upload waits for the current batch, discards remaining queued rows, then swaps destination")
+    func destinationDriftDuringActiveUploadWaitsForBatchBoundary() async throws {
+        let transport = SuspendedTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(transport: transport, uploadBatchSize: 1)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("old_event_1")
+        try await Fantasma.track("old_event_2")
+
+        let firstFlush = Task {
+            try await Fantasma.flush()
+        }
+        try await transport.waitUntilSendStarts()
+
+        let probe = CompletionProbe()
+        let reconfigure = Task {
+            defer { Task { await probe.markCompleted() } }
+            try await Fantasma.configure(serverURL: replacementURL(), writeKey: "fg_ing_next")
+        }
+
+        try await waitUntil(timeoutNanoseconds: 250_000_000) {
+            await transport.requests().count == 1
+        }
+        #expect(await probe.completed == false)
+
+        await transport.release()
+        try await firstFlush.value
+        try await reconfigure.value
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+
+        try await Fantasma.track("new_event")
+        let secondFlush = Task {
+            try await Fantasma.flush()
+        }
+        try await waitUntil(timeoutNanoseconds: 250_000_000) {
+            await transport.requests().count == 2
+        }
+        let requests = await transport.requests()
+        #expect(requests[0].url?.absoluteString == localhostURL().appendingPathComponent("v1/events").absoluteString)
+        #expect(requests[0].value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_test")
+        #expect(requests[1].url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
+        #expect(requests[1].value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
+        await transport.release()
+        try await secondFlush.value
+    }
+
+    @Test("reconfiguring during batch assembly discards the prepared old-destination batch before it uploads")
+    func destinationDriftDuringBatchAssemblyDiscardsPreparedBatch() async throws {
+        let transport = RecordingTransport()
+        let gate = SuspensionGate()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(
+            transport: transport,
+            afterBuildBatch: {
+                await gate.markStarted()
+                await gate.waitUntilReleased()
+            }
+        )
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("old_event")
+
+        let firstFlush = Task {
+            try await Fantasma.flush()
+        }
+        try await gate.waitUntilStarted()
+
+        let probe = CompletionProbe()
+        let reconfigure = Task {
+            defer { Task { await probe.markCompleted() } }
+            try await Fantasma.configure(serverURL: replacementURL(), writeKey: "fg_ing_next")
+        }
+
+        #expect(await probe.completed == false)
+        #expect(await transport.requests().isEmpty)
+
+        await gate.release()
+        try await firstFlush.value
+        try await reconfigure.value
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+        #expect(await transport.requests().isEmpty)
+
+        try await Fantasma.track("new_event")
+        try await Fantasma.flush()
+
+        let request = try #require(await transport.requests().first)
+        #expect(request.url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
+        #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
+    }
+
+    @Test("reconfiguring while track is preparing an event waits for enqueue completion, then discards the old-destination row")
+    func destinationDriftDuringTrackPreparationDiscardsQueuedRow() async throws {
+        let transport = RecordingTransport()
+        let gate = SuspensionGate()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(
+            transport: transport,
+            beforeEnqueue: {
+                await gate.markStarted()
+                await gate.waitUntilReleased()
+            }
+        )
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+
+        let track = Task {
+            try await Fantasma.track("old_event")
+        }
+        try await gate.waitUntilStarted()
+
+        let probe = CompletionProbe()
+        let reconfigure = Task {
+            defer { Task { await probe.markCompleted() } }
+            try await Fantasma.configure(serverURL: replacementURL(), writeKey: "fg_ing_next")
+        }
+
+        #expect(await probe.completed == false)
+
+        await gate.release()
+        try await track.value
+        try await reconfigure.value
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+
+        try await Fantasma.track("new_event")
+        try await Fantasma.flush()
+
+        let request = try #require(await transport.requests().first)
+        #expect(request.url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
+        #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
     }
 
     @Test("clear rotates identity even when live core creation fails")
@@ -418,6 +804,45 @@ private actor CompletionProbe {
     }
 }
 
+private actor SuspensionGate {
+    private var started = false
+    private var released = false
+    private var startContinuation: CheckedContinuation<Void, Error>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func markStarted() {
+        started = true
+        startContinuation?.resume()
+        startContinuation = nil
+    }
+
+    func waitUntilStarted() async throws {
+        if started {
+            return
+        }
+
+        try await withCheckedThrowingContinuation { continuation in
+            startContinuation = continuation
+        }
+    }
+
+    func waitUntilReleased() async {
+        if released {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func release() {
+        released = true
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
 private actor SuspendedTransport: FantasmaTransport {
     private var capturedRequests: [URLRequest] = []
     private var didStartSend = false
@@ -501,13 +926,17 @@ private struct TestHarness {
 
     func installSharedCore(
         transport: any FantasmaTransport,
-        uploadBatchSize: Int = 50
+        uploadBatchSize: Int = 50,
+        beforeEnqueue: @escaping @Sendable () async -> Void = {},
+        afterBuildBatch: @escaping @Sendable () async -> Void = {}
     ) async throws {
         let userDefaults = try #require(UserDefaults(suiteName: defaultsName))
         userDefaults.removePersistentDomain(forName: defaultsName)
         let core = try makeCore(
             transport: transport,
-            uploadBatchSize: uploadBatchSize
+            uploadBatchSize: uploadBatchSize,
+            beforeEnqueue: beforeEnqueue,
+            afterBuildBatch: afterBuildBatch
         )
         await Fantasma.replaceSharedCoreForTesting(core)
     }
@@ -528,7 +957,9 @@ private struct TestHarness {
 
     private func makeCore(
         transport: any FantasmaTransport,
-        uploadBatchSize: Int
+        uploadBatchSize: Int,
+        beforeEnqueue: @escaping @Sendable () async -> Void,
+        afterBuildBatch: @escaping @Sendable () async -> Void
     ) throws -> FantasmaCore {
         let dependencies = FantasmaDependencies(
             databaseURL: databaseURL,
@@ -538,14 +969,19 @@ private struct TestHarness {
             osVersion: { "18.3" },
             newIdentifier: { identifiers.next() },
             timerInterval: .seconds(3_600),
-            uploadBatchSize: uploadBatchSize
+            uploadBatchSize: uploadBatchSize,
+            beforeEnqueue: beforeEnqueue
         )
         let identityStore = IdentityStore(
             provider: UserDefaultsProvider(suiteName: defaultsName),
             newIdentifier: { identifiers.next() }
         )
         let queue = try SQLiteEventQueue(databaseURL: databaseURL)
-        let uploader = EventUploader(queue: queue, transport: transport)
+        let uploader = EventUploader(
+            queue: queue,
+            transport: transport,
+            afterBuildBatch: afterBuildBatch
+        )
         return FantasmaCore(
             dependencies: dependencies,
             identityStore: identityStore,
@@ -691,6 +1127,16 @@ private func successResponse(accepted: Int) -> (Data, HTTPURLResponse) {
     return (payload, response)
 }
 
+private func invalidAcceptedResponse(body: Data) -> (Data, HTTPURLResponse) {
+    let response = HTTPURLResponse(
+        url: URL(string: "http://localhost:8081/v1/events")!,
+        statusCode: 202,
+        httpVersion: nil,
+        headerFields: nil
+    )!
+    return (body, response)
+}
+
 private func makeFixedDate() -> Date {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -699,6 +1145,14 @@ private func makeFixedDate() -> Date {
 
 private func localhostURL() -> URL {
     URL(string: "http://localhost:8081")!
+}
+
+private func replacementURL() -> URL {
+    URL(string: "http://localhost:8082")!
+}
+
+private func localhostDestinationSignature() -> String {
+    try! FantasmaConfiguration.normalized(serverURL: localhostURL(), writeKey: "fg_ing_test").destinationSignature
 }
 
 private func waitUntil(

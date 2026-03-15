@@ -9,15 +9,117 @@ public enum FantasmaError: Error, Equatable, Sendable {
     case invalidWriteKey
     case unsupportedServerURL
     case invalidEventName
+    case invalidPropertyCount
+    case invalidPropertyName
+    case reservedPropertyName
     case encodingFailed
     case invalidResponse
     case uploadFailed
     case storageFailure(String)
 }
 
-struct FantasmaConfiguration: Sendable {
+struct FantasmaConfiguration: Equatable, Sendable {
     let serverURL: URL
     let writeKey: String
+
+    var destinationSignature: String {
+        "\(serverURL.absoluteString)|\(writeKey)"
+    }
+
+    static func normalized(serverURL: URL, writeKey: String) throws -> FantasmaConfiguration {
+        let normalizedWriteKey = writeKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedWriteKey.isEmpty else {
+            throw FantasmaError.invalidWriteKey
+        }
+
+        guard var components = URLComponents(url: serverURL, resolvingAgainstBaseURL: false) else {
+            throw FantasmaError.unsupportedServerURL
+        }
+
+        let normalizedScheme = components.scheme?.lowercased()
+        guard normalizedScheme == "http" || normalizedScheme == "https" else {
+            throw FantasmaError.unsupportedServerURL
+        }
+
+        components.scheme = normalizedScheme
+        if let host = components.host {
+            components.host = host.lowercased()
+        }
+        if components.percentEncodedPath == "/" {
+            components.percentEncodedPath = ""
+        } else {
+            components.percentEncodedPath = components.percentEncodedPath.trimmingTrailingSlashes()
+        }
+
+        guard let normalizedURL = components.url else {
+            throw FantasmaError.unsupportedServerURL
+        }
+
+        return FantasmaConfiguration(serverURL: normalizedURL, writeKey: normalizedWriteKey)
+    }
+}
+
+private enum EventPropertyValidation {
+    static let reservedKeys: Set<String> = [
+        "project_id",
+        "event",
+        "timestamp",
+        "install_id",
+        "properties",
+        "metric",
+        "granularity",
+        "start",
+        "end",
+        "start_date",
+        "end_date",
+        "group_by",
+        "platform",
+        "app_version",
+        "os_version",
+    ]
+
+    static func validated(_ properties: [String: String]?) throws -> [String: String]? {
+        guard let properties, !properties.isEmpty else {
+            return nil
+        }
+
+        guard properties.count <= 4 else {
+            throw FantasmaError.invalidPropertyCount
+        }
+
+        for key in properties.keys {
+            guard isValidKey(key) else {
+                throw FantasmaError.invalidPropertyName
+            }
+            guard !reservedKeys.contains(key) else {
+                throw FantasmaError.reservedPropertyName
+            }
+        }
+
+        return properties
+    }
+
+    static func isValidKey(_ key: String) -> Bool {
+        guard let first = key.unicodeScalars.first, key.count <= 63 else {
+            return false
+        }
+
+        guard first.value >= 97 && first.value <= 122 else {
+            return false
+        }
+
+        for scalar in key.unicodeScalars.dropFirst() {
+            let value = scalar.value
+            let isLowercaseLetter = value >= 97 && value <= 122
+            let isDigit = value >= 48 && value <= 57
+            let isUnderscore = value == 95
+            if !(isLowercaseLetter || isDigit || isUnderscore) {
+                return false
+            }
+        }
+
+        return true
+    }
 }
 
 struct EventEnvelope: Codable, Equatable, Sendable {
@@ -59,6 +161,7 @@ struct FantasmaDependencies: Sendable {
     let newIdentifier: @Sendable () -> String
     let timerInterval: Duration
     let uploadBatchSize: Int
+    let beforeEnqueue: @Sendable () async -> Void
 
     static func live() -> FantasmaDependencies {
         FantasmaDependencies(
@@ -79,7 +182,8 @@ struct FantasmaDependencies: Sendable {
             },
             newIdentifier: { UUID().uuidString.lowercased() },
             timerInterval: .seconds(10),
-            uploadBatchSize: 50
+            uploadBatchSize: 50,
+            beforeEnqueue: {}
         )
     }
 
@@ -111,9 +215,13 @@ actor FantasmaCore {
     private var identity: IdentityState?
     private var periodicFlushTask: Task<Void, Never>?
     private var backgroundFlushTask: Task<Void, Never>?
-    private var uploadInFlight = false
+    private var flushInProgress = false
     private var pendingUpload = false
+    private var trackOperationsInProgress = 0
+    private var reconfigurationInProgress = false
+    private var pendingReconfiguration: FantasmaConfiguration?
     private var flushWaiters: [CheckedContinuation<Void, Error>] = []
+    private var reconfigurationWaiters: [CheckedContinuation<Void, Error>] = []
 
     static func live() throws -> FantasmaCore {
         let dependencies = FantasmaDependencies.live()
@@ -150,20 +258,38 @@ actor FantasmaCore {
         backgroundFlushTask = nil
     }
 
-    func configure(serverURL: URL, writeKey: String) throws {
-        let normalizedWriteKey = writeKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedWriteKey.isEmpty else {
-            throw FantasmaError.invalidWriteKey
-        }
+    func configure(serverURL: URL, writeKey: String) async throws {
+        let configuration = try FantasmaConfiguration.normalized(serverURL: serverURL, writeKey: writeKey)
 
-        let normalizedScheme = serverURL.scheme?.lowercased()
-        guard normalizedScheme == "http" || normalizedScheme == "https" else {
-            throw FantasmaError.unsupportedServerURL
-        }
+        while true {
+            if reconfigurationInProgress {
+                try await waitForReconfiguration()
+                continue
+            }
 
-        configuration = FantasmaConfiguration(serverURL: serverURL, writeKey: normalizedWriteKey)
-        installTimerIfNeeded()
-        installBackgroundFlushTaskIfNeeded()
+            if self.configuration == configuration {
+                installTimerIfNeeded()
+                installBackgroundFlushTaskIfNeeded()
+                return
+            }
+
+            if flushInProgress || trackOperationsInProgress > 0 {
+                reconfigurationInProgress = true
+                pendingReconfiguration = configuration
+                try await waitForReconfiguration()
+                continue
+            }
+
+            reconfigurationInProgress = true
+            do {
+                try await applyConfigurationChange(to: configuration)
+                finishReconfiguration()
+                return
+            } catch {
+                failReconfiguration(error)
+                throw error
+            }
+        }
     }
 
     func track(_ eventName: String, properties: [String: String]?) async throws {
@@ -176,30 +302,50 @@ actor FantasmaCore {
             throw FantasmaError.invalidEventName
         }
 
-        let now = dependencies.now()
-        let identity = await currentIdentity()
-        let event = EventEnvelope(
-            event: name,
-            timestamp: FantasmaJSON.timestamp(from: now),
-            installId: identity.installID,
-            platform: "ios",
-            appVersion: dependencies.appVersion(),
-            osVersion: dependencies.osVersion(),
-            properties: properties?.isEmpty == false ? properties : nil
-        )
-
-        let payload: Data
+        trackOperationsInProgress += 1
         do {
-            payload = try JSONEncoder().encode(event)
+            let validatedProperties = try EventPropertyValidation.validated(properties)
+
+            let now = dependencies.now()
+            let identity = await currentIdentity()
+            let event = EventEnvelope(
+                event: name,
+                timestamp: FantasmaJSON.timestamp(from: now),
+                installId: identity.installID,
+                platform: "ios",
+                appVersion: dependencies.appVersion(),
+                osVersion: dependencies.osVersion(),
+                properties: validatedProperties
+            )
+
+            let payload: Data
+            do {
+                payload = try JSONEncoder().encode(event)
+            } catch {
+                throw FantasmaError.encodingFailed
+            }
+
+            await dependencies.beforeEnqueue()
+            guard let configuration else {
+                throw FantasmaError.notConfigured
+            }
+            try await eventQueue.enqueue(
+                payload: payload,
+                createdAt: Int64(now.timeIntervalSince1970),
+                destinationSignature: configuration.destinationSignature
+            )
+
+            if try await eventQueue.count() >= dependencies.uploadBatchSize {
+                scheduleBackgroundFlush()
+            }
         } catch {
-            throw FantasmaError.encodingFailed
+            trackOperationsInProgress -= 1
+            _ = try? await applyPendingReconfigurationIfNeeded()
+            throw error
         }
 
-        try await eventQueue.enqueue(payload: payload, createdAt: Int64(now.timeIntervalSince1970))
-
-        if try await eventQueue.count() >= dependencies.uploadBatchSize {
-            scheduleBackgroundFlush()
-        }
+        trackOperationsInProgress -= 1
+        _ = try await applyPendingReconfigurationIfNeeded()
     }
 
     func clear() async {
@@ -258,7 +404,7 @@ actor FantasmaCore {
         allowUnconfigured: Bool,
         waitForInFlight: Bool
     ) async throws {
-        guard !uploadInFlight else {
+        guard !flushInProgress else {
             pendingUpload = true
             if waitForInFlight {
                 try await withCheckedThrowingContinuation { continuation in
@@ -268,7 +414,7 @@ actor FantasmaCore {
             return
         }
 
-        guard let configuration else {
+        guard configuration != nil else {
             if allowUnconfigured {
                 return
             }
@@ -276,18 +422,58 @@ actor FantasmaCore {
         }
 
         do {
-            uploadInFlight = true
-            defer { uploadInFlight = false }
+            flushInProgress = true
+            defer { flushInProgress = false }
 
             while true {
-                pendingUpload = false
-
-                guard let batch = try await uploader.makeBatch(limit: dependencies.uploadBatchSize) else {
+                if try await applyPendingReconfigurationIfNeeded(allowWhileFlushing: true) {
                     resumeFlushWaiters()
                     return
                 }
 
-                try await uploader.upload(batch, configuration: configuration)
+                pendingUpload = false
+
+                guard let configuration = self.configuration else {
+                    if allowUnconfigured {
+                        resumeFlushWaiters()
+                        return
+                    }
+                    throw FantasmaError.notConfigured
+                }
+
+                guard let batch = try await uploader.makeBatch(limit: dependencies.uploadBatchSize) else {
+                    if try await applyPendingReconfigurationIfNeeded(allowWhileFlushing: true) {
+                        resumeFlushWaiters()
+                        return
+                    }
+                    resumeFlushWaiters()
+                    return
+                }
+
+                if try await applyPendingReconfigurationIfNeeded(allowWhileFlushing: true) {
+                    resumeFlushWaiters()
+                    return
+                }
+
+                do {
+                    try await uploader.upload(batch, configuration: configuration)
+                } catch {
+                    do {
+                        _ = try await applyPendingReconfigurationIfNeeded(allowWhileFlushing: true)
+                    } catch {
+                        failFlushWaiters(error)
+                        throw error
+                    }
+
+                    failFlushWaiters(error)
+                    throw error
+                }
+
+                if try await applyPendingReconfigurationIfNeeded(allowWhileFlushing: true) {
+                    resumeFlushWaiters()
+                    return
+                }
+
                 let queueCount = try await eventQueue.count()
                 if !(pendingUpload || queueCount > 0) {
                     resumeFlushWaiters()
@@ -306,6 +492,43 @@ actor FantasmaCore {
         }
     }
 
+    private func applyConfigurationChange(to configuration: FantasmaConfiguration) async throws {
+        let persistedDestinationSignature = try await eventQueue.destinationSignature()
+        let shouldDiscardQueuedRows =
+            persistedDestinationSignature != nil
+            && persistedDestinationSignature != configuration.destinationSignature
+        if shouldDiscardQueuedRows {
+            try await eventQueue.reset()
+            pendingUpload = false
+        }
+
+        self.configuration = configuration
+        pendingReconfiguration = nil
+        installTimerIfNeeded()
+        installBackgroundFlushTaskIfNeeded()
+    }
+
+    private func applyPendingReconfigurationIfNeeded(
+        allowWhileFlushing: Bool = false
+    ) async throws -> Bool {
+        guard let configuration = pendingReconfiguration else {
+            return false
+        }
+
+        guard (allowWhileFlushing || !flushInProgress) && trackOperationsInProgress == 0 else {
+            return false
+        }
+
+        do {
+            try await applyConfigurationChange(to: configuration)
+            finishReconfiguration()
+            return true
+        } catch {
+            failReconfiguration(error)
+            throw error
+        }
+    }
+
     private func resumeFlushWaiters() {
         let waiters = flushWaiters
         flushWaiters.removeAll(keepingCapacity: false)
@@ -320,5 +543,44 @@ actor FantasmaCore {
         for waiter in waiters {
             waiter.resume(throwing: error)
         }
+    }
+
+    private func waitForReconfiguration() async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            reconfigurationWaiters.append(continuation)
+        }
+    }
+
+    private func finishReconfiguration() {
+        reconfigurationInProgress = false
+        let waiters = reconfigurationWaiters
+        reconfigurationWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func failReconfiguration(_ error: Error) {
+        reconfigurationInProgress = false
+        pendingReconfiguration = nil
+        let waiters = reconfigurationWaiters
+        reconfigurationWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume(throwing: error)
+        }
+    }
+}
+
+private extension String {
+    func trimmingTrailingSlashes() -> String {
+        guard !isEmpty else {
+            return self
+        }
+
+        var value = self
+        while value.count > 1 && value.hasSuffix("/") {
+            value.removeLast()
+        }
+        return value == "/" ? "" : value
     }
 }

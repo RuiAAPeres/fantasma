@@ -22,6 +22,10 @@ internal struct QueuedEventRow: Equatable, Sendable {
 }
 
 internal actor SQLiteEventQueue {
+    private enum QueueStateKey {
+        static let destinationSignature = "destination_signature"
+    }
+
     private let database: SQLiteDatabaseHandle
 
     init(databaseURL: URL) throws {
@@ -62,15 +66,42 @@ internal actor SQLiteEventQueue {
             sqlite3_free(errorMessage)
             throw FantasmaError.storageFailure(message)
         }
+
+        errorMessage = nil
+        if sqlite3_exec(
+            self.database.pointer,
+            """
+            CREATE TABLE IF NOT EXISTS queue_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """,
+            nil,
+            nil,
+            &errorMessage
+        ) != SQLITE_OK {
+            let message = errorMessage.map { String(cString: $0) } ?? "unknown sqlite error"
+            sqlite3_free(errorMessage)
+            throw FantasmaError.storageFailure(message)
+        }
     }
 
-    func enqueue(payload: Data, createdAt: Int64) throws {
-        let statement = try prepare("INSERT INTO events (payload, created_at) VALUES (?, ?);")
-        defer { sqlite3_finalize(statement) }
+    func enqueue(payload: Data, createdAt: Int64, destinationSignature: String) throws {
+        try inTransaction {
+            let existingSignature = try readQueueState(for: QueueStateKey.destinationSignature)
+            if let existingSignature, existingSignature != destinationSignature {
+                throw FantasmaError.storageFailure("queue destination mismatch")
+            }
 
-        try bind(payload, to: statement, at: 1)
-        try bind(createdAt, to: statement, at: 2)
-        try step(statement)
+            try writeQueueState(destinationSignature, for: QueueStateKey.destinationSignature)
+
+            let statement = try prepare("INSERT INTO events (payload, created_at) VALUES (?, ?);")
+            defer { sqlite3_finalize(statement) }
+
+            try bind(payload, to: statement, at: 1)
+            try bind(createdAt, to: statement, at: 2)
+            try step(statement)
+        }
     }
 
     func peek(limit: Int) throws -> [QueuedEventRow] {
@@ -119,15 +150,40 @@ internal actor SQLiteEventQueue {
             return
         }
 
-        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
-        let statement = try prepare("DELETE FROM events WHERE id IN (\(placeholders));")
-        defer { sqlite3_finalize(statement) }
+        try inTransaction {
+            let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+            let statement = try prepare("DELETE FROM events WHERE id IN (\(placeholders));")
+            defer { sqlite3_finalize(statement) }
 
-        for (index, id) in ids.enumerated() {
-            try bind(id, to: statement, at: Int32(index + 1))
+            for (index, id) in ids.enumerated() {
+                try bind(id, to: statement, at: Int32(index + 1))
+            }
+
+            try step(statement)
+
+            if try rowCount() == 0 {
+                try deleteQueueState(for: QueueStateKey.destinationSignature)
+            }
+        }
+    }
+
+    func reset() throws {
+        try inTransaction {
+            try execute("DELETE FROM events;")
+            try deleteQueueState(for: QueueStateKey.destinationSignature)
+        }
+    }
+
+    func destinationSignature() throws -> String? {
+        let count = try rowCount()
+        guard count > 0 else {
+            if try readQueueState(for: QueueStateKey.destinationSignature) != nil {
+                try deleteQueueState(for: QueueStateKey.destinationSignature)
+            }
+            return nil
         }
 
-        try step(statement)
+        return try readQueueState(for: QueueStateKey.destinationSignature)
     }
 
     private func execute(_ sql: String) throws {
@@ -169,10 +225,77 @@ internal actor SQLiteEventQueue {
         }
     }
 
+    private func rowCount() throws -> Int {
+        let statement = try prepare("SELECT COUNT(*) FROM events;")
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw FantasmaError.storageFailure("failed to count queued events")
+        }
+
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private func readQueueState(for key: String) throws -> String? {
+        let statement = try prepare("SELECT value FROM queue_state WHERE key = ? LIMIT 1;")
+        defer { sqlite3_finalize(statement) }
+
+        try bind(key, to: statement, at: 1)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        guard let text = sqlite3_column_text(statement, 0) else {
+            return nil
+        }
+
+        return String(cString: text)
+    }
+
+    private func writeQueueState(_ value: String, for key: String) throws {
+        let statement = try prepare("""
+            INSERT INTO queue_state (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """)
+        defer { sqlite3_finalize(statement) }
+
+        try bind(key, to: statement, at: 1)
+        try bind(value, to: statement, at: 2)
+        try step(statement)
+    }
+
+    private func deleteQueueState(for key: String) throws {
+        let statement = try prepare("DELETE FROM queue_state WHERE key = ?;")
+        defer { sqlite3_finalize(statement) }
+
+        try bind(key, to: statement, at: 1)
+        try step(statement)
+    }
+
+    private func inTransaction<T>(_ operation: () throws -> T) throws -> T {
+        try execute("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            let result = try operation()
+            try execute("COMMIT;")
+            return result
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
     private func lastErrorMessage() -> String {
         guard let database = database.pointer else {
             return "database is not open"
         }
         return String(cString: sqlite3_errmsg(database))
+    }
+
+    private func bind(_ value: String, to statement: OpaquePointer?, at index: Int32) throws {
+        guard sqlite3_bind_text(statement, index, value, -1, sqliteTransient) == SQLITE_OK else {
+            throw FantasmaError.storageFailure(lastErrorMessage())
+        }
     }
 }

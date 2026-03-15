@@ -264,6 +264,9 @@ Current iOS SDK shape:
 - serialize each tracked event to JSON and store it as an immutable SQLite row
 - auto-populate `platform`, `app_version`, and `os_version`
 - upload queued events asynchronously to `POST /v1/events` using an `ingest` key only
+- reject invalid event property maps before they enter the local queue: at most 4 keys, `^[a-z][a-z0-9_]{0,62}$`, and no reserved query or built-in keys such as `metric`, `granularity`, `start`, `end`, `platform`, `app_version`, or `os_version`
+- treat malformed `202 Accepted` envelopes as invalid responses and keep queued rows for later operator-visible handling
+- when `configure(serverURL, writeKey)` changes destination, finish the current upload boundary, discard still-queued rows from that old destination even across relaunches, and only then let future uploads target the new destination
 
 Current upload triggers:
 
@@ -275,3 +278,4 @@ Current upload triggers:
 Current identity rules:
 
 - the SDK generates one local install identity on first use, reuses it until `clear()`, and leaves already queued rows untouched when that identity rotates
+- `clear()` remains identity-only; queue deletion is reserved for destination-drift reconfiguration rather than normal identity rotation
