@@ -231,6 +231,148 @@ async fn pipeline_provisions_project_and_scopes_ingest_and_read_keys(pool: PgPoo
 }
 
 #[sqlx::test]
+async fn event_discovery_routes_return_catalog_and_top_events_for_real_ingest(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-pro-1",
+                                "platform": "ios",
+                                "app_version": "1.0.0",
+                                "os_version": "18.3",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "strava"
+                                }
+                            },
+                            {
+                                "event": "purchase_completed",
+                                "timestamp": "2026-01-01T00:05:00Z",
+                                "install_id": "install-pro-1",
+                                "platform": "ios",
+                                "app_version": "1.0.0",
+                                "os_version": "18.3",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "strava"
+                                }
+                            },
+                            {
+                                "event": "screen_view",
+                                "timestamp": "2026-01-01T00:10:00Z",
+                                "install_id": "install-free-1",
+                                "platform": "ios",
+                                "app_version": "1.0.1",
+                                "os_version": "18.4",
+                                "properties": {
+                                    "plan": "free",
+                                    "provider": "garmin"
+                                }
+                            },
+                            {
+                                "event": "screen_view",
+                                "timestamp": "2026-01-01T00:15:00Z",
+                                "install_id": "install-free-2",
+                                "platform": "ios",
+                                "app_version": "1.0.1",
+                                "os_version": "18.4",
+                                "properties": {
+                                    "plan": "free",
+                                    "provider": "garmin"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    let catalog_response = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics/events/catalog?start=2026-01-01&end=2026-01-01")
+                .header("x-fantasma-key", &provisioned.read_key)
+                .body(Body::empty())
+                .expect("valid catalog request"),
+        )
+        .await
+        .expect("catalog request succeeds");
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(catalog_response).await,
+        serde_json::json!({
+            "events": [
+                { "name": "screen_view", "last_seen_at": "2026-01-01T00:15:00Z" },
+                { "name": "purchase_completed", "last_seen_at": "2026-01-01T00:05:00Z" },
+                { "name": "app_open", "last_seen_at": "2026-01-01T00:00:00Z" }
+            ]
+        })
+    );
+
+    let top_response = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics/events/top?start=2026-01-01&end=2026-01-01&limit=3")
+                .header("x-fantasma-key", &provisioned.read_key)
+                .body(Body::empty())
+                .expect("valid top request"),
+        )
+        .await
+        .expect("top request succeeds");
+    assert_eq!(top_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(top_response).await,
+        serde_json::json!({
+            "events": [
+                { "name": "screen_view", "count": 2 },
+                { "name": "app_open", "count": 1 },
+                { "name": "purchase_completed", "count": 1 }
+            ]
+        })
+    );
+
+    let filtered_top_response = api
+        .oneshot(
+            Request::get("/v1/metrics/events/top?start=2026-01-01&end=2026-01-01&plan=pro&limit=3")
+                .header("x-fantasma-key", &provisioned.read_key)
+                .body(Body::empty())
+                .expect("valid filtered top request"),
+        )
+        .await
+        .expect("filtered top request succeeds");
+    assert_eq!(filtered_top_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(filtered_top_response).await,
+        serde_json::json!({
+            "events": [
+                { "name": "app_open", "count": 1 },
+                { "name": "purchase_completed", "count": 1 }
+            ]
+        })
+    );
+}
+
+#[sqlx::test]
 async fn pipeline_exposes_bucketed_session_metrics_after_worker_batch(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 

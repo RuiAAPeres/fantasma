@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     body::{Body, to_bytes},
     http::{
-        Request, StatusCode,
+        Method, Request, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
     response::Response,
@@ -447,4 +447,302 @@ async fn management_create_routes_reject_unknown_json_fields(pool: PgPool) {
         response_json(create_key_response).await,
         serde_json::json!({ "error": "invalid_request" })
     );
+}
+
+#[sqlx::test]
+async fn project_metadata_routes_require_operator_bearer_auth(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_id, _, read_key) = provision_project(api.clone()).await;
+
+    let unauthorized_get = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{project_id}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(unauthorized_get.status(), StatusCode::UNAUTHORIZED);
+
+    let read_key_get = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{project_id}"))
+                .header("x-fantasma-key", &read_key)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(read_key_get.status(), StatusCode::UNAUTHORIZED);
+
+    let operator_get = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(operator_get.status(), StatusCode::OK);
+
+    let read_key_patch = api
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/v1/projects/{project_id}"))
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &read_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "Renamed Project"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(read_key_patch.status(), StatusCode::UNAUTHORIZED);
+
+    let operator_patch = api
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "Renamed Project"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(operator_patch.status(), StatusCode::OK);
+}
+
+#[sqlx::test]
+async fn project_metadata_get_and_patch_return_project_payload(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_id, _, _) = provision_project(api.clone()).await;
+
+    let get_response = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(get_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(get_response).await["project"]["name"],
+        serde_json::json!("API Test Project")
+    );
+
+    let patch_response = api
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "Renamed API Test Project"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(patch_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(patch_response).await["project"]["name"],
+        serde_json::json!("Renamed API Test Project")
+    );
+
+    let get_after_patch = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(get_after_patch.status(), StatusCode::OK);
+    let project = response_json(get_after_patch).await["project"].clone();
+    assert_eq!(project["id"], serde_json::json!(project_id));
+    assert_eq!(
+        project["name"],
+        serde_json::json!("Renamed API Test Project")
+    );
+    assert!(project["created_at"].is_string());
+}
+
+#[sqlx::test]
+async fn project_metadata_patch_rejects_unknown_fields_and_missing_projects(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let missing_project_id = Uuid::new_v4();
+    let (project_id, _, _) = provision_project(api.clone()).await;
+
+    let invalid_patch = api
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "Still Valid",
+                        "slug": "not-allowed"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(invalid_patch.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response_json(invalid_patch).await,
+        serde_json::json!({ "error": "invalid_request" })
+    );
+
+    let missing_get = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{missing_project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(missing_get.status(), StatusCode::NOT_FOUND);
+
+    let missing_patch = api
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/v1/projects/{missing_project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "Renamed Project"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(missing_patch.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test]
+async fn event_discovery_routes_require_read_keys(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_id, ingest_key, read_key) = provision_project(api.clone()).await;
+
+    let operator_catalog = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics/events/catalog?start=2026-01-01&end=2026-01-02")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(operator_catalog.status(), StatusCode::UNAUTHORIZED);
+
+    let ingest_top = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics/events/top?start=2026-01-01&end=2026-01-02")
+                .header("x-fantasma-key", &ingest_key)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(ingest_top.status(), StatusCode::UNAUTHORIZED);
+
+    let read_catalog = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics/events/catalog?start=2026-01-01&end=2026-01-02")
+                .header("x-fantasma-key", &read_key)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(read_catalog.status(), StatusCode::OK);
+
+    let invalid_project_query = api
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/v1/metrics/events/catalog?project_id={project_id}&start=2026-01-01&end=2026-01-02"
+            ))
+            .header("x-fantasma-key", &read_key)
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(
+        invalid_project_query.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let invalid_limit = api
+        .oneshot(
+            Request::get("/v1/metrics/events/top?start=2026-01-01&end=2026-01-02&limit=0")
+                .header("x-fantasma-key", &read_key)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(invalid_limit.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

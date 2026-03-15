@@ -54,6 +54,18 @@ pub struct ProjectRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCatalogRecord {
+    pub event_name: String,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopEventRecord {
+    pub event_name: String,
+    pub event_count: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKeyKind {
     Ingest,
@@ -520,6 +532,27 @@ pub async fn load_project(
         "#,
     )
     .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(project_record_from_row).transpose()
+}
+
+pub async fn rename_project(
+    pool: &PgPool,
+    project_id: Uuid,
+    name: &str,
+) -> Result<Option<ProjectRecord>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        UPDATE projects
+        SET name = $2
+        WHERE id = $1
+        RETURNING id, name, created_at
+        "#,
+    )
+    .bind(project_id)
+    .bind(name)
     .fetch_optional(pool)
     .await?;
 
@@ -1553,6 +1586,74 @@ where
     .await?;
 
     rows.into_iter().map(raw_event_from_row).collect()
+}
+
+pub async fn list_event_catalog(
+    pool: &PgPool,
+    project_id: Uuid,
+    start: DateTime<Utc>,
+    end_exclusive: DateTime<Utc>,
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventCatalogRecord>, StoreError> {
+    let mut query = QueryBuilder::<Postgres>::new(
+        "SELECT event_name, MAX(timestamp) AS last_seen_at \
+         FROM events_raw \
+         WHERE project_id = ",
+    );
+    query.push_bind(project_id);
+    query.push(" AND timestamp >= ");
+    query.push_bind(start);
+    query.push(" AND timestamp < ");
+    query.push_bind(end_exclusive);
+    append_raw_event_filters(&mut query, filters);
+    query.push(" GROUP BY event_name ORDER BY MAX(timestamp) DESC, event_name ASC");
+
+    let rows = query.build().fetch_all(pool).await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(EventCatalogRecord {
+                event_name: row.try_get("event_name")?,
+                last_seen_at: row.try_get("last_seen_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(StoreError::Database)
+}
+
+pub async fn list_top_events(
+    pool: &PgPool,
+    project_id: Uuid,
+    start: DateTime<Utc>,
+    end_exclusive: DateTime<Utc>,
+    filters: &BTreeMap<String, String>,
+    limit: i64,
+) -> Result<Vec<TopEventRecord>, StoreError> {
+    let mut query = QueryBuilder::<Postgres>::new(
+        "SELECT event_name, COUNT(*)::bigint AS event_count \
+         FROM events_raw \
+         WHERE project_id = ",
+    );
+    query.push_bind(project_id);
+    query.push(" AND timestamp >= ");
+    query.push_bind(start);
+    query.push(" AND timestamp < ");
+    query.push_bind(end_exclusive);
+    append_raw_event_filters(&mut query, filters);
+    query.push(" GROUP BY event_name ORDER BY COUNT(*) DESC, event_name ASC LIMIT ");
+    query.push_bind(limit);
+
+    let rows = query.build().fetch_all(pool).await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(TopEventRecord {
+                event_name: row.try_get("event_name")?,
+                event_count: row.try_get("event_count")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(StoreError::Database)
 }
 
 pub async fn fetch_events_for_install_after_id_through_in_tx(
@@ -4412,6 +4513,28 @@ fn platform_from_str(value: &str) -> Result<Platform, StoreError> {
         "ios" => Ok(Platform::Ios),
         "android" => Ok(Platform::Android),
         other => Err(StoreError::InvalidPlatform(other.to_owned())),
+    }
+}
+
+fn append_raw_event_filters(
+    query: &mut QueryBuilder<'_, Postgres>,
+    filters: &BTreeMap<String, String>,
+) {
+    for (key, value) in filters {
+        match key.as_str() {
+            "platform" | "app_version" | "os_version" => {
+                query.push(" AND ");
+                query.push(key.as_str());
+                query.push(" = ");
+                query.push_bind(value.clone());
+            }
+            _ => {
+                query.push(" AND properties ->> ");
+                query.push_bind(key.clone());
+                query.push(" = ");
+                query.push_bind(value.clone());
+            }
+        }
     }
 }
 

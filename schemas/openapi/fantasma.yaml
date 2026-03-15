@@ -136,6 +136,87 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/projects/{project_id}:
+    get:
+      tags:
+        - management
+      summary: Get project metadata
+      operationId: getProject
+      security:
+        - OperatorBearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectPathId'
+      responses:
+        '200':
+          description: Project metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Project not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while loading project metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    patch:
+      tags:
+        - management
+      summary: Rename a project
+      operationId: patchProject
+      security:
+        - OperatorBearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectPathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchProjectRequest'
+      responses:
+        '200':
+          description: Project metadata after the narrow update.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Project not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while updating project metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/projects/{project_id}/keys:
     get:
       tags:
@@ -331,6 +412,140 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/events/catalog:
+    get:
+      tags:
+        - metrics
+      summary: List known event names in a time window
+      operationId: getEventCatalog
+      security:
+        - ProjectKeyHeader: []
+      description: |
+        Returns distinct event names seen for the authenticated project in the
+        requested time window, ordered by most recent occurrence.
+
+        These reads are project-scoped from the authenticated `read` key and
+        read directly from accepted raw events. They are intended for event
+        discovery, not bucketed chart series.
+
+        Use normal query params for equality filters:
+
+        - built-ins: `platform`, `app_version`, `os_version`
+        - explicit properties: any additional non-reserved query key matching
+          `^[a-z][a-z0-9_]{0,62}$`
+        - legacy public params such as `project_id`, `start_date`, and
+          `end_date` fail fast and are never reinterpreted as property filters
+      x-fantasma-explicit-property-filters:
+        type: object
+        description: |
+          Any additional non-reserved top-level query parameter whose key
+          matches `^[a-z][a-z0-9_]{0,62}$` is treated as an equality filter on
+          an explicit event property.
+        additionalProperties:
+          type: string
+      parameters:
+        - $ref: '#/components/parameters/EventDiscoveryStart'
+        - $ref: '#/components/parameters/EventDiscoveryEnd'
+        - $ref: '#/components/parameters/PlatformFilter'
+        - $ref: '#/components/parameters/AppVersionFilter'
+        - $ref: '#/components/parameters/OsVersionFilter'
+      responses:
+        '200':
+          description: Distinct event names ordered by most recent occurrence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventCatalogResponse'
+        '401':
+          description: Missing, invalid, revoked, or wrong-kind project read key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `invalid_time_range`
+            - `invalid_query_key`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while loading event catalog data.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/events/top:
+    get:
+      tags:
+        - metrics
+      summary: Return ranked event counts in a time window
+      operationId: getTopEvents
+      security:
+        - ProjectKeyHeader: []
+      description: |
+        Returns ranked event counts for the authenticated project in the
+        requested time window, ordered by count descending and event name
+        ascending as a deterministic tie-breaker.
+
+        These reads are project-scoped from the authenticated `read` key and
+        read directly from accepted raw events. They are discovery helpers, not
+        worker-derived bucketed metrics.
+
+        Use normal query params for equality filters:
+
+        - built-ins: `platform`, `app_version`, `os_version`
+        - explicit properties: any additional non-reserved query key matching
+          `^[a-z][a-z0-9_]{0,62}$`
+        - legacy public params such as `project_id`, `start_date`, and
+          `end_date` fail fast and are never reinterpreted as property filters
+      x-fantasma-explicit-property-filters:
+        type: object
+        description: |
+          Any additional non-reserved top-level query parameter whose key
+          matches `^[a-z][a-z0-9_]{0,62}$` is treated as an equality filter on
+          an explicit event property.
+        additionalProperties:
+          type: string
+      parameters:
+        - $ref: '#/components/parameters/EventDiscoveryStart'
+        - $ref: '#/components/parameters/EventDiscoveryEnd'
+        - $ref: '#/components/parameters/TopEventsLimit'
+        - $ref: '#/components/parameters/PlatformFilter'
+        - $ref: '#/components/parameters/AppVersionFilter'
+        - $ref: '#/components/parameters/OsVersionFilter'
+      responses:
+        '200':
+          description: Ranked event counts in the requested window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopEventsResponse'
+        '401':
+          description: Missing, invalid, revoked, or wrong-kind project read key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `invalid_time_range`
+            - `invalid_query_key`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while loading top-events data.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/metrics/sessions:
     get:
       tags:
@@ -521,6 +736,34 @@ components:
       description: |
         Inclusive UTC bucket end. Use `YYYY-MM-DD` when `granularity=day`
         and RFC3339 `...:00:00Z` hour starts when `granularity=hour`.
+    EventDiscoveryStart:
+      in: query
+      name: start
+      required: true
+      schema:
+        type: string
+      description: |
+        Inclusive UTC start for event discovery reads. Use `YYYY-MM-DD` for
+        whole-day windows or RFC3339 timestamps for a narrower window.
+    EventDiscoveryEnd:
+      in: query
+      name: end
+      required: true
+      schema:
+        type: string
+      description: |
+        Inclusive UTC end for event discovery reads. Use `YYYY-MM-DD` for
+        whole-day windows or RFC3339 timestamps for a narrower window.
+    TopEventsLimit:
+      in: query
+      name: limit
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 10
+      description: Maximum number of ranked events to return.
   schemas:
     Project:
       type: object
@@ -547,6 +790,13 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Project'
+    ProjectResponse:
+      type: object
+      required:
+        - project
+      properties:
+        project:
+          $ref: '#/components/schemas/Project'
     ProjectKeyKind:
       type: string
       enum:
@@ -648,6 +898,15 @@ components:
           $ref: '#/components/schemas/Project'
         ingest_key:
           $ref: '#/components/schemas/ProjectKeyWithSecret'
+    PatchProjectRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
     CreateProjectKeyRequest:
       type: object
       additionalProperties: false
@@ -775,6 +1034,48 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/EventValidationIssue'
+    EventCatalogItem:
+      type: object
+      required:
+        - name
+        - last_seen_at
+      properties:
+        name:
+          type: string
+          minLength: 1
+        last_seen_at:
+          type: string
+          format: date-time
+    EventCatalogResponse:
+      type: object
+      required:
+        - events
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventCatalogItem'
+    TopEventItem:
+      type: object
+      required:
+        - name
+        - count
+      properties:
+        name:
+          type: string
+          minLength: 1
+        count:
+          type: integer
+          minimum: 0
+    TopEventsResponse:
+      type: object
+      required:
+        - events
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/TopEventItem'
     MetricGranularityValue:
       type: string
       enum:

@@ -20,12 +20,13 @@ use fantasma_core::{
     is_reserved_event_property_key, is_valid_event_property_key,
 };
 use fantasma_store::{
-    ApiKeyKind, EventMetricsAggregateCubeRow, EventMetricsCubeRow, PgPool, ProjectRecord,
-    ResolvedApiKey, SessionMetricsAggregateCubeRow, SessionMetricsCubeRow, StoreError,
-    create_api_key, create_project_with_api_key, fetch_event_metrics_aggregate_cube_rows_in_tx,
-    fetch_event_metrics_cube_rows_in_tx, fetch_session_metrics_aggregate_cube_rows_in_tx,
-    fetch_session_metrics_cube_rows_in_tx, generate_api_key_secret, list_api_keys, list_projects,
-    resolve_api_key, revoke_api_key,
+    ApiKeyKind, EventCatalogRecord, EventMetricsAggregateCubeRow, EventMetricsCubeRow, PgPool,
+    ProjectRecord, ResolvedApiKey, SessionMetricsAggregateCubeRow, SessionMetricsCubeRow,
+    StoreError, TopEventRecord, create_api_key, create_project_with_api_key,
+    fetch_event_metrics_aggregate_cube_rows_in_tx, fetch_event_metrics_cube_rows_in_tx,
+    fetch_session_metrics_aggregate_cube_rows_in_tx, fetch_session_metrics_cube_rows_in_tx,
+    generate_api_key_secret, list_api_keys, list_event_catalog, list_projects, list_top_events,
+    load_project, rename_project, resolve_api_key, revoke_api_key,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use sqlx::{Postgres, Transaction};
@@ -71,12 +72,38 @@ struct CreateApiKeyRequest {
     kind: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchProjectRequest {
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventDiscoveryQuery {
+    start: DateTime<Utc>,
+    end_exclusive: DateTime<Utc>,
+    filters: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TopEventsQuery {
+    window: EventDiscoveryQuery,
+    limit: i64,
+}
+
+const DEFAULT_TOP_EVENTS_LIMIT: i64 = 10;
+const MAX_TOP_EVENTS_LIMIT: i64 = 50;
+
 pub fn app(pool: PgPool, authorizer: Arc<StaticAdminAuthorizer>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route(
             "/v1/projects",
             get(list_projects_route).post(create_project_route),
+        )
+        .route(
+            "/v1/projects/{project_id}",
+            get(get_project_route).patch(patch_project_route),
         )
         .route(
             "/v1/projects/{project_id}/keys",
@@ -87,6 +114,8 @@ pub fn app(pool: PgPool, authorizer: Arc<StaticAdminAuthorizer>) -> Router {
             delete(revoke_project_key_route),
         )
         .route("/v1/metrics/events", get(events_metrics))
+        .route("/v1/metrics/events/catalog", get(event_catalog_route))
+        .route("/v1/metrics/events/top", get(top_events_route))
         .route("/v1/metrics/sessions", get(sessions_metrics))
         .with_state(AppState { authorizer, pool })
 }
@@ -325,6 +354,134 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
     })
 }
 
+fn parse_event_catalog_query(raw_query: &str) -> Result<EventDiscoveryQuery, &'static str> {
+    parse_event_discovery_query(raw_query, false).map(|(window, _)| window)
+}
+
+fn parse_top_events_query(raw_query: &str) -> Result<TopEventsQuery, &'static str> {
+    let (window, limit) = parse_event_discovery_query(raw_query, true)?;
+
+    Ok(TopEventsQuery {
+        window,
+        limit: limit.expect("top-events parser always returns a limit"),
+    })
+}
+
+fn parse_event_discovery_query(
+    raw_query: &str,
+    allow_limit: bool,
+) -> Result<(EventDiscoveryQuery, Option<i64>), &'static str> {
+    let mut start = None;
+    let mut end = None;
+    let mut filters = BTreeMap::new();
+    let mut limit = None;
+
+    for (raw_key, raw_value) in form_urlencoded::parse(raw_query.as_bytes()) {
+        let key = raw_key.into_owned();
+        let value = raw_value.into_owned();
+
+        match key.as_str() {
+            "start" => {
+                if start.is_some() {
+                    return Err("invalid_query_key");
+                }
+
+                start = Some(value);
+            }
+            "end" => {
+                if end.is_some() {
+                    return Err("invalid_query_key");
+                }
+
+                end = Some(value);
+            }
+            "limit" => {
+                if !allow_limit || limit.is_some() {
+                    return Err("invalid_query_key");
+                }
+
+                limit = Some(parse_top_events_limit(&value)?);
+            }
+            "platform" | "app_version" | "os_version" => {
+                if filters.insert(key, value).is_some() {
+                    return Err("invalid_query_key");
+                }
+            }
+            "project_id" | "event" | "metric" | "granularity" | "group_by" => {
+                return Err("invalid_query_key");
+            }
+            _ => {
+                if is_reserved_event_property_key(&key) || !is_valid_event_property_key(&key) {
+                    return Err("invalid_query_key");
+                }
+
+                if filters.insert(key, value).is_some() {
+                    return Err("invalid_query_key");
+                }
+            }
+        }
+    }
+
+    let (start, end_exclusive) = parse_event_discovery_window(
+        start.as_deref().ok_or("invalid_time_range")?,
+        end.as_deref().ok_or("invalid_time_range")?,
+    )?;
+
+    Ok((
+        EventDiscoveryQuery {
+            start,
+            end_exclusive,
+            filters,
+        },
+        Some(limit.unwrap_or(DEFAULT_TOP_EVENTS_LIMIT)).filter(|_| allow_limit),
+    ))
+}
+
+fn parse_top_events_limit(raw: &str) -> Result<i64, &'static str> {
+    let limit = raw.parse::<i64>().map_err(|_| "invalid_query_key")?;
+
+    if !(1..=MAX_TOP_EVENTS_LIMIT).contains(&limit) {
+        return Err("invalid_query_key");
+    }
+
+    Ok(limit)
+}
+
+fn parse_event_discovery_window(
+    start: &str,
+    end: &str,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), &'static str> {
+    if let (Ok(start_day), Ok(end_day)) = (parse_day_bucket(start), parse_day_bucket(end)) {
+        if start_day > end_day {
+            return Err("invalid_time_range");
+        }
+
+        return Ok((
+            start_day,
+            end_day
+                .checked_add_signed(ChronoDuration::days(1))
+                .ok_or("invalid_time_range")?,
+        ));
+    }
+
+    let start = DateTime::parse_from_rfc3339(start)
+        .map_err(|_| "invalid_time_range")?
+        .with_timezone(&Utc);
+    let end = DateTime::parse_from_rfc3339(end)
+        .map_err(|_| "invalid_time_range")?
+        .with_timezone(&Utc);
+
+    if start > end {
+        return Err("invalid_time_range");
+    }
+
+    Ok((
+        start,
+        end.checked_add_signed(ChronoDuration::microseconds(1))
+            .ok_or("invalid_time_range")?,
+    ))
+}
+
 fn parse_event_metric(raw: &str) -> Option<EventMetric> {
     match raw {
         "count" => Some(EventMetric::Count),
@@ -480,6 +637,67 @@ async fn create_project_route(
         .into_response()
 }
 
+async fn get_project_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<Uuid>,
+) -> axum::response::Response {
+    if let Err(response) = authorize_operator(&state.authorizer, &headers) {
+        return response;
+    }
+
+    match load_project(&state.pool, project_id).await {
+        Ok(Some(project)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "project": project_json(&project),
+            })),
+        )
+            .into_response(),
+        Ok(None) => query_error_response("not_found"),
+        Err(error) => {
+            tracing::error!(?error, project_id = %project_id, "failed to load project");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
+async fn patch_project_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<Uuid>,
+    body: Bytes,
+) -> axum::response::Response {
+    if let Err(response) = authorize_operator(&state.authorizer, &headers) {
+        return response;
+    }
+
+    let payload = match parse_json_body::<PatchProjectRequest>(&body) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+
+    let project_name = match validate_name(&payload.name) {
+        Some(name) => name,
+        None => return query_error_response("invalid_request"),
+    };
+
+    match rename_project(&state.pool, project_id, &project_name).await {
+        Ok(Some(project)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "project": project_json(&project),
+            })),
+        )
+            .into_response(),
+        Ok(None) => query_error_response("not_found"),
+        Err(error) => {
+            tracing::error!(?error, project_id = %project_id, "failed to rename project");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
 async fn list_project_keys_route(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -626,6 +844,20 @@ fn project_json(project: &ProjectRecord) -> serde_json::Value {
     })
 }
 
+fn event_catalog_json(event: &EventCatalogRecord) -> serde_json::Value {
+    serde_json::json!({
+        "name": event.event_name,
+        "last_seen_at": event.last_seen_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+    })
+}
+
+fn top_event_json(event: &TopEventRecord) -> serde_json::Value {
+    serde_json::json!({
+        "name": event.event_name,
+        "count": event.event_count,
+    })
+}
+
 fn api_key_metadata_json(key: &fantasma_store::ApiKeyRecord) -> serde_json::Value {
     serde_json::json!({
         "id": key.id,
@@ -721,6 +953,83 @@ async fn sessions_metrics(
         }
         Err(MetricsResponseError::Store(error)) => {
             tracing::error!(?error, "failed to load session metrics");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
+async fn event_catalog_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> impl IntoResponse {
+    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+
+    let query = match parse_event_catalog_query(raw_query.as_deref().unwrap_or_default()) {
+        Ok(query) => query,
+        Err(error) => return query_error_response(error),
+    };
+
+    match list_event_catalog(
+        &state.pool,
+        auth.project_id,
+        query.start,
+        query.end_exclusive,
+        &query.filters,
+    )
+    .await
+    {
+        Ok(events) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "events": events.iter().map(event_catalog_json).collect::<Vec<_>>(),
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(?error, project_id = %auth.project_id, "failed to list event catalog");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
+async fn top_events_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> impl IntoResponse {
+    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+
+    let query = match parse_top_events_query(raw_query.as_deref().unwrap_or_default()) {
+        Ok(query) => query,
+        Err(error) => return query_error_response(error),
+    };
+
+    match list_top_events(
+        &state.pool,
+        auth.project_id,
+        query.window.start,
+        query.window.end_exclusive,
+        &query.window.filters,
+        query.limit,
+    )
+    .await
+    {
+        Ok(events) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "events": events.iter().map(top_event_json).collect::<Vec<_>>(),
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(?error, project_id = %auth.project_id, "failed to list top events");
             query_error_response("internal_server_error")
         }
     }
@@ -1879,6 +2188,15 @@ mod tests {
         let ingest_422 = &spec["paths"]["/v1/events"]["post"]["responses"]["422"]["content"]["application/json"]
             ["schema"]["oneOf"];
         let event_metrics_500 = &spec["paths"]["/v1/metrics/events"]["get"]["responses"]["500"];
+        let catalog_security = spec["paths"]["/v1/metrics/events/catalog"]["get"]["security"]
+            .as_sequence()
+            .expect("catalog security");
+        let top_parameters = spec["paths"]["/v1/metrics/events/top"]["get"]["parameters"]
+            .as_sequence()
+            .expect("top-events parameters");
+        let project_route_security = spec["paths"]["/v1/projects/{project_id}"]["get"]["security"]
+            .as_sequence()
+            .expect("project route security");
         let session_metrics_500 = &spec["paths"]["/v1/metrics/sessions"]["get"]["responses"]["500"];
         let explicit_filters =
             &spec["paths"]["/v1/metrics/events"]["get"]["x-fantasma-explicit-property-filters"];
@@ -1920,6 +2238,18 @@ mod tests {
             "event metrics route must document internal_server_error"
         );
         assert!(
+            spec["paths"]["/v1/projects/{project_id}"]["patch"].is_mapping(),
+            "openapi must publish the project metadata patch route"
+        );
+        assert!(
+            spec["paths"]["/v1/metrics/events/catalog"]["get"].is_mapping(),
+            "openapi must publish the event catalog route"
+        );
+        assert!(
+            spec["paths"]["/v1/metrics/events/top"]["get"].is_mapping(),
+            "openapi must publish the top-events route"
+        );
+        assert!(
             session_metrics_500.is_mapping(),
             "session metrics route must document internal_server_error"
         );
@@ -1946,10 +2276,28 @@ mod tests {
             "management routes must document operator bearer auth"
         );
         assert!(
+            project_route_security
+                .iter()
+                .any(|entry| entry["OperatorBearerAuth"].is_sequence()),
+            "project metadata routes must document operator bearer auth"
+        );
+        assert!(
             metrics_security
                 .iter()
                 .any(|entry| entry["ProjectKeyHeader"].is_sequence()),
             "metrics routes must document project-key auth"
+        );
+        assert!(
+            catalog_security
+                .iter()
+                .any(|entry| entry["ProjectKeyHeader"].is_sequence()),
+            "event catalog must document project-key auth"
+        );
+        assert!(
+            top_parameters
+                .iter()
+                .any(|parameter| parameter["$ref"] == "#/components/parameters/TopEventsLimit"),
+            "top-events must document the limit parameter"
         );
     }
 

@@ -20,7 +20,7 @@
 ```text
 operator
   -> fantasma CLI
-  -> GET/POST /v1/projects* and GET /v1/metrics/*
+  -> GET/POST/PATCH /v1/projects* and GET /v1/metrics/*
   -> fantasma-api
   -> projects + api_keys in Postgres
 
@@ -31,6 +31,7 @@ curl / SDK
   -> fantasma-worker
   -> derived Postgres sessions, session_daily, session_daily_installs, event bucket rollups, session bucket rollups, and install first-seen state
   -> GET /v1/metrics/events and /v1/metrics/sessions
+  -> GET /v1/metrics/events/catalog and /v1/metrics/events/top
   -> query API
 ```
 
@@ -144,7 +145,8 @@ Responsibilities:
 - expose operator-authenticated project/key management routes
 - expose project-scoped query endpoints
 - parse the explicit event-metrics query surface from raw query params
-- read only worker-derived aggregates for analytics queries
+- read worker-derived aggregates for bucketed analytics queries
+- read raw accepted events for event discovery helpers such as catalog and top-events
 - provide a stable public API for first-party and third-party clients
 
 Current operator access pattern:
@@ -159,7 +161,7 @@ Auth model:
 - one static operator bearer token is reserved for `/v1/projects*`
 - project keys are scoped to exactly one project and one key kind
 - `ingest` keys authenticate `POST /v1/events`
-- `read` keys authenticate `/v1/metrics/*`
+- `read` keys authenticate `/v1/metrics/*`, including the event discovery helpers
 - metrics project scope is derived from the authenticated key, not from a public `project_id` parameter
 - the CLI does not add user accounts or alternate auth paths; it wraps the same operator and project-key model directly
 
@@ -211,6 +213,11 @@ Public metrics use exactly two endpoint shapes:
 
 - `GET /v1/metrics/events`
 - `GET /v1/metrics/sessions`
+
+Public event discovery extends that read surface with:
+
+- `GET /v1/metrics/events/catalog`
+- `GET /v1/metrics/events/top`
 
 Shared query semantics:
 
