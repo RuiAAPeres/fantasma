@@ -48,9 +48,11 @@ pub(crate) const EVENT_METRICS_WORKER_NAME: &str = "event_metrics";
 const DEFAULT_SESSION_INCREMENTAL_CONCURRENCY: usize = 8;
 const DEFAULT_SESSION_REPAIR_CONCURRENCY: usize = 2;
 const STAGE_B_TRACE_PATH_ENV: &str = "FANTASMA_WORKER_STAGE_B_TRACE_PATH";
+const EVENT_LANE_TRACE_PATH_ENV: &str = "FANTASMA_WORKER_EVENT_LANE_TRACE_PATH";
 const STAGE_B_TRACE_REPAIR_JOB: &str = "repair_job";
 const STAGE_B_TRACE_REBUILD_FINALIZE: &str = "rebuild_finalize";
 static STAGE_B_TRACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static EVENT_LANE_TRACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct StageBTraceRecord {
@@ -65,6 +67,18 @@ struct StageBTraceRecord {
     finalization_subphases_ms: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     session_daily_subphases_ms: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    counts: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct EventLaneTraceRecord {
+    record_type: String,
+    last_processed_event_id: i64,
+    next_offset: i64,
+    processed_events: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    phases_ms: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     counts: BTreeMap<String, u64>,
 }
@@ -129,6 +143,31 @@ impl StageBTraceRecord {
     }
 }
 
+impl EventLaneTraceRecord {
+    fn event_metrics_batch(
+        last_processed_event_id: i64,
+        next_offset: i64,
+        processed_events: usize,
+    ) -> Self {
+        Self {
+            record_type: "event_metrics_batch".to_owned(),
+            last_processed_event_id,
+            next_offset,
+            processed_events,
+            phases_ms: BTreeMap::new(),
+            counts: BTreeMap::new(),
+        }
+    }
+
+    fn add_phase_duration(&mut self, phase: &str, elapsed: std::time::Duration) {
+        *self.phases_ms.entry(phase.to_owned()).or_default() += duration_ms(elapsed);
+    }
+
+    fn add_count(&mut self, name: &str, value: usize) {
+        *self.counts.entry(name.to_owned()).or_default() += value as u64;
+    }
+}
+
 fn duration_ms(elapsed: std::time::Duration) -> u64 {
     elapsed.as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -166,6 +205,33 @@ fn record_stage_b_trace(record: &StageBTraceRecord) -> Result<(), StoreError> {
     use std::io::Write as _;
     file.write_all(b"\n").map_err(|error| {
         StoreError::InvariantViolation(format!("append Stage B trace newline to {path}: {error}"))
+    })?;
+
+    Ok(())
+}
+
+fn record_event_lane_trace(record: &EventLaneTraceRecord) -> Result<(), StoreError> {
+    let Ok(path) = std::env::var(EVENT_LANE_TRACE_PATH_ENV) else {
+        return Ok(());
+    };
+    let _guard = EVENT_LANE_TRACE_WRITE_LOCK.lock().map_err(|error| {
+        StoreError::InvariantViolation(format!("lock event lane trace file {path}: {error}"))
+    })?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| {
+            StoreError::InvariantViolation(format!("open event lane trace file {path}: {error}"))
+        })?;
+    serde_json::to_writer(&mut file, record).map_err(|error| {
+        StoreError::InvariantViolation(format!("serialize event lane trace record: {error}"))
+    })?;
+    use std::io::Write as _;
+    file.write_all(b"\n").map_err(|error| {
+        StoreError::InvariantViolation(format!(
+            "append event lane trace newline to {path}: {error}"
+        ))
     })?;
 
     Ok(())
@@ -1222,15 +1288,42 @@ pub(crate) async fn process_event_metrics_batch_with_config(
         .last()
         .map(|event| event.id)
         .expect("non-empty batch has last event");
+    let mut trace = EventLaneTraceRecord::event_metrics_batch(
+        last_processed_event_id,
+        next_offset,
+        processed_events,
+    );
+    let build_started_at = Instant::now();
     let rollups = build_event_metric_rollups(&batch);
+    trace.add_phase_duration("build_rollups", build_started_at.elapsed());
+    trace.add_count("total_delta_rows", rollups.total_deltas.len());
+    trace.add_count("dim1_delta_rows", rollups.dim1_deltas.len());
+    trace.add_count("dim2_delta_rows", rollups.dim2_deltas.len());
+    trace.add_count("dim3_delta_rows", rollups.dim3_deltas.len());
+    trace.add_count("dim4_delta_rows", rollups.dim4_deltas.len());
 
+    let total_upsert_started_at = Instant::now();
     upsert_event_metric_buckets_total_in_tx(&mut tx, &rollups.total_deltas).await?;
+    trace.add_phase_duration("upsert_total", total_upsert_started_at.elapsed());
+    let dim1_upsert_started_at = Instant::now();
     upsert_event_metric_buckets_dim1_in_tx(&mut tx, &rollups.dim1_deltas).await?;
+    trace.add_phase_duration("upsert_dim1", dim1_upsert_started_at.elapsed());
+    let dim2_upsert_started_at = Instant::now();
     upsert_event_metric_buckets_dim2_in_tx(&mut tx, &rollups.dim2_deltas).await?;
+    trace.add_phase_duration("upsert_dim2", dim2_upsert_started_at.elapsed());
+    let dim3_upsert_started_at = Instant::now();
     upsert_event_metric_buckets_dim3_in_tx(&mut tx, &rollups.dim3_deltas).await?;
+    trace.add_phase_duration("upsert_dim3", dim3_upsert_started_at.elapsed());
+    let dim4_upsert_started_at = Instant::now();
     upsert_event_metric_buckets_dim4_in_tx(&mut tx, &rollups.dim4_deltas).await?;
+    trace.add_phase_duration("upsert_dim4", dim4_upsert_started_at.elapsed());
+    let save_offset_started_at = Instant::now();
     save_worker_offset_in_tx(&mut tx, EVENT_METRICS_WORKER_NAME, next_offset).await?;
+    trace.add_phase_duration("save_offset", save_offset_started_at.elapsed());
+    let commit_started_at = Instant::now();
     tx.commit().await.map_err(StoreError::from)?;
+    trace.add_phase_duration("commit", commit_started_at.elapsed());
+    record_event_lane_trace(&trace)?;
 
     Ok(processed_events)
 }
@@ -2890,6 +2983,32 @@ mod tests {
         }
     }
 
+    fn sample_event_lane_trace_record() -> EventLaneTraceRecord {
+        EventLaneTraceRecord {
+            record_type: "event_metrics_batch".to_owned(),
+            last_processed_event_id: 10,
+            next_offset: 42,
+            processed_events: 32,
+            phases_ms: BTreeMap::from([
+                ("build_rollups".to_owned(), 17),
+                ("upsert_total".to_owned(), 5),
+                ("upsert_dim1".to_owned(), 7),
+                ("upsert_dim2".to_owned(), 11),
+                ("upsert_dim3".to_owned(), 13),
+                ("upsert_dim4".to_owned(), 19),
+                ("save_offset".to_owned(), 2),
+                ("commit".to_owned(), 3),
+            ]),
+            counts: BTreeMap::from([
+                ("total_delta_rows".to_owned(), 4),
+                ("dim1_delta_rows".to_owned(), 12),
+                ("dim2_delta_rows".to_owned(), 18),
+                ("dim3_delta_rows".to_owned(), 24),
+                ("dim4_delta_rows".to_owned(), 12),
+            ]),
+        }
+    }
+
     #[test]
     fn stage_b_trace_writer_emits_jsonl_when_trace_path_is_set() {
         let _guard = lock_trace_env();
@@ -2930,6 +3049,51 @@ mod tests {
         assert!(
             !path.exists(),
             "trace writer should not create files when the env var is unset"
+        );
+    }
+
+    #[test]
+    fn event_lane_trace_writer_emits_jsonl_when_trace_path_is_set() {
+        let _guard = lock_trace_env();
+        let path = std::env::temp_dir().join(format!("event-lane-trace-{}.jsonl", Uuid::new_v4()));
+        unsafe {
+            std::env::set_var("FANTASMA_WORKER_EVENT_LANE_TRACE_PATH", &path);
+        }
+
+        record_event_lane_trace(&sample_event_lane_trace_record()).expect("write event lane trace");
+
+        let contents = fs::read_to_string(&path).expect("read event lane trace file");
+        let line = contents.lines().next().expect("event lane trace line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("parse event lane trace record as json");
+
+        assert_eq!(parsed["record_type"], "event_metrics_batch");
+        assert_eq!(parsed["last_processed_event_id"], 10);
+        assert_eq!(parsed["next_offset"], 42);
+        assert_eq!(parsed["processed_events"], 32);
+        assert_eq!(parsed["phases_ms"]["build_rollups"], 17);
+        assert_eq!(parsed["counts"]["dim4_delta_rows"], 12);
+
+        let _ = fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("FANTASMA_WORKER_EVENT_LANE_TRACE_PATH");
+        }
+    }
+
+    #[test]
+    fn event_lane_trace_writer_is_noop_when_trace_path_is_unset() {
+        let _guard = lock_trace_env();
+        unsafe {
+            std::env::remove_var("FANTASMA_WORKER_EVENT_LANE_TRACE_PATH");
+        }
+        let path = std::env::temp_dir().join(format!("event-lane-trace-{}.jsonl", Uuid::new_v4()));
+
+        record_event_lane_trace(&sample_event_lane_trace_record())
+            .expect("skip event lane trace write");
+
+        assert!(
+            !path.exists(),
+            "event lane trace writer should not create files when the env var is unset"
         );
     }
 

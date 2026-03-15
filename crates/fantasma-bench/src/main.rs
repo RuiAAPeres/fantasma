@@ -13,6 +13,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sqlx::{PgPool, postgres::PgPoolOptions};
+use uuid::Uuid;
 
 const DEFAULT_ADMIN_TOKEN: &str = "fg_pat_dev";
 const BENCHMARK_COMPOSE_PROJECT_NAME: &str = "fantasma-bench";
@@ -40,6 +42,7 @@ const DEFAULT_SLO_SESSION_BATCH_SIZE: i64 = 1_000;
 const DEFAULT_SLO_EVENT_BATCH_SIZE: i64 = 5_000;
 const DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY: usize = 8;
 const DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY: usize = 2;
+const DEFAULT_SLO_IDLE_POLL_INTERVAL_MS: u64 = 250;
 const DEFAULT_SLO_ITERATIVE_INSTALL_COUNT: usize = 250;
 const SLO_REPRESENTATIVE_WINDOW_DAYS: usize = 30;
 const SLO_REPRESENTATIVE_INSTALL_COUNT: usize = 1_000;
@@ -56,9 +59,15 @@ const SLO_REPRESENTATIVE_REPAIR_LATE_EVENTS_PER_SESSION: usize = 2;
 const SLO_REPRESENTATIVE_REPAIR_DURATION_DELTA_SECONDS: u64 = 10 * 60;
 const WORKER_STAGE_B_TRACE_ENV_VAR: &str = "FANTASMA_WORKER_STAGE_B_TRACE_PATH";
 const WORKER_STAGE_B_TRACE_CONTAINER_PATH: &str = "/tmp/stage-b-trace.jsonl";
+const WORKER_EVENT_LANE_TRACE_ENV_VAR: &str = "FANTASMA_WORKER_EVENT_LANE_TRACE_PATH";
+const WORKER_EVENT_LANE_TRACE_CONTAINER_PATH: &str = "/tmp/event-lane-trace.jsonl";
 const STAGE_B_TRACE_FILENAME: &str = "stage-b-trace.jsonl";
 const STAGE_B_SUMMARY_FILENAME: &str = "stage-b.json";
 const CHECKPOINT_SUMMARY_FILENAME: &str = "checkpoint-readiness.json";
+const APPEND_ATTRIBUTION_FILENAME: &str = "append-attribution.json";
+const EVENT_LANE_TRACE_FILENAME: &str = "event-lane-trace.jsonl";
+const BENCHMARK_EVENT_METRICS_WORKER_NAME: &str = "event_metrics";
+const BENCHMARK_SESSION_WORKER_NAME: &str = "sessions";
 const STAGE_B_DOMINANT_MIN_SHARE: f64 = 0.40;
 const STAGE_B_DOMINANT_MIN_LEAD: f64 = 0.10;
 const STAGE_B_SLOW_RECORD_LIMIT: usize = 10;
@@ -191,6 +200,8 @@ enum CliCommand {
         worker_session_incremental_concurrency: usize,
         #[arg(long, default_value_t = DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY)]
         worker_session_repair_concurrency: usize,
+        #[arg(long, default_value_t = DEFAULT_SLO_IDLE_POLL_INTERVAL_MS)]
+        worker_idle_poll_interval_ms: u64,
     },
 }
 
@@ -654,6 +665,80 @@ struct CheckpointReadinessSample {
     derived_metrics_ready_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AppendAttributionSample {
+    sequence: usize,
+    blob_kind: String,
+    events_in_blob: usize,
+    cumulative_events: u64,
+    checkpoint_target_event_id: i64,
+    upload_complete_ms: u64,
+    event_lane_expected_ready_ms: u64,
+    session_lane_expected_ready_ms: u64,
+    derived_ready_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AppendAttributionSummary {
+    sample_count: usize,
+    upload_to_event_lane_ready_p50_ms: u64,
+    upload_to_event_lane_ready_p95_ms: u64,
+    upload_to_event_lane_ready_max_ms: u64,
+    upload_to_session_lane_ready_p50_ms: u64,
+    upload_to_session_lane_ready_p95_ms: u64,
+    upload_to_session_lane_ready_max_ms: u64,
+    latest_lane_to_derived_visible_p50_ms: u64,
+    latest_lane_to_derived_visible_p95_ms: u64,
+    latest_lane_to_derived_visible_max_ms: u64,
+    overall_derived_ready_p50_ms: u64,
+    overall_derived_ready_p95_ms: u64,
+    overall_derived_ready_max_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dominant_contributor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct AppendAttributionSidecar {
+    scenario: String,
+    run_config: SloRunConfig,
+    summary: AppendAttributionSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_lane_summary: Option<EventLaneBatchSummary>,
+    samples: Vec<AppendAttributionSample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EventLaneTraceRecord {
+    record_type: String,
+    last_processed_event_id: i64,
+    next_offset: i64,
+    processed_events: usize,
+    #[serde(default)]
+    phases_ms: BTreeMap<String, u64>,
+    #[serde(default)]
+    counts: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct EventLanePhaseSummary {
+    name: String,
+    total_ms: u64,
+    share: f64,
+    distribution: StageBDistributionStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct EventLaneBatchSummary {
+    record_count: usize,
+    processed_events_total: usize,
+    measured_event_lane_ms: u64,
+    phases: Vec<EventLanePhaseSummary>,
+    #[serde(default)]
+    delta_rows_by_family: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dominant_phase: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UploadBlobKind {
     Append,
@@ -687,12 +772,23 @@ struct UploadBlob {
     checkpoint: bool,
 }
 
+#[derive(Clone, Copy)]
+struct LiveSloIngestContext<'a> {
+    client: &'a Client,
+    project: &'a ProvisionedProject,
+    append_probe_pool: Option<&'a PgPool>,
+    scenario: &'a SloScenarioDefinition,
+    phase_name: &'a str,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 struct BenchWorkerConfig {
     session_batch_size: i64,
     event_batch_size: i64,
     session_incremental_concurrency: usize,
     session_repair_concurrency: usize,
+    idle_poll_interval_ms: u64,
 }
 
 impl Default for BenchWorkerConfig {
@@ -702,6 +798,7 @@ impl Default for BenchWorkerConfig {
             event_batch_size: DEFAULT_SLO_EVENT_BATCH_SIZE,
             session_incremental_concurrency: DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY,
             session_repair_concurrency: DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY,
+            idle_poll_interval_ms: DEFAULT_SLO_IDLE_POLL_INTERVAL_MS,
         }
     }
 }
@@ -768,7 +865,7 @@ struct StageBContextSummary {
     distribution: StageBDistributionStats,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct StageBDistributionStats {
     count: usize,
     min_ms: u64,
@@ -837,6 +934,7 @@ struct EventBatch<'a> {
 
 #[derive(Debug, Clone)]
 struct ProvisionedProject {
+    project_id: Uuid,
     ingest_key: String,
     read_key: String,
 }
@@ -849,7 +947,7 @@ struct CreatedProjectResponse {
 
 #[derive(Debug, Deserialize)]
 struct CreatedProject {
-    id: String,
+    id: Uuid,
 }
 
 #[derive(Debug, Deserialize)]
@@ -962,6 +1060,7 @@ where
             worker_event_batch_size,
             worker_session_incremental_concurrency,
             worker_session_repair_concurrency,
+            worker_idle_poll_interval_ms,
         } => BenchCommand::Slo(SloArgs {
             output_dir,
             scenarios,
@@ -974,6 +1073,7 @@ where
                     event_batch_size: worker_event_batch_size.max(1),
                     session_incremental_concurrency: worker_session_incremental_concurrency.max(1),
                     session_repair_concurrency: worker_session_repair_concurrency.max(1),
+                    idle_poll_interval_ms: worker_idle_poll_interval_ms.max(1),
                 },
             },
         }),
@@ -1055,6 +1155,7 @@ impl SloExpectation {
 struct ExecutedSloScenario {
     result: SloScenarioResult,
     checkpoint_samples: Vec<CheckpointReadinessSample>,
+    append_attribution_samples: Vec<AppendAttributionSample>,
 }
 
 #[derive(Debug, Clone)]
@@ -1254,13 +1355,25 @@ async fn execute_slo_scenario(
     stack.start()?;
     wait_for_health(&client).await?;
     let project = provision_project(&client).await?;
+    let append_probe_pool = if scenario.kind == SloScenarioKind::LiveAppendSmallBlobs {
+        Some(connect_benchmark_database(&stack.compose_file).await?)
+    } else {
+        None
+    };
 
     let executed = match scenario.kind {
         SloScenarioKind::LiveAppendSmallBlobs
         | SloScenarioKind::LiveAppendOfflineFlush
         | SloScenarioKind::LiveAppendPlusLightRepair
         | SloScenarioKind::LiveAppendPlusRepairHotProject => {
-            run_live_slo_scenario(&client, &project, scenario, run_config).await
+            run_live_slo_scenario(
+                &client,
+                &project,
+                append_probe_pool.as_ref(),
+                scenario,
+                run_config,
+            )
+            .await
         }
         SloScenarioKind::StressAppend => {
             run_slo_append_like(&client, &project, scenario, run_config, false, false).await
@@ -1277,11 +1390,21 @@ async fn execute_slo_scenario(
     };
 
     let trace_capture = copy_stage_b_trace_from_worker(&stack.compose_file);
+    let event_lane_trace_capture = copy_event_lane_trace_from_worker(&stack.compose_file);
     match executed {
         Ok(executed) => {
             if !executed.checkpoint_samples.is_empty() {
                 let scenario_dir = slo_paths(output_dir, scenario).scenario_dir;
                 write_checkpoint_readiness_sidecar(&scenario_dir, &executed.checkpoint_samples)?;
+                if !executed.append_attribution_samples.is_empty() {
+                    write_append_attribution_sidecar(
+                        &scenario_dir,
+                        &scenario.key(),
+                        run_config,
+                        &executed.append_attribution_samples,
+                        event_lane_trace_capture?.as_deref(),
+                    )?;
+                }
             }
             if let Some(trace_contents) = trace_capture? {
                 let scenario_dir = slo_paths(output_dir, scenario).scenario_dir;
@@ -1295,6 +1418,7 @@ async fn execute_slo_scenario(
             Ok(executed.result)
         }
         Err(error) => {
+            let _ = event_lane_trace_capture;
             if let Ok(Some(trace_contents)) = trace_capture {
                 let scenario_dir = slo_paths(output_dir, scenario).scenario_dir;
                 let _ = write_stage_b_sidecars(
@@ -1312,21 +1436,28 @@ async fn execute_slo_scenario(
 async fn run_live_slo_scenario(
     client: &Client,
     project: &ProvisionedProject,
+    append_probe_pool: Option<&PgPool>,
     scenario: &SloScenarioDefinition,
     run_config: &SloRunConfig,
 ) -> Result<ExecutedSloScenario> {
     let (append_blobs, repair_blobs) = live_slo_schedule(scenario, run_config)?;
     let mut expectation = SloExpectation::default();
     let mut checkpoint_samples = Vec::new();
-
-    let append_phase = ingest_live_slo_blobs(
+    let mut append_attribution_samples = Vec::new();
+    let append_ingest = LiveSloIngestContext {
         client,
         project,
+        append_probe_pool,
         scenario,
+        phase_name: "append_uploads",
+    };
+
+    let append_phase = ingest_live_slo_blobs(
+        append_ingest,
         &append_blobs,
         &mut expectation,
         &mut checkpoint_samples,
-        "append_uploads",
+        &mut append_attribution_samples,
     )
     .await?;
 
@@ -1335,13 +1466,17 @@ async fn run_live_slo_scenario(
     if !repair_blobs.is_empty() {
         phases.push(
             ingest_live_slo_blobs(
-                client,
-                project,
-                scenario,
+                LiveSloIngestContext {
+                    client,
+                    project,
+                    append_probe_pool: None,
+                    scenario,
+                    phase_name: "repair_uploads",
+                },
                 &repair_blobs,
                 &mut expectation,
                 &mut checkpoint_samples,
-                "repair_uploads",
+                &mut append_attribution_samples,
             )
             .await?,
         );
@@ -1370,49 +1505,92 @@ async fn run_live_slo_scenario(
             failure: None,
         },
         checkpoint_samples,
+        append_attribution_samples,
     })
 }
 
 async fn ingest_live_slo_blobs(
-    client: &Client,
-    project: &ProvisionedProject,
-    scenario: &SloScenarioDefinition,
+    ingest: LiveSloIngestContext<'_>,
     blobs: &[UploadBlob],
     expectation: &mut SloExpectation,
     checkpoint_samples: &mut Vec<CheckpointReadinessSample>,
-    phase_name: &str,
+    append_attribution_samples: &mut Vec<AppendAttributionSample>,
 ) -> Result<PhaseMeasurement> {
     let started = Instant::now();
     let mut events_sent = 0usize;
 
     for blob in blobs {
-        post_upload_blob(client, project, blob).await?;
+        post_upload_blob(ingest.client, ingest.project, blob).await?;
         expectation.apply_delta(&blob.delta);
         events_sent += blob.events.len();
 
         if blob.checkpoint {
+            let checkpoint_started_at = Instant::now();
+            let checkpoint_target_event_id = if let Some(pool) = ingest.append_probe_pool {
+                Some(load_project_raw_event_tail_id(pool, ingest.project.project_id).await?)
+            } else {
+                None
+            };
+            let deadline = checkpoint_started_at + ingest.scenario.window.readiness_timeout();
             let readiness = wait_for_slo_expectation(
-                client,
-                project,
-                scenario,
+                ingest.client,
+                ingest.project,
+                ingest.scenario,
                 expectation,
-                Instant::now(),
+                checkpoint_started_at,
                 "checkpoint readiness",
                 false,
-            )
-            .await?;
-            checkpoint_samples.push(checkpoint_sample(
-                checkpoint_samples.len() + 1,
-                blob,
-                expectation.total_events,
-                &readiness,
-            )?);
+            );
+            if let (Some(pool), Some(checkpoint_target_event_id)) =
+                (ingest.append_probe_pool, checkpoint_target_event_id)
+            {
+                let (event_lane_expected_ready_ms, session_lane_expected_ready_ms, readiness) = tokio::try_join!(
+                    wait_for_worker_offset_target(
+                        pool,
+                        BENCHMARK_EVENT_METRICS_WORKER_NAME,
+                        checkpoint_target_event_id,
+                        deadline,
+                        checkpoint_started_at,
+                    ),
+                    wait_for_worker_offset_target(
+                        pool,
+                        BENCHMARK_SESSION_WORKER_NAME,
+                        checkpoint_target_event_id,
+                        deadline,
+                        checkpoint_started_at,
+                    ),
+                    readiness,
+                )?;
+                append_attribution_samples.push(append_attribution_sample(
+                    blob,
+                    checkpoint_samples.len() + 1,
+                    expectation.total_events,
+                    checkpoint_target_event_id,
+                    event_lane_expected_ready_ms,
+                    session_lane_expected_ready_ms,
+                    readiness_measurement(&readiness, "derived_metrics_ready_ms")?,
+                )?);
+                checkpoint_samples.push(checkpoint_sample(
+                    checkpoint_samples.len() + 1,
+                    blob,
+                    expectation.total_events,
+                    &readiness,
+                )?);
+            } else {
+                let readiness = readiness.await?;
+                checkpoint_samples.push(checkpoint_sample(
+                    checkpoint_samples.len() + 1,
+                    blob,
+                    expectation.total_events,
+                    &readiness,
+                )?);
+            }
         }
     }
 
     let elapsed = started.elapsed();
     Ok(PhaseMeasurement {
-        name: phase_name.to_owned(),
+        name: ingest.phase_name.to_owned(),
         events_sent,
         elapsed_ms: elapsed.as_millis() as u64,
         events_per_second: throughput(events_sent, elapsed),
@@ -1486,6 +1664,7 @@ async fn run_slo_append_like(
             failure: None,
         },
         checkpoint_samples: Vec::new(),
+        append_attribution_samples: Vec::new(),
     })
 }
 
@@ -1537,6 +1716,7 @@ async fn run_slo_repair(
             failure: None,
         },
         checkpoint_samples: Vec::new(),
+        append_attribution_samples: Vec::new(),
     })
 }
 
@@ -2289,6 +2469,222 @@ fn checkpoint_readiness_summary(
     })
 }
 
+fn append_attribution_sample(
+    blob: &UploadBlob,
+    sequence: usize,
+    cumulative_events: u64,
+    checkpoint_target_event_id: i64,
+    event_lane_expected_ready_ms: u64,
+    session_lane_expected_ready_ms: u64,
+    derived_ready_ms: u64,
+) -> Result<AppendAttributionSample> {
+    Ok(AppendAttributionSample {
+        sequence,
+        blob_kind: blob.kind.key().to_owned(),
+        events_in_blob: blob.events.len(),
+        cumulative_events,
+        checkpoint_target_event_id,
+        upload_complete_ms: 0,
+        event_lane_expected_ready_ms,
+        session_lane_expected_ready_ms,
+        derived_ready_ms,
+    })
+}
+
+async fn wait_for_worker_offset_target(
+    pool: &PgPool,
+    worker_name: &str,
+    checkpoint_target_event_id: i64,
+    deadline: Instant,
+    started_at: Instant,
+) -> Result<u64> {
+    let elapsed =
+        poll_until_elapsed(
+            || async {
+                Ok(load_benchmark_worker_offset(pool, worker_name).await?
+                    >= checkpoint_target_event_id)
+            },
+            deadline,
+            worker_name,
+            started_at,
+            false,
+        )
+        .await?;
+    Ok(elapsed
+        .expect("worker offset target should not timeout when publication timeout is disabled"))
+}
+
+fn summarize_append_attribution_samples(
+    samples: &[AppendAttributionSample],
+) -> Option<AppendAttributionSummary> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    let mut upload_to_event = samples
+        .iter()
+        .map(|sample| {
+            sample
+                .event_lane_expected_ready_ms
+                .saturating_sub(sample.upload_complete_ms)
+        })
+        .collect::<Vec<_>>();
+    let mut upload_to_session = samples
+        .iter()
+        .map(|sample| {
+            sample
+                .session_lane_expected_ready_ms
+                .saturating_sub(sample.upload_complete_ms)
+        })
+        .collect::<Vec<_>>();
+    let mut latest_lane_to_derived = samples
+        .iter()
+        .map(|sample| {
+            sample.derived_ready_ms.saturating_sub(
+                sample
+                    .event_lane_expected_ready_ms
+                    .max(sample.session_lane_expected_ready_ms),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut overall_derived = samples
+        .iter()
+        .map(|sample| sample.derived_ready_ms)
+        .collect::<Vec<_>>();
+    upload_to_event.sort_unstable();
+    upload_to_session.sort_unstable();
+    latest_lane_to_derived.sort_unstable();
+    overall_derived.sort_unstable();
+
+    let contributor_p95 = [
+        (
+            "upload_to_event_lane_ready",
+            percentile(&upload_to_event, 0.95),
+        ),
+        (
+            "upload_to_session_lane_ready",
+            percentile(&upload_to_session, 0.95),
+        ),
+        (
+            "latest_lane_to_derived_visible",
+            percentile(&latest_lane_to_derived, 0.95),
+        ),
+    ];
+    let dominant_contributor = contributor_p95
+        .into_iter()
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(right.0)))
+        .map(|(name, _)| name.to_owned());
+
+    Some(AppendAttributionSummary {
+        sample_count: samples.len(),
+        upload_to_event_lane_ready_p50_ms: percentile(&upload_to_event, 0.50),
+        upload_to_event_lane_ready_p95_ms: percentile(&upload_to_event, 0.95),
+        upload_to_event_lane_ready_max_ms: *upload_to_event.last().unwrap_or(&0),
+        upload_to_session_lane_ready_p50_ms: percentile(&upload_to_session, 0.50),
+        upload_to_session_lane_ready_p95_ms: percentile(&upload_to_session, 0.95),
+        upload_to_session_lane_ready_max_ms: *upload_to_session.last().unwrap_or(&0),
+        latest_lane_to_derived_visible_p50_ms: percentile(&latest_lane_to_derived, 0.50),
+        latest_lane_to_derived_visible_p95_ms: percentile(&latest_lane_to_derived, 0.95),
+        latest_lane_to_derived_visible_max_ms: *latest_lane_to_derived.last().unwrap_or(&0),
+        overall_derived_ready_p50_ms: percentile(&overall_derived, 0.50),
+        overall_derived_ready_p95_ms: percentile(&overall_derived, 0.95),
+        overall_derived_ready_max_ms: *overall_derived.last().unwrap_or(&0),
+        dominant_contributor,
+    })
+}
+
+fn parse_event_lane_trace_records(trace_contents: &str) -> Result<Vec<EventLaneTraceRecord>> {
+    trace_contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).context("parse event lane trace record"))
+        .collect()
+}
+
+fn summarize_event_lane_trace_records(
+    records: &[EventLaneTraceRecord],
+) -> Option<EventLaneBatchSummary> {
+    if records.is_empty() {
+        return None;
+    }
+
+    let mut phase_totals = BTreeMap::<String, u64>::new();
+    let mut phase_samples = BTreeMap::<String, Vec<u64>>::new();
+    let mut delta_rows_by_family = BTreeMap::<String, u64>::new();
+    let mut processed_events_total = 0usize;
+
+    for record in records {
+        processed_events_total += record.processed_events;
+        for (phase, elapsed_ms) in &record.phases_ms {
+            *phase_totals.entry(phase.clone()).or_default() += *elapsed_ms;
+            phase_samples
+                .entry(phase.clone())
+                .or_default()
+                .push(*elapsed_ms);
+        }
+        for (name, value) in &record.counts {
+            if name.ends_with("_delta_rows") {
+                *delta_rows_by_family.entry(name.clone()).or_default() += *value;
+            }
+        }
+    }
+
+    let measured_event_lane_ms: u64 = phase_totals.values().copied().sum();
+    let mut phases = phase_totals
+        .into_iter()
+        .map(|(name, total_ms)| {
+            let mut samples = phase_samples
+                .remove(&name)
+                .expect("event lane phase samples tracked alongside totals");
+            samples.sort_unstable();
+            EventLanePhaseSummary {
+                name,
+                total_ms,
+                share: if measured_event_lane_ms == 0 {
+                    0.0
+                } else {
+                    total_ms as f64 / measured_event_lane_ms as f64
+                },
+                distribution: StageBDistributionStats {
+                    count: samples.len(),
+                    min_ms: *samples.first().unwrap_or(&0),
+                    p50_ms: percentile(&samples, 0.50),
+                    p95_ms: percentile(&samples, 0.95),
+                    max_ms: *samples.last().unwrap_or(&0),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    phases.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    Some(EventLaneBatchSummary {
+        record_count: records.len(),
+        processed_events_total,
+        measured_event_lane_ms,
+        dominant_phase: dominant_event_lane_phase(&phases),
+        phases,
+        delta_rows_by_family,
+    })
+}
+
+fn dominant_event_lane_phase(phases: &[EventLanePhaseSummary]) -> Option<String> {
+    let largest = phases.first()?;
+    let second_share = phases.get(1).map_or(0.0, |phase| phase.share);
+
+    if largest.share >= STAGE_B_DOMINANT_MIN_SHARE
+        && (largest.share - second_share) >= STAGE_B_DOMINANT_MIN_LEAD
+    {
+        Some(largest.name.clone())
+    } else {
+        None
+    }
+}
+
 fn write_checkpoint_readiness_sidecar(
     scenario_dir: &Path,
     samples: &[CheckpointReadinessSample],
@@ -2304,6 +2700,50 @@ fn write_checkpoint_readiness_sidecar(
         )
     })?;
     write_pretty_json(&scenario_dir.join(CHECKPOINT_SUMMARY_FILENAME), &samples)
+}
+
+fn write_append_attribution_sidecar(
+    scenario_dir: &Path,
+    scenario: &str,
+    run_config: &SloRunConfig,
+    samples: &[AppendAttributionSample],
+    event_lane_trace_contents: Option<&str>,
+) -> Result<()> {
+    let Some(summary) = summarize_append_attribution_samples(samples) else {
+        return Ok(());
+    };
+    let event_lane_summary = event_lane_trace_contents
+        .map(parse_event_lane_trace_records)
+        .transpose()?
+        .and_then(|records| summarize_event_lane_trace_records(&records));
+
+    fs::create_dir_all(scenario_dir).with_context(|| {
+        format!(
+            "create scenario sidecar directory {}",
+            scenario_dir.display()
+        )
+    })?;
+    if let Some(trace_contents) = event_lane_trace_contents.filter(|contents| !contents.is_empty())
+    {
+        fs::write(event_lane_trace_output_path(scenario_dir), trace_contents).with_context(
+            || {
+                format!(
+                    "write event lane trace sidecar {}",
+                    event_lane_trace_output_path(scenario_dir).display()
+                )
+            },
+        )?;
+    }
+    write_pretty_json(
+        &scenario_dir.join(APPEND_ATTRIBUTION_FILENAME),
+        &AppendAttributionSidecar {
+            scenario: scenario.to_owned(),
+            run_config: run_config.clone(),
+            summary,
+            event_lane_summary,
+            samples: samples.to_vec(),
+        },
+    )
 }
 
 async fn poll_until_elapsed<F, Fut>(
@@ -3104,6 +3544,10 @@ fn render_slo_run_config_lines(run_config: &SloRunConfig) -> Vec<String> {
             "  - worker_session_repair_concurrency: {}",
             run_config.worker_config.session_repair_concurrency
         ),
+        format!(
+            "  - worker_idle_poll_interval_ms: {}",
+            run_config.worker_config.idle_poll_interval_ms
+        ),
     ]
 }
 
@@ -3714,6 +4158,7 @@ async fn provision_project(client: &Client) -> Result<ProvisionedProject> {
         .context("decode read-key provisioning response")?;
 
     Ok(ProvisionedProject {
+        project_id: created_project.project.id,
         ingest_key: created_project.ingest_key.secret,
         read_key: created_read_key.key.secret,
     })
@@ -3740,6 +4185,87 @@ async fn wait_for_health(client: &Client) -> Result<()> {
         "stack health",
     )
     .await
+}
+
+async fn connect_benchmark_database(compose_file: &Path) -> Result<PgPool> {
+    let database_url = benchmark_database_url(compose_file)?;
+    let connect_started_at = Instant::now();
+
+    loop {
+        match PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+        {
+            Ok(pool) => return Ok(pool),
+            Err(error) if connect_started_at.elapsed() < HEALTH_TIMEOUT => {
+                let _ = error;
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("connect benchmark postgres at {}", database_url));
+            }
+        }
+    }
+}
+
+fn benchmark_database_url(compose_file: &Path) -> Result<String> {
+    let output = docker_compose_command(compose_file, ["port", "postgres", "5432"])
+        .output()
+        .context("resolve benchmark postgres host port")?;
+    if !output.status.success() {
+        bail!(
+            "resolve benchmark postgres host port failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let port = parse_docker_compose_port_output(&String::from_utf8_lossy(&output.stdout))?;
+    Ok(format!(
+        "postgres://fantasma:fantasma@127.0.0.1:{port}/fantasma"
+    ))
+}
+
+fn parse_docker_compose_port_output(output: &str) -> Result<u16> {
+    let trimmed = output.trim();
+    let port = trimmed
+        .rsplit(':')
+        .next()
+        .ok_or_else(|| anyhow!("missing port in docker compose port output: {trimmed}"))?;
+    port.parse::<u16>()
+        .with_context(|| format!("parse docker compose port output: {trimmed}"))
+}
+
+async fn load_project_raw_event_tail_id(pool: &PgPool, project_id: Uuid) -> Result<i64> {
+    Ok(sqlx::query_scalar::<_, Option<i64>>(
+        r#"
+            SELECT MAX(id)
+            FROM events_raw
+            WHERE project_id = $1
+            "#,
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await?
+    .unwrap_or(0))
+}
+
+async fn load_benchmark_worker_offset(pool: &PgPool, worker_name: &str) -> Result<i64> {
+    Ok(sqlx::query_scalar::<_, Option<i64>>(
+        r#"
+            SELECT last_processed_event_id
+            FROM worker_offsets
+            WHERE worker_name = $1
+            "#,
+    )
+    .bind(worker_name)
+    .fetch_optional(pool)
+    .await?
+    .flatten()
+    .unwrap_or(0))
 }
 
 async fn poll_until<F, Fut>(mut check: F, timeout: Duration, label: &str) -> Result<()>
@@ -4849,6 +5375,10 @@ fn stage_b_summary_output_path(scenario_dir: &Path) -> PathBuf {
     scenario_dir.join(STAGE_B_SUMMARY_FILENAME)
 }
 
+fn event_lane_trace_output_path(scenario_dir: &Path) -> PathBuf {
+    scenario_dir.join(EVENT_LANE_TRACE_FILENAME)
+}
+
 fn copy_stage_b_trace_from_worker(compose_file: &Path) -> Result<Option<String>> {
     let local_copy = std::env::temp_dir().join(format!(
         "fantasma-stage-b-trace-{}-{}.jsonl",
@@ -4879,6 +5409,46 @@ fn copy_stage_b_trace_from_worker(compose_file: &Path) -> Result<Option<String>>
 
 fn stage_b_trace_copy_command(compose_file: &Path, destination: &Path) -> Command {
     let source = format!("fantasma-worker:{}", WORKER_STAGE_B_TRACE_CONTAINER_PATH);
+    docker_compose_command(
+        compose_file,
+        [
+            OsString::from("cp"),
+            OsString::from(source),
+            destination.as_os_str().to_os_string(),
+        ],
+    )
+}
+
+fn copy_event_lane_trace_from_worker(compose_file: &Path) -> Result<Option<String>> {
+    let local_copy = std::env::temp_dir().join(format!(
+        "fantasma-event-lane-trace-{}-{}.jsonl",
+        std::process::id(),
+        Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000)
+    ));
+    let output = event_lane_trace_copy_command(compose_file, &local_copy)
+        .output()
+        .context("copy event lane trace from worker container")?;
+
+    if !output.status.success() {
+        let _ = fs::remove_file(&local_copy);
+        return Ok(None);
+    }
+
+    let trace_contents = fs::read_to_string(&local_copy)
+        .with_context(|| format!("read copied event lane trace {}", local_copy.display()))?;
+    let _ = fs::remove_file(&local_copy);
+
+    if trace_contents.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(trace_contents))
+}
+
+fn event_lane_trace_copy_command(compose_file: &Path, destination: &Path) -> Command {
+    let source = format!("fantasma-worker:{}", WORKER_EVENT_LANE_TRACE_CONTAINER_PATH);
     docker_compose_command(
         compose_file,
         [
@@ -5081,9 +5651,18 @@ fn render_slo_compose_file(run_config: &SloRunConfig) -> Result<PathBuf> {
 fn render_benchmark_compose_template(template: &str, worker_config: &BenchWorkerConfig) -> String {
     let mut rendered_lines = Vec::new();
     let mut trace_path_rendered = false;
+    let mut event_lane_trace_path_rendered = false;
 
     for line in template.lines() {
         if line
+            .trim_start()
+            .starts_with("FANTASMA_WORKER_IDLE_POLL_INTERVAL_MS:")
+        {
+            rendered_lines.push(format!(
+                "      FANTASMA_WORKER_IDLE_POLL_INTERVAL_MS: {}",
+                worker_config.idle_poll_interval_ms
+            ));
+        } else if line
             .trim_start()
             .starts_with("FANTASMA_WORKER_SESSION_BATCH_SIZE:")
         {
@@ -5121,11 +5700,25 @@ fn render_benchmark_compose_template(template: &str, worker_config: &BenchWorker
                 ));
                 trace_path_rendered = true;
             }
+            if !event_lane_trace_path_rendered {
+                rendered_lines.push(format!(
+                    "      {WORKER_EVENT_LANE_TRACE_ENV_VAR}: {WORKER_EVENT_LANE_TRACE_CONTAINER_PATH}"
+                ));
+                event_lane_trace_path_rendered = true;
+            }
         } else if line.trim_start().starts_with(WORKER_STAGE_B_TRACE_ENV_VAR) {
             rendered_lines.push(format!(
                 "      {WORKER_STAGE_B_TRACE_ENV_VAR}: {WORKER_STAGE_B_TRACE_CONTAINER_PATH}"
             ));
             trace_path_rendered = true;
+        } else if line
+            .trim_start()
+            .starts_with(WORKER_EVENT_LANE_TRACE_ENV_VAR)
+        {
+            rendered_lines.push(format!(
+                "      {WORKER_EVENT_LANE_TRACE_ENV_VAR}: {WORKER_EVENT_LANE_TRACE_CONTAINER_PATH}"
+            ));
+            event_lane_trace_path_rendered = true;
         } else {
             rendered_lines.push(line.to_owned());
         }
@@ -5567,6 +6160,8 @@ mod tests {
             "12",
             "--worker-session-repair-concurrency",
             "4",
+            "--worker-idle-poll-interval-ms",
+            "75",
         ])
         .expect("parse slo override command");
 
@@ -5576,6 +6171,17 @@ mod tests {
                     args.output_dir,
                     PathBuf::from("artifacts/performance/2026-03-13-derived-metrics-slo")
                 );
+                assert_eq!(args.run_config.publication_repetitions, 3);
+                assert_eq!(args.run_config.worker_config.session_batch_size, 2_000);
+                assert_eq!(args.run_config.worker_config.event_batch_size, 7_000);
+                assert_eq!(
+                    args.run_config
+                        .worker_config
+                        .session_incremental_concurrency,
+                    12
+                );
+                assert_eq!(args.run_config.worker_config.session_repair_concurrency, 4);
+                assert_eq!(args.run_config.worker_config.idle_poll_interval_ms, 75);
             }
             other => panic!("expected SLO command, got {other:?}"),
         }
@@ -5633,7 +6239,8 @@ mod tests {
                 "session_batch_size": DEFAULT_SLO_SESSION_BATCH_SIZE,
                 "event_batch_size": DEFAULT_SLO_EVENT_BATCH_SIZE,
                 "session_incremental_concurrency": DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY,
-                "session_repair_concurrency": DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY
+                "session_repair_concurrency": DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY,
+                "idle_poll_interval_ms": DEFAULT_SLO_IDLE_POLL_INTERVAL_MS
             }
         }))
         .expect("parse publication config");
@@ -6944,14 +7551,31 @@ mod tests {
                 event_batch_size: 7_000,
                 session_incremental_concurrency: 12,
                 session_repair_concurrency: 4,
+                idle_poll_interval_ms: 75,
             },
         );
 
+        assert!(rendered.contains("FANTASMA_WORKER_IDLE_POLL_INTERVAL_MS: 75"));
         assert!(rendered.contains("FANTASMA_WORKER_SESSION_BATCH_SIZE: 2000"));
         assert!(rendered.contains("FANTASMA_WORKER_EVENT_BATCH_SIZE: 7000"));
         assert!(rendered.contains("FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY: 12"));
         assert!(rendered.contains("FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY: 4"));
         assert!(rendered.contains("FANTASMA_WORKER_STAGE_B_TRACE_PATH: /tmp/stage-b-trace.jsonl"));
+        assert!(
+            rendered.contains("FANTASMA_WORKER_EVENT_LANE_TRACE_PATH: /tmp/event-lane-trace.jsonl")
+        );
+    }
+
+    #[test]
+    fn parse_docker_compose_port_output_accepts_ipv4_and_ipv6_bindings() {
+        assert_eq!(
+            parse_docker_compose_port_output("127.0.0.1:54321\n").expect("parse ipv4 binding"),
+            54_321
+        );
+        assert_eq!(
+            parse_docker_compose_port_output("[::1]:40123\n").expect("parse ipv6 binding"),
+            40_123
+        );
     }
 
     #[test]
@@ -7011,6 +7635,123 @@ mod tests {
         assert!(!wrote_sidecars, "empty trace should not produce sidecars");
         assert!(!scenario_dir.join("stage-b-trace.jsonl").exists());
         assert!(!scenario_dir.join("stage-b.json").exists());
+    }
+
+    #[test]
+    fn summarize_append_attribution_samples_uses_latest_lane_gap_for_visibility() {
+        let summary = summarize_append_attribution_samples(&[
+            AppendAttributionSample {
+                sequence: 1,
+                blob_kind: "append".to_owned(),
+                events_in_blob: 5,
+                cumulative_events: 5,
+                checkpoint_target_event_id: 5,
+                upload_complete_ms: 20,
+                event_lane_expected_ready_ms: 45,
+                session_lane_expected_ready_ms: 60,
+                derived_ready_ms: 90,
+            },
+            AppendAttributionSample {
+                sequence: 2,
+                blob_kind: "append".to_owned(),
+                events_in_blob: 5,
+                cumulative_events: 10,
+                checkpoint_target_event_id: 10,
+                upload_complete_ms: 25,
+                event_lane_expected_ready_ms: 80,
+                session_lane_expected_ready_ms: 55,
+                derived_ready_ms: 95,
+            },
+        ])
+        .expect("append attribution summary");
+
+        assert_eq!(summary.sample_count, 2);
+        assert_eq!(summary.upload_to_event_lane_ready_p50_ms, 25);
+        assert_eq!(summary.upload_to_event_lane_ready_p95_ms, 55);
+        assert_eq!(summary.upload_to_session_lane_ready_p50_ms, 30);
+        assert_eq!(summary.upload_to_session_lane_ready_p95_ms, 40);
+        assert_eq!(summary.latest_lane_to_derived_visible_p50_ms, 15);
+        assert_eq!(summary.latest_lane_to_derived_visible_p95_ms, 30);
+        assert_eq!(summary.overall_derived_ready_p50_ms, 90);
+        assert_eq!(summary.overall_derived_ready_p95_ms, 95);
+        assert_eq!(
+            summary.dominant_contributor,
+            Some("upload_to_event_lane_ready".to_owned())
+        );
+    }
+
+    #[test]
+    fn write_append_attribution_sidecar_writes_summary_and_samples() {
+        let tempdir = tempdir().expect("create tempdir");
+        let scenario_dir = tempdir.path().join("live-append-small-blobs");
+        let samples = vec![AppendAttributionSample {
+            sequence: 1,
+            blob_kind: "append".to_owned(),
+            events_in_blob: 5,
+            cumulative_events: 5,
+            checkpoint_target_event_id: 5,
+            upload_complete_ms: 20,
+            event_lane_expected_ready_ms: 50,
+            session_lane_expected_ready_ms: 65,
+            derived_ready_ms: 90,
+        }];
+        let event_lane_trace = r#"{"record_type":"event_metrics_batch","last_processed_event_id":0,"next_offset":5,"processed_events":5,"phases_ms":{"build_rollups":17,"upsert_total":5,"upsert_dim1":7,"commit":3},"counts":{"total_delta_rows":2,"dim1_delta_rows":6}}
+"#;
+
+        write_append_attribution_sidecar(
+            &scenario_dir,
+            "live-append-small-blobs",
+            &dummy_slo_run_config(),
+            &samples,
+            Some(event_lane_trace),
+        )
+        .expect("write append attribution sidecar");
+
+        let sidecar: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(scenario_dir.join("append-attribution.json"))
+                .expect("read append attribution sidecar"),
+        )
+        .expect("parse append attribution sidecar");
+
+        assert_eq!(sidecar["scenario"], "live-append-small-blobs");
+        assert_eq!(sidecar["samples"][0]["checkpoint_target_event_id"], 5);
+        assert_eq!(sidecar["summary"]["sample_count"], 1);
+        assert_eq!(sidecar["summary"]["upload_to_event_lane_ready_p95_ms"], 30);
+        assert_eq!(
+            sidecar["summary"]["latest_lane_to_derived_visible_p95_ms"],
+            25
+        );
+        assert_eq!(
+            sidecar["event_lane_summary"]["dominant_phase"],
+            "build_rollups"
+        );
+        assert_eq!(
+            sidecar["event_lane_summary"]["delta_rows_by_family"]["dim1_delta_rows"],
+            6
+        );
+        assert_eq!(
+            fs::read_to_string(scenario_dir.join("event-lane-trace.jsonl"))
+                .expect("read event lane trace sidecar"),
+            event_lane_trace
+        );
+    }
+
+    #[test]
+    fn summarize_event_lane_trace_records_surfaces_dominant_phase_and_delta_rows() {
+        let records = parse_event_lane_trace_records(
+            r#"{"record_type":"event_metrics_batch","last_processed_event_id":0,"next_offset":5,"processed_events":5,"phases_ms":{"build_rollups":17,"upsert_total":5,"upsert_dim1":7,"commit":3},"counts":{"total_delta_rows":2,"dim1_delta_rows":6,"dim2_delta_rows":8}}
+{"record_type":"event_metrics_batch","last_processed_event_id":5,"next_offset":10,"processed_events":5,"phases_ms":{"build_rollups":19,"upsert_total":6,"upsert_dim1":8,"commit":4},"counts":{"total_delta_rows":2,"dim1_delta_rows":6,"dim2_delta_rows":8}}
+"#,
+        )
+        .expect("parse event lane traces");
+        let summary = summarize_event_lane_trace_records(&records).expect("event lane summary");
+
+        assert_eq!(summary.record_count, 2);
+        assert_eq!(summary.processed_events_total, 10);
+        assert_eq!(summary.delta_rows_by_family["dim2_delta_rows"], 16);
+        assert_eq!(summary.phases[0].name, "build_rollups");
+        assert_eq!(summary.phases[0].distribution.p95_ms, 19);
+        assert_eq!(summary.dominant_phase.as_deref(), Some("build_rollups"));
     }
 
     #[test]
