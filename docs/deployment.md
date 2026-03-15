@@ -245,20 +245,21 @@ debugging.
 Worker-built metrics are asynchronous. If you verify manually, expect a short
 delay between ingesting events and seeing derived metric reads update.
 
-Run the CLI-driven smoke path against the same local stack:
+Run the CLI-driven smoke path in its own disposable stack:
 
 ```bash
 ./scripts/cli-smoke.sh
 ```
 
-That helper uses a fresh `XDG_CONFIG_HOME`, provisions an instance/profile
-through the CLI, creates a project plus a local `read` key, ingests one sample
-event with the printed ingest key, and polls one CLI metrics query until the
-derived session count appears.
+That helper starts its own disposable Compose project with a fresh
+`XDG_CONFIG_HOME`, provisions an instance/profile through the CLI, creates a
+project plus a local `read` key, ingests one sample event with the printed
+ingest key, and polls one CLI metrics query until the derived session count
+appears.
 
 For operator-facing changes, treat [`scripts/cli-smoke.sh`](../scripts/cli-smoke.sh)
 as the required dogfooding check. Keep [`scripts/compose-smoke.sh`](../scripts/compose-smoke.sh)
-as the lower-level stack smoke when you need direct HTTP visibility.
+as an optional lower-level manual smoke when you need direct HTTP visibility.
 
 ## Manual Checks
 
@@ -311,6 +312,28 @@ cargo run -p fantasma-cli -- metrics events \
   --end 2026-01-02 \
   --filter platform=ios \
   --group-by provider
+```
+
+```bash
+cargo run -p fantasma-cli -- metrics events-total \
+  --metric count \
+  --granularity day \
+  --start 2026-01-01 \
+  --end 2026-01-02 \
+  --filter platform=ios
+```
+
+```bash
+cargo run -p fantasma-cli -- metrics events-top \
+  --start 2026-01-01 \
+  --end 2026-01-02 \
+  --limit 10
+```
+
+```bash
+cargo run -p fantasma-cli -- metrics events-catalog \
+  --start 2026-01-01 \
+  --end 2026-01-02
 ```
 
 If you need raw shell variables for curl-based checks, use the automation

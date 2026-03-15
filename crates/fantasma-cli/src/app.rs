@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 use crate::{
     cli::{
-        AuthSubcommand, Cli, Command, EventMetricArg, EventMetricsArgs, InstanceAddArgs,
-        InstanceRemoveArgs, InstanceUseArgs, InstancesSubcommand, KeyCreateArgs, KeyKind,
-        KeysSubcommand, MetricsSubcommand, ProjectsSubcommand, ReadOutputArgs, SessionMetricArg,
-        SessionMetricsArgs,
+        AuthSubcommand, Cli, Command, EventCatalogArgs, EventMetricArg, EventMetricsArgs,
+        InstanceAddArgs, InstanceRemoveArgs, InstanceUseArgs, InstancesSubcommand, KeyCreateArgs,
+        KeyKind, KeysSubcommand, MetricsSubcommand, ProjectsSubcommand, ReadOutputArgs,
+        SessionMetricArg, SessionMetricsArgs, TopEventsArgs, TotalEventMetricsArgs,
     },
     config::{
         CliConfig, InstanceProfile, StoredReadKey, ensure_secure_persistence_supported,
@@ -102,6 +102,11 @@ impl App {
             Command::Status(output) => self.status(output).await,
             Command::Metrics(metrics) => match metrics.command {
                 MetricsSubcommand::Events(events) => self.metrics_events(events).await,
+                MetricsSubcommand::EventsTotal(total) => self.metrics_events_total(total).await,
+                MetricsSubcommand::EventsTop(top) => self.metrics_events_top(top).await,
+                MetricsSubcommand::EventsCatalog(catalog) => {
+                    self.metrics_events_catalog(catalog).await
+                }
                 MetricsSubcommand::Sessions(sessions) => self.metrics_sessions(sessions).await,
             },
         }
@@ -603,6 +608,54 @@ impl App {
         render_metrics_output(body, events.output.json)
     }
 
+    async fn metrics_events_total(
+        &self,
+        total: TotalEventMetricsArgs,
+    ) -> anyhow::Result<CommandOutput> {
+        let body = self
+            .metrics_request(MetricsRequest {
+                path: "/v1/metrics/events/total",
+                metric: total.metric.as_str(),
+                granularity: total.granularity.as_str(),
+                start: &total.start,
+                end: &total.end,
+                event: None,
+                filters: &total.filters,
+                group_by: &[],
+            })
+            .await?;
+        render_metrics_output(body, total.output.json)
+    }
+
+    async fn metrics_events_top(&self, top: TopEventsArgs) -> anyhow::Result<CommandOutput> {
+        let body = self
+            .project_key_request(
+                "/v1/metrics/events/top",
+                &top.start,
+                &top.end,
+                &top.filters,
+                &[("limit", top.limit.to_string())],
+            )
+            .await?;
+        render_top_events_output(body, top.output.json)
+    }
+
+    async fn metrics_events_catalog(
+        &self,
+        catalog: EventCatalogArgs,
+    ) -> anyhow::Result<CommandOutput> {
+        let body = self
+            .project_key_request(
+                "/v1/metrics/events/catalog",
+                &catalog.start,
+                &catalog.end,
+                &catalog.filters,
+                &[],
+            )
+            .await?;
+        render_event_catalog_output(body, catalog.output.json)
+    }
+
     async fn metrics_request(&self, request: MetricsRequest<'_>) -> anyhow::Result<String> {
         let config = load_config(&self.config_path)?;
         let profile = active_instance(&config)?;
@@ -617,6 +670,7 @@ impl App {
             .context(
                 "read key is not configured for the active project; run `fantasma keys create --kind read --name <key-name>`",
             )?;
+        let parsed_filters = parse_filters(request.filters)?;
         let mut url = api_url(&profile.api_base_url, request.path).context("build metrics url")?;
         {
             let mut query = url.query_pairs_mut();
@@ -627,10 +681,7 @@ impl App {
             if let Some(event) = request.event.as_deref() {
                 query.append_pair("event", event);
             }
-            for filter in request.filters {
-                let (key, value) = filter
-                    .split_once('=')
-                    .with_context(|| format!("invalid filter '{filter}', expected key=value"))?;
+            for (key, value) in &parsed_filters {
                 query.append_pair(key, value);
             }
             for dimension in request.group_by {
@@ -646,6 +697,51 @@ impl App {
             .context("load metrics")?;
         ensure_success(response.status(), "load metrics")?;
         response.text().await.context("read metrics body")
+    }
+
+    async fn project_key_request(
+        &self,
+        path: &str,
+        start: &str,
+        end: &str,
+        filters: &[String],
+        extra_query: &[(&str, String)],
+    ) -> anyhow::Result<String> {
+        let config = load_config(&self.config_path)?;
+        let profile = active_instance(&config)?;
+        let project_id = profile
+            .active_project_id
+            .context(
+                "active project is not configured for the active instance; run `fantasma projects use <project-id>`",
+            )?;
+        let read_key = profile
+            .read_keys
+            .get(&project_id)
+            .context(
+                "read key is not configured for the active project; run `fantasma keys create --kind read --name <key-name>`",
+            )?;
+        let parsed_filters = parse_filters(filters)?;
+        let mut url = api_url(&profile.api_base_url, path).context("build event metrics url")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("start", start);
+            query.append_pair("end", end);
+            for (key, value) in extra_query {
+                query.append_pair(key, value);
+            }
+            for (key, value) in &parsed_filters {
+                query.append_pair(key, value);
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .header("x-fantasma-key", &read_key.secret)
+            .send()
+            .await
+            .context("load event discovery")?;
+        ensure_success(response.status(), "load event discovery")?;
+        response.text().await.context("read event discovery body")
     }
 }
 
@@ -851,4 +947,72 @@ fn render_metrics_output(body: String, json_output: bool) -> anyhow::Result<Comm
     Ok(CommandOutput {
         stdout: lines.join("\n"),
     })
+}
+
+fn render_top_events_output(body: String, json_output: bool) -> anyhow::Result<CommandOutput> {
+    if json_output {
+        return Ok(CommandOutput { stdout: body });
+    }
+
+    let response: TopEventsResponse =
+        serde_json::from_str(&body).context("decode top events body")?;
+    let lines = response
+        .events
+        .into_iter()
+        .map(|event| format!("{}\t{}", event.name, event.count))
+        .collect::<Vec<_>>();
+    Ok(CommandOutput {
+        stdout: lines.join("\n"),
+    })
+}
+
+fn render_event_catalog_output(body: String, json_output: bool) -> anyhow::Result<CommandOutput> {
+    if json_output {
+        return Ok(CommandOutput { stdout: body });
+    }
+
+    let response: EventCatalogResponse =
+        serde_json::from_str(&body).context("decode event catalog body")?;
+    let lines = response
+        .events
+        .into_iter()
+        .map(|event| format!("{}\t{}", event.name, event.last_seen_at))
+        .collect::<Vec<_>>();
+    Ok(CommandOutput {
+        stdout: lines.join("\n"),
+    })
+}
+
+fn parse_filters(filters: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    filters
+        .iter()
+        .map(|filter| {
+            let (key, value) = filter
+                .split_once('=')
+                .with_context(|| format!("invalid filter '{filter}', expected key=value"))?;
+            Ok((key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct TopEventsResponse {
+    events: Vec<TopEventRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopEventRecord {
+    name: String,
+    count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventCatalogResponse {
+    events: Vec<EventCatalogItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventCatalogItem {
+    name: String,
+    last_seen_at: String,
 }

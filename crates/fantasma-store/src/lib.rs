@@ -1035,50 +1035,6 @@ pub async fn insert_install_first_seen_in_tx(
     Ok(result.rows_affected() == 1)
 }
 
-pub async fn load_install_first_seen_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    project_id: Uuid,
-    install_id: &str,
-) -> Result<Option<InstallFirstSeenRecord>, StoreError> {
-    let row = sqlx::query(
-        r#"
-        SELECT project_id, install_id, first_seen_event_id, first_seen_at, platform, app_version
-        FROM install_first_seen
-        WHERE project_id = $1
-          AND install_id = $2
-        "#,
-    )
-    .bind(project_id)
-    .bind(install_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-
-    row.map(install_first_seen_from_row).transpose()
-}
-
-pub async fn fetch_event_metrics_cube_rows(
-    pool: &PgPool,
-    project_id: Uuid,
-    granularity: MetricGranularity,
-    event_name: &str,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    cube_keys: &[String],
-    filters: &BTreeMap<String, String>,
-) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
-    fetch_event_metrics_cube_rows_in_executor(
-        pool,
-        project_id,
-        granularity,
-        event_name,
-        start,
-        end,
-        cube_keys,
-        filters,
-    )
-    .await
-}
-
 pub async fn fetch_event_metrics_cube_rows_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
@@ -1188,29 +1144,6 @@ where
     }
 }
 
-pub async fn fetch_event_metrics_aggregate_cube_rows(
-    pool: &PgPool,
-    project_id: Uuid,
-    granularity: MetricGranularity,
-    event_name: &str,
-    window: (DateTime<Utc>, DateTime<Utc>),
-    cube_keys: &[String],
-    filters: &BTreeMap<String, String>,
-    limit: Option<usize>,
-) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
-    fetch_event_metrics_aggregate_cube_rows_in_executor(
-        pool,
-        project_id,
-        granularity,
-        event_name,
-        window,
-        cube_keys,
-        filters,
-        limit,
-    )
-    .await
-}
-
 pub async fn fetch_event_metrics_aggregate_cube_rows_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
@@ -1318,29 +1251,6 @@ where
             "event metrics cube arity must be between 0 and 4, got {other}"
         ))),
     }
-}
-
-pub async fn fetch_session_metrics_cube_rows(
-    pool: &PgPool,
-    project_id: Uuid,
-    granularity: MetricGranularity,
-    metric: SessionMetric,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    cube_keys: &[String],
-    filters: &BTreeMap<String, String>,
-) -> Result<Vec<SessionMetricsCubeRow>, StoreError> {
-    fetch_session_metrics_cube_rows_in_executor(
-        pool,
-        project_id,
-        granularity,
-        metric,
-        start,
-        end,
-        cube_keys,
-        filters,
-    )
-    .await
 }
 
 pub async fn fetch_session_metrics_cube_rows_in_tx(
@@ -1500,14 +1410,6 @@ where
             "session metrics cube arity must be between 0 and 2, got {other}"
         ))),
     }
-}
-
-pub async fn fetch_events_after(
-    pool: &PgPool,
-    last_processed_event_id: i64,
-    limit: i64,
-) -> Result<Vec<RawEventRecord>, StoreError> {
-    fetch_events_after_in_executor(pool, last_processed_event_id, limit).await
 }
 
 pub async fn fetch_events_after_in_tx(
@@ -1807,14 +1709,6 @@ pub async fn load_install_session_state(
     install_id: &str,
 ) -> Result<Option<InstallSessionStateRecord>, StoreError> {
     load_install_session_state_in_executor(pool, project_id, install_id).await
-}
-
-pub async fn load_install_session_state_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    project_id: Uuid,
-    install_id: &str,
-) -> Result<Option<InstallSessionStateRecord>, StoreError> {
-    load_install_session_state_in_executor(&mut **tx, project_id, install_id).await
 }
 
 pub async fn load_install_session_states_in_tx(
@@ -2611,23 +2505,6 @@ pub async fn increment_session_daily_for_new_session(
     .await
 }
 
-pub async fn increment_session_daily_for_new_session_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    project_id: Uuid,
-    day: NaiveDate,
-    install_id: &str,
-    duration_seconds: i64,
-) -> Result<u64, StoreError> {
-    increment_session_daily_for_new_session_in_executor(
-        &mut **tx,
-        project_id,
-        day,
-        install_id,
-        duration_seconds,
-    )
-    .await
-}
-
 async fn increment_session_daily_for_new_session_in_executor<'a, E>(
     executor: E,
     project_id: Uuid,
@@ -2796,15 +2673,6 @@ pub async fn add_session_daily_duration_delta(
     add_session_daily_duration_delta_in_executor(pool, project_id, day, duration_delta).await
 }
 
-pub async fn add_session_daily_duration_delta_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    project_id: Uuid,
-    day: NaiveDate,
-    duration_delta: i64,
-) -> Result<u64, StoreError> {
-    add_session_daily_duration_delta_in_executor(&mut **tx, project_id, day, duration_delta).await
-}
-
 async fn add_session_daily_duration_delta_in_executor<'a, E>(
     executor: E,
     project_id: Uuid,
@@ -2830,35 +2698,6 @@ where
     .await?;
 
     Ok(result.rows_affected())
-}
-
-pub async fn fetch_session_daily_range(
-    pool: &PgPool,
-    project_id: Uuid,
-    start_date: NaiveDate,
-    end_date: NaiveDate,
-) -> Result<Vec<SessionDailyRecord>, StoreError> {
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            project_id,
-            day,
-            sessions_count,
-            active_installs,
-            total_duration_seconds
-        FROM session_daily
-        WHERE project_id = $1
-          AND day BETWEEN $2 AND $3
-        ORDER BY day ASC
-        "#,
-    )
-    .bind(project_id)
-    .bind(start_date)
-    .bind(end_date)
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter().map(session_daily_from_row).collect()
 }
 
 pub async fn rebuild_session_daily_days_in_tx(
@@ -2887,20 +2726,6 @@ pub struct SessionDailyRebuildTelemetry {
 enum SessionDailyInstallRebuildMode {
     FullDay,
     PendingQueue,
-}
-
-pub async fn rebuild_session_daily_days_with_telemetry_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    project_id: Uuid,
-    days: &[NaiveDate],
-) -> Result<SessionDailyRebuildTelemetry, StoreError> {
-    rebuild_session_daily_days_with_telemetry_for_mode_in_tx(
-        tx,
-        project_id,
-        days,
-        SessionDailyInstallRebuildMode::FullDay,
-    )
-    .await
 }
 
 pub async fn rebuild_session_daily_days_from_pending_install_rebuilds_with_telemetry_in_tx(
@@ -4512,29 +4337,6 @@ fn install_session_state_from_row(
         tail_duration_seconds: row.try_get("tail_duration_seconds")?,
         tail_day: row.try_get("tail_day")?,
         last_processed_event_id: row.try_get("last_processed_event_id")?,
-    })
-}
-
-fn session_daily_from_row(row: sqlx::postgres::PgRow) -> Result<SessionDailyRecord, StoreError> {
-    Ok(SessionDailyRecord {
-        project_id: row.try_get("project_id")?,
-        day: row.try_get("day")?,
-        sessions_count: row.try_get("sessions_count")?,
-        active_installs: row.try_get("active_installs")?,
-        total_duration_seconds: row.try_get("total_duration_seconds")?,
-    })
-}
-
-fn install_first_seen_from_row(
-    row: sqlx::postgres::PgRow,
-) -> Result<InstallFirstSeenRecord, StoreError> {
-    Ok(InstallFirstSeenRecord {
-        project_id: row.try_get("project_id")?,
-        install_id: row.try_get("install_id")?,
-        first_seen_event_id: row.try_get("first_seen_event_id")?,
-        first_seen_at: row.try_get("first_seen_at")?,
-        platform: platform_from_str(&row.try_get::<String, _>("platform")?)?,
-        app_version: row.try_get("app_version")?,
     })
 }
 

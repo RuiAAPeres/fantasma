@@ -155,6 +155,12 @@ pub struct MetricsCommand {
 #[derive(Debug, Subcommand)]
 pub enum MetricsSubcommand {
     Events(EventMetricsArgs),
+    #[command(name = "events-total")]
+    EventsTotal(TotalEventMetricsArgs),
+    #[command(name = "events-top")]
+    EventsTop(TopEventsArgs),
+    #[command(name = "events-catalog")]
+    EventsCatalog(EventCatalogArgs),
     Sessions(SessionMetricsArgs),
 }
 
@@ -174,6 +180,48 @@ pub struct EventMetricsArgs {
     pub filters: Vec<String>,
     #[arg(long = "group-by")]
     pub group_by: Vec<String>,
+    #[command(flatten)]
+    pub output: ReadOutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct TotalEventMetricsArgs {
+    #[arg(long)]
+    pub metric: EventMetricArg,
+    #[arg(long)]
+    pub granularity: MetricGranularityArg,
+    #[arg(long)]
+    pub start: String,
+    #[arg(long)]
+    pub end: String,
+    #[arg(long = "filter")]
+    pub filters: Vec<String>,
+    #[command(flatten)]
+    pub output: ReadOutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct TopEventsArgs {
+    #[arg(long)]
+    pub start: String,
+    #[arg(long)]
+    pub end: String,
+    #[arg(long, default_value_t = 10)]
+    pub limit: u32,
+    #[arg(long = "filter")]
+    pub filters: Vec<String>,
+    #[command(flatten)]
+    pub output: ReadOutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct EventCatalogArgs {
+    #[arg(long)]
+    pub start: String,
+    #[arg(long)]
+    pub end: String,
+    #[arg(long = "filter")]
+    pub filters: Vec<String>,
     #[command(flatten)]
     pub output: ReadOutputArgs,
 }

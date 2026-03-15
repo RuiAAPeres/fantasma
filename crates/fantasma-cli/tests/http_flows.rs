@@ -91,6 +91,9 @@ impl TestServer {
                 delete(revoke_key),
             )
             .route("/v1/metrics/events", get(event_metrics))
+            .route("/v1/metrics/events/total", get(total_event_metrics))
+            .route("/v1/metrics/events/top", get(top_events))
+            .route("/v1/metrics/events/catalog", get(event_catalog))
             .route("/v1/metrics/sessions", get(session_metrics))
             .with_state(state);
         let router = if base_path == "/" {
@@ -1125,6 +1128,47 @@ async fn metrics_events_rejects_malformed_filters_before_request() {
 }
 
 #[tokio::test]
+async fn metrics_events_total_text_renders_series_rows() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: "fg_rd_created".to_owned(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "events-total",
+            "--metric",
+            "count",
+            "--granularity",
+            "day",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-02",
+            "--filter",
+            "platform=ios",
+        ]))
+        .await
+        .expect("total event metrics succeed");
+
+    assert!(output.stdout.contains("{}"));
+    assert!(output.stdout.contains("2026-03-01"));
+    assert!(output.stdout.contains("7"));
+}
+
+#[tokio::test]
 async fn metrics_events_text_renders_series_rows() {
     let server = TestServer::spawn().await;
     let mut config = server.read_config();
@@ -1167,6 +1211,58 @@ async fn metrics_events_text_renders_series_rows() {
     assert!(output.stdout.contains("\"platform\":\"ios\""));
     assert!(output.stdout.contains("2026-03-01"));
     assert!(output.stdout.contains("4"));
+}
+
+#[tokio::test]
+async fn metrics_events_total_serializes_filters_exactly() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: server.read_key_secret.clone(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "events-total",
+            "--metric",
+            "count",
+            "--granularity",
+            "day",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-02",
+            "--filter",
+            "platform=ios",
+            "--filter",
+            "app_version=1.2.3",
+            "--json",
+        ]))
+        .await
+        .expect("total event metrics succeed");
+
+    let records = server.records();
+    let request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/events/total")
+        .expect("total event metrics request");
+    assert_eq!(
+        request.query.as_deref(),
+        Some(
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.2.3"
+        )
+    );
 }
 
 #[tokio::test]
@@ -1224,6 +1320,104 @@ async fn metrics_events_serializes_filters_and_repeated_group_by_exactly() {
         Some(
             "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&event=app_open&platform=ios&app_version=1.2.3&group_by=platform&group_by=app_version"
         )
+    );
+}
+
+#[tokio::test]
+async fn metrics_events_top_text_renders_ranked_rows_and_serializes_limit() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: server.read_key_secret.clone(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "events-top",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-02",
+            "--limit",
+            "5",
+            "--filter",
+            "platform=ios",
+        ]))
+        .await
+        .expect("top events succeed");
+
+    assert!(output.stdout.contains("app_open\t12"));
+    assert!(output.stdout.contains("button_pressed\t4"));
+
+    let records = server.records();
+    let request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/events/top")
+        .expect("top events request");
+    assert_eq!(
+        request.query.as_deref(),
+        Some("start=2026-03-01&end=2026-03-02&limit=5&platform=ios")
+    );
+}
+
+#[tokio::test]
+async fn metrics_events_catalog_text_renders_last_seen_rows() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: server.read_key_secret.clone(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "events-catalog",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-02",
+            "--filter",
+            "platform=ios",
+        ]))
+        .await
+        .expect("event catalog succeeds");
+
+    assert!(output.stdout.contains("app_open\t2026-03-02T10:15:00Z"));
+    assert!(
+        output
+            .stdout
+            .contains("button_pressed\t2026-03-01T08:00:00Z")
+    );
+
+    let records = server.records();
+    let request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/events/catalog")
+        .expect("event catalog request");
+    assert_eq!(
+        request.query.as_deref(),
+        Some("start=2026-03-01&end=2026-03-02&platform=ios")
     );
 }
 
@@ -1733,6 +1927,112 @@ async fn event_metrics(
                             "value": 4
                         }
                     ]
+                }
+            ]
+        })),
+    )
+        .into_response()
+}
+
+async fn total_event_metrics(
+    State(state): State<ServerState>,
+    original_uri: OriginalUri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(status) = project_key_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
+    }
+    record_request(
+        &state,
+        "GET",
+        original_uri.path(),
+        original_uri.query(),
+        headers,
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "metric": "count",
+            "granularity": "day",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        {
+                            "bucket": "2026-03-01",
+                            "value": 7
+                        }
+                    ]
+                }
+            ]
+        })),
+    )
+        .into_response()
+}
+
+async fn top_events(
+    State(state): State<ServerState>,
+    original_uri: OriginalUri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(status) = project_key_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
+    }
+    record_request(
+        &state,
+        "GET",
+        original_uri.path(),
+        original_uri.query(),
+        headers,
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "events": [
+                {
+                    "name": "app_open",
+                    "count": 12
+                },
+                {
+                    "name": "button_pressed",
+                    "count": 4
+                }
+            ]
+        })),
+    )
+        .into_response()
+}
+
+async fn event_catalog(
+    State(state): State<ServerState>,
+    original_uri: OriginalUri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(status) = project_key_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
+    }
+    record_request(
+        &state,
+        "GET",
+        original_uri.path(),
+        original_uri.query(),
+        headers,
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "events": [
+                {
+                    "name": "app_open",
+                    "last_seen_at": "2026-03-02T10:15:00Z"
+                },
+                {
+                    "name": "button_pressed",
+                    "last_seen_at": "2026-03-01T08:00:00Z"
                 }
             ]
         })),
