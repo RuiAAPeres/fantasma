@@ -31,6 +31,7 @@ curl / SDK
   -> fantasma-worker
   -> derived Postgres sessions, session_daily, session_daily_installs, event bucket rollups, session bucket rollups, and install first-seen state
   -> GET /v1/metrics/events and /v1/metrics/sessions
+  -> GET /v1/metrics/events/total
   -> GET /v1/metrics/events/catalog and /v1/metrics/events/top
   -> query API
 ```

@@ -66,6 +66,12 @@ pub struct TopEventRecord {
     pub event_count: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventBucketCountRecord {
+    pub bucket_start: DateTime<Utc>,
+    pub event_count: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKeyKind {
     Ingest,
@@ -1649,6 +1655,45 @@ pub async fn list_top_events(
         .map(|row| {
             Ok(TopEventRecord {
                 event_name: row.try_get("event_name")?,
+                event_count: row.try_get("event_count")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(StoreError::Database)
+}
+
+pub async fn fetch_total_event_counts_by_bucket(
+    pool: &PgPool,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    start: DateTime<Utc>,
+    end_exclusive: DateTime<Utc>,
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventBucketCountRecord>, StoreError> {
+    let bucket_expression = match granularity {
+        MetricGranularity::Hour => "date_trunc('hour', timestamp)",
+        MetricGranularity::Day => "date_trunc('day', timestamp)",
+    };
+
+    let mut query = QueryBuilder::<Postgres>::new("SELECT ");
+    query.push(bucket_expression);
+    query.push(
+        " AS bucket_start, COUNT(*)::bigint AS event_count FROM events_raw WHERE project_id = ",
+    );
+    query.push_bind(project_id);
+    query.push(" AND timestamp >= ");
+    query.push_bind(start);
+    query.push(" AND timestamp < ");
+    query.push_bind(end_exclusive);
+    append_raw_event_filters(&mut query, filters);
+    query.push(" GROUP BY 1 ORDER BY 1 ASC");
+
+    let rows = query.build().fetch_all(pool).await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(EventBucketCountRecord {
+                bucket_start: row.try_get("bucket_start")?,
                 event_count: row.try_get("event_count")?,
             })
         })

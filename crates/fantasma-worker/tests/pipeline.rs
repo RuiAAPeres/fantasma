@@ -351,6 +351,36 @@ async fn event_discovery_routes_return_catalog_and_top_events_for_real_ingest(po
         })
     );
 
+    let total_response = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/events/total?metric=count&granularity=day&start=2026-01-01&end=2026-01-01",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid total request"),
+        )
+        .await
+        .expect("total request succeeds");
+    assert_eq!(total_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(total_response).await,
+        serde_json::json!({
+            "metric": "count",
+            "granularity": "day",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 4 }
+                    ]
+                }
+            ]
+        })
+    );
+
     let filtered_top_response = api
         .oneshot(
             Request::get("/v1/metrics/events/top?start=2026-01-01&end=2026-01-01&plan=pro&limit=3")

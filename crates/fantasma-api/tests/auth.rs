@@ -706,6 +706,20 @@ async fn event_discovery_routes_require_read_keys(pool: PgPool) {
         .expect("response succeeds");
     assert_eq!(ingest_top.status(), StatusCode::UNAUTHORIZED);
 
+    let operator_total = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/events/total?metric=count&granularity=day&start=2026-01-01&end=2026-01-02",
+            )
+            .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(operator_total.status(), StatusCode::UNAUTHORIZED);
+
     let read_catalog = api
         .clone()
         .oneshot(
@@ -717,6 +731,20 @@ async fn event_discovery_routes_require_read_keys(pool: PgPool) {
         .await
         .expect("response succeeds");
     assert_eq!(read_catalog.status(), StatusCode::OK);
+
+    let read_total = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/events/total?metric=count&granularity=day&start=2026-01-01&end=2026-01-02",
+            )
+            .header("x-fantasma-key", &read_key)
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(read_total.status(), StatusCode::OK);
 
     let invalid_project_query = api
         .clone()
@@ -732,6 +760,23 @@ async fn event_discovery_routes_require_read_keys(pool: PgPool) {
         .expect("response succeeds");
     assert_eq!(
         invalid_project_query.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let invalid_total_query = api
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/v1/metrics/events/total?project_id={project_id}&metric=count&granularity=day&start=2026-01-01&end=2026-01-02"
+            ))
+            .header("x-fantasma-key", &read_key)
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(
+        invalid_total_query.status(),
         StatusCode::UNPROCESSABLE_ENTITY
     );
 

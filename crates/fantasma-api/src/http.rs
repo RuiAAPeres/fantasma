@@ -25,8 +25,8 @@ use fantasma_store::{
     StoreError, TopEventRecord, create_api_key, create_project_with_api_key,
     fetch_event_metrics_aggregate_cube_rows_in_tx, fetch_event_metrics_cube_rows_in_tx,
     fetch_session_metrics_aggregate_cube_rows_in_tx, fetch_session_metrics_cube_rows_in_tx,
-    generate_api_key_secret, list_api_keys, list_event_catalog, list_projects, list_top_events,
-    load_project, rename_project, resolve_api_key, revoke_api_key,
+    fetch_total_event_counts_by_bucket, generate_api_key_secret, list_api_keys, list_event_catalog,
+    list_projects, list_top_events, load_project, rename_project, resolve_api_key, revoke_api_key,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use sqlx::{Postgres, Transaction};
@@ -56,6 +56,13 @@ struct PublicSessionMetricsQuery {
     window: MetricsBucketWindow,
     filters: BTreeMap<String, String>,
     group_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicTotalEventsQuery {
+    metric: EventMetric,
+    window: MetricsBucketWindow,
+    filters: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,6 +121,7 @@ pub fn app(pool: PgPool, authorizer: Arc<StaticAdminAuthorizer>) -> Router {
             delete(revoke_project_key_route),
         )
         .route("/v1/metrics/events", get(events_metrics))
+        .route("/v1/metrics/events/total", get(total_events_metrics))
         .route("/v1/metrics/events/catalog", get(event_catalog_route))
         .route("/v1/metrics/events/top", get(top_events_route))
         .route("/v1/metrics/sessions", get(sessions_metrics))
@@ -351,6 +359,88 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
         .map_err(|_| "invalid_request")?,
         filters,
         group_by,
+    })
+}
+
+fn parse_total_event_metrics_query(
+    raw_query: &str,
+) -> Result<PublicTotalEventsQuery, EventMetricsQueryError> {
+    let mut metric = None;
+    let mut granularity = None;
+    let mut start = None;
+    let mut end = None;
+    let mut filters = BTreeMap::new();
+
+    for (raw_key, raw_value) in form_urlencoded::parse(raw_query.as_bytes()) {
+        let key = raw_key.into_owned();
+        let value = raw_value.into_owned();
+
+        match key.as_str() {
+            "metric" => {
+                if metric.is_some() {
+                    return Err(EventMetricsQueryError("duplicate_query_key"));
+                }
+
+                metric = Some(
+                    parse_event_metric(&value).ok_or(EventMetricsQueryError("invalid_metric"))?,
+                );
+            }
+            "granularity" => {
+                if granularity.is_some() {
+                    return Err(EventMetricsQueryError("duplicate_query_key"));
+                }
+
+                granularity = Some(
+                    parse_metric_granularity(&value)
+                        .ok_or(EventMetricsQueryError("invalid_granularity"))?,
+                );
+            }
+            "start" => {
+                if start.is_some() {
+                    return Err(EventMetricsQueryError("duplicate_query_key"));
+                }
+
+                start = Some(value);
+            }
+            "end" => {
+                if end.is_some() {
+                    return Err(EventMetricsQueryError("duplicate_query_key"));
+                }
+
+                end = Some(value);
+            }
+            "platform" | "app_version" | "os_version" => {
+                if filters.insert(key, value).is_some() {
+                    return Err(EventMetricsQueryError("duplicate_query_key"));
+                }
+            }
+            "project_id" | "start_date" | "end_date" | "event" | "group_by" => {
+                return Err(EventMetricsQueryError("invalid_query_key"));
+            }
+            _ => {
+                if is_reserved_event_property_key(&key) || !is_valid_event_property_key(&key) {
+                    return Err(EventMetricsQueryError("invalid_query_key"));
+                }
+
+                if filters.insert(key, value).is_some() {
+                    return Err(EventMetricsQueryError("duplicate_query_key"));
+                }
+            }
+        }
+    }
+
+    Ok(PublicTotalEventsQuery {
+        metric: metric.ok_or(EventMetricsQueryError("invalid_metric"))?,
+        window: parse_metrics_window(
+            granularity.ok_or(EventMetricsQueryError("invalid_granularity"))?,
+            start
+                .as_deref()
+                .ok_or(EventMetricsQueryError("invalid_time_range"))?,
+            end.as_deref()
+                .ok_or(EventMetricsQueryError("invalid_time_range"))?,
+        )
+        .map_err(EventMetricsQueryError)?,
+        filters,
     })
 }
 
@@ -922,6 +1012,69 @@ async fn events_metrics(
         }
         Err(MetricsResponseError::Store(error)) => {
             tracing::error!(?error, "failed to load event metrics");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
+async fn total_events_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> impl IntoResponse {
+    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+
+    let public_query =
+        match parse_total_event_metrics_query(raw_query.as_deref().unwrap_or_default()) {
+            Ok(query) => query,
+            Err(error) => return query_error_response(error.error_code()),
+        };
+    let end_exclusive = next_bucket_start(public_query.window.end, public_query.window.granularity);
+
+    match fetch_total_event_counts_by_bucket(
+        &state.pool,
+        auth.project_id,
+        public_query.window.granularity,
+        public_query.window.start,
+        end_exclusive,
+        &public_query.filters,
+    )
+    .await
+    {
+        Ok(rows) => {
+            let counts_by_bucket = rows
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.bucket_start,
+                        BTreeMap::from([(
+                            Vec::new(),
+                            u64::try_from(row.event_count)
+                                .expect("event counts from postgres must be non-negative"),
+                        )]),
+                    )
+                })
+                .collect();
+            let response = build_metrics_response(
+                public_query.metric.as_str(),
+                &public_query.window,
+                &[],
+                counts_by_bucket,
+            );
+
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(response).expect("serialize total event metrics response"),
+                ),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::error!(?error, "failed to load total event metrics");
             query_error_response("internal_server_error")
         }
     }
@@ -2195,6 +2348,9 @@ mod tests {
         let ingest_422 = &spec["paths"]["/v1/events"]["post"]["responses"]["422"]["content"]["application/json"]
             ["schema"]["oneOf"];
         let event_metrics_500 = &spec["paths"]["/v1/metrics/events"]["get"]["responses"]["500"];
+        let total_security = spec["paths"]["/v1/metrics/events/total"]["get"]["security"]
+            .as_sequence()
+            .expect("total-event security");
         let catalog_security = spec["paths"]["/v1/metrics/events/catalog"]["get"]["security"]
             .as_sequence()
             .expect("catalog security");
@@ -2249,6 +2405,10 @@ mod tests {
             "openapi must publish the project metadata patch route"
         );
         assert!(
+            spec["paths"]["/v1/metrics/events/total"]["get"].is_mapping(),
+            "openapi must publish the total-event route"
+        );
+        assert!(
             spec["paths"]["/v1/metrics/events/catalog"]["get"].is_mapping(),
             "openapi must publish the event catalog route"
         );
@@ -2293,6 +2453,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry["ProjectKeyHeader"].is_sequence()),
             "metrics routes must document project-key auth"
+        );
+        assert!(
+            total_security
+                .iter()
+                .any(|entry| entry["ProjectKeyHeader"].is_sequence()),
+            "total-event metrics must document project-key auth"
         );
         assert!(
             catalog_security

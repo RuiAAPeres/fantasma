@@ -412,6 +412,73 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/events/total:
+    get:
+      tags:
+        - metrics
+      summary: Return total event volume over time
+      operationId: getTotalEventMetrics
+      security:
+        - ProjectKeyHeader: []
+      description: |
+        Returns one bucketed event-count series for all accepted event names in
+        the authenticated project across the requested time window.
+
+        Use normal query params for equality filters:
+
+        - built-ins: `platform`, `app_version`, `os_version`
+        - explicit properties: any additional non-reserved query key matching
+          `^[a-z][a-z0-9_]{0,62}$`
+        - legacy public params such as `project_id`, `start_date`, and
+          `end_date` fail fast and are never reinterpreted as property filters
+      x-fantasma-explicit-property-filters:
+        type: object
+        description: |
+          Any additional non-reserved top-level query parameter whose key
+          matches `^[a-z][a-z0-9_]{0,62}$` is treated as an equality filter on
+          an explicit event property.
+        additionalProperties:
+          type: string
+      parameters:
+        - $ref: '#/components/parameters/EventMetric'
+        - $ref: '#/components/parameters/MetricGranularity'
+        - $ref: '#/components/parameters/MetricStart'
+        - $ref: '#/components/parameters/MetricEnd'
+        - $ref: '#/components/parameters/PlatformFilter'
+        - $ref: '#/components/parameters/AppVersionFilter'
+        - $ref: '#/components/parameters/OsVersionFilter'
+      responses:
+        '200':
+          description: Bucketed total event-count series using the uniform metrics family response shape.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsResponse'
+        '401':
+          description: Missing, invalid, revoked, or wrong-kind project read key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `invalid_metric`
+            - `invalid_granularity`
+            - `invalid_time_range`
+            - `invalid_query_key`
+            - `duplicate_query_key`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while loading total event metrics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/metrics/events/catalog:
     get:
       tags:
