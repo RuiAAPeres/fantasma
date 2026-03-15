@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/infra/docker/compose.test.yaml"
 PROJECT_NAME="fantasma-tests"
 KEEP_CONTAINERS="${FANTASMA_DOCKER_TEST_KEEP_CONTAINERS:-0}"
+KEEP_CACHE="${FANTASMA_DOCKER_TEST_KEEP_CACHE:-0}"
 HEALTH_TIMEOUT_SECONDS="${FANTASMA_DOCKER_TEST_HEALTH_TIMEOUT_SECONDS:-60}"
 
 compose() {
@@ -34,7 +35,13 @@ cleanup() {
     exit "$exit_code"
   fi
 
-  compose down --remove-orphans >/dev/null 2>&1 || true
+  if [[ "$KEEP_CACHE" == "1" ]]; then
+    echo "keeping docker test cache volumes because FANTASMA_DOCKER_TEST_KEEP_CACHE=1" >&2
+    compose down --remove-orphans >/dev/null 2>&1 || true
+    exit "$exit_code"
+  fi
+
+  compose down --volumes --remove-orphans --rmi local >/dev/null 2>&1 || true
   exit "$exit_code"
 }
 

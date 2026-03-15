@@ -1,3 +1,5 @@
+name: fantasma-local
+
 services:
   postgres:
     image: postgres:17-alpine

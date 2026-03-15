@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/infra/docker/compose.yaml"
-PROJECT_NAME="${FANTASMA_CLI_SMOKE_PROJECT_NAME:-fantasma-cli-smoke-$$}"
+PROJECT_NAME="${FANTASMA_CLI_SMOKE_PROJECT_NAME:-fantasma-cli-smoke}"
 ADMIN_TOKEN=""
 INSTANCE_NAME="${FANTASMA_CLI_SMOKE_INSTANCE:-local}"
 API_URL="${FANTASMA_CLI_SMOKE_API_URL:-http://localhost:8082}"
@@ -11,6 +11,7 @@ INGEST_URL="${FANTASMA_CLI_SMOKE_INGEST_URL:-http://localhost:8081}"
 PROJECT_LABEL="${FANTASMA_CLI_SMOKE_PROJECT_NAME_LABEL:-CLI Smoke}"
 TIMEOUT_SECONDS=60
 SLEEP_SECONDS=2
+KEEP_STACK="${FANTASMA_CLI_SMOKE_KEEP_STACK:-0}"
 XDG_CONFIG_HOME="$(mktemp -d)"
 
 compose() {
@@ -44,7 +45,13 @@ cleanup() {
   local exit_code=$?
   trap - EXIT INT TERM
   rm -rf "$XDG_CONFIG_HOME"
-  compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+
+  if [[ "$KEEP_STACK" == "1" ]]; then
+    echo "keeping CLI smoke stack because FANTASMA_CLI_SMOKE_KEEP_STACK=1" >&2
+    exit "$exit_code"
+  fi
+
+  compose down --volumes --remove-orphans --rmi local >/dev/null 2>&1 || true
   exit "$exit_code"
 }
 

@@ -21,6 +21,15 @@ Repository files:
 - operator CLI: `cargo run -p fantasma-cli -- ...`
 - CLI smoke helper: [`scripts/cli-smoke.sh`](../scripts/cli-smoke.sh)
 - automation helper: [`scripts/provision-project.sh`](../scripts/provision-project.sh)
+- Docker reclaim helper: [`scripts/docker-reclaim.sh`](../scripts/docker-reclaim.sh)
+
+Stable default Compose project names used in local workflows:
+
+- default stack: `fantasma-local`
+- benchmark stack: `fantasma-bench`
+- Docker-backed workspace tests: `fantasma-tests`
+- HTTP smoke helper: `fantasma-smoke`
+- CLI smoke helper: `fantasma-cli-smoke`
 
 ## Configuration
 
@@ -136,6 +145,17 @@ Stop the stack and remove volumes:
 docker compose -f infra/docker/compose.yaml down --volumes --remove-orphans
 ```
 
+`infra/docker/compose.yaml` declares `name: fantasma-local`, so the default
+local stack now keeps one stable Compose project name unless you override it
+explicitly with `docker compose -p ...`.
+
+If you have older Fantasma-owned Docker images, containers, or volumes left
+behind from earlier local runs, reclaim them explicitly with:
+
+```bash
+./scripts/docker-reclaim.sh
+```
+
 ## CLI Access
 
 Run the CLI directly from the workspace:
@@ -232,15 +252,22 @@ Run the preflighted smoke script:
 The smoke path:
 
 - checks free disk and Docker availability
-- runs the stack in a disposable Compose project
+- starts from a clean local Docker state for the stable `fantasma-smoke`
+  Compose project
 - waits for `http://localhost:8081/health` and `http://localhost:8082/health`
 - provisions a project plus scoped ingest/read keys on the blank database
 - ingests sample events
 - polls worker-derived metrics until the expected data appears
-- tears the stack down with volumes on exit
+- tears the stack down with `--volumes --remove-orphans --rmi local` on exit
+
+`./scripts/compose-smoke.sh` is disk-first by default. It clears any prior
+`fantasma-smoke` stack before bringing the services up, and it removes the
+stack's local images and volumes again during cleanup so repeated local runs do
+not keep accumulating Fantasma-owned Docker artifacts.
 
 Set `FANTASMA_SMOKE_PROJECT_NAME` if you need a stable Compose project name for
-debugging.
+debugging. Set `FANTASMA_SMOKE_KEEP_STACK=1` if you need the HTTP smoke stack
+left running after the script exits.
 
 Worker-built metrics are asynchronous. If you verify manually, expect a short
 delay between ingesting events and seeing derived metric reads update.
@@ -251,11 +278,34 @@ Run the CLI-driven smoke path in its own disposable stack:
 ./scripts/cli-smoke.sh
 ```
 
-That helper starts its own disposable Compose project with a fresh
-`XDG_CONFIG_HOME`, provisions an instance/profile through the CLI, creates a
-project plus a local `read` key, ingests one sample event with the printed
-ingest key, and polls one CLI metrics query until the derived session count
-appears.
+That helper uses the stable `fantasma-cli-smoke` Compose project name, starts
+from a fresh `XDG_CONFIG_HOME`, provisions an instance/profile through the CLI,
+creates a project plus a local `read` key, ingests one sample event with the
+printed ingest key, polls one CLI metrics query until the derived session count
+appears, and then removes its local images and volumes with
+`--volumes --remove-orphans --rmi local`.
+
+Set `FANTASMA_CLI_SMOKE_PROJECT_NAME` if you need a different stable Compose
+project name for debugging. Set `FANTASMA_CLI_SMOKE_KEEP_STACK=1` if you need
+the CLI smoke stack left running after the script exits.
+
+## Docker-Backed Tests
+
+Run DB-backed Rust tests through the Docker helper:
+
+```bash
+./scripts/docker-test.sh
+```
+
+`./scripts/docker-test.sh` uses the stable `fantasma-tests` Compose project
+name and is now disk-first by default. Successful and failed runs both clean up
+the test stack with `--volumes --remove-orphans --rmi local`, which drops the
+workspace test containers, local images, and the Cargo cache volumes created by
+`infra/docker/compose.test.yaml`.
+
+If you need to keep those cache volumes between runs, set
+`FANTASMA_DOCKER_TEST_KEEP_CACHE=1`. If you need the containers left behind for
+deeper debugging, set `FANTASMA_DOCKER_TEST_KEEP_CONTAINERS=1`.
 
 For operator-facing changes, treat [`scripts/cli-smoke.sh`](../scripts/cli-smoke.sh)
 as the required dogfooding check. Keep [`scripts/compose-smoke.sh`](../scripts/compose-smoke.sh)

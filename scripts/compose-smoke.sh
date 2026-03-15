@@ -3,13 +3,14 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/infra/docker/compose.yaml"
-PROJECT_NAME="${FANTASMA_SMOKE_PROJECT_NAME:-fantasma-smoke-$$}"
+PROJECT_NAME="${FANTASMA_SMOKE_PROJECT_NAME:-fantasma-smoke}"
 ADMIN_TOKEN=""
 MIN_FREE_KB=5000000
 TIMEOUT_SECONDS=60
 SLEEP_SECONDS=2
 INGEST_KEY=""
 READ_KEY=""
+KEEP_STACK="${FANTASMA_SMOKE_KEEP_STACK:-0}"
 
 compose() {
   docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
@@ -54,7 +55,13 @@ print_logs() {
 cleanup() {
   local exit_code=$?
   trap - EXIT INT TERM
-  compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+
+  if [[ "$KEEP_STACK" == "1" ]]; then
+    echo "keeping compose smoke stack because FANTASMA_SMOKE_KEEP_STACK=1" >&2
+    exit "$exit_code"
+  fi
+
+  compose down --volumes --remove-orphans --rmi local >/dev/null 2>&1 || true
   exit "$exit_code"
 }
 
@@ -155,7 +162,7 @@ main() {
 
   trap cleanup EXIT INT TERM
 
-  compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+  compose down --volumes --remove-orphans --rmi local >/dev/null 2>&1 || true
   compose up -d --build
   wait_for_http
 

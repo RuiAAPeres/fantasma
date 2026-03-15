@@ -1,3 +1,5 @@
+name: fantasma-tests
+
 services:
   postgres:
     image: postgres:17-alpine
