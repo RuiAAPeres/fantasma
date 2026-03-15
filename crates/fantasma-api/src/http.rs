@@ -396,7 +396,14 @@ fn parse_event_discovery_query(
                 end = Some(value);
             }
             "limit" => {
-                if !allow_limit || limit.is_some() {
+                if !allow_limit {
+                    if filters.insert(key, value).is_some() {
+                        return Err("invalid_query_key");
+                    }
+                    continue;
+                }
+
+                if limit.is_some() {
                     return Err("invalid_query_key");
                 }
 
@@ -847,7 +854,7 @@ fn project_json(project: &ProjectRecord) -> serde_json::Value {
 fn event_catalog_json(event: &EventCatalogRecord) -> serde_json::Value {
     serde_json::json!({
         "name": event.event_name,
-        "last_seen_at": event.last_seen_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "last_seen_at": event.last_seen_at.to_rfc3339_opts(SecondsFormat::AutoSi, true),
     })
 }
 

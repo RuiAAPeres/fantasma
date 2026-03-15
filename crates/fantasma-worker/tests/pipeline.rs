@@ -263,7 +263,7 @@ async fn event_discovery_routes_return_catalog_and_top_events_for_real_ingest(po
                             },
                             {
                                 "event": "purchase_completed",
-                                "timestamp": "2026-01-01T00:05:00Z",
+                                "timestamp": "2026-01-01T00:05:00.123Z",
                                 "install_id": "install-pro-1",
                                 "platform": "ios",
                                 "app_version": "1.0.0",
@@ -323,7 +323,7 @@ async fn event_discovery_routes_return_catalog_and_top_events_for_real_ingest(po
         serde_json::json!({
             "events": [
                 { "name": "screen_view", "last_seen_at": "2026-01-01T00:15:00Z" },
-                { "name": "purchase_completed", "last_seen_at": "2026-01-01T00:05:00Z" },
+                { "name": "purchase_completed", "last_seen_at": "2026-01-01T00:05:00.123Z" },
                 { "name": "app_open", "last_seen_at": "2026-01-01T00:00:00Z" }
             ]
         })
@@ -367,6 +367,73 @@ async fn event_discovery_routes_return_catalog_and_top_events_for_real_ingest(po
             "events": [
                 { "name": "app_open", "count": 1 },
                 { "name": "purchase_completed", "count": 1 }
+            ]
+        })
+    );
+}
+
+#[sqlx::test]
+async fn event_catalog_accepts_limit_as_an_explicit_property_filter(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "trial_started",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-soft-limit",
+                                "platform": "ios",
+                                "properties": {
+                                    "limit": "soft"
+                                }
+                            },
+                            {
+                                "event": "trial_blocked",
+                                "timestamp": "2026-01-01T00:05:00Z",
+                                "install_id": "install-hard-limit",
+                                "platform": "ios",
+                                "properties": {
+                                    "limit": "hard"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    let catalog_response = api
+        .oneshot(
+            Request::get("/v1/metrics/events/catalog?start=2026-01-01&end=2026-01-01&limit=soft")
+                .header("x-fantasma-key", &provisioned.read_key)
+                .body(Body::empty())
+                .expect("valid catalog request"),
+        )
+        .await
+        .expect("catalog request succeeds");
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(catalog_response).await,
+        serde_json::json!({
+            "events": [
+                { "name": "trial_started", "last_seen_at": "2026-01-01T00:00:00Z" }
             ]
         })
     );
