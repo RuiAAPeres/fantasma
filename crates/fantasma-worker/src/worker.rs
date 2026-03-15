@@ -11,26 +11,28 @@ use fantasma_core::MetricGranularity;
 use fantasma_store::{
     EventMetricBucketDim1Delta, EventMetricBucketDim2Delta, EventMetricBucketDim3Delta,
     EventMetricBucketDim4Delta, EventMetricBucketTotalDelta, InstallFirstSeenRecord,
-    InstallSessionStateRecord, PgPool, RawEventRecord, SessionDailyActiveInstallDelta,
-    SessionDailyDelta, SessionDailyDurationDelta, SessionDailyInstallDelta, SessionMetricDim1Delta,
-    SessionMetricDim2Delta, SessionMetricTotalDelta, SessionRecord, SessionRepairJobRecord,
-    SessionRepairJobUpsert, SessionTailUpdate, StoreError, add_session_daily_duration_deltas_in_tx,
+    InstallSessionStateRecord, PendingSessionDailyInstallRebuildRecord, PgPool, RawEventRecord,
+    SessionDailyActiveInstallDelta, SessionDailyDelta, SessionDailyDurationDelta,
+    SessionDailyInstallDelta, SessionMetricDim1Delta, SessionMetricDim2Delta,
+    SessionMetricTotalDelta, SessionRecord, SessionRepairJobRecord, SessionRepairJobUpsert,
+    SessionTailUpdate, StoreError, add_session_daily_duration_deltas_in_tx,
     claim_and_sweep_pending_session_rebuild_buckets_in_tx, claim_pending_session_repair_jobs_in_tx,
     complete_session_repair_job_in_tx, delete_sessions_overlapping_window_in_tx,
-    enqueue_session_rebuild_buckets_in_tx, fetch_events_after_in_tx,
-    fetch_events_for_install_after_id_through_in_tx, fetch_events_for_install_between_in_tx,
-    fetch_latest_session_for_install_in_tx, fetch_sessions_overlapping_window_in_tx,
-    insert_install_first_seen_in_tx, insert_session_in_tx, insert_sessions_in_tx,
-    load_install_session_states_in_tx, load_session_repair_jobs_for_installs_in_tx,
-    load_tail_sessions_for_installs_in_tx, lock_worker_offset,
-    rebuild_session_daily_days_with_telemetry_in_tx, release_session_repair_job_claim_in_tx,
-    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_event_metric_buckets_dim1_in_tx,
-    upsert_event_metric_buckets_dim2_in_tx, upsert_event_metric_buckets_dim3_in_tx,
-    upsert_event_metric_buckets_dim4_in_tx, upsert_event_metric_buckets_total_in_tx,
-    upsert_install_session_state_in_tx, upsert_session_daily_deltas_in_tx,
-    upsert_session_daily_install_deltas_in_tx, upsert_session_metric_dim1_in_tx,
-    upsert_session_metric_dim2_in_tx, upsert_session_metric_totals_in_tx,
-    upsert_session_repair_jobs_in_tx,
+    enqueue_session_daily_installs_rebuilds_in_tx, enqueue_session_rebuild_buckets_in_tx,
+    fetch_events_after_in_tx, fetch_events_for_install_after_id_through_in_tx,
+    fetch_events_for_install_between_in_tx, fetch_latest_session_for_install_in_tx,
+    fetch_sessions_overlapping_window_in_tx, insert_install_first_seen_in_tx, insert_session_in_tx,
+    insert_sessions_in_tx, load_install_session_states_in_tx,
+    load_session_repair_jobs_for_installs_in_tx, load_tail_sessions_for_installs_in_tx,
+    lock_worker_offset,
+    rebuild_session_daily_days_from_pending_install_rebuilds_with_telemetry_in_tx,
+    release_session_repair_job_claim_in_tx, save_worker_offset_in_tx, update_session_tail_in_tx,
+    upsert_event_metric_buckets_dim1_in_tx, upsert_event_metric_buckets_dim2_in_tx,
+    upsert_event_metric_buckets_dim3_in_tx, upsert_event_metric_buckets_dim4_in_tx,
+    upsert_event_metric_buckets_total_in_tx, upsert_install_session_state_in_tx,
+    upsert_session_daily_deltas_in_tx, upsert_session_daily_install_deltas_in_tx,
+    upsert_session_metric_dim1_in_tx, upsert_session_metric_dim2_in_tx,
+    upsert_session_metric_totals_in_tx, upsert_session_repair_jobs_in_tx,
 };
 use serde::Serialize;
 use sqlx::{Postgres, Row, Transaction};
@@ -1183,7 +1185,8 @@ async fn process_session_repair_job(
     )
     .await?;
     let enqueue_started_at = Instant::now();
-    enqueue_repair_bucket_finalization_in_tx(tx, job.project_id, &touched_buckets).await?;
+    enqueue_repair_bucket_finalization_in_tx(tx, job.project_id, &job.install_id, &touched_buckets)
+        .await?;
     trace.add_phase_duration("touched_bucket_enqueue", enqueue_started_at.elapsed());
     trace.add_count("touched_day_buckets", touched_buckets.days.len());
     trace.add_count("touched_hour_buckets", touched_buckets.hours.len());
@@ -1959,7 +1962,10 @@ async fn rebuild_touched_session_buckets_in_tx(
     if !days.is_empty() {
         let session_daily_started_at = Instant::now();
         let session_daily_telemetry =
-            rebuild_session_daily_days_with_telemetry_in_tx(tx, project_id, &days).await?;
+            rebuild_session_daily_days_from_pending_install_rebuilds_with_telemetry_in_tx(
+                tx, project_id, &days,
+            )
+            .await?;
         trace.add_finalization_subphase_duration(
             "finalization_session_daily_rebuild",
             session_daily_started_at.elapsed(),
@@ -2012,6 +2018,7 @@ async fn rebuild_touched_session_buckets_in_tx(
 async fn enqueue_repair_bucket_finalization_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
+    install_id: &str,
     touched_buckets: &SessionRepairBuckets,
 ) -> Result<(), StoreError> {
     let day_bucket_starts = touched_buckets
@@ -2022,6 +2029,19 @@ async fn enqueue_repair_bucket_finalization_in_tx(
         .collect::<Vec<_>>();
     let hour_bucket_starts = touched_buckets.hours.iter().copied().collect::<Vec<_>>();
 
+    let install_rebuild_rows = touched_buckets
+        .days
+        .iter()
+        .copied()
+        .map(|day| PendingSessionDailyInstallRebuildRecord {
+            project_id,
+            day,
+            install_id: install_id.to_owned(),
+        })
+        .collect::<Vec<_>>();
+    // Keep install-day queue rows and shared day/hour bucket rows in the same transaction so a
+    // later finalizer only sees install-day work once the matching shared bucket scope is visible.
+    enqueue_session_daily_installs_rebuilds_in_tx(tx, &install_rebuild_rows).await?;
     enqueue_session_rebuild_buckets_in_tx(tx, project_id, &day_bucket_starts, &hour_bucket_starts)
         .await
 }
@@ -2802,6 +2822,29 @@ mod tests {
             .expect("load pending session rebuild buckets");
         tx.commit().await.expect("commit pending rebuild bucket tx");
         pending
+    }
+
+    async fn pending_session_daily_install_rebuild_rows(pool: &PgPool) -> Vec<(NaiveDate, String)> {
+        sqlx::query(
+            r#"
+            SELECT day, install_id
+            FROM session_daily_installs_rebuild_queue
+            WHERE project_id = $1
+            ORDER BY day ASC, install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .fetch_all(pool)
+        .await
+        .expect("fetch pending session_daily install rebuild rows")
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<NaiveDate, _>("day").expect("day"),
+                row.try_get::<String, _>("install_id").expect("install_id"),
+            )
+        })
+        .collect()
     }
 
     async fn pending_session_repair_frontier(pool: &PgPool, install_id: &str) -> Option<i64> {
@@ -4122,6 +4165,139 @@ mod tests {
         .expect("count memberships");
 
         assert_eq!(memberships, 2);
+    }
+
+    #[sqlx::test]
+    async fn repeated_same_install_day_repairs_collapse_to_one_pending_membership_rewrite(
+        pool: PgPool,
+    ) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 1, 0), event("install-1", 1, 1, 10)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 50)])
+            .await
+            .expect("insert first late event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue first repair frontier");
+
+        let mut first_tx = pool.begin().await.expect("begin first repair tx");
+        let first_job = claim_pending_session_repair_jobs_in_tx(&mut first_tx, 1)
+            .await
+            .expect("claim first repair job")
+            .into_iter()
+            .next()
+            .expect("first repair job exists");
+        process_session_repair_job(
+            &mut first_tx,
+            first_job,
+            &mut StageBTraceRecord::repair_job("install-1", 0),
+        )
+        .await
+        .expect("process first repair job");
+        first_tx.commit().await.expect("commit first repair tx");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 40)])
+            .await
+            .expect("insert second late event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue second repair frontier");
+
+        let mut second_tx = pool.begin().await.expect("begin second repair tx");
+        let second_job = claim_pending_session_repair_jobs_in_tx(&mut second_tx, 1)
+            .await
+            .expect("claim second repair job")
+            .into_iter()
+            .next()
+            .expect("second repair job exists");
+        process_session_repair_job(
+            &mut second_tx,
+            second_job,
+            &mut StageBTraceRecord::repair_job("install-1", 0),
+        )
+        .await
+        .expect("process second repair job");
+        second_tx.commit().await.expect("commit second repair tx");
+
+        assert_eq!(
+            pending_session_daily_install_rebuild_rows(&pool).await,
+            vec![(
+                NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                "install-1".to_owned()
+            )],
+            "multiple repairs on the same install/day should collapse to one queued membership rewrite"
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_repair_batch_drains_pending_membership_rebuild_rows_during_project_sweep(
+        pool: PgPool,
+    ) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 1, 0), event("install-1", 1, 1, 10)],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(&pool, project_id(), &[event("install-1", 1, 0, 50)])
+            .await
+            .expect("insert late event");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("enqueue repair frontier");
+
+        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
+        assert!(
+            pending_session_daily_install_rebuild_rows(&pool)
+                .await
+                .is_empty(),
+            "batch finalization should drain pending membership rebuild rows"
+        );
+        assert_eq!(
+            session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
+            Some((1, 1, 20 * 60))
+        );
     }
 
     #[sqlx::test]

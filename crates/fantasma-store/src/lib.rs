@@ -339,6 +339,13 @@ pub struct PendingSessionRebuildBucketRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSessionDailyInstallRebuildRecord {
+    pub project_id: Uuid,
+    pub day: NaiveDate,
+    pub install_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRepairJobRecord {
     pub project_id: Uuid,
     pub install_id: String,
@@ -2069,6 +2076,31 @@ pub async fn enqueue_session_rebuild_buckets_in_tx(
     Ok(())
 }
 
+pub async fn enqueue_session_daily_installs_rebuilds_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    rebuilds: &[PendingSessionDailyInstallRebuildRecord],
+) -> Result<(), StoreError> {
+    if rebuilds.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in rebuilds.chunks(max_rows_per_batched_statement(3)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_daily_installs_rebuild_queue (project_id, day, install_id) ",
+        );
+        builder.push_values(chunk, |mut separated, rebuild| {
+            separated
+                .push_bind(rebuild.project_id)
+                .push_bind(rebuild.day)
+                .push_bind(&rebuild.install_id);
+        });
+        builder.push(" ON CONFLICT (project_id, day, install_id) DO NOTHING");
+        builder.build().execute(&mut **tx).await?;
+    }
+
+    Ok(())
+}
+
 pub async fn load_pending_session_rebuild_buckets_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_ids: &[Uuid],
@@ -2099,6 +2131,41 @@ pub async fn load_pending_session_rebuild_buckets_in_tx(
                 project_id: row.try_get("project_id")?,
                 granularity: metric_granularity_from_str(row.try_get::<&str, _>("granularity")?)?,
                 bucket_start: row.try_get("bucket_start")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn load_pending_session_daily_install_rebuilds_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_ids: &[Uuid],
+) -> Result<Vec<PendingSessionDailyInstallRebuildRecord>, StoreError> {
+    if project_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new("WITH requested(project_id) AS (");
+    builder.push_values(project_ids, |mut row, project_id| {
+        row.push_bind(project_id);
+    });
+    builder.push(
+        ") SELECT \
+            q.project_id, \
+            q.day, \
+            q.install_id \
+          FROM session_daily_installs_rebuild_queue q \
+          INNER JOIN requested r \
+            ON q.project_id = r.project_id \
+          ORDER BY q.project_id ASC, q.day ASC, q.install_id ASC",
+    );
+
+    let rows = builder.build().fetch_all(&mut **tx).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(PendingSessionDailyInstallRebuildRecord {
+                project_id: row.try_get("project_id")?,
+                day: row.try_get("day")?,
+                install_id: row.try_get("install_id")?,
             })
         })
         .collect()
@@ -2213,6 +2280,28 @@ pub async fn delete_pending_session_rebuild_buckets_in_tx(
     });
     builder.push(
         ") DELETE FROM session_rebuild_queue q \
+         USING requested r \
+         WHERE q.project_id = r.project_id",
+    );
+
+    let result = builder.build().execute(&mut **tx).await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn delete_pending_session_daily_install_rebuilds_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_ids: &[Uuid],
+) -> Result<u64, StoreError> {
+    if project_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new("WITH requested(project_id) AS (");
+    builder.push_values(project_ids, |mut row, project_id| {
+        row.push_bind(project_id);
+    });
+    builder.push(
+        ") DELETE FROM session_daily_installs_rebuild_queue q \
          USING requested r \
          WHERE q.project_id = r.project_id",
     );
@@ -2631,9 +2720,14 @@ pub async fn rebuild_session_daily_days_in_tx(
     project_id: Uuid,
     days: &[NaiveDate],
 ) -> Result<(), StoreError> {
-    rebuild_session_daily_days_with_telemetry_in_tx(tx, project_id, days)
-        .await
-        .map(|_| ())
+    rebuild_session_daily_days_with_telemetry_for_mode_in_tx(
+        tx,
+        project_id,
+        days,
+        SessionDailyInstallRebuildMode::FullDay,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2643,10 +2737,45 @@ pub struct SessionDailyRebuildTelemetry {
     pub cleanup_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionDailyInstallRebuildMode {
+    FullDay,
+    PendingQueue,
+}
+
 pub async fn rebuild_session_daily_days_with_telemetry_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     days: &[NaiveDate],
+) -> Result<SessionDailyRebuildTelemetry, StoreError> {
+    rebuild_session_daily_days_with_telemetry_for_mode_in_tx(
+        tx,
+        project_id,
+        days,
+        SessionDailyInstallRebuildMode::FullDay,
+    )
+    .await
+}
+
+pub async fn rebuild_session_daily_days_from_pending_install_rebuilds_with_telemetry_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    days: &[NaiveDate],
+) -> Result<SessionDailyRebuildTelemetry, StoreError> {
+    rebuild_session_daily_days_with_telemetry_for_mode_in_tx(
+        tx,
+        project_id,
+        days,
+        SessionDailyInstallRebuildMode::PendingQueue,
+    )
+    .await
+}
+
+async fn rebuild_session_daily_days_with_telemetry_for_mode_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    days: &[NaiveDate],
+    install_rebuild_mode: SessionDailyInstallRebuildMode,
 ) -> Result<SessionDailyRebuildTelemetry, StoreError> {
     let days = days
         .iter()
@@ -2662,7 +2791,15 @@ pub async fn rebuild_session_daily_days_with_telemetry_in_tx(
     let mut telemetry = SessionDailyRebuildTelemetry::default();
 
     let installs_write_started_at = std::time::Instant::now();
-    rebuild_session_daily_installs_days_in_tx(tx, project_id, &days).await?;
+    match install_rebuild_mode {
+        SessionDailyInstallRebuildMode::FullDay => {
+            rebuild_session_daily_installs_days_in_tx(tx, project_id, &days).await?;
+        }
+        SessionDailyInstallRebuildMode::PendingQueue => {
+            rebuild_session_daily_installs_for_pending_rebuilds_in_tx(tx, project_id, &days)
+                .await?;
+        }
+    }
     telemetry.installs_write_ms = installs_write_started_at.elapsed().as_millis() as u64;
 
     let cleanup_started_at = std::time::Instant::now();
@@ -2777,6 +2914,125 @@ async fn rebuild_session_daily_installs_days_in_tx(
     .await?;
 
     Ok(())
+}
+
+async fn rebuild_session_daily_installs_for_pending_rebuilds_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    days: &[NaiveDate],
+) -> Result<(), StoreError> {
+    let claimed_days =
+        stage_pending_session_daily_install_rebuild_scope_in_tx(tx, project_id, days).await?;
+    let requested_days = days.iter().copied().collect::<BTreeSet<_>>();
+    if claimed_days != requested_days {
+        return Err(StoreError::InvariantViolation(format!(
+            "missing session_daily_installs rebuild queue rows for project {project_id}; requested {requested_days:?}, claimed {claimed_days:?}"
+        )));
+    }
+
+    sqlx::query(
+        r#"
+        DELETE FROM session_daily_installs installs
+        USING pg_temp.session_daily_install_rebuild_scope scope
+        WHERE installs.project_id = scope.project_id
+          AND installs.day = scope.day
+          AND installs.install_id = scope.install_id
+        "#,
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO session_daily_installs (
+            project_id,
+            day,
+            install_id,
+            session_count
+        )
+        SELECT
+            scope.project_id,
+            scope.day,
+            scope.install_id,
+            COUNT(*)::INTEGER AS session_count
+        FROM pg_temp.session_daily_install_rebuild_scope scope
+        INNER JOIN sessions
+          ON sessions.project_id = scope.project_id
+         AND DATE(sessions.session_start AT TIME ZONE 'UTC') = scope.day
+         AND sessions.install_id = scope.install_id
+        GROUP BY scope.project_id, scope.day, scope.install_id
+        ON CONFLICT (project_id, day, install_id) DO UPDATE SET
+            session_count = EXCLUDED.session_count,
+            updated_at = now()
+        "#,
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+async fn stage_pending_session_daily_install_rebuild_scope_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    days: &[NaiveDate],
+) -> Result<BTreeSet<NaiveDate>, StoreError> {
+    sqlx::query(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS pg_temp.session_daily_install_rebuild_scope (
+            project_id UUID NOT NULL,
+            day DATE NOT NULL,
+            install_id TEXT NOT NULL,
+            PRIMARY KEY (project_id, day, install_id)
+        ) ON COMMIT DROP
+        "#,
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query("TRUNCATE pg_temp.session_daily_install_rebuild_scope")
+        .execute(&mut **tx)
+        .await?;
+
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        WITH claimed AS (
+            DELETE FROM session_daily_installs_rebuild_queue
+            WHERE project_id = $1
+              AND day = ANY($2)
+            RETURNING project_id, day, install_id
+        ),
+        inserted AS (
+            INSERT INTO pg_temp.session_daily_install_rebuild_scope (
+                project_id,
+                day,
+                install_id
+            )
+            SELECT project_id, day, install_id
+            FROM claimed
+            ON CONFLICT (project_id, day, install_id) DO NOTHING
+            RETURNING 1
+        )
+        SELECT COUNT(*)::BIGINT
+        FROM inserted
+        "#,
+    )
+    .bind(project_id)
+    .bind(days)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let claimed_days = sqlx::query_scalar::<_, NaiveDate>(
+        r#"
+        SELECT DISTINCT day
+        FROM pg_temp.session_daily_install_rebuild_scope
+        ORDER BY day ASC
+        "#,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+
+    Ok(claimed_days.into_iter().collect())
 }
 
 pub async fn load_worker_offset(pool: &PgPool, worker_name: &str) -> Result<i64, StoreError> {
@@ -5943,6 +6199,26 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn run_migrations_creates_session_daily_installs_rebuild_queue_table(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let table_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_name = 'session_daily_installs_rebuild_queue'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch membership rebuild queue existence");
+
+        assert!(table_exists);
+    }
+
+    #[sqlx::test]
     async fn run_migrations_create_bucketed_metrics_and_first_seen_tables(pool: PgPool) {
         run_migrations(&pool).await.expect("migrations succeed");
 
@@ -6242,7 +6518,7 @@ mod tests {
         ensure_local_project(&pool, Some(&bootstrap_config()))
             .await
             .expect("ensure local project succeeds");
-        let other_project = Uuid::new_v4();
+        let other_project = Uuid::from_u128(u128::MAX);
         sqlx::query("INSERT INTO projects (id, name) VALUES ($1, $2)")
             .bind(other_project)
             .bind("Other")
@@ -6318,6 +6594,105 @@ mod tests {
                     bucket_start: timestamp(24 * 60),
                 },
             ]
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_daily_installs_rebuild_queue_round_trips_pending_rows_by_project(
+        pool: PgPool,
+    ) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+        let other_project = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects (id, name) VALUES ($1, $2)")
+            .bind(other_project)
+            .bind("Other")
+            .execute(&pool)
+            .await
+            .expect("insert other project");
+
+        let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
+        let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date");
+
+        let mut seed_tx = pool.begin().await.expect("begin queue seed tx");
+        enqueue_session_daily_installs_rebuilds_in_tx(
+            &mut seed_tx,
+            &[
+                PendingSessionDailyInstallRebuildRecord {
+                    project_id: project_id(),
+                    day: day_1,
+                    install_id: "install-1".to_owned(),
+                },
+                PendingSessionDailyInstallRebuildRecord {
+                    project_id: project_id(),
+                    day: day_1,
+                    install_id: "install-2".to_owned(),
+                },
+                PendingSessionDailyInstallRebuildRecord {
+                    project_id: project_id(),
+                    day: day_1,
+                    install_id: "install-1".to_owned(),
+                },
+                PendingSessionDailyInstallRebuildRecord {
+                    project_id: other_project,
+                    day: day_2,
+                    install_id: "other-install".to_owned(),
+                },
+            ],
+        )
+        .await
+        .expect("enqueue install rebuild rows");
+        seed_tx.commit().await.expect("commit queue seed tx");
+
+        let mut load_tx = pool.begin().await.expect("begin queue load tx");
+        let pending =
+            load_pending_session_daily_install_rebuilds_in_tx(&mut load_tx, &[project_id()])
+                .await
+                .expect("load pending install rebuild rows");
+        let deleted =
+            delete_pending_session_daily_install_rebuilds_in_tx(&mut load_tx, &[project_id()])
+                .await
+                .expect("delete pending install rebuild rows");
+        load_tx.commit().await.expect("commit queue load tx");
+
+        assert_eq!(
+            pending,
+            vec![
+                PendingSessionDailyInstallRebuildRecord {
+                    project_id: project_id(),
+                    day: day_1,
+                    install_id: "install-1".to_owned(),
+                },
+                PendingSessionDailyInstallRebuildRecord {
+                    project_id: project_id(),
+                    day: day_1,
+                    install_id: "install-2".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(deleted, 2);
+
+        let mut verify_tx = pool.begin().await.expect("begin queue verify tx");
+        let primary_pending =
+            load_pending_session_daily_install_rebuilds_in_tx(&mut verify_tx, &[project_id()])
+                .await
+                .expect("load deleted install rebuild rows");
+        let other_pending =
+            load_pending_session_daily_install_rebuilds_in_tx(&mut verify_tx, &[other_project])
+                .await
+                .expect("load untouched install rebuild rows");
+        verify_tx.commit().await.expect("commit queue verify tx");
+
+        assert!(primary_pending.is_empty());
+        assert_eq!(
+            other_pending,
+            vec![PendingSessionDailyInstallRebuildRecord {
+                project_id: other_project,
+                day: day_2,
+                install_id: "other-install".to_owned(),
+            }]
         );
     }
 
@@ -7511,7 +7886,8 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_session_daily_days_helper_matches_attribution_reset_shape() {
+    fn rebuild_session_daily_days_helper_uses_full_rebuild_for_direct_callers_and_queue_scope_for_stage_b()
+     {
         let source = include_str!("lib.rs");
         let start = source
             .find("pub async fn rebuild_session_daily_days_in_tx")
@@ -7523,24 +7899,549 @@ mod tests {
 
         assert!(
             helper.contains("rebuild_session_daily_installs_days_in_tx"),
-            "attribution-reset baseline should rebuild session_daily_installs via the dedicated helper"
+            "direct callers should keep the existing full-day session_daily_installs rebuild helper"
         );
         assert_eq!(
             helper.matches("FROM sessions").count(),
             2,
-            "attribution-reset baseline should scan sessions once for installs and once for the aggregate rollup"
+            "direct callers should still scan sessions once for installs and once for the aggregate rollup"
         );
         assert!(
             helper.contains("install_rollups AS"),
-            "attribution-reset baseline should keep the install_rollups CTE"
+            "the session_daily aggregate rebuild should keep the install_rollups CTE"
         );
         assert!(
             helper.contains("FROM session_daily_installs"),
             "session_daily aggregate rebuild should still derive active installs from session_daily_installs"
         );
         assert!(
-            !helper.contains("pg_temp.session_daily_rebuild_source"),
-            "failed temp-table rewrite must not remain in the restored baseline"
+            source.contains("rebuild_session_daily_installs_for_pending_rebuilds_in_tx"),
+            "Stage B should gain a queue-driven install-day session_daily_installs rewrite helper"
         );
+    }
+
+    #[sqlx::test]
+    async fn queued_session_daily_install_rebuild_rewrites_only_targeted_install_rows_within_touched_day(
+        pool: PgPool,
+    ) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
+        let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date");
+
+        let mut seed_tx = pool.begin().await.expect("begin seed transaction");
+        insert_session_in_tx(&mut seed_tx, &session("install-1", 0, 10))
+            .await
+            .expect("insert install-1 day 1 session");
+        insert_session_in_tx(&mut seed_tx, &session("install-2", 15, 30))
+            .await
+            .expect("insert install-2 day 1 session");
+        insert_session_in_tx(&mut seed_tx, &session("install-3", 24 * 60, 24 * 60 + 10))
+            .await
+            .expect("insert install-3 day 2 session");
+        rebuild_session_daily_days_in_tx(&mut seed_tx, project_id(), &[day_1, day_2])
+            .await
+            .expect("seed session_daily rows");
+        seed_tx.commit().await.expect("commit seed transaction");
+
+        let untouched_install_before = sqlx::query(
+            r#"
+            SELECT session_count, updated_at
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = $2
+              AND install_id = $3
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_1)
+        .bind("install-2")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch untouched install before rewrite");
+
+        sqlx::query("SELECT pg_sleep(0.01)")
+            .execute(&pool)
+            .await
+            .expect("sleep for updated_at delta");
+
+        sqlx::query(
+            r#"
+            UPDATE sessions
+            SET session_end = $4,
+                duration_seconds = $5
+            WHERE project_id = $1
+              AND install_id = $2
+              AND DATE(session_start AT TIME ZONE 'UTC') = $3
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .bind(day_1)
+        .bind(timestamp(45))
+        .bind(45 * 60)
+        .execute(&pool)
+        .await
+        .expect("update targeted install session");
+
+        let mut rebuild_tx = pool.begin().await.expect("begin queued rebuild tx");
+        enqueue_session_daily_installs_rebuilds_in_tx(
+            &mut rebuild_tx,
+            &[PendingSessionDailyInstallRebuildRecord {
+                project_id: project_id(),
+                day: day_1,
+                install_id: "install-1".to_owned(),
+            }],
+        )
+        .await
+        .expect("enqueue targeted install rebuild");
+        rebuild_session_daily_installs_for_pending_rebuilds_in_tx(
+            &mut rebuild_tx,
+            project_id(),
+            &[day_1],
+        )
+        .await
+        .expect("rebuild queued install rows");
+        rebuild_tx.commit().await.expect("commit queued rebuild tx");
+
+        let targeted_install_after = sqlx::query(
+            r#"
+            SELECT session_count
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = $2
+              AND install_id = $3
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_1)
+        .bind("install-1")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch targeted install after rewrite");
+        let untouched_install_after = sqlx::query(
+            r#"
+            SELECT session_count, updated_at
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = $2
+              AND install_id = $3
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_1)
+        .bind("install-2")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch untouched install after rewrite");
+
+        assert_eq!(
+            targeted_install_after
+                .try_get::<i32, _>("session_count")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            untouched_install_after
+                .try_get::<i32, _>("session_count")
+                .unwrap(),
+            untouched_install_before
+                .try_get::<i32, _>("session_count")
+                .unwrap()
+        );
+        assert_eq!(
+            untouched_install_after
+                .try_get::<DateTime<Utc>, _>("updated_at")
+                .unwrap(),
+            untouched_install_before
+                .try_get::<DateTime<Utc>, _>("updated_at")
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test]
+    async fn queued_session_daily_install_rebuild_rollback_preserves_existing_rows_and_pending_queue(
+        pool: PgPool,
+    ) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
+
+        let mut seed_tx = pool.begin().await.expect("begin seed transaction");
+        insert_session_in_tx(&mut seed_tx, &session("install-1", 0, 10))
+            .await
+            .expect("insert install-1 session");
+        insert_session_in_tx(&mut seed_tx, &session("install-2", 15, 30))
+            .await
+            .expect("insert install-2 session");
+        rebuild_session_daily_days_in_tx(&mut seed_tx, project_id(), &[day_1])
+            .await
+            .expect("seed session_daily rows");
+        seed_tx.commit().await.expect("commit seed transaction");
+
+        let installs_before = sqlx::query(
+            r#"
+            SELECT install_id, session_count
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = $2
+            ORDER BY install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_1)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch installs before rollback");
+
+        sqlx::query(
+            r#"
+            UPDATE sessions
+            SET session_end = $4,
+                duration_seconds = $5
+            WHERE project_id = $1
+              AND install_id = $2
+              AND DATE(session_start AT TIME ZONE 'UTC') = $3
+            "#,
+        )
+        .bind(project_id())
+        .bind("install-1")
+        .bind(day_1)
+        .bind(timestamp(45))
+        .bind(45 * 60)
+        .execute(&pool)
+        .await
+        .expect("update targeted install session");
+
+        let queued_row = PendingSessionDailyInstallRebuildRecord {
+            project_id: project_id(),
+            day: day_1,
+            install_id: "install-1".to_owned(),
+        };
+        let mut queue_tx = pool.begin().await.expect("begin queue seed tx");
+        enqueue_session_daily_installs_rebuilds_in_tx(
+            &mut queue_tx,
+            std::slice::from_ref(&queued_row),
+        )
+        .await
+        .expect("enqueue install rebuild row");
+        queue_tx.commit().await.expect("commit queue seed tx");
+
+        let mut rebuild_tx = pool.begin().await.expect("begin queued rebuild tx");
+        rebuild_session_daily_installs_for_pending_rebuilds_in_tx(
+            &mut rebuild_tx,
+            project_id(),
+            &[day_1],
+        )
+        .await
+        .expect("rebuild queued install rows");
+        rebuild_tx
+            .rollback()
+            .await
+            .expect("rollback queued rebuild tx");
+
+        let installs_after = sqlx::query(
+            r#"
+            SELECT install_id, session_count
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = $2
+            ORDER BY install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .bind(day_1)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch installs after rollback");
+        let queued_after = sqlx::query(
+            r#"
+            SELECT project_id, day, install_id
+            FROM session_daily_installs_rebuild_queue
+            WHERE project_id = $1
+            ORDER BY day ASC, install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .fetch_all(&pool)
+        .await
+        .expect("fetch queued install rebuild rows after rollback");
+
+        assert_eq!(installs_after.len(), installs_before.len());
+        for (after, before) in installs_after.iter().zip(installs_before.iter()) {
+            assert_eq!(
+                after.try_get::<String, _>("install_id").unwrap(),
+                before.try_get::<String, _>("install_id").unwrap()
+            );
+            assert_eq!(
+                after.try_get::<i32, _>("session_count").unwrap(),
+                before.try_get::<i32, _>("session_count").unwrap()
+            );
+        }
+        assert_eq!(
+            queued_after
+                .into_iter()
+                .map(|row| PendingSessionDailyInstallRebuildRecord {
+                    project_id: row.try_get("project_id").unwrap(),
+                    day: row.try_get("day").unwrap(),
+                    install_id: row.try_get("install_id").unwrap(),
+                })
+                .collect::<Vec<_>>(),
+            vec![queued_row]
+        );
+    }
+
+    #[sqlx::test]
+    async fn queued_session_daily_install_rebuild_requires_pending_queue_rows_for_stage_b_scope(
+        pool: PgPool,
+    ) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
+        let mut seed_tx = pool.begin().await.expect("begin seed transaction");
+        insert_session_in_tx(&mut seed_tx, &session("install-1", 0, 10))
+            .await
+            .expect("insert install-1 session");
+        rebuild_session_daily_days_in_tx(&mut seed_tx, project_id(), &[day_1])
+            .await
+            .expect("seed session_daily rows");
+        seed_tx.commit().await.expect("commit seed transaction");
+
+        let mut rebuild_tx = pool.begin().await.expect("begin rebuild transaction");
+        let error = rebuild_session_daily_installs_for_pending_rebuilds_in_tx(
+            &mut rebuild_tx,
+            project_id(),
+            &[day_1],
+        )
+        .await
+        .expect_err("Stage B scope without queue rows should fail loudly");
+        rebuild_tx
+            .rollback()
+            .await
+            .expect("rollback failed rebuild transaction");
+
+        assert!(
+            matches!(error, StoreError::InvariantViolation(message) if message.contains("missing session_daily_installs rebuild queue rows")),
+            "missing queue rows should raise an invariant violation instead of silently broadening the rebuild"
+        );
+    }
+
+    #[sqlx::test]
+    async fn queued_session_daily_install_rebuild_requires_queue_coverage_for_every_requested_day(
+        pool: PgPool,
+    ) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
+        let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date");
+
+        let mut seed_tx = pool.begin().await.expect("begin seed transaction");
+        insert_session_in_tx(&mut seed_tx, &session("install-1", 0, 10))
+            .await
+            .expect("insert day 1 session");
+        insert_session_in_tx(&mut seed_tx, &session("install-2", 24 * 60, 24 * 60 + 10))
+            .await
+            .expect("insert day 2 session");
+        rebuild_session_daily_days_in_tx(&mut seed_tx, project_id(), &[day_1, day_2])
+            .await
+            .expect("seed session_daily rows");
+        seed_tx.commit().await.expect("commit seed transaction");
+
+        let mut queue_tx = pool.begin().await.expect("begin queue seed tx");
+        enqueue_session_daily_installs_rebuilds_in_tx(
+            &mut queue_tx,
+            &[PendingSessionDailyInstallRebuildRecord {
+                project_id: project_id(),
+                day: day_1,
+                install_id: "install-1".to_owned(),
+            }],
+        )
+        .await
+        .expect("enqueue partial queue coverage");
+        queue_tx.commit().await.expect("commit queue seed tx");
+
+        let mut rebuild_tx = pool.begin().await.expect("begin rebuild transaction");
+        let error = rebuild_session_daily_installs_for_pending_rebuilds_in_tx(
+            &mut rebuild_tx,
+            project_id(),
+            &[day_1, day_2],
+        )
+        .await
+        .expect_err("partial queue coverage should fail loudly");
+        rebuild_tx
+            .rollback()
+            .await
+            .expect("rollback partial coverage rebuild transaction");
+
+        assert!(
+            matches!(error, StoreError::InvariantViolation(message) if message.contains("requested") && message.contains("claimed")),
+            "Stage B should reject partial queue coverage instead of rebuilding only some requested days"
+        );
+    }
+
+    #[sqlx::test]
+    async fn later_same_day_refill_waits_until_current_sweep_commits_and_keeps_matching_queue_rows(
+        pool: PgPool,
+    ) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date");
+        let day_bucket_start = timestamp(0);
+
+        let mut seed_tx = pool.begin().await.expect("begin seed transaction");
+        insert_session_in_tx(&mut seed_tx, &session("install-1", 0, 10))
+            .await
+            .expect("insert install-1 session");
+        insert_session_in_tx(&mut seed_tx, &session("install-2", 15, 30))
+            .await
+            .expect("insert install-2 session");
+        rebuild_session_daily_days_in_tx(&mut seed_tx, project_id(), &[day_1])
+            .await
+            .expect("seed session_daily rows");
+        enqueue_session_rebuild_buckets_in_tx(&mut seed_tx, project_id(), &[day_bucket_start], &[])
+            .await
+            .expect("enqueue original day bucket");
+        enqueue_session_daily_installs_rebuilds_in_tx(
+            &mut seed_tx,
+            &[PendingSessionDailyInstallRebuildRecord {
+                project_id: project_id(),
+                day: day_1,
+                install_id: "install-1".to_owned(),
+            }],
+        )
+        .await
+        .expect("enqueue original install rebuild row");
+        seed_tx.commit().await.expect("commit seed transaction");
+
+        let mut finalizer_tx = pool.begin().await.expect("begin finalizer transaction");
+        let swept = claim_and_sweep_pending_session_rebuild_buckets_in_tx(&mut finalizer_tx, 1)
+            .await
+            .expect("claim current day bucket");
+        assert_eq!(
+            swept,
+            vec![PendingSessionRebuildBucketRecord {
+                project_id: project_id(),
+                granularity: MetricGranularity::Day,
+                bucket_start: day_bucket_start,
+            }]
+        );
+
+        let refill_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let refill_bucket_enqueued = std::sync::Arc::new(tokio::sync::Notify::new());
+        let refill_pool = pool.clone();
+        let refill_started_clone = refill_started.clone();
+        let refill_bucket_enqueued_clone = refill_bucket_enqueued.clone();
+        let refill_task = tokio::spawn(async move {
+            let mut refill_tx = refill_pool.begin().await.expect("begin refill transaction");
+            enqueue_session_daily_installs_rebuilds_in_tx(
+                &mut refill_tx,
+                &[PendingSessionDailyInstallRebuildRecord {
+                    project_id: project_id(),
+                    day: day_1,
+                    install_id: "install-2".to_owned(),
+                }],
+            )
+            .await
+            .expect("enqueue refill install row");
+            refill_started_clone.notify_waiters();
+            enqueue_session_rebuild_buckets_in_tx(
+                &mut refill_tx,
+                project_id(),
+                &[day_bucket_start],
+                &[],
+            )
+            .await
+            .expect("enqueue refill day bucket");
+            refill_bucket_enqueued_clone.notify_waiters();
+            refill_tx.commit().await.expect("commit refill transaction");
+        });
+
+        refill_started.notified().await;
+
+        rebuild_session_daily_installs_for_pending_rebuilds_in_tx(
+            &mut finalizer_tx,
+            project_id(),
+            &[day_1],
+        )
+        .await
+        .expect("rebuild current sweep install rows");
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                refill_bucket_enqueued.notified()
+            )
+            .await
+            .is_err(),
+            "matching day-bucket refill should stay blocked until the current sweep commits"
+        );
+
+        finalizer_tx
+            .commit()
+            .await
+            .expect("commit finalizer transaction");
+        refill_task.await.expect("join refill task");
+
+        let mut verify_tx = pool.begin().await.expect("begin verify transaction");
+        let pending_buckets =
+            load_pending_session_rebuild_buckets_in_tx(&mut verify_tx, &[project_id()])
+                .await
+                .expect("load refilled day bucket");
+        let pending_installs =
+            load_pending_session_daily_install_rebuilds_in_tx(&mut verify_tx, &[project_id()])
+                .await
+                .expect("load refilled install rows");
+
+        assert_eq!(
+            pending_buckets,
+            vec![PendingSessionRebuildBucketRecord {
+                project_id: project_id(),
+                granularity: MetricGranularity::Day,
+                bucket_start: day_bucket_start,
+            }]
+        );
+        assert_eq!(
+            pending_installs,
+            vec![PendingSessionDailyInstallRebuildRecord {
+                project_id: project_id(),
+                day: day_1,
+                install_id: "install-2".to_owned(),
+            }]
+        );
+
+        let next_swept = claim_and_sweep_pending_session_rebuild_buckets_in_tx(&mut verify_tx, 1)
+            .await
+            .expect("claim refilled day bucket");
+        assert_eq!(
+            next_swept,
+            vec![PendingSessionRebuildBucketRecord {
+                project_id: project_id(),
+                granularity: MetricGranularity::Day,
+                bucket_start: day_bucket_start,
+            }]
+        );
+        rebuild_session_daily_installs_for_pending_rebuilds_in_tx(
+            &mut verify_tx,
+            project_id(),
+            &[day_1],
+        )
+        .await
+        .expect("rebuild refilled install rows");
+        verify_tx.commit().await.expect("commit verify transaction");
     }
 }
