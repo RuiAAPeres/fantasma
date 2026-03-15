@@ -2,7 +2,7 @@
 
 ## Goal
 
-Add the narrow public API routes the private dashboard needs without introducing any hosted-product concepts into Fantasma. The new surface should cover project metadata reads/edits under operator auth and lightweight event discovery reads under read-key auth.
+Add narrow public API routes that external clients can use without introducing any product-specific concepts into Fantasma. The new surface should cover project metadata reads/edits under operator auth and lightweight event discovery reads under read-key auth.
 
 ## Scope
 
