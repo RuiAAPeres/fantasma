@@ -50,6 +50,27 @@ Current Compose defaults:
 - `fantasma-api` gets `0.0.0.0:8082` and `FANTASMA_ADMIN_TOKEN=fg_pat_dev`
 - `fantasma-worker` gets the lane-based defaults above
 
+## Data Protection
+
+Fantasma does not currently implement application-level encryption at rest for
+Postgres data or the iOS SDK queue.
+
+Current protections and operator expectations:
+
+- project API keys are not stored in plaintext; the backend stores only a hash
+  plus redacted prefix
+- operators should run Fantasma on encrypted disks or encrypted cloud volumes
+- Postgres backups and snapshots should also be encrypted
+- non-local deployments should be published behind TLS
+- Fantasma's privacy posture is primarily product-shape based: install-scoped
+  analytics, no person-level identity, no hidden stitching, and intentionally
+  narrow event context
+
+Fantasma should not claim protection against a full server compromise through
+at-rest encryption alone. If the repository later adds application-level
+encryption, the docs should state exactly which data is encrypted, where keys
+live, and what operational tradeoffs apply.
+
 ## Startup Behavior
 
 On startup, `fantasma-ingest`, `fantasma-api`, and `fantasma-worker` all:
