@@ -67,6 +67,8 @@ jobs:
   deployment:
     name: Deployment Checks
     runs-on: ubuntu-latest
+    env:
+      FANTASMA_ADMIN_TOKEN: ci-compose-check-token
 
     steps:
       - name: Check out repository
