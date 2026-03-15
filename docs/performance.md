@@ -9,9 +9,18 @@ Fantasma now treats derived-metrics benchmarking as four explicit local suites i
 
 The harness is local/manual by design. Numeric benchmark publication is not a GitHub workflow.
 
+## Modes
+
+`fantasma-bench slo` now has two explicit execution modes:
+
+- `iterative`: fast, directional, and the default CLI path
+- `publication`: slower, richer, and the only mode allowed to produce product-facing benchmark artifacts
+
+Iterative mode keeps the same 30-day representative identity, but it is not a publication-quality benchmark. Treat it as a better/flat/worse worker iteration screen.
+
 ## Default Gate
 
-The default product-facing worker gate is `representative` plus `mixed-repair` together:
+The default iterative worker gate is the canonical representative plus mixed-repair pair:
 
 ```bash
 cargo run -p fantasma-bench -- \
@@ -19,12 +28,18 @@ cargo run -p fantasma-bench -- \
   --output-dir artifacts/performance/2026-03-15-derived-metrics-slo
 ```
 
-That default run answers the worker question first:
+That default iterative run answers the worker question first:
 
 - how derived freshness behaves under realistic append traffic
 - whether a low but non-zero repair rate collapses freshness
+- whether the current branch looks better, flat, or worse against the pinned iterative baseline
 
 Grouped public reads are no longer part of that worker gate. They still run in `reads-visibility`, but they do not drive worker-tuning decisions.
+
+The default iterative pair is:
+
+- `live-append-small-blobs`
+- `live-append-plus-light-repair`
 
 ## Suite Selection
 
@@ -47,12 +62,13 @@ cargo run -p fantasma-bench -- \
   --scenario live-append-small-blobs
 ```
 
-Publication-oriented reruns can override repetition for the worker-facing suites:
+Publication-oriented reruns should switch mode explicitly and may override repetition for the worker-facing suites:
 
 ```bash
 cargo run -p fantasma-bench -- \
   slo \
   --output-dir artifacts/performance/2026-03-15-derived-metrics-slo \
+  --mode publication \
   --suite representative \
   --suite mixed-repair \
   --publication-repetitions 3
@@ -60,6 +76,7 @@ cargo run -p fantasma-bench -- \
 
 Supported SLO-specific overrides:
 
+- `--mode <iterative|publication>`
 - `--suite <representative|mixed-repair|stress|reads-visibility>`
 - `--scenario <key>`
 - `--publication-repetitions`
@@ -103,20 +120,29 @@ Legacy mapping:
 
 Representative and mixed-repair both use a fixed `30` day horizon, but the benchmark identity is now upload-shaped instead of giant-window-shaped.
 
-Representative defaults:
+Representative defaults are now mode-specific:
 
-- `1,000` active installs/day and `30` events/install/day, matching the current overall SLO scale baseline
-- many installs with deterministic staggered upload order
-- mostly small append blobs
-- one explicit offline-flush scenario with medium bursts
-- no real wall-clock sleeping; cadence is simulated through deterministic upload ordering
-- sampled checkpoint freshness instead of phase-end-only freshness
+- `iterative`
+  - `250` installs/day
+  - directional-only checkpoint sampling
+  - intended for repeated local worker iteration
+- `publication`
+  - `1,000` installs/day and `30` events/install/day, matching the current full representative scale baseline
+  - publication-grade checkpoint density and suite coverage
+  - intended for artifact-quality publication and promotion decisions
 
-Checkpoint policy:
+Iterative checkpoint policy:
+
+- append blobs sample every `200th`
+- offline-flush blobs sample every `25th`
+- repair blobs sample every `10th`
+- end-of-scenario readiness still runs for every scenario
+
+Publication checkpoint policy:
 
 - every repair blob is sampled
 - every offline-flush blob is sampled
-- normal append blobs sample every 20th append blob
+- normal append blobs sample every `20th` append blob
 
 Stress keeps the previous large append/backfill/repair windows for ceiling visibility. Reads-visibility keeps the grouped and ungrouped public query matrix for query-path visibility.
 
@@ -137,12 +163,23 @@ Representative and mixed-repair also publish checkpoint freshness summaries:
 
 Detailed checkpoint samples are written as a sidecar artifact beside the main scenario result. Stage B worker-attribution sidecars remain available for representative, mixed-repair, and stress scenarios.
 
+Iterative summaries also print a compact verdict block from the pinned baseline:
+
+- representative append: `better|flat|worse`
+- representative checkpoint derived: `better|flat|worse`
+- representative final derived: `better|flat|worse`
+- mixed repair: `better|flat|worse`
+- mixed repair checkpoint derived: `better|flat|worse`
+- mixed repair final derived: `better|flat|worse`
+- dominant Stage B phase: `changed|unchanged`
+- overall verdict: `better|flat|worse`
+
 ## Gating
 
-Default ship gate:
+Default iterative ship gate:
 
-- both representative scenarios must pass
-- both mixed-repair scenarios must pass
+- `live-append-small-blobs`
+- `live-append-plus-light-repair`
 
 Primary worker signal:
 
@@ -163,6 +200,8 @@ Secondary worker context:
 Product-facing publication must include `representative` and `mixed-repair` together.
 
 `stress` and `reads-visibility` may publish separately when the goal is regression visibility rather than default worker promotion.
+
+The pinned iterative baseline is checked in under `crates/fantasma-bench/baselines/`. Refresh it only when the team intentionally accepts a new performance baseline or changes benchmark policy. Baseline refresh is explicit and checked in; routine iterative runs never rewrite it automatically. Keep baseline provenance actionable: point it at a retained repo path or documented status entry, not an ephemeral local `/tmp` artifact path.
 
 ## Artifacts
 

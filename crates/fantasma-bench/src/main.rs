@@ -40,6 +40,7 @@ const DEFAULT_SLO_SESSION_BATCH_SIZE: i64 = 1_000;
 const DEFAULT_SLO_EVENT_BATCH_SIZE: i64 = 5_000;
 const DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY: usize = 8;
 const DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY: usize = 2;
+const DEFAULT_SLO_ITERATIVE_INSTALL_COUNT: usize = 250;
 const SLO_REPRESENTATIVE_WINDOW_DAYS: usize = 30;
 const SLO_REPRESENTATIVE_INSTALL_COUNT: usize = 1_000;
 const SLO_REPRESENTATIVE_SESSIONS_PER_INSTALL_PER_DAY: usize = 6;
@@ -63,6 +64,9 @@ const STAGE_B_DOMINANT_MIN_LEAD: f64 = 0.10;
 const STAGE_B_SLOW_RECORD_LIMIT: usize = 10;
 const STAGE_B_QUEUE_LAG_CONTEXT_NAMES: [&str; 2] =
     ["queue_wait_claim", "row_mutation_lag_before_claim"];
+const SLO_ITERATIVE_APPEND_CHECKPOINT_INTERVAL: usize = 200;
+const SLO_ITERATIVE_OFFLINE_FLUSH_CHECKPOINT_INTERVAL: usize = 25;
+const SLO_ITERATIVE_REPAIR_CHECKPOINT_INTERVAL: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -175,6 +179,8 @@ enum CliCommand {
         scenarios: Vec<String>,
         #[arg(long = "suite")]
         suites: Vec<String>,
+        #[arg(long, value_enum, default_value_t = SloMode::Iterative)]
+        mode: SloMode,
         #[arg(long, default_value_t = DEFAULT_SLO_PUBLICATION_REPETITIONS)]
         publication_repetitions: usize,
         #[arg(long, default_value_t = DEFAULT_SLO_SESSION_BATCH_SIZE)]
@@ -498,11 +504,30 @@ struct SloSummary {
     host: HostMetadata,
     suites: Vec<String>,
     run_config: SloRunConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verdict: Option<SloVerdict>,
     scenarios: Vec<SloScenarioResult>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum SloMode {
+    Iterative,
+    Publication,
+}
+
+impl SloMode {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Iterative => "iterative",
+            Self::Publication => "publication",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SloRunConfig {
+    mode: SloMode,
     publication_repetitions: usize,
     worker_config: BenchWorkerConfig,
 }
@@ -510,10 +535,98 @@ struct SloRunConfig {
 impl Default for SloRunConfig {
     fn default() -> Self {
         Self {
+            mode: SloMode::Iterative,
             publication_repetitions: DEFAULT_SLO_PUBLICATION_REPETITIONS,
             worker_config: BenchWorkerConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SloVerdict {
+    baseline_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    representative_append: Option<SloScenarioVerdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mixed_repair: Option<SloScenarioVerdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dominant_stage_b_phase: Option<SloStageBPhaseVerdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    overall: Option<SloVerdictStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SloScenarioVerdict {
+    overall: SloVerdictStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_sample_count_matches: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_derived: Option<SloVerdictStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_derived: Option<SloVerdictStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum SloVerdictStatus {
+    Better,
+    Flat,
+    Worse,
+}
+
+impl SloVerdictStatus {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Better => "better",
+            Self::Flat => "flat",
+            Self::Worse => "worse",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum SloStageBPhaseVerdict {
+    Changed,
+    Unchanged,
+    Unknown,
+}
+
+impl SloStageBPhaseVerdict {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Changed => "changed",
+            Self::Unchanged => "unchanged",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SloIterativeBaseline {
+    mode: SloMode,
+    source_artifact: String,
+    benchmarked_at: String,
+    scenarios: BTreeMap<String, SloIterativeBaselineScenario>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SloIterativeBaselineScenario {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_sample_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_derived_p95_ms: Option<u64>,
+    final_derived_ready_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dominant_stage_b_phase: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveSloPolicy {
+    install_count: usize,
+    append_checkpoint_interval: usize,
+    offline_flush_checkpoint_interval: usize,
+    repair_checkpoint_interval: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -632,6 +745,12 @@ struct StageBSummary {
     dominant_finalization_subphase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dominant_session_daily_subphase: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StageBSidecarSummary {
+    #[serde(default)]
+    dominant_phase: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -837,6 +956,7 @@ where
             output_dir,
             scenarios,
             suites,
+            mode,
             publication_repetitions,
             worker_session_batch_size,
             worker_event_batch_size,
@@ -847,6 +967,7 @@ where
             scenarios,
             suites,
             run_config: SloRunConfig {
+                mode,
                 publication_repetitions: publication_repetitions.max(1),
                 worker_config: BenchWorkerConfig {
                     session_batch_size: worker_session_batch_size.max(1),
@@ -1060,6 +1181,7 @@ where
         host,
         suites: summarized_slo_suites(&summary_results),
         run_config: run_config.clone(),
+        verdict: derive_slo_verdict(output_dir, run_config, &summary_results)?,
         scenarios: summary_results,
     };
     write_slo_summary(output_dir, &summary)?;
@@ -1193,7 +1315,7 @@ async fn run_live_slo_scenario(
     scenario: &SloScenarioDefinition,
     run_config: &SloRunConfig,
 ) -> Result<ExecutedSloScenario> {
-    let (append_blobs, repair_blobs) = live_slo_schedule(scenario)?;
+    let (append_blobs, repair_blobs) = live_slo_schedule(scenario, run_config)?;
     let mut expectation = SloExpectation::default();
     let mut checkpoint_samples = Vec::new();
 
@@ -1488,15 +1610,7 @@ fn select_slo_scenarios(
 ) -> Result<Vec<SloScenarioDefinition>> {
     let scenarios = slo_scenario_definitions(run_config);
     if requested.is_empty() {
-        return Ok(scenarios
-            .into_iter()
-            .filter(|scenario| {
-                matches!(
-                    scenario.suite,
-                    SloSuite::Representative | SloSuite::MixedRepair
-                )
-            })
-            .collect());
+        return Ok(default_slo_scenarios(run_config));
     }
 
     let known = scenarios
@@ -1562,7 +1676,47 @@ fn select_requested_slo_scenarios(
 }
 
 fn representative_repetitions(run_config: &SloRunConfig) -> usize {
-    run_config.publication_repetitions.max(1)
+    match run_config.mode {
+        SloMode::Iterative => 1,
+        SloMode::Publication => run_config.publication_repetitions.max(1),
+    }
+}
+
+fn default_slo_scenarios(run_config: &SloRunConfig) -> Vec<SloScenarioDefinition> {
+    let default_keys = match run_config.mode {
+        SloMode::Iterative => {
+            ["live-append-small-blobs", "live-append-plus-light-repair"].as_slice()
+        }
+        SloMode::Publication => [
+            "live-append-small-blobs",
+            "live-append-offline-flush",
+            "live-append-plus-light-repair",
+            "live-append-plus-repair-hot-project",
+        ]
+        .as_slice(),
+    };
+
+    slo_scenario_definitions(run_config)
+        .into_iter()
+        .filter(|scenario| default_keys.iter().any(|key| scenario.key() == *key))
+        .collect()
+}
+
+fn live_slo_policy(run_config: &SloRunConfig) -> LiveSloPolicy {
+    match run_config.mode {
+        SloMode::Iterative => LiveSloPolicy {
+            install_count: DEFAULT_SLO_ITERATIVE_INSTALL_COUNT,
+            append_checkpoint_interval: SLO_ITERATIVE_APPEND_CHECKPOINT_INTERVAL,
+            offline_flush_checkpoint_interval: SLO_ITERATIVE_OFFLINE_FLUSH_CHECKPOINT_INTERVAL,
+            repair_checkpoint_interval: SLO_ITERATIVE_REPAIR_CHECKPOINT_INTERVAL,
+        },
+        SloMode::Publication => LiveSloPolicy {
+            install_count: SLO_REPRESENTATIVE_INSTALL_COUNT,
+            append_checkpoint_interval: SLO_REPRESENTATIVE_CHECKPOINT_APPEND_INTERVAL,
+            offline_flush_checkpoint_interval: 1,
+            repair_checkpoint_interval: 1,
+        },
+    }
 }
 
 fn summarized_slo_suites(results: &[SloScenarioResult]) -> Vec<String> {
@@ -2374,6 +2528,221 @@ fn is_slo_grouped_query(name: &str) -> bool {
     name.ends_with("_grouped")
 }
 
+fn derive_slo_verdict(
+    output_dir: &Path,
+    run_config: &SloRunConfig,
+    results: &[SloScenarioResult],
+) -> Result<Option<SloVerdict>> {
+    if run_config.mode != SloMode::Iterative {
+        return Ok(None);
+    }
+
+    let has_iterative_gate_result = results.iter().any(|result| {
+        matches!(
+            result.scenario.as_str(),
+            "live-append-small-blobs" | "live-append-plus-light-repair"
+        )
+    });
+    if !has_iterative_gate_result {
+        return Ok(None);
+    }
+
+    let baseline = load_slo_iterative_baseline(&slo_iterative_baseline_path())?;
+    let representative_append = scenario_verdict(
+        results
+            .iter()
+            .find(|result| result.scenario == "live-append-small-blobs"),
+        baseline.scenarios.get("live-append-small-blobs"),
+    );
+    let mixed_repair = scenario_verdict(
+        results
+            .iter()
+            .find(|result| result.scenario == "live-append-plus-light-repair"),
+        baseline.scenarios.get("live-append-plus-light-repair"),
+    );
+    let dominant_stage_b_phase = stage_b_phase_verdict(
+        output_dir,
+        results
+            .iter()
+            .find(|result| result.scenario == "live-append-plus-light-repair"),
+        baseline.scenarios.get("live-append-plus-light-repair"),
+    )?;
+
+    let overall = overall_slo_verdict([
+        representative_append
+            .as_ref()
+            .map(|verdict| verdict.overall),
+        mixed_repair.as_ref().map(|verdict| verdict.overall),
+    ]);
+    if representative_append.is_none()
+        && mixed_repair.is_none()
+        && dominant_stage_b_phase.is_none()
+        && overall.is_none()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(SloVerdict {
+        baseline_source: baseline.source_artifact,
+        representative_append,
+        mixed_repair,
+        dominant_stage_b_phase,
+        overall,
+    }))
+}
+
+fn scenario_verdict(
+    result: Option<&SloScenarioResult>,
+    baseline: Option<&SloIterativeBaselineScenario>,
+) -> Option<SloScenarioVerdict> {
+    let baseline = baseline?;
+    let result = result?;
+    let checkpoint_sample_count_matches = checkpoint_sample_count_matches(
+        result
+            .checkpoint_readiness
+            .as_ref()
+            .map(|summary| summary.sample_count),
+        baseline.checkpoint_sample_count,
+    );
+    let checkpoint_derived = if checkpoint_sample_count_matches {
+        metric_verdict(
+            result
+                .checkpoint_readiness
+                .as_ref()
+                .map(|summary| summary.derived_metrics_ready_p95_ms),
+            baseline.checkpoint_derived_p95_ms,
+        )
+    } else {
+        None
+    };
+    let final_derived = metric_verdict(
+        slo_result_readiness_ms(result, "derived_metrics_ready_ms"),
+        Some(baseline.final_derived_ready_ms),
+    );
+    let overall = overall_slo_verdict([checkpoint_derived, final_derived])?;
+
+    Some(SloScenarioVerdict {
+        overall,
+        checkpoint_sample_count_matches: baseline
+            .checkpoint_sample_count
+            .map(|_| checkpoint_sample_count_matches),
+        checkpoint_derived,
+        final_derived,
+    })
+}
+
+fn checkpoint_sample_count_matches(current: Option<usize>, baseline: Option<usize>) -> bool {
+    match (current, baseline) {
+        (_, None) => true,
+        (Some(current), Some(baseline)) => current == baseline,
+        (None, Some(_)) => false,
+    }
+}
+
+fn metric_verdict(current: Option<u64>, baseline: Option<u64>) -> Option<SloVerdictStatus> {
+    match (current, baseline) {
+        (None, None) | (Some(_), None) => None,
+        (None, Some(_)) => Some(SloVerdictStatus::Worse),
+        (Some(current), Some(baseline)) => {
+            let threshold = baseline.max(1).div_ceil(20).max(1_000);
+            if baseline.saturating_sub(current) >= threshold {
+                Some(SloVerdictStatus::Better)
+            } else if current.saturating_sub(baseline) >= threshold {
+                Some(SloVerdictStatus::Worse)
+            } else {
+                Some(SloVerdictStatus::Flat)
+            }
+        }
+    }
+}
+
+fn overall_slo_verdict(
+    scenario_verdicts: [Option<SloVerdictStatus>; 2],
+) -> Option<SloVerdictStatus> {
+    if scenario_verdicts
+        .iter()
+        .flatten()
+        .any(|verdict| *verdict == SloVerdictStatus::Worse)
+    {
+        Some(SloVerdictStatus::Worse)
+    } else if scenario_verdicts
+        .iter()
+        .flatten()
+        .any(|verdict| *verdict == SloVerdictStatus::Better)
+    {
+        Some(SloVerdictStatus::Better)
+    } else if scenario_verdicts.iter().flatten().next().is_some() {
+        Some(SloVerdictStatus::Flat)
+    } else {
+        None
+    }
+}
+
+fn stage_b_phase_verdict(
+    output_dir: &Path,
+    result: Option<&SloScenarioResult>,
+    baseline: Option<&SloIterativeBaselineScenario>,
+) -> Result<Option<SloStageBPhaseVerdict>> {
+    let (Some(baseline), Some(result)) = (baseline, result) else {
+        return Ok(None);
+    };
+    let current = load_stage_b_dominant_phase(output_dir, &result.scenario)?;
+
+    Ok(
+        match (
+            current.as_deref(),
+            baseline.dominant_stage_b_phase.as_deref(),
+        ) {
+            (None, None) => None,
+            (None, Some(_)) | (Some(_), None) => Some(SloStageBPhaseVerdict::Unknown),
+            (Some(current), Some(baseline)) if current == baseline => {
+                Some(SloStageBPhaseVerdict::Unchanged)
+            }
+            _ => Some(SloStageBPhaseVerdict::Changed),
+        },
+    )
+}
+
+fn slo_result_readiness_ms(result: &SloScenarioResult, name: &str) -> Option<u64> {
+    result
+        .readiness
+        .iter()
+        .find(|measurement| measurement.name == name)
+        .map(|measurement| measurement.elapsed_ms)
+}
+
+fn load_slo_iterative_baseline(path: &Path) -> Result<SloIterativeBaseline> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read iterative SLO baseline {}", path.display()))?;
+    let baseline: SloIterativeBaseline = serde_json::from_str(&contents)
+        .with_context(|| format!("parse iterative SLO baseline {}", path.display()))?;
+    if baseline.mode != SloMode::Iterative {
+        bail!(
+            "iterative SLO baseline {} must declare iterative mode",
+            path.display()
+        );
+    }
+    Ok(baseline)
+}
+
+fn load_stage_b_dominant_phase(output_dir: &Path, scenario: &str) -> Result<Option<String>> {
+    let path = output_dir.join(scenario).join(STAGE_B_SUMMARY_FILENAME);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read Stage B summary {}", path.display()));
+        }
+    };
+    let summary: StageBSidecarSummary = serde_json::from_str(&contents)
+        .with_context(|| format!("parse Stage B summary {}", path.display()))?;
+    Ok(summary.dominant_phase)
+}
+
+fn slo_iterative_baseline_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("baselines/slo-iterative-default.json")
+}
+
 fn aggregate_slo_runs(
     scenario: &SloScenarioDefinition,
     runs: &[SloScenarioResult],
@@ -2579,6 +2948,61 @@ fn render_slo_markdown_summary(summary: &SloSummary) -> String {
     ];
     lines.extend(render_slo_run_config_lines(&summary.run_config));
     lines.push(String::new());
+    if let Some(verdict) = &summary.verdict {
+        lines.push("## Iterative Verdict".to_owned());
+        lines.push(String::new());
+        lines.push(format!("- baseline: {}", verdict.baseline_source));
+        if let Some(verdict) = &verdict.representative_append {
+            lines.push(format!(
+                "- representative append verdict: {}",
+                verdict.overall.key()
+            ));
+            if verdict.checkpoint_sample_count_matches == Some(false) {
+                lines.push(
+                    "- representative checkpoint sample count: mismatch vs baseline".to_owned(),
+                );
+            }
+            if let Some(component) = verdict.checkpoint_derived {
+                lines.push(format!(
+                    "- representative checkpoint derived verdict: {}",
+                    component.key()
+                ));
+            }
+            if let Some(component) = verdict.final_derived {
+                lines.push(format!(
+                    "- representative final derived verdict: {}",
+                    component.key()
+                ));
+            }
+        }
+        if let Some(verdict) = &verdict.mixed_repair {
+            lines.push(format!("- mixed repair verdict: {}", verdict.overall.key()));
+            if verdict.checkpoint_sample_count_matches == Some(false) {
+                lines.push(
+                    "- mixed repair checkpoint sample count: mismatch vs baseline".to_owned(),
+                );
+            }
+            if let Some(component) = verdict.checkpoint_derived {
+                lines.push(format!(
+                    "- mixed repair checkpoint derived verdict: {}",
+                    component.key()
+                ));
+            }
+            if let Some(component) = verdict.final_derived {
+                lines.push(format!(
+                    "- mixed repair final derived verdict: {}",
+                    component.key()
+                ));
+            }
+        }
+        if let Some(verdict) = verdict.dominant_stage_b_phase {
+            lines.push(format!("- dominant Stage B phase: {}", verdict.key()));
+        }
+        if let Some(verdict) = verdict.overall {
+            lines.push(format!("- overall verdict: {}", verdict.key()));
+        }
+        lines.push(String::new());
+    }
 
     for scenario in &summary.scenarios {
         lines.push(render_slo_scenario_section(scenario, Some("##")));
@@ -2659,6 +3083,7 @@ fn render_slo_scenario_section(result: &SloScenarioResult, heading_prefix: Optio
 fn render_slo_run_config_lines(run_config: &SloRunConfig) -> Vec<String> {
     vec![
         "- Run config:".to_owned(),
+        format!("  - mode: {}", run_config.mode.key()),
         format!(
             "  - publication_repetitions: {}",
             run_config.publication_repetitions
@@ -2959,21 +3384,23 @@ async fn post_upload_blob(
 
 fn live_slo_schedule(
     scenario: &SloScenarioDefinition,
+    run_config: &SloRunConfig,
 ) -> Result<(Vec<UploadBlob>, Vec<UploadBlob>)> {
+    let policy = live_slo_policy(run_config);
     match scenario.kind {
         SloScenarioKind::LiveAppendSmallBlobs => {
-            Ok((build_live_append_blobs(false, false)?, Vec::new()))
+            Ok((build_live_append_blobs(policy, false, false)?, Vec::new()))
         }
         SloScenarioKind::LiveAppendOfflineFlush => {
-            Ok((build_live_append_blobs(true, false)?, Vec::new()))
+            Ok((build_live_append_blobs(policy, true, false)?, Vec::new()))
         }
         SloScenarioKind::LiveAppendPlusLightRepair => Ok((
-            build_live_append_blobs(false, false)?,
-            build_live_repair_blobs(false)?,
+            build_live_append_blobs(policy, false, false)?,
+            build_live_repair_blobs(policy, false)?,
         )),
         SloScenarioKind::LiveAppendPlusRepairHotProject => Ok((
-            build_live_append_blobs(true, true)?,
-            build_live_repair_blobs(true)?,
+            build_live_append_blobs(policy, true, true)?,
+            build_live_repair_blobs(policy, true)?,
         )),
         _ => bail!(
             "live schedule requested for non-live scenario {}",
@@ -2983,15 +3410,17 @@ fn live_slo_schedule(
 }
 
 fn build_live_append_blobs(
+    policy: LiveSloPolicy,
     include_offline_flush: bool,
     hot_project_flush: bool,
 ) -> Result<Vec<UploadBlob>> {
     let mut scheduled = Vec::new();
     let mut append_index = 0usize;
+    let mut offline_flush_index = 0usize;
 
     for day_offset in 0..SLO_REPRESENTATIVE_WINDOW_DAYS {
         let day = slo_start_day() + ChronoDuration::days(day_offset as i64);
-        for install_index in 0..SLO_REPRESENTATIVE_INSTALL_COUNT {
+        for install_index in 0..policy.install_count {
             let install_uses_offline_flush = include_offline_flush
                 && install_index % SLO_REPRESENTATIVE_OFFLINE_FLUSH_INSTALL_MODULUS
                     == day_offset % SLO_REPRESENTATIVE_OFFLINE_FLUSH_INSTALL_MODULUS;
@@ -3020,7 +3449,7 @@ fn build_live_append_blobs(
                                 },
                             },
                             checkpoint: append_index
-                                .is_multiple_of(SLO_REPRESENTATIVE_CHECKPOINT_APPEND_INTERVAL),
+                                .is_multiple_of(policy.append_checkpoint_interval),
                         },
                     ));
                 }
@@ -3034,6 +3463,7 @@ fn build_live_append_blobs(
                         session_index,
                     )?);
                 }
+                offline_flush_index += 1;
                 scheduled.push((
                     live_offline_flush_sort_key(day_offset, install_index, hot_project_flush),
                     UploadBlob {
@@ -3049,7 +3479,8 @@ fn build_live_append_blobs(
                                 * SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS,
                             total_new_installs: 0,
                         },
-                        checkpoint: true,
+                        checkpoint: offline_flush_index
+                            .is_multiple_of(policy.offline_flush_checkpoint_interval),
                     },
                 ));
                 continue;
@@ -3072,8 +3503,7 @@ fn build_live_append_blobs(
                                 0
                             },
                         },
-                        checkpoint: append_index
-                            .is_multiple_of(SLO_REPRESENTATIVE_CHECKPOINT_APPEND_INTERVAL),
+                        checkpoint: append_index.is_multiple_of(policy.append_checkpoint_interval),
                     },
                 ));
             }
@@ -3084,8 +3514,9 @@ fn build_live_append_blobs(
     Ok(scheduled.into_iter().map(|(_, blob)| blob).collect())
 }
 
-fn build_live_repair_blobs(hot_project: bool) -> Result<Vec<UploadBlob>> {
+fn build_live_repair_blobs(policy: LiveSloPolicy, hot_project: bool) -> Result<Vec<UploadBlob>> {
     let mut scheduled = Vec::new();
+    let mut repair_index = 0usize;
 
     for day_offset in 0..SLO_REPRESENTATIVE_WINDOW_DAYS {
         let day = slo_start_day() + ChronoDuration::days(day_offset as i64);
@@ -3095,10 +3526,11 @@ fn build_live_repair_blobs(hot_project: bool) -> Result<Vec<UploadBlob>> {
             SLO_REPRESENTATIVE_LIGHT_REPAIR_INSTALL_MODULUS
         };
 
-        for install_index in 0..SLO_REPRESENTATIVE_INSTALL_COUNT {
+        for install_index in 0..policy.install_count {
             if install_index % repair_modulus != day_offset % repair_modulus {
                 continue;
             }
+            repair_index += 1;
 
             let session_start = live_session_start(day, day_offset, install_index, 0)?;
             let mut events = Vec::with_capacity(SLO_REPRESENTATIVE_REPAIR_LATE_EVENTS_PER_SESSION);
@@ -3122,7 +3554,7 @@ fn build_live_repair_blobs(hot_project: bool) -> Result<Vec<UploadBlob>> {
                         total_duration_seconds: SLO_REPRESENTATIVE_REPAIR_DURATION_DELTA_SECONDS,
                         total_new_installs: 0,
                     },
-                    checkpoint: true,
+                    checkpoint: repair_index.is_multiple_of(policy.repair_checkpoint_interval),
                 },
             ));
         }
@@ -5070,6 +5502,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_slo_command_defaults_to_iterative_mode() {
+        let BenchCommand::Slo(args) = parse_args([
+            "fantasma-bench",
+            "slo",
+            "--output-dir",
+            "artifacts/performance/2026-03-15-derived-metrics-slo",
+        ])
+        .expect("parse iterative default") else {
+            panic!("expected SLO command");
+        };
+
+        let rendered = serde_json::to_value(&args.run_config).expect("serialize run config");
+
+        assert_eq!(rendered["mode"], serde_json::json!("iterative"));
+    }
+
+    #[test]
     fn parse_slo_command_reads_requested_scenarios() {
         let command = parse_args([
             "fantasma-bench",
@@ -5165,7 +5614,33 @@ mod tests {
         let run_config = dummy_slo_run_config();
         let scenarios = select_slo_scenarios(&[], &run_config).expect("load default scenarios");
 
-        assert_eq!(scenarios.len(), 4);
+        assert_eq!(scenarios.len(), 2);
+        assert_eq!(
+            scenarios
+                .iter()
+                .map(|scenario| scenario.key())
+                .collect::<Vec<_>>(),
+            vec!["live-append-small-blobs", "live-append-plus-light-repair",]
+        );
+    }
+
+    #[test]
+    fn publication_mode_default_selection_keeps_the_full_live_worker_family() {
+        let summary: serde_json::Value = serde_json::from_value(serde_json::json!({
+            "publication_repetitions": 2,
+            "mode": "publication",
+            "worker_config": {
+                "session_batch_size": DEFAULT_SLO_SESSION_BATCH_SIZE,
+                "event_batch_size": DEFAULT_SLO_EVENT_BATCH_SIZE,
+                "session_incremental_concurrency": DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY,
+                "session_repair_concurrency": DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY
+            }
+        }))
+        .expect("parse publication config");
+        let run_config: SloRunConfig =
+            serde_json::from_value(summary).expect("deserialize publication run config");
+        let scenarios = select_slo_scenarios(&[], &run_config).expect("load publication defaults");
+
         assert_eq!(
             scenarios
                 .iter()
@@ -5242,6 +5717,8 @@ mod tests {
             "slo",
             "--output-dir",
             "artifacts/performance/2026-03-13-derived-metrics-slo",
+            "--mode",
+            "publication",
             "--publication-repetitions",
             "3",
         ])
@@ -5328,13 +5805,14 @@ mod tests {
     }
 
     #[test]
-    fn live_append_small_blob_schedule_samples_every_20th_append_blob() {
+    fn iterative_live_append_small_blob_schedule_uses_reduced_cohort_and_sparse_checkpoints() {
         let scenario = slo_scenario_definitions(&dummy_slo_run_config())
             .into_iter()
             .find(|scenario| scenario.key() == "live-append-small-blobs")
             .expect("live-append-small-blobs");
 
-        let (append_blobs, repair_blobs) = live_slo_schedule(&scenario).expect("build schedule");
+        let (append_blobs, repair_blobs) =
+            live_slo_schedule(&scenario, &dummy_slo_run_config()).expect("build schedule");
         let checkpointed_append_blobs = append_blobs
             .iter()
             .filter(|blob| blob.kind == UploadBlobKind::Append && blob.checkpoint)
@@ -5343,24 +5821,31 @@ mod tests {
         assert!(repair_blobs.is_empty());
         assert_eq!(
             append_blobs.len(),
-            SLO_REPRESENTATIVE_WINDOW_DAYS
-                * SLO_REPRESENTATIVE_INSTALL_COUNT
-                * SLO_REPRESENTATIVE_SESSIONS_PER_INSTALL_PER_DAY
+            SLO_REPRESENTATIVE_WINDOW_DAYS * 250 * SLO_REPRESENTATIVE_SESSIONS_PER_INSTALL_PER_DAY
         );
-        assert_eq!(
-            checkpointed_append_blobs,
-            append_blobs.len() / SLO_REPRESENTATIVE_CHECKPOINT_APPEND_INTERVAL
-        );
+        assert_eq!(checkpointed_append_blobs, append_blobs.len() / 200);
     }
 
     #[test]
-    fn live_append_small_blob_schedule_keeps_the_1000_install_day_baseline() {
+    fn publication_live_append_small_blob_schedule_keeps_the_1000_install_day_baseline() {
+        let run_config: SloRunConfig = serde_json::from_value(serde_json::json!({
+            "publication_repetitions": 2,
+            "mode": "publication",
+            "worker_config": {
+                "session_batch_size": DEFAULT_SLO_SESSION_BATCH_SIZE,
+                "event_batch_size": DEFAULT_SLO_EVENT_BATCH_SIZE,
+                "session_incremental_concurrency": DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY,
+                "session_repair_concurrency": DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY
+            }
+        }))
+        .expect("deserialize publication run config");
         let scenario = slo_scenario_definitions(&dummy_slo_run_config())
             .into_iter()
             .find(|scenario| scenario.key() == "live-append-small-blobs")
             .expect("live-append-small-blobs");
 
-        let (append_blobs, repair_blobs) = live_slo_schedule(&scenario).expect("build schedule");
+        let (append_blobs, repair_blobs) =
+            live_slo_schedule(&scenario, &run_config).expect("build schedule");
 
         assert!(repair_blobs.is_empty());
         assert_eq!(
@@ -5372,32 +5857,40 @@ mod tests {
     }
 
     #[test]
-    fn offline_flush_and_repair_live_schedules_keep_special_blobs_checkpointed() {
+    fn iterative_offline_flush_and_repair_live_schedules_use_bounded_checkpoint_sampling() {
         let offline_flush_scenario = slo_scenario_definitions(&dummy_slo_run_config())
             .into_iter()
             .find(|scenario| scenario.key() == "live-append-offline-flush")
             .expect("live-append-offline-flush");
         let (offline_flush_blobs, _) =
-            live_slo_schedule(&offline_flush_scenario).expect("offline flush schedule");
+            live_slo_schedule(&offline_flush_scenario, &dummy_slo_run_config())
+                .expect("offline flush schedule");
         let flush_blobs = offline_flush_blobs
             .iter()
             .filter(|blob| blob.kind == UploadBlobKind::OfflineFlush)
             .collect::<Vec<_>>();
         assert!(!flush_blobs.is_empty());
-        assert!(flush_blobs.iter().all(|blob| blob.checkpoint));
+        assert_eq!(
+            flush_blobs.iter().filter(|blob| blob.checkpoint).count(),
+            flush_blobs.len() / 25
+        );
 
         let repair_scenario = slo_scenario_definitions(&dummy_slo_run_config())
             .into_iter()
             .find(|scenario| scenario.key() == "live-append-plus-light-repair")
             .expect("live-append-plus-light-repair");
-        let (_, repair_blobs) = live_slo_schedule(&repair_scenario).expect("repair schedule");
+        let (_, repair_blobs) =
+            live_slo_schedule(&repair_scenario, &dummy_slo_run_config()).expect("repair schedule");
         assert!(!repair_blobs.is_empty());
         assert!(
             repair_blobs
                 .iter()
                 .all(|blob| blob.kind == UploadBlobKind::Repair)
         );
-        assert!(repair_blobs.iter().all(|blob| blob.checkpoint));
+        assert_eq!(
+            repair_blobs.iter().filter(|blob| blob.checkpoint).count(),
+            repair_blobs.len() / 10
+        );
     }
 
     #[test]
@@ -5729,72 +6222,102 @@ mod tests {
 
     #[test]
     fn render_slo_markdown_summary_includes_family_readiness_and_budgets() {
-        let summary = SloSummary {
-            host: HostMetadata {
-                cpu_model: "Apple M3 Pro".to_owned(),
-                memory_bytes: 38_654_705_664,
-                memory_gib: 36.0,
-                os_kernel: "Darwin 25.1.0".to_owned(),
-                architecture: "arm64".to_owned(),
-                benchmarked_at: "2026-03-13T12:12:00Z".to_owned(),
+        let summary: SloSummary = serde_json::from_value(serde_json::json!({
+            "host": {
+                "cpu_model": "Apple M3 Pro",
+                "memory_bytes": 38654705664u64,
+                "memory_gib": 36.0,
+                "os_kernel": "Darwin 25.1.0",
+                "architecture": "arm64",
+                "benchmarked_at": "2026-03-13T12:12:00Z"
             },
-            suites: vec!["representative".to_owned(), "mixed-repair".to_owned()],
-            run_config: dummy_slo_run_config(),
-            scenarios: vec![SloScenarioResult {
-                scenario: "live-append-small-blobs".to_owned(),
-                run_config: dummy_slo_run_config(),
-                phases: vec![PhaseMeasurement {
-                    name: "ingest".to_owned(),
-                    events_sent: 900_000,
-                    elapsed_ms: 15_000,
-                    events_per_second: 60_000.0,
+            "suites": ["representative", "mixed-repair"],
+            "run_config": {
+                "publication_repetitions": 1,
+                "mode": "iterative",
+                "worker_config": {
+                    "session_batch_size": DEFAULT_SLO_SESSION_BATCH_SIZE,
+                    "event_batch_size": DEFAULT_SLO_EVENT_BATCH_SIZE,
+                    "session_incremental_concurrency": DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY,
+                    "session_repair_concurrency": DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY
+                }
+            },
+            "verdict": {
+                "baseline_source": "crates/fantasma-bench/baselines/slo-iterative-default.json",
+                "representative_append": {
+                    "overall": "better",
+                    "checkpoint_derived": "better",
+                    "final_derived": "flat"
+                },
+                "mixed_repair": {
+                    "overall": "flat",
+                    "checkpoint_derived": "flat",
+                    "final_derived": "flat"
+                },
+                "dominant_stage_b_phase": "changed",
+                "overall": "better"
+            },
+            "scenarios": [{
+                "scenario": "live-append-small-blobs",
+                "run_config": {
+                    "publication_repetitions": 1,
+                    "mode": "iterative",
+                    "worker_config": {
+                        "session_batch_size": DEFAULT_SLO_SESSION_BATCH_SIZE,
+                        "event_batch_size": DEFAULT_SLO_EVENT_BATCH_SIZE,
+                        "session_incremental_concurrency": DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY,
+                        "session_repair_concurrency": DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY
+                    }
+                },
+                "phases": [{
+                    "name": "ingest",
+                    "events_sent": 900000,
+                    "elapsed_ms": 15000,
+                    "events_per_second": 60000.0
                 }],
-                readiness: vec![
-                    ReadinessMeasurement {
-                        name: "event_metrics_ready_ms".to_owned(),
-                        elapsed_ms: 20_000,
-                    },
-                    ReadinessMeasurement {
-                        name: "session_metrics_ready_ms".to_owned(),
-                        elapsed_ms: 40_000,
-                    },
-                    ReadinessMeasurement {
-                        name: "derived_metrics_ready_ms".to_owned(),
-                        elapsed_ms: 40_000,
-                    },
+                "readiness": [
+                    {"name": "event_metrics_ready_ms", "elapsed_ms": 20000},
+                    {"name": "session_metrics_ready_ms", "elapsed_ms": 40000},
+                    {"name": "derived_metrics_ready_ms", "elapsed_ms": 40000}
                 ],
-                checkpoint_readiness: Some(CheckpointReadinessSummary {
-                    sample_count: 10,
-                    event_metrics_ready_p50_ms: 10_000,
-                    event_metrics_ready_p95_ms: 20_000,
-                    event_metrics_ready_max_ms: 25_000,
-                    session_metrics_ready_p50_ms: 20_000,
-                    session_metrics_ready_p95_ms: 40_000,
-                    session_metrics_ready_max_ms: 45_000,
-                    derived_metrics_ready_p50_ms: 20_000,
-                    derived_metrics_ready_p95_ms: 40_000,
-                    derived_metrics_ready_max_ms: 45_000,
-                }),
-                queries: vec![QueryMeasurement {
-                    name: "events_count_day_grouped".to_owned(),
-                    iterations: 100,
-                    min_ms: 50,
-                    p50_ms: 60,
-                    p95_ms: 80,
-                    max_ms: 95,
+                "checkpoint_readiness": {
+                    "sample_count": 10,
+                    "event_metrics_ready_p50_ms": 10000,
+                    "event_metrics_ready_p95_ms": 20000,
+                    "event_metrics_ready_max_ms": 25000,
+                    "session_metrics_ready_p50_ms": 20000,
+                    "session_metrics_ready_p95_ms": 40000,
+                    "session_metrics_ready_max_ms": 45000,
+                    "derived_metrics_ready_p50_ms": 20000,
+                    "derived_metrics_ready_p95_ms": 40000,
+                    "derived_metrics_ready_max_ms": 45000
+                },
+                "queries": [{
+                    "name": "events_count_day_grouped",
+                    "iterations": 100,
+                    "min_ms": 50,
+                    "p50_ms": 60,
+                    "p95_ms": 80,
+                    "max_ms": 95
                 }],
-                budget: Some(BudgetEvaluation {
-                    passed: true,
-                    failures: vec![],
-                }),
-                failure: None,
-            }],
-        };
+                "budget": {"passed": true, "failures": []}
+            }]
+        }))
+        .expect("parse SLO summary fixture");
 
         let markdown = render_slo_markdown_summary(&summary);
+        let rendered = serde_json::to_value(&summary).expect("serialize SLO summary");
 
         assert!(markdown.contains("# Fantasma Derived Metrics SLO Suite"));
         assert!(markdown.contains("- Published suites: representative, mixed-repair"));
+        assert!(markdown.contains("- representative append verdict: better"));
+        assert!(markdown.contains("- representative checkpoint derived verdict: better"));
+        assert!(markdown.contains("- representative final derived verdict: flat"));
+        assert!(markdown.contains("- mixed repair verdict: flat"));
+        assert!(markdown.contains("- mixed repair checkpoint derived verdict: flat"));
+        assert!(markdown.contains("- mixed repair final derived verdict: flat"));
+        assert!(markdown.contains("- dominant Stage B phase: changed"));
+        assert!(markdown.contains("- overall verdict: better"));
         assert!(markdown.contains("- Run config:"));
         assert!(markdown.contains("## live-append-small-blobs"));
         assert!(markdown.contains("- event_metrics_ready_ms: 20000ms"));
@@ -5803,6 +6326,184 @@ mod tests {
         assert!(markdown.contains("- checkpoint derived p95: 40000ms"));
         assert!(markdown.contains("- Budget: PASS"));
         assert!(markdown.contains("| events_count_day_grouped | 60 | 80 | 50 | 95 |"));
+        assert_eq!(
+            rendered["run_config"]["mode"],
+            serde_json::json!("iterative")
+        );
+        assert_eq!(rendered["verdict"]["overall"], serde_json::json!("better"));
+        assert_eq!(
+            rendered["verdict"]["representative_append"]["checkpoint_derived"],
+            serde_json::json!("better")
+        );
+    }
+
+    #[test]
+    fn metric_verdict_uses_the_larger_of_one_second_or_five_percent_threshold() {
+        assert_eq!(
+            metric_verdict(Some(18_900), Some(20_000)),
+            Some(SloVerdictStatus::Better)
+        );
+        assert_eq!(
+            metric_verdict(Some(20_900), Some(20_000)),
+            Some(SloVerdictStatus::Flat)
+        );
+        assert_eq!(
+            metric_verdict(Some(21_000), Some(20_000)),
+            Some(SloVerdictStatus::Worse)
+        );
+        assert_eq!(
+            metric_verdict(Some(95_000), Some(100_000)),
+            Some(SloVerdictStatus::Better)
+        );
+        assert_eq!(
+            metric_verdict(Some(104_999), Some(100_000)),
+            Some(SloVerdictStatus::Flat)
+        );
+        assert_eq!(
+            metric_verdict(Some(105_000), Some(100_000)),
+            Some(SloVerdictStatus::Worse)
+        );
+    }
+
+    #[test]
+    fn checkpoint_metric_requires_matching_sample_counts() {
+        let baseline = SloIterativeBaselineScenario {
+            checkpoint_sample_count: Some(10),
+            checkpoint_derived_p95_ms: Some(400),
+            final_derived_ready_ms: 100,
+            dominant_stage_b_phase: None,
+        };
+
+        let matching = scenario_verdict(
+            Some(&dummy_slo_scenario_result_with_checkpoint_samples(
+                10, 400, 100,
+            )),
+            Some(&baseline),
+        )
+        .expect("matching sample-count verdict");
+        assert_eq!(matching.checkpoint_sample_count_matches, Some(true));
+        assert_eq!(matching.checkpoint_derived, Some(SloVerdictStatus::Flat));
+
+        let mismatched = scenario_verdict(
+            Some(&dummy_slo_scenario_result_with_checkpoint_samples(
+                9, 400, 100,
+            )),
+            Some(&baseline),
+        )
+        .expect("mismatched sample-count verdict");
+        assert_eq!(mismatched.checkpoint_sample_count_matches, Some(false));
+        assert_eq!(mismatched.checkpoint_derived, None);
+        assert_eq!(mismatched.final_derived, Some(SloVerdictStatus::Flat));
+        assert_eq!(mismatched.overall, SloVerdictStatus::Flat);
+    }
+
+    #[test]
+    fn overall_slo_verdict_prefers_worse_then_better_then_flat() {
+        assert_eq!(
+            overall_slo_verdict([Some(SloVerdictStatus::Better), Some(SloVerdictStatus::Flat)]),
+            Some(SloVerdictStatus::Better)
+        );
+        assert_eq!(
+            overall_slo_verdict([Some(SloVerdictStatus::Flat), Some(SloVerdictStatus::Flat)]),
+            Some(SloVerdictStatus::Flat)
+        );
+        assert_eq!(
+            overall_slo_verdict([
+                Some(SloVerdictStatus::Better),
+                Some(SloVerdictStatus::Worse)
+            ]),
+            Some(SloVerdictStatus::Worse)
+        );
+    }
+
+    #[test]
+    fn stage_b_phase_verdict_reports_changed_when_the_dominant_phase_differs() {
+        let tempdir = tempdir().expect("create tempdir");
+        let scenario_dir = tempdir.path().join("live-append-plus-light-repair");
+        fs::create_dir_all(&scenario_dir).expect("create scenario dir");
+        fs::write(
+            scenario_dir.join(STAGE_B_SUMMARY_FILENAME),
+            serde_json::to_vec(&serde_json::json!({
+                "dominant_phase": "shared_bucket_finalize"
+            }))
+            .expect("serialize sidecar"),
+        )
+        .expect("write sidecar");
+
+        let verdict = stage_b_phase_verdict(
+            tempdir.path(),
+            Some(&SloScenarioResult {
+                scenario: "live-append-plus-light-repair".to_owned(),
+                run_config: dummy_slo_run_config(),
+                phases: vec![],
+                readiness: vec![],
+                checkpoint_readiness: None,
+                queries: vec![],
+                budget: None,
+                failure: None,
+            }),
+            Some(&SloIterativeBaselineScenario {
+                checkpoint_sample_count: Some(10),
+                checkpoint_derived_p95_ms: Some(20_000),
+                final_derived_ready_ms: 25_000,
+                dominant_stage_b_phase: Some("session_rewrite".to_owned()),
+            }),
+        )
+        .expect("derive stage-b verdict");
+
+        assert_eq!(verdict, Some(SloStageBPhaseVerdict::Changed));
+    }
+
+    #[test]
+    fn stage_b_phase_verdict_reports_unknown_when_current_sidecar_is_missing() {
+        let tempdir = tempdir().expect("create tempdir");
+
+        let verdict = stage_b_phase_verdict(
+            tempdir.path(),
+            Some(&dummy_slo_scenario_result_with_checkpoint_samples(
+                10, 400, 100,
+            )),
+            Some(&SloIterativeBaselineScenario {
+                checkpoint_sample_count: Some(10),
+                checkpoint_derived_p95_ms: Some(400),
+                final_derived_ready_ms: 100,
+                dominant_stage_b_phase: Some("shared_bucket_finalize".to_owned()),
+            }),
+        )
+        .expect("derive stage-b verdict");
+
+        assert_eq!(verdict, Some(SloStageBPhaseVerdict::Unknown));
+    }
+
+    fn dummy_slo_scenario_result_with_checkpoint_samples(
+        sample_count: usize,
+        checkpoint_derived_p95_ms: u64,
+        final_derived_ready_ms: u64,
+    ) -> SloScenarioResult {
+        SloScenarioResult {
+            scenario: "live-append-plus-light-repair".to_owned(),
+            run_config: dummy_slo_run_config(),
+            phases: vec![],
+            readiness: vec![ReadinessMeasurement {
+                name: "derived_metrics_ready_ms".to_owned(),
+                elapsed_ms: final_derived_ready_ms,
+            }],
+            checkpoint_readiness: Some(CheckpointReadinessSummary {
+                sample_count,
+                event_metrics_ready_p50_ms: checkpoint_derived_p95_ms,
+                event_metrics_ready_p95_ms: checkpoint_derived_p95_ms,
+                event_metrics_ready_max_ms: checkpoint_derived_p95_ms,
+                session_metrics_ready_p50_ms: checkpoint_derived_p95_ms,
+                session_metrics_ready_p95_ms: checkpoint_derived_p95_ms,
+                session_metrics_ready_max_ms: checkpoint_derived_p95_ms,
+                derived_metrics_ready_p50_ms: checkpoint_derived_p95_ms,
+                derived_metrics_ready_p95_ms: checkpoint_derived_p95_ms,
+                derived_metrics_ready_max_ms: checkpoint_derived_p95_ms,
+            }),
+            queries: vec![],
+            budget: None,
+            failure: None,
+        }
     }
 
     #[test]
@@ -5818,6 +6519,7 @@ mod tests {
             },
             suites: vec!["reads-visibility".to_owned()],
             run_config: dummy_slo_run_config(),
+            verdict: None,
             scenarios: vec![SloScenarioResult {
                 scenario: "reads-visibility-30d".to_owned(),
                 run_config: dummy_slo_run_config(),
