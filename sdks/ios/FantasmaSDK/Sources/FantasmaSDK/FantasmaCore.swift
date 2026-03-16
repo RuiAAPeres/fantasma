@@ -154,7 +154,7 @@ struct UploadBatch: Sendable {
 
 struct FantasmaDependencies: Sendable {
     let databaseURL: URL
-    let transport: any FantasmaTransport
+    let transport: FantasmaTransport
     let now: @Sendable () -> Date
     let appVersion: @Sendable () -> String?
     let osVersion: @Sendable () -> String?

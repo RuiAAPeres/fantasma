@@ -1,12 +1,12 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 5.6
 
 import PackageDescription
 
 let package = Package(
     name: "FantasmaSDK",
     platforms: [
-        .iOS(.v17),
-        .macOS(.v14),
+        .iOS("17.0"),
+        .macOS("14.0"),
     ],
     products: [
         .library(
@@ -17,15 +17,17 @@ let package = Package(
     targets: [
         .systemLibrary(
             name: "CSQLite",
-            path: "Sources/CSQLite"
+            path: "sdks/ios/FantasmaSDK/Sources/CSQLite"
         ),
         .target(
             name: "FantasmaSDK",
-            dependencies: ["CSQLite"]
+            dependencies: ["CSQLite"],
+            path: "sdks/ios/FantasmaSDK/Sources/FantasmaSDK"
         ),
         .testTarget(
             name: "FantasmaSDKTests",
-            dependencies: ["FantasmaSDK"]
+            dependencies: ["FantasmaSDK"],
+            path: "sdks/ios/FantasmaSDK/Tests/FantasmaSDKTests"
         ),
     ]
 )

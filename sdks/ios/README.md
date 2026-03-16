@@ -1,6 +1,7 @@
 # Fantasma iOS SDK
 
-The first iOS SDK implementation lives in `sdks/ios/FantasmaSDK` as a Swift Package.
+The iOS SDK sources live in `sdks/ios/FantasmaSDK`, and the repo root publishes
+them as the `FantasmaSDK` Swift package.
 
 Public API:
 
@@ -39,6 +40,32 @@ use reserved keys such as `event`, `install_id`, `metric`, `granularity`,
 `start`, `end`, `platform`, `app_version`, or `os_version`. The SDK rejects
 invalid property maps before they enter the local queue. The SDK auto-populates
 `platform`, `app_version`, and `os_version` for each event.
+
+## Install
+
+Add `FantasmaSDK` from the repo root package URL:
+
+```text
+https://github.com/<org>/<repo>.git
+```
+
+Then use:
+
+- Package: `FantasmaSDK`
+- Minimum version: your tagged release (for example, `1.0.0`)
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/<org>/<repo>.git", from: "1.0.0"),
+]
+```
+
+For local development, you can also use an explicit path to this repository until
+you have tags available.
+
+```swift
+.package(path: "../fantasma"),
+```
 
 Behavior notes:
 

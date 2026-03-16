@@ -2,12 +2,12 @@ import Foundation
 
 struct EventUploader: Sendable {
     private let queue: SQLiteEventQueue
-    private let transport: any FantasmaTransport
+    private let transport: FantasmaTransport
     private let afterBuildBatch: @Sendable () async -> Void
 
     init(
         queue: SQLiteEventQueue,
-        transport: any FantasmaTransport,
+        transport: FantasmaTransport,
         afterBuildBatch: @escaping @Sendable () async -> Void = {}
     ) {
         self.queue = queue

@@ -1,4 +1,5 @@
 import Foundation
+#if canImport(Testing)
 import Testing
 @testable import FantasmaSDK
 
@@ -38,7 +39,7 @@ struct FantasmaSDKInternalTests {
         }
 
         let uploader = EventUploader(queue: queue, transport: RecordingTransport())
-        let batch = try #require(await uploader.makeBatch(limit: 50))
+        let batch = try requireValue(await uploader.makeBatch(limit: 50))
 
         #expect(batch.rowIDs.count == 50)
         #expect(try await queue.count() == 55)
@@ -72,7 +73,7 @@ struct FantasmaSDKBehaviorTests {
         try await Fantasma.track("screen_view", properties: ["screen": "Home"])
 
         let queue = try harness.makeQueue()
-        let row = try #require(await queue.peek(limit: 1).first)
+        let row = try requireValue(await queue.peek(limit: 1).first)
         let event = try JSONDecoder().decode(EventEnvelope.self, from: row.payload)
 
         #expect(event.event == "screen_view")
@@ -99,8 +100,8 @@ struct FantasmaSDKBehaviorTests {
 
         let queue = try harness.makeQueue()
         let rows = try await queue.peek(limit: 10)
-        let first = try JSONDecoder().decode(EventEnvelope.self, from: try #require(rows.first?.payload))
-        let second = try JSONDecoder().decode(EventEnvelope.self, from: try #require(rows.last?.payload))
+        let first = try JSONDecoder().decode(EventEnvelope.self, from: requireValue(rows.first?.payload))
+        let second = try JSONDecoder().decode(EventEnvelope.self, from: requireValue(rows.last?.payload))
 
         #expect(rows.count == 2)
         #expect(first.installId == "install-a")
@@ -264,7 +265,7 @@ struct FantasmaSDKBehaviorTests {
         let queue = try harness.makeQueue()
         #expect(try await queue.count() == 0)
 
-        let request = try #require(await transport.requests().first)
+        let request = try requireValue(await transport.requests().first)
         #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_test")
     }
 
@@ -290,7 +291,7 @@ struct FantasmaSDKBehaviorTests {
         try await Fantasma.track("new_event")
         try await Fantasma.flush()
 
-        let request = try #require(await transport.requests().first)
+        let request = try requireValue(await transport.requests().first)
         #expect(request.url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
         #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
     }
@@ -318,8 +319,8 @@ struct FantasmaSDKBehaviorTests {
         let queue = try harness.makeQueue()
         #expect(try await queue.count() == 0)
 
-        let request = try #require(await secondTransport.requests().first)
-        let batch = try JSONDecoder().decode(EventBatch.self, from: try #require(request.httpBody))
+        let request = try requireValue(await secondTransport.requests().first)
+        let batch = try JSONDecoder().decode(EventBatch.self, from: requireValue(request.httpBody))
         #expect(batch.events.count == 1)
         #expect(batch.events.first?.event == "old_event")
         #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_test")
@@ -350,8 +351,8 @@ struct FantasmaSDKBehaviorTests {
         try await Fantasma.track("new_event")
         try await Fantasma.flush()
 
-        let request = try #require(await secondTransport.requests().first)
-        let batch = try JSONDecoder().decode(EventBatch.self, from: try #require(request.httpBody))
+        let request = try requireValue(await secondTransport.requests().first)
+        let batch = try JSONDecoder().decode(EventBatch.self, from: requireValue(request.httpBody))
         #expect(batch.events.count == 1)
         #expect(batch.events.first?.event == "new_event")
         #expect(request.url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
@@ -644,7 +645,7 @@ struct FantasmaSDKBehaviorTests {
         try await Fantasma.track("new_event")
         try await Fantasma.flush()
 
-        let request = try #require(await transport.requests().first)
+        let request = try requireValue(await transport.requests().first)
         #expect(request.url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
         #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
     }
@@ -691,7 +692,7 @@ struct FantasmaSDKBehaviorTests {
         try await Fantasma.track("new_event")
         try await Fantasma.flush()
 
-        let request = try #require(await transport.requests().first)
+        let request = try requireValue(await transport.requests().first)
         #expect(request.url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
         #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
     }
@@ -715,7 +716,7 @@ struct FantasmaSDKBehaviorTests {
 
         await Fantasma.clear()
 
-        let userDefaults = try #require(UserDefaults(suiteName: harness.defaultsName))
+        let userDefaults = try requireValue(UserDefaults(suiteName: harness.defaultsName))
         #expect(userDefaults.string(forKey: "dev.fantasma.sdk.install-id") == "install-z")
 
         await Fantasma.resetRuntimeEnvironmentForTesting()
@@ -740,7 +741,7 @@ struct FantasmaSDKBehaviorTests {
 
         let request = try await server.waitForRequest()
         let body = try JSONDecoder().decode(EventBatch.self, from: request.body)
-        let event = try #require(body.events.first)
+        let event = try requireValue(body.events.first)
 
         #expect(request.method == "POST")
         #expect(request.path == "/v1/events")
@@ -966,13 +967,13 @@ private struct TestHarness {
     }
 
     func installSharedCore(
-        transport: any FantasmaTransport,
+        transport: FantasmaTransport,
         uploadBatchSize: Int = 50,
         beforeEnqueue: @escaping @Sendable () async -> Void = {},
         afterBuildBatch: @escaping @Sendable () async -> Void = {},
         beforeUploadBoundary: @escaping @Sendable () async -> Void = {}
     ) async throws {
-        let userDefaults = try #require(UserDefaults(suiteName: defaultsName))
+        let userDefaults = try requireValue(UserDefaults(suiteName: defaultsName))
         userDefaults.removePersistentDomain(forName: defaultsName)
         let core = try makeCore(
             transport: transport,
@@ -999,7 +1000,7 @@ private struct TestHarness {
     }
 
     private func makeCore(
-        transport: any FantasmaTransport,
+        transport: FantasmaTransport,
         uploadBatchSize: Int,
         beforeEnqueue: @escaping @Sendable () async -> Void,
         afterBuildBatch: @escaping @Sendable () async -> Void,
@@ -1035,6 +1036,8 @@ private struct TestHarness {
         )
     }
 }
+
+#endif
 
 private struct CapturedRequest: Sendable {
     let method: String
@@ -1125,7 +1128,7 @@ server.handle_request()
 
         let portText = try String(contentsOf: readyURL, encoding: .utf8)
         let port = Int(portText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-        return try #require(URL(string: "http://127.0.0.1:\(port)"))
+        return try requireValue(URL(string: "http://127.0.0.1:\(port)"))
     }
 
     func stop() {
@@ -1197,7 +1200,14 @@ private func replacementURL() -> URL {
 }
 
 private func localhostDestinationSignature() -> String {
-    try! FantasmaConfiguration.normalized(serverURL: localhostURL(), writeKey: "fg_ing_test").destinationSignature
+    "\(localhostURL().absoluteString)|fg_ing_test"
+}
+
+private func requireValue<T>(_ value: T?) throws -> T {
+    guard let value else {
+        throw TestError.noPlannedResponse
+    }
+    return value
 }
 
 private func waitUntil(
