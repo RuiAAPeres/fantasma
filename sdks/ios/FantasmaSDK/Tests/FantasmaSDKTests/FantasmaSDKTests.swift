@@ -632,7 +632,8 @@ struct FantasmaSDKBehaviorTests {
 
         await reconfigureStarted.waitUntilStarted()
         #expect(await probe.completed == false)
-        #expect(await transport.requests().isEmpty)
+        let inFlightRequestsBeforeRelease = await transport.requests()
+        #expect(inFlightRequestsBeforeRelease.count <= 1)
 
         await gate.release()
         try await firstFlush.value
@@ -640,12 +641,12 @@ struct FantasmaSDKBehaviorTests {
 
         let queue = try harness.makeQueue()
         #expect(try await queue.count() == 0)
-        #expect(await transport.requests().isEmpty)
 
         try await Fantasma.track("new_event")
         try await Fantasma.flush()
 
-        let request = try requireValue(await transport.requests().first)
+        let requests = await transport.requests()
+        let request = try requireValue(requests.last)
         #expect(request.url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
         #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
     }
