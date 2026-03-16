@@ -46,17 +46,17 @@ invalid property maps before they enter the local queue. The SDK auto-populates
 Add `FantasmaSDK` from the repo root package URL:
 
 ```text
-https://github.com/<org>/<repo>.git
+https://github.com/RuiAAPeres/fantasma.git
 ```
 
 Then use:
 
 - Package: `FantasmaSDK`
-- Minimum version: your tagged release (for example, `1.0.0`)
+- Minimum version: your tagged release (for example, `0.1.0`)
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/<org>/<repo>.git", from: "1.0.0"),
+    .package(url: "https://github.com/RuiAAPeres/fantasma.git", from: "0.1.0"),
 ]
 ```
 
