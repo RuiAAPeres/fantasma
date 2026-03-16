@@ -632,6 +632,12 @@ struct FantasmaSDKBehaviorTests {
 
         await reconfigureStarted.waitUntilStarted()
         #expect(await probe.completed == false)
+        try await waitUntil(timeoutNanoseconds: 250_000_000) {
+            (try? await Fantasma.pendingConfigurationMatchesForTesting(
+                serverURL: replacementURL(),
+                writeKey: "fg_ing_next"
+            )) == true
+        }
         let inFlightRequestsBeforeRelease = await transport.requests()
         #expect(inFlightRequestsBeforeRelease.count <= 1)
 

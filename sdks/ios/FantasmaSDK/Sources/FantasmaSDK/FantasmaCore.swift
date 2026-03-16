@@ -354,6 +354,10 @@ actor FantasmaCore {
         identity = await identityStore.clear()
     }
 
+    func pendingConfigurationMatchesForTesting(_ configuration: FantasmaConfiguration) -> Bool {
+        pendingReconfiguration == configuration
+    }
+
     func flush() async throws {
         try await flush(allowUnconfigured: false, waitForInFlight: true)
     }

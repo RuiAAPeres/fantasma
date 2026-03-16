@@ -98,6 +98,18 @@ public enum Fantasma {
         )
     }
 
+    internal static func pendingConfigurationMatchesForTesting(
+        serverURL: URL,
+        writeKey: String
+    ) async throws -> Bool {
+        let configuration = try FantasmaConfiguration.normalized(
+            serverURL: serverURL,
+            writeKey: writeKey
+        )
+        let core = try await runtime.sharedCore()
+        return await core.pendingConfigurationMatchesForTesting(configuration)
+    }
+
     internal static func resetRuntimeEnvironmentForTesting() async {
         await runtime.resetEnvironment()
         await runtime.replaceCore(nil)
