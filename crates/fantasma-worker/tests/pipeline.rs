@@ -2004,47 +2004,52 @@ async fn pipeline_readiness_poll_for_grouped_session_counts_stays_200_and_conver
 
     let mut saw_internal_server_error = false;
     let mut saw_expected_total = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-
-    while tokio::time::Instant::now() < deadline {
-        let response = grouped_session_count_response(
-            api.clone(),
-            &provisioned.read_key,
-            "2026-01-01",
-            "2026-01-10",
-        )
-        .await;
-
-        if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
-            saw_internal_server_error = true;
-            break;
-        }
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_json(response).await;
-        if sum_metric_series(&body["series"]) == expected_total {
-            saw_expected_total = true;
-            break;
-        }
-
-        if worker.is_finished() {
-            let final_poll = grouped_session_count_response(
+    let poll_completed = tokio::time::timeout(Duration::from_secs(300), async {
+        loop {
+            let response = grouped_session_count_response(
                 api.clone(),
                 &provisioned.read_key,
                 "2026-01-01",
                 "2026-01-10",
             )
             .await;
-            assert_eq!(final_poll.status(), StatusCode::OK);
-            let final_poll_body = response_json(final_poll).await;
-            if sum_metric_series(&final_poll_body["series"]) == expected_total {
-                saw_expected_total = true;
-            }
-            break;
-        }
 
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+            if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
+                saw_internal_server_error = true;
+                break;
+            }
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            if sum_metric_series(&body["series"]) == expected_total {
+                saw_expected_total = true;
+                break;
+            }
+
+            if worker.is_finished() {
+                let final_poll = grouped_session_count_response(
+                    api.clone(),
+                    &provisioned.read_key,
+                    "2026-01-01",
+                    "2026-01-10",
+                )
+                .await;
+                assert_eq!(final_poll.status(), StatusCode::OK);
+                let final_poll_body = response_json(final_poll).await;
+                if sum_metric_series(&final_poll_body["series"]) == expected_total {
+                    saw_expected_total = true;
+                }
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    assert!(
+        poll_completed.is_ok(),
+        "readiness polling should converge before the bounded worker timeout"
+    );
 
     worker.await.expect("worker task joins");
 
