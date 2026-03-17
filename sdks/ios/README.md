@@ -52,11 +52,11 @@ https://github.com/RuiAAPeres/fantasma.git
 Then use:
 
 - Package: `FantasmaSDK`
-- Minimum version: your tagged release (for example, `0.1.0`)
+- Minimum version: your tagged release (for example, `0.2.0`)
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/RuiAAPeres/fantasma.git", from: "0.1.0"),
+    .package(url: "https://github.com/RuiAAPeres/fantasma.git", from: "0.2.0"),
 ]
 ```
 

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Fantasma API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Fantasma is a privacy-first, self-hosted, install-scoped mobile analytics
     platform.
