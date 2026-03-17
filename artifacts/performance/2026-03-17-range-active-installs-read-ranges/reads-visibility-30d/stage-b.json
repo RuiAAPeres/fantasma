@@ -1,0 +1,241 @@
+{
+  "scenario": "reads-visibility-30d",
+  "run_config": {
+    "mode": "iterative",
+    "publication_repetitions": 1,
+    "worker_config": {
+      "session_batch_size": 1000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2,
+      "idle_poll_interval_ms": 250
+    }
+  },
+  "record_count": 960,
+  "measured_stage_b_ms": 24890,
+  "record_type_counts": {
+    "rebuild_finalize": 960
+  },
+  "phases": [
+    {
+      "name": "shared_bucket_finalize",
+      "total_ms": 24890,
+      "share": 1.0,
+      "distribution": {
+        "count": 960,
+        "min_ms": 6,
+        "p50_ms": 26,
+        "p95_ms": 39,
+        "max_ms": 52
+      }
+    }
+  ],
+  "finalization_subphases": [
+    {
+      "name": "finalization_metric_rebuild",
+      "total_ms": 23954,
+      "share": 0.9981665138761563,
+      "distribution": {
+        "count": 960,
+        "min_ms": 6,
+        "p50_ms": 25,
+        "p95_ms": 38,
+        "max_ms": 51
+      }
+    },
+    {
+      "name": "finalization_drain_setup",
+      "total_ms": 44,
+      "share": 0.0018334861238436537,
+      "distribution": {
+        "count": 960,
+        "min_ms": 0,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "max_ms": 10
+      }
+    }
+  ],
+  "total_counts": {
+    "claimed_rebuild_bucket_rows": 2657,
+    "drain_projects": 960,
+    "touched_day_buckets": 960,
+    "touched_hour_buckets": 1697
+  },
+  "slowest_records_by_type": {
+    "rebuild_finalize": [
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 52,
+        "phases_ms": {
+          "shared_bucket_finalize": 52
+        },
+        "finalization_subphases_ms": {
+          "finalization_drain_setup": 0,
+          "finalization_metric_rebuild": 51
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 3,
+          "drain_projects": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 2
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 47,
+        "phases_ms": {
+          "shared_bucket_finalize": 47
+        },
+        "finalization_subphases_ms": {
+          "finalization_drain_setup": 0,
+          "finalization_metric_rebuild": 46
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 3,
+          "drain_projects": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 2
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 46,
+        "phases_ms": {
+          "shared_bucket_finalize": 46
+        },
+        "finalization_subphases_ms": {
+          "finalization_drain_setup": 9,
+          "finalization_metric_rebuild": 35
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 2,
+          "drain_projects": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 45,
+        "phases_ms": {
+          "shared_bucket_finalize": 45
+        },
+        "finalization_subphases_ms": {
+          "finalization_drain_setup": 0,
+          "finalization_metric_rebuild": 44
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 2,
+          "drain_projects": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 44,
+        "phases_ms": {
+          "shared_bucket_finalize": 44
+        },
+        "finalization_subphases_ms": {
+          "finalization_drain_setup": 0,
+          "finalization_metric_rebuild": 43
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 3,
+          "drain_projects": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 2
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 44,
+        "phases_ms": {
+          "shared_bucket_finalize": 44
+        },
+        "finalization_subphases_ms": {
+          "finalization_drain_setup": 0,
+          "finalization_metric_rebuild": 43
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 2,
+          "drain_projects": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 43,
+        "phases_ms": {
+          "shared_bucket_finalize": 43
+        },
+        "finalization_subphases_ms": {
+          "finalization_drain_setup": 0,
+          "finalization_metric_rebuild": 43
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 3,
+          "drain_projects": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 2
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 43,
+        "phases_ms": {
+          "shared_bucket_finalize": 43
+        },
+        "finalization_subphases_ms": {
+          "finalization_drain_setup": 0,
+          "finalization_metric_rebuild": 42
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 3,
+          "drain_projects": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 2
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 43,
+        "phases_ms": {
+          "shared_bucket_finalize": 43
+        },
+        "finalization_subphases_ms": {
+          "finalization_drain_setup": 0,
+          "finalization_metric_rebuild": 42
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 3,
+          "drain_projects": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 2
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 43,
+        "phases_ms": {
+          "shared_bucket_finalize": 43
+        },
+        "finalization_subphases_ms": {
+          "finalization_drain_setup": 0,
+          "finalization_metric_rebuild": 42
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 3,
+          "drain_projects": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 2
+        }
+      }
+    ]
+  },
+  "dominant_phase": "shared_bucket_finalize",
+  "dominant_finalization_subphase": "finalization_metric_rebuild"
+}

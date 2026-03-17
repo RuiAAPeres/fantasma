@@ -423,36 +423,6 @@ async fn event_discovery_routes_return_catalog_and_top_events_for_real_ingest(po
         })
     );
 
-    let total_response = api
-        .clone()
-        .oneshot(
-            Request::get(
-                "/v1/metrics/events/total?metric=count&granularity=day&start=2026-01-01&end=2026-01-01",
-            )
-            .header("x-fantasma-key", &provisioned.read_key)
-            .body(Body::empty())
-            .expect("valid total request"),
-        )
-        .await
-        .expect("total request succeeds");
-    assert_eq!(total_response.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(total_response).await,
-        serde_json::json!({
-            "metric": "count",
-            "granularity": "day",
-            "group_by": [],
-            "series": [
-                {
-                    "dimensions": {},
-                    "points": [
-                        { "bucket": "2026-01-01", "value": 4 }
-                    ]
-                }
-            ]
-        })
-    );
-
     let filtered_top_response = api
         .oneshot(
             Request::get("/v1/metrics/events/top?start=2026-01-01&end=2026-01-01&plan=pro&limit=3")
@@ -992,6 +962,8 @@ async fn pipeline_rejects_active_installs_invalid_combinations(pool: PgPool) {
 
     for path in [
         "/v1/metrics/sessions?metric=active_installs&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T00:00:00Z",
+        "/v1/metrics/sessions?metric=active_installs&granularity=week&start=2026-01-03&end=2026-01-10",
+        "/v1/metrics/sessions?metric=count&granularity=week&start=2026-01-05&end=2026-01-12",
     ] {
         let response = api
             .clone()
@@ -1012,6 +984,109 @@ async fn pipeline_rejects_active_installs_invalid_combinations(pool: PgPool) {
             })
         );
     }
+}
+
+#[sqlx::test]
+async fn pipeline_exposes_weekly_active_installs_with_zero_fill(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-03-02T10:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "app_version": "1.1.0",
+                                "os_version": "18.3",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "strava"
+                                }
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-03-03T12:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "app_version": "1.1.0",
+                                "os_version": "18.3",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "garmin"
+                                }
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-03-10T09:00:00Z",
+                                "install_id": "install-2",
+                                "platform": "ios",
+                                "app_version": "1.1.0",
+                                "os_version": "18.3",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "strava"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    fantasma_worker::process_session_batch(&pool, 100)
+        .await
+        .expect("worker batch succeeds");
+
+    let response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=active_installs&granularity=week&start=2026-03-02&end=2026-03-16",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("api request succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "metric": "active_installs",
+            "granularity": "week",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        { "bucket": "2026-03-02", "value": 1 },
+                        { "bucket": "2026-03-09", "value": 1 },
+                        { "bucket": "2026-03-16", "value": 0 }
+                    ]
+                }
+            ]
+        })
+    );
 }
 
 #[sqlx::test]

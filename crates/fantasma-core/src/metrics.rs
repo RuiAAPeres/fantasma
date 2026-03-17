@@ -9,6 +9,9 @@ use uuid::Uuid;
 pub enum MetricGranularity {
     Hour,
     Day,
+    Week,
+    Month,
+    Year,
 }
 
 impl MetricGranularity {
@@ -16,6 +19,9 @@ impl MetricGranularity {
         match self {
             Self::Hour => "hour",
             Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Year => "year",
         }
     }
 }
@@ -169,6 +175,41 @@ mod tests {
                         },
                         "points": [
                             { "bucket": "2026-03-01T10:00:00Z", "value": 80 }
+                        ]
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn metrics_response_serializes_weekly_granularity_shape() {
+        let response = MetricsResponse {
+            metric: "active_installs".to_owned(),
+            granularity: MetricGranularity::Week,
+            group_by: Vec::new(),
+            series: vec![MetricsSeries {
+                dimensions: BTreeMap::new(),
+                points: vec![MetricsPoint {
+                    bucket: "2026-03-02".to_owned(),
+                    value: 14,
+                }],
+            }],
+        };
+
+        let json = serde_json::to_value(response).expect("serialize response");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "metric": "active_installs",
+                "granularity": "week",
+                "group_by": [],
+                "series": [
+                    {
+                        "dimensions": {},
+                        "points": [
+                            { "bucket": "2026-03-02", "value": 14 }
                         ]
                     }
                 ]

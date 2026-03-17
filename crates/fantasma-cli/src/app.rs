@@ -12,7 +12,7 @@ use crate::{
         AuthSubcommand, Cli, Command, EventCatalogArgs, EventMetricArg, EventMetricsArgs,
         InstanceAddArgs, InstanceRemoveArgs, InstanceUseArgs, InstancesSubcommand, KeyCreateArgs,
         KeyKind, KeysSubcommand, MetricsSubcommand, ProjectsSubcommand, ReadOutputArgs,
-        SessionMetricArg, SessionMetricsArgs, TopEventsArgs, TotalEventMetricsArgs,
+        SessionMetricArg, SessionMetricsArgs, TopEventsArgs,
     },
     config::{
         CliConfig, InstanceProfile, StoredReadKey, ensure_secure_persistence_supported,
@@ -102,7 +102,6 @@ impl App {
             Command::Status(output) => self.status(output).await,
             Command::Metrics(metrics) => match metrics.command {
                 MetricsSubcommand::Events(events) => self.metrics_events(events).await,
-                MetricsSubcommand::EventsTotal(total) => self.metrics_events_total(total).await,
                 MetricsSubcommand::EventsTop(top) => self.metrics_events_top(top).await,
                 MetricsSubcommand::EventsCatalog(catalog) => {
                     self.metrics_events_catalog(catalog).await
@@ -594,6 +593,7 @@ impl App {
     }
 
     async fn metrics_events(&self, events: EventMetricsArgs) -> anyhow::Result<CommandOutput> {
+        validate_event_metrics_args(&events)?;
         let body = self
             .metrics_request(MetricsRequest {
                 path: "/v1/metrics/events",
@@ -601,31 +601,12 @@ impl App {
                 granularity: events.granularity.as_str(),
                 start: &events.start,
                 end: &events.end,
-                event: Some(events.event),
+                event: events.event,
                 filters: &events.filters,
                 group_by: &events.group_by,
             })
             .await?;
         render_metrics_output(body, events.output.json)
-    }
-
-    async fn metrics_events_total(
-        &self,
-        total: TotalEventMetricsArgs,
-    ) -> anyhow::Result<CommandOutput> {
-        let body = self
-            .metrics_request(MetricsRequest {
-                path: "/v1/metrics/events/total",
-                metric: total.metric.as_str(),
-                granularity: total.granularity.as_str(),
-                start: &total.start,
-                end: &total.end,
-                event: None,
-                filters: &total.filters,
-                group_by: &[],
-            })
-            .await?;
-        render_metrics_output(body, total.output.json)
     }
 
     async fn metrics_events_top(&self, top: TopEventsArgs) -> anyhow::Result<CommandOutput> {
@@ -920,15 +901,44 @@ impl SessionMetricArg {
 }
 
 fn validate_session_metrics_args(args: &SessionMetricsArgs) -> anyhow::Result<()> {
-    if args.metric != SessionMetricArg::ActiveInstalls {
-        return Ok(());
+    match args.metric {
+        SessionMetricArg::ActiveInstalls => match args.granularity {
+            crate::cli::MetricGranularityArg::Day
+            | crate::cli::MetricGranularityArg::Week
+            | crate::cli::MetricGranularityArg::Month
+            | crate::cli::MetricGranularityArg::Year => Ok(()),
+            crate::cli::MetricGranularityArg::Hour => {
+                bail!("active_installs does not support hour granularity")
+            }
+        },
+        SessionMetricArg::Count
+        | SessionMetricArg::DurationTotal
+        | SessionMetricArg::NewInstalls => match args.granularity {
+            crate::cli::MetricGranularityArg::Hour | crate::cli::MetricGranularityArg::Day => {
+                Ok(())
+            }
+            crate::cli::MetricGranularityArg::Week
+            | crate::cli::MetricGranularityArg::Month
+            | crate::cli::MetricGranularityArg::Year => {
+                bail!("only active_installs supports week/month/year granularity")
+            }
+        },
+    }
+}
+
+fn validate_event_metrics_args(args: &EventMetricsArgs) -> anyhow::Result<()> {
+    if args.event.is_none() {
+        bail!("count requires --event");
     }
 
-    if args.granularity != crate::cli::MetricGranularityArg::Day {
-        bail!("active_installs only supports day granularity");
+    match args.granularity {
+        crate::cli::MetricGranularityArg::Hour | crate::cli::MetricGranularityArg::Day => Ok(()),
+        crate::cli::MetricGranularityArg::Week
+        | crate::cli::MetricGranularityArg::Month
+        | crate::cli::MetricGranularityArg::Year => {
+            bail!("event metrics only support hour/day granularity")
+        }
     }
-
-    Ok(())
 }
 
 impl crate::cli::MetricGranularityArg {
@@ -936,6 +946,9 @@ impl crate::cli::MetricGranularityArg {
         match self {
             Self::Hour => "hour",
             Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Year => "year",
         }
     }
 }

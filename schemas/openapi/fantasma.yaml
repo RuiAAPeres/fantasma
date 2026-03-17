@@ -334,7 +334,7 @@ paths:
     get:
       tags:
         - metrics
-      summary: Return worker-derived bucketed event-count series
+      summary: Return worker-derived bucketed event metrics
       operationId: getEventMetrics
       security:
         - ProjectKeyHeader: []
@@ -342,7 +342,7 @@ paths:
         Event metrics are eventually consistent because the API reads only from
         worker-built hourly and daily rollups.
 
-        `metric=count` is the only public event metric in v1.
+        `metric=count` is the only public event metric, and it requires `event`.
 
         Use normal query params for equality filters:
 
@@ -375,7 +375,7 @@ paths:
         - $ref: '#/components/parameters/OsVersionFilter'
       responses:
         '200':
-          description: Bucketed event-count series using the uniform metrics family response shape.
+          description: Bucketed event metric series using the uniform metrics family response shape.
           content:
             application/json:
               schema:
@@ -408,73 +408,6 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '500':
           description: Internal server error while loading worker-derived event metrics.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /v1/metrics/events/total:
-    get:
-      tags:
-        - metrics
-      summary: Return total event volume over time
-      operationId: getTotalEventMetrics
-      security:
-        - ProjectKeyHeader: []
-      description: |
-        Returns one bucketed event-count series for all accepted event names in
-        the authenticated project across the requested time window.
-
-        Use normal query params for equality filters:
-
-        - built-ins: `platform`, `app_version`, `os_version`
-        - explicit properties: any additional non-reserved query key matching
-          `^[a-z][a-z0-9_]{0,62}$`
-        - legacy public params such as `project_id`, `start_date`, and
-          `end_date` fail fast and are never reinterpreted as property filters
-      x-fantasma-explicit-property-filters:
-        type: object
-        description: |
-          Any additional non-reserved top-level query parameter whose key
-          matches `^[a-z][a-z0-9_]{0,62}$` is treated as an equality filter on
-          an explicit event property.
-        additionalProperties:
-          type: string
-      parameters:
-        - $ref: '#/components/parameters/EventMetric'
-        - $ref: '#/components/parameters/MetricGranularity'
-        - $ref: '#/components/parameters/MetricStart'
-        - $ref: '#/components/parameters/MetricEnd'
-        - $ref: '#/components/parameters/PlatformFilter'
-        - $ref: '#/components/parameters/AppVersionFilter'
-        - $ref: '#/components/parameters/OsVersionFilter'
-      responses:
-        '200':
-          description: Bucketed total event-count series using the uniform metrics family response shape.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricsResponse'
-        '401':
-          description: Missing, invalid, revoked, or wrong-kind project read key.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '422':
-          description: |
-            Invalid query. Error envelope is `{ "error": "..." }` with one of:
-
-            - `invalid_metric`
-            - `invalid_granularity`
-            - `invalid_time_range`
-            - `invalid_query_key`
-            - `duplicate_query_key`
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '500':
-          description: Internal server error while loading total event metrics.
           content:
             application/json:
               schema:
@@ -635,9 +568,8 @@ paths:
         `count`, `duration_total`, and `new_installs` read from worker-built
         hourly and daily rollups.
 
-        `active_installs` supports only `granularity=day`, but it accepts the
-        same session D2 filter and grouping vocabulary as the other session
-        metrics.
+        `active_installs` accepts `granularity=day|week|month|year`. `count`,
+        `duration_total`, and `new_installs` remain `hour|day` only.
 
         Built-in session dimensions are `platform`, `app_version`, and
         `os_version`. Any other non-reserved query key matching
@@ -650,7 +582,10 @@ paths:
 
         `new_installs` keeps first-seen assignment fixed once an install is
         recorded, even if earlier late events arrive later. `active_installs`
-        grouped or filtered slices may overlap, so grouped totals are not
+        counts installs whose session starts fall inside each returned bucket.
+        Week buckets use UTC ISO Mondays; month and year buckets use the first
+        UTC day of the calendar month or year. Grouped or filtered
+        `active_installs` slices may overlap, so grouped totals are not
         guaranteed to sum back to the ungrouped distinct-install total.
       parameters:
         - $ref: '#/components/parameters/SessionMetric'
@@ -726,10 +661,12 @@ components:
     EventName:
       in: query
       name: event
-      required: true
+      required: false
       schema:
         type: string
         minLength: 1
+      description: |
+        Required when `metric=count`.
     EventGroupBy:
       in: query
       name: group_by
@@ -786,9 +723,14 @@ components:
         enum:
           - hour
           - day
+          - week
+          - month
+          - year
       description: |
-        Bucket granularity. `hour` uses UTC RFC3339 hour-start timestamps for
-        `start` and `end`; `day` uses inclusive UTC `YYYY-MM-DD` bucket dates.
+        Bucket granularity. Event metrics and non-`active_installs` session
+        metrics accept only `hour|day`. `active_installs` additionally accepts
+        `week|month|year`. `hour` uses UTC RFC3339 hour-start timestamps.
+        `day|week|month|year` use inclusive UTC `YYYY-MM-DD` bucket starts.
     PlatformFilter:
       in: query
       name: platform
@@ -818,8 +760,10 @@ components:
       schema:
         type: string
       description: |
-        Inclusive UTC bucket start. Use `YYYY-MM-DD` when `granularity=day`
-        and RFC3339 `...:00:00Z` hour starts when `granularity=hour`.
+        Inclusive UTC bucket start. Use RFC3339 `...:00:00Z` hour starts when
+        `granularity=hour`. Use `YYYY-MM-DD` for `day|week|month|year`, with
+        week aligned to a UTC ISO Monday and month/year aligned to the first
+        UTC day of the calendar month or year.
     MetricEnd:
       in: query
       name: end
@@ -827,8 +771,10 @@ components:
       schema:
         type: string
       description: |
-        Inclusive UTC bucket end. Use `YYYY-MM-DD` when `granularity=day`
-        and RFC3339 `...:00:00Z` hour starts when `granularity=hour`.
+        Inclusive UTC bucket end. Use RFC3339 `...:00:00Z` hour starts when
+        `granularity=hour`. Use `YYYY-MM-DD` for `day|week|month|year`, with
+        week aligned to a UTC ISO Monday and month/year aligned to the first
+        UTC day of the calendar month or year.
     EventDiscoveryStart:
       in: query
       name: start
@@ -1174,6 +1120,9 @@ components:
       enum:
         - hour
         - day
+        - week
+        - month
+        - year
     MetricsPoint:
       type: object
       required:
@@ -1182,7 +1131,7 @@ components:
       properties:
         bucket:
           type: string
-          description: UTC bucket identifier. Days use `YYYY-MM-DD`; hours use RFC3339 hour starts.
+          description: UTC bucket identifier. `hour` uses RFC3339 hour starts; `day|week|month|year` use `YYYY-MM-DD` bucket starts.
         value:
           type: integer
           minimum: 0

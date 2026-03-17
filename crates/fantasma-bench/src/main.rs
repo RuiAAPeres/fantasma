@@ -1964,8 +1964,20 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
     let day_end = end_day.to_string();
     let hour_start = format!("{start_day}T00:00:00Z");
     let hour_end = format!("{end_day}T23:00:00Z");
+    let week_start_day = bucket_week_start(start_day);
+    let week_end_day = bucket_week_start(end_day);
+    let week_start = week_start_day.to_string();
+    let week_end = week_end_day.to_string();
+    let month_start_day = bucket_month_start(start_day);
+    let month_end_day = bucket_month_start(end_day);
+    let month_start = month_start_day.to_string();
+    let month_end = month_end_day.to_string();
+    let year_start_day = bucket_year_start(start_day);
+    let year_end_day = bucket_year_start(end_day);
+    let year_start = year_start_day.to_string();
+    let year_end = year_end_day.to_string();
 
-    let mut queries = Vec::with_capacity(28);
+    let mut queries = Vec::with_capacity(32);
 
     queries.extend([
         SloQuerySpec {
@@ -2244,6 +2256,96 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
             expected_total: SloQueryExpectedTotal::SessionsActiveInstalls,
         },
         SloQuerySpec {
+            name: "sessions_active_installs_week_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=active_installs&granularity=week&start={week_start}&end={week_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsActiveInstalls,
+        },
+        SloQuerySpec {
+            name: "sessions_active_installs_week_dim2_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=active_installs&granularity=week&start={week_start}&end={week_end}&plan=pro&group_by=provider",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsActiveInstalls,
+        },
+        SloQuerySpec {
+            name: "sessions_active_installs_week_dim2_filtered".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=active_installs&granularity=week&start={week_start}&end={week_end}&plan=pro&provider=strava",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsActiveInstalls,
+        },
+        SloQuerySpec {
+            name: "sessions_active_installs_month_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=active_installs&granularity=month&start={month_start}&end={month_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsActiveInstalls,
+        },
+        SloQuerySpec {
+            name: "sessions_active_installs_month_dim2_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=active_installs&granularity=month&start={month_start}&end={month_end}&plan=pro&group_by=provider",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsActiveInstalls,
+        },
+        SloQuerySpec {
+            name: "sessions_active_installs_month_dim2_filtered".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=active_installs&granularity=month&start={month_start}&end={month_end}&plan=pro&provider=strava",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsActiveInstalls,
+        },
+        SloQuerySpec {
+            name: "sessions_active_installs_year_ungrouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=active_installs&granularity=year&start={year_start}&end={year_end}",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsActiveInstalls,
+        },
+        SloQuerySpec {
+            name: "sessions_active_installs_year_dim2_grouped".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=active_installs&granularity=year&start={year_start}&end={year_end}&plan=pro&group_by=provider",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsActiveInstalls,
+        },
+        SloQuerySpec {
+            name: "sessions_active_installs_year_dim2_filtered".to_owned(),
+            url: format!(
+                "{}/v1/metrics/sessions?metric=active_installs&granularity=year&start={year_start}&end={year_end}&plan=pro&provider=strava",
+                benchmark_api_base_url()
+            ),
+            hard_gate: false,
+            family: "session",
+            expected_total: SloQueryExpectedTotal::SessionsActiveInstalls,
+        },
+        SloQuerySpec {
             name: "sessions_new_installs_hour_ungrouped".to_owned(),
             url: format!(
                 "{}/v1/metrics/sessions?metric=new_installs&granularity=hour&start={hour_start}&end={hour_end}",
@@ -2256,6 +2358,18 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
     ]);
 
     queries
+}
+
+fn bucket_week_start(day: NaiveDate) -> NaiveDate {
+    day - ChronoDuration::days(i64::from(day.weekday().num_days_from_monday()))
+}
+
+fn bucket_month_start(day: NaiveDate) -> NaiveDate {
+    NaiveDate::from_ymd_opt(day.year(), day.month(), 1).expect("valid month start")
+}
+
+fn bucket_year_start(day: NaiveDate) -> NaiveDate {
+    NaiveDate::from_ymd_opt(day.year(), 1, 1).expect("valid year start")
 }
 
 async fn ingest_slo_window(
@@ -6698,17 +6812,51 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 1, 1).expect("start day"),
         );
 
-        let grouped = queries
-            .iter()
-            .find(|query| query.name == "sessions_active_installs_day_dim2_grouped")
-            .expect("grouped active-installs query");
-        assert!(!grouped.hard_gate);
+        for query_name in [
+            "sessions_active_installs_day_dim2_grouped",
+            "sessions_active_installs_day_dim2_filtered",
+            "sessions_active_installs_week_dim2_grouped",
+            "sessions_active_installs_week_dim2_filtered",
+            "sessions_active_installs_month_dim2_grouped",
+            "sessions_active_installs_month_dim2_filtered",
+            "sessions_active_installs_year_dim2_grouped",
+            "sessions_active_installs_year_dim2_filtered",
+        ] {
+            let query = queries
+                .iter()
+                .find(|query| query.name == query_name)
+                .unwrap_or_else(|| panic!("missing {query_name}"));
+            assert!(!query.hard_gate, "{query_name} should stay visibility-only");
+        }
+    }
 
-        let filtered = queries
+    #[test]
+    fn session_active_installs_range_queries_use_aligned_calendar_windows() {
+        let queries = slo_query_matrix(
+            SloWindow::Days30,
+            NaiveDate::from_ymd_opt(2026, 1, 1).expect("start day"),
+        );
+
+        let week = queries
             .iter()
-            .find(|query| query.name == "sessions_active_installs_day_dim2_filtered")
-            .expect("filtered active-installs query");
-        assert!(!filtered.hard_gate);
+            .find(|query| query.name == "sessions_active_installs_week_ungrouped")
+            .expect("weekly active-installs query");
+        assert!(week.url.contains("start=2025-12-29"));
+        assert!(week.url.contains("end=2026-01-26"));
+
+        let month = queries
+            .iter()
+            .find(|query| query.name == "sessions_active_installs_month_ungrouped")
+            .expect("monthly active-installs query");
+        assert!(month.url.contains("start=2026-01-01"));
+        assert!(month.url.contains("end=2026-01-01"));
+
+        let year = queries
+            .iter()
+            .find(|query| query.name == "sessions_active_installs_year_ungrouped")
+            .expect("yearly active-installs query");
+        assert!(year.url.contains("start=2026-01-01"));
+        assert!(year.url.contains("end=2026-01-01"));
     }
 
     #[test]

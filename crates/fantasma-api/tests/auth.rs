@@ -710,7 +710,7 @@ async fn event_discovery_routes_require_read_keys(pool: PgPool) {
         .clone()
         .oneshot(
             Request::get(
-                "/v1/metrics/events/total?metric=count&granularity=day&start=2026-01-01&end=2026-01-02",
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02",
             )
             .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
             .body(Body::empty())
@@ -736,7 +736,7 @@ async fn event_discovery_routes_require_read_keys(pool: PgPool) {
         .clone()
         .oneshot(
             Request::get(
-                "/v1/metrics/events/total?metric=count&granularity=day&start=2026-01-01&end=2026-01-02",
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02",
             )
             .header("x-fantasma-key", &read_key)
             .body(Body::empty())
@@ -767,7 +767,7 @@ async fn event_discovery_routes_require_read_keys(pool: PgPool) {
         .clone()
         .oneshot(
             Request::get(format!(
-                "/v1/metrics/events/total?project_id={project_id}&metric=count&granularity=day&start=2026-01-01&end=2026-01-02"
+                "/v1/metrics/events?project_id={project_id}&event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02"
             ))
             .header("x-fantasma-key", &read_key)
             .body(Body::empty())

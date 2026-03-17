@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Timelike, Utc};
 use fantasma_core::MetricGranularity;
 use fantasma_store::{
     EventMetricBucketDim1Delta, EventMetricBucketDim2Delta, EventMetricBucketTotalDelta,
@@ -32,7 +32,7 @@ use fantasma_store::{
     upsert_session_daily_install_deltas_in_tx, upsert_session_repair_jobs_in_tx,
 };
 use serde::Serialize;
-use sqlx::{Postgres, Transaction};
+use sqlx::{Postgres, Row, Transaction};
 use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
 use tracing::warn;
 use uuid::Uuid;
@@ -51,6 +51,8 @@ const STAGE_B_TRACE_REBUILD_FINALIZE: &str = "rebuild_finalize";
 static STAGE_B_TRACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static EVENT_LANE_TRACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SESSION_REBUILD_DRAIN_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+static ACTIVE_INSTALL_RANGE_REBUILD_DRAIN_LOCK: LazyLock<AsyncMutex<()>> =
+    LazyLock::new(|| AsyncMutex::new(()));
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct StageBTraceRecord {
@@ -433,6 +435,10 @@ async fn process_session_batch_inner(
     }
 
     if let Err(error) = drain_pending_session_rebuild_buckets(pool).await {
+        tx.commit().await.map_err(StoreError::from)?;
+        return Err(error);
+    }
+    if let Err(error) = drain_pending_active_install_range_rebuild_buckets(pool).await {
         tx.commit().await.map_err(StoreError::from)?;
         return Err(error);
     }
@@ -858,6 +864,15 @@ async fn process_session_repair_batch_inner(
         if let Some(batch_error) = batch_error {
             return Err(StoreError::InvariantViolation(format!(
                 "session repair batch failed with {batch_error}; draining queued rebuilds also failed with {drain_error}"
+            )));
+        }
+
+        return Err(drain_error);
+    }
+    if let Err(drain_error) = drain_pending_active_install_range_rebuild_buckets(pool).await {
+        if let Some(batch_error) = batch_error {
+            return Err(StoreError::InvariantViolation(format!(
+                "session repair batch failed with {batch_error}; draining active-install range rebuilds also failed with {drain_error}"
             )));
         }
 
@@ -1583,6 +1598,12 @@ async fn apply_incremental_session_plan(
         &plan.metric_rebuild_scope,
     )
     .await?;
+    enqueue_touched_active_install_range_buckets_in_tx(
+        tx,
+        plan.next_state.project_id,
+        &plan.metric_rebuild_scope.days,
+    )
+    .await?;
 
     upsert_install_session_state_in_tx(tx, &plan.next_state).await?;
 
@@ -1794,6 +1815,38 @@ async fn enqueue_touched_session_metric_buckets_in_tx(
         .await
 }
 
+async fn enqueue_touched_active_install_range_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    touched_days: &BTreeSet<NaiveDate>,
+) -> Result<(), StoreError> {
+    if touched_days.is_empty() {
+        return Ok(());
+    }
+
+    let mut pending_rows = Vec::with_capacity(touched_days.len() * 3);
+    for day in touched_days {
+        pending_rows.push((MetricGranularity::Week, bucket_start_for_week(*day)));
+        pending_rows.push((MetricGranularity::Month, bucket_start_for_month(*day)));
+        pending_rows.push((MetricGranularity::Year, bucket_start_for_year(*day)));
+    }
+    pending_rows.sort();
+    pending_rows.dedup();
+
+    let mut builder = sqlx::QueryBuilder::<Postgres>::new(
+        "INSERT INTO active_install_range_rebuild_queue (project_id, granularity, bucket_start) ",
+    );
+    builder.push_values(pending_rows, |mut row, (granularity, bucket_start)| {
+        row.push_bind(project_id)
+            .push_bind(granularity.as_str())
+            .push_bind(bucket_start);
+    });
+    builder.push(" ON CONFLICT (project_id, granularity, bucket_start) DO NOTHING");
+    builder.build().execute(&mut **tx).await?;
+
+    Ok(())
+}
+
 async fn enqueue_repair_bucket_finalization_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
@@ -1822,7 +1875,8 @@ async fn enqueue_repair_bucket_finalization_in_tx(
     // later finalizer only sees install-day work once the matching shared bucket scope is visible.
     enqueue_session_daily_installs_rebuilds_in_tx(tx, &install_rebuild_rows).await?;
     enqueue_session_rebuild_buckets_in_tx(tx, project_id, &day_bucket_starts, &hour_bucket_starts)
-        .await
+        .await?;
+    enqueue_touched_active_install_range_buckets_in_tx(tx, project_id, &touched_buckets.days).await
 }
 
 async fn drain_pending_session_rebuild_buckets(pool: &PgPool) -> Result<(), StoreError> {
@@ -1851,6 +1905,12 @@ async fn drain_pending_session_rebuild_buckets(pool: &PgPool) -> Result<(), Stor
                 }
                 MetricGranularity::Hour => {
                     touched_buckets.hours.insert(bucket.bucket_start);
+                }
+                MetricGranularity::Week | MetricGranularity::Month | MetricGranularity::Year => {
+                    return Err(StoreError::InvariantViolation(format!(
+                        "session rebuild queue should not contain {} buckets",
+                        bucket.granularity.as_str()
+                    )));
                 }
             }
         }
@@ -1892,6 +1952,347 @@ async fn drain_pending_session_rebuild_buckets(pool: &PgPool) -> Result<(), Stor
             warn!(%error, "failed to record Stage B rebuild-finalize trace");
         }
     }
+
+    Ok(())
+}
+
+async fn drain_pending_active_install_range_rebuild_buckets(
+    pool: &PgPool,
+) -> Result<(), StoreError> {
+    let _drain_guard = ACTIVE_INSTALL_RANGE_REBUILD_DRAIN_LOCK.lock().await;
+
+    loop {
+        let mut tx = pool.begin().await.map_err(StoreError::from)?;
+        let rows = sqlx::query(
+            r#"
+            WITH claimable AS (
+                SELECT project_id, granularity, bucket_start
+                FROM active_install_range_rebuild_queue
+                ORDER BY project_id ASC, granularity ASC, bucket_start ASC
+                LIMIT 512
+                FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM active_install_range_rebuild_queue AS queue
+            USING claimable
+            WHERE queue.project_id = claimable.project_id
+              AND queue.granularity = claimable.granularity
+              AND queue.bucket_start = claimable.bucket_start
+            RETURNING queue.project_id, queue.granularity, queue.bucket_start
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if rows.is_empty() {
+            tx.commit().await.map_err(StoreError::from)?;
+            break;
+        }
+
+        let mut buckets_by_scope = BTreeMap::<(Uuid, MetricGranularity), Vec<DateTime<Utc>>>::new();
+        for row in rows {
+            let granularity = match row.try_get::<&str, _>("granularity")? {
+                "week" => MetricGranularity::Week,
+                "month" => MetricGranularity::Month,
+                "year" => MetricGranularity::Year,
+                other => {
+                    return Err(StoreError::InvariantViolation(format!(
+                        "invalid active-install range rebuild granularity {other}"
+                    )));
+                }
+            };
+            buckets_by_scope
+                .entry((row.try_get("project_id")?, granularity))
+                .or_default()
+                .push(row.try_get("bucket_start")?);
+        }
+
+        for ((project_id, granularity), bucket_starts) in buckets_by_scope {
+            rebuild_active_install_range_buckets_in_tx(
+                &mut tx,
+                project_id,
+                granularity,
+                &bucket_starts,
+            )
+            .await?;
+        }
+
+        tx.commit().await.map_err(StoreError::from)?;
+    }
+
+    Ok(())
+}
+
+async fn rebuild_active_install_range_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    bucket_starts: &[DateTime<Utc>],
+) -> Result<(), StoreError> {
+    let bucket_starts = bucket_starts
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if bucket_starts.is_empty() {
+        return Ok(());
+    }
+
+    debug_assert!(matches!(
+        granularity,
+        MetricGranularity::Week | MetricGranularity::Month | MetricGranularity::Year
+    ));
+
+    for table in [
+        "active_install_metric_buckets_total",
+        "active_install_metric_buckets_dim1",
+        "active_install_metric_buckets_dim2",
+    ] {
+        let sql = format!(
+            "DELETE FROM {table} WHERE project_id = $1 AND granularity = $2 AND bucket_start = ANY($3)"
+        );
+        sqlx::query(&sql)
+            .bind(project_id)
+            .bind(granularity.as_str())
+            .bind(&bucket_starts)
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    let bucket_expr = bucket_sql(granularity, "session_start");
+
+    let total_sql = format!(
+        r#"
+        WITH scoped_sessions AS MATERIALIZED (
+            SELECT
+                {bucket_expr} AS bucket_start,
+                install_id
+            FROM sessions
+            WHERE project_id = $1
+              AND {bucket_expr} = ANY($2)
+        ),
+        distinct_installs AS MATERIALIZED (
+            SELECT DISTINCT bucket_start, install_id
+            FROM scoped_sessions
+        )
+        INSERT INTO active_install_metric_buckets_total (
+            project_id,
+            granularity,
+            bucket_start,
+            active_installs
+        )
+        SELECT
+            $1,
+            $3,
+            bucket_start,
+            COUNT(*)::BIGINT AS active_installs
+        FROM distinct_installs
+        GROUP BY bucket_start
+        "#,
+    );
+    sqlx::query(&total_sql)
+        .bind(project_id)
+        .bind(&bucket_starts)
+        .bind(granularity.as_str())
+        .execute(&mut **tx)
+        .await?;
+
+    let dim1_sql = format!(
+        r#"
+        WITH scoped_sessions AS MATERIALIZED (
+            SELECT
+                {bucket_expr} AS bucket_start,
+                install_id,
+                platform,
+                app_version,
+                os_version,
+                properties
+            FROM sessions
+            WHERE project_id = $1
+              AND {bucket_expr} = ANY($2)
+        ),
+        distinct_dims AS MATERIALIZED (
+            SELECT DISTINCT
+                bucket_start,
+                install_id,
+                dim_key,
+                dim_value,
+                dim_value_is_null
+            FROM (
+                SELECT
+                    bucket_start,
+                    install_id,
+                    'platform'::text AS dim_key,
+                    platform::text AS dim_value,
+                    false AS dim_value_is_null
+                FROM scoped_sessions
+                UNION ALL
+                SELECT
+                    bucket_start,
+                    install_id,
+                    'app_version'::text,
+                    COALESCE(app_version, ''),
+                    app_version IS NULL
+                FROM scoped_sessions
+                UNION ALL
+                SELECT
+                    bucket_start,
+                    install_id,
+                    'os_version'::text,
+                    COALESCE(os_version, ''),
+                    os_version IS NULL
+                FROM scoped_sessions
+                UNION ALL
+                SELECT
+                    scoped_sessions.bucket_start,
+                    scoped_sessions.install_id,
+                    props.key,
+                    props.value,
+                    false
+                FROM scoped_sessions
+                CROSS JOIN LATERAL jsonb_each_text(COALESCE(scoped_sessions.properties, '{{}}'::jsonb)) AS props(key, value)
+            ) dims
+        )
+        INSERT INTO active_install_metric_buckets_dim1 (
+            project_id,
+            granularity,
+            bucket_start,
+            dim1_key,
+            dim1_value,
+            dim1_value_is_null,
+            active_installs
+        )
+        SELECT
+            $1,
+            $3,
+            bucket_start,
+            dim_key,
+            dim_value,
+            dim_value_is_null,
+            COUNT(*)::BIGINT AS active_installs
+        FROM distinct_dims
+        GROUP BY bucket_start, dim_key, dim_value, dim_value_is_null
+        "#,
+    );
+    sqlx::query(&dim1_sql)
+        .bind(project_id)
+        .bind(&bucket_starts)
+        .bind(granularity.as_str())
+        .execute(&mut **tx)
+        .await?;
+
+    let dim2_sql = format!(
+        r#"
+        WITH scoped_sessions AS MATERIALIZED (
+            SELECT
+                {bucket_expr} AS bucket_start,
+                install_id,
+                platform,
+                app_version,
+                os_version,
+                properties
+            FROM sessions
+            WHERE project_id = $1
+              AND {bucket_expr} = ANY($2)
+        ),
+        distinct_dims AS MATERIALIZED (
+            SELECT DISTINCT
+                bucket_start,
+                install_id,
+                dim_key,
+                dim_value,
+                dim_value_is_null
+            FROM (
+                SELECT
+                    bucket_start,
+                    install_id,
+                    'platform'::text AS dim_key,
+                    platform::text AS dim_value,
+                    false AS dim_value_is_null
+                FROM scoped_sessions
+                UNION ALL
+                SELECT
+                    bucket_start,
+                    install_id,
+                    'app_version'::text,
+                    COALESCE(app_version, ''),
+                    app_version IS NULL
+                FROM scoped_sessions
+                UNION ALL
+                SELECT
+                    bucket_start,
+                    install_id,
+                    'os_version'::text,
+                    COALESCE(os_version, ''),
+                    os_version IS NULL
+                FROM scoped_sessions
+                UNION ALL
+                SELECT
+                    scoped_sessions.bucket_start,
+                    scoped_sessions.install_id,
+                    props.key,
+                    props.value,
+                    false
+                FROM scoped_sessions
+                CROSS JOIN LATERAL jsonb_each_text(COALESCE(scoped_sessions.properties, '{{}}'::jsonb)) AS props(key, value)
+            ) dims
+        ),
+        distinct_pairs AS MATERIALIZED (
+            SELECT DISTINCT
+                left_dims.bucket_start,
+                left_dims.install_id,
+                left_dims.dim_key AS dim1_key,
+                left_dims.dim_value AS dim1_value,
+                left_dims.dim_value_is_null AS dim1_value_is_null,
+                right_dims.dim_key AS dim2_key,
+                right_dims.dim_value AS dim2_value,
+                right_dims.dim_value_is_null AS dim2_value_is_null
+            FROM distinct_dims AS left_dims
+            INNER JOIN distinct_dims AS right_dims
+                ON left_dims.bucket_start = right_dims.bucket_start
+               AND left_dims.install_id = right_dims.install_id
+               AND left_dims.dim_key < right_dims.dim_key
+        )
+        INSERT INTO active_install_metric_buckets_dim2 (
+            project_id,
+            granularity,
+            bucket_start,
+            dim1_key,
+            dim1_value,
+            dim1_value_is_null,
+            dim2_key,
+            dim2_value,
+            dim2_value_is_null,
+            active_installs
+        )
+        SELECT
+            $1,
+            $3,
+            bucket_start,
+            dim1_key,
+            dim1_value,
+            dim1_value_is_null,
+            dim2_key,
+            dim2_value,
+            dim2_value_is_null,
+            COUNT(*)::BIGINT AS active_installs
+        FROM distinct_pairs
+        GROUP BY
+            bucket_start,
+            dim1_key,
+            dim1_value,
+            dim1_value_is_null,
+            dim2_key,
+            dim2_value,
+            dim2_value_is_null
+        "#,
+    );
+    sqlx::query(&dim2_sql)
+        .bind(project_id)
+        .bind(&bucket_starts)
+        .bind(granularity.as_str())
+        .execute(&mut **tx)
+        .await?;
 
     Ok(())
 }
@@ -2073,7 +2474,6 @@ fn bucket_start_for_granularity(
     granularity: MetricGranularity,
 ) -> DateTime<Utc> {
     match granularity {
-        MetricGranularity::Day => bucket_start_for_day(timestamp.date_naive()),
         MetricGranularity::Hour => DateTime::from_naive_utc_and_offset(
             timestamp
                 .date_naive()
@@ -2081,6 +2481,10 @@ fn bucket_start_for_granularity(
                 .expect("top-of-hour is a valid UTC datetime"),
             Utc,
         ),
+        MetricGranularity::Day => bucket_start_for_day(timestamp.date_naive()),
+        MetricGranularity::Week => bucket_start_for_week(timestamp.date_naive()),
+        MetricGranularity::Month => bucket_start_for_month(timestamp.date_naive()),
+        MetricGranularity::Year => bucket_start_for_year(timestamp.date_naive()),
     }
 }
 
@@ -2096,9 +2500,27 @@ fn bucket_sql(granularity: MetricGranularity, column: &str) -> String {
     let precision = match granularity {
         MetricGranularity::Hour => "hour",
         MetricGranularity::Day => "day",
+        MetricGranularity::Week => "week",
+        MetricGranularity::Month => "month",
+        MetricGranularity::Year => "year",
     };
 
     format!("date_trunc('{precision}', {column} AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'")
+}
+
+fn bucket_start_for_week(day: NaiveDate) -> DateTime<Utc> {
+    let week_start = day - ChronoDuration::days(i64::from(day.weekday().num_days_from_monday()));
+    bucket_start_for_day(week_start)
+}
+
+fn bucket_start_for_month(day: NaiveDate) -> DateTime<Utc> {
+    bucket_start_for_day(
+        NaiveDate::from_ymd_opt(day.year(), day.month(), 1).expect("valid month start"),
+    )
+}
+
+fn bucket_start_for_year(day: NaiveDate) -> DateTime<Utc> {
+    bucket_start_for_day(NaiveDate::from_ymd_opt(day.year(), 1, 1).expect("valid year start"))
 }
 
 fn session_dimension_sql(source_alias: &str) -> String {

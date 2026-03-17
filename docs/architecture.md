@@ -31,7 +31,6 @@ curl / SDK
   -> fantasma-worker
   -> derived Postgres sessions, session_daily, session_daily_installs, event bucket rollups, session bucket rollups, and install first-seen state
   -> GET /v1/metrics/events and /v1/metrics/sessions
-  -> GET /v1/metrics/events/total
   -> GET /v1/metrics/events/catalog and /v1/metrics/events/top
   -> query API
 ```
@@ -231,12 +230,13 @@ Shared query semantics:
 
 Event metrics:
 
-- only `metric=count` is public
+- supported public metrics are `count`
 - `event` is required
 - built-in equality filters use `platform`, `app_version`, and `os_version`
 - any other non-reserved query key matching `^[a-z][a-z0-9_]{0,62}$` is an equality filter on an explicit string property
 - `group_by` may be repeated up to twice
 - the total number of distinct referenced dimensions across filters plus `group_by` is capped at 2
+- `group_by=event` is invalid
 - grouped event metrics synthesize explicit `null` buckets from lower-order cuboids so grouped totals add back up to the filtered total
 
 Session metrics:
@@ -249,7 +249,10 @@ Session metrics:
 - session grouped dimensions are fixed from the session's first event
 - `duration_total` is assigned to the bucket where the session starts
 - `new_installs` is assigned once from the install's first accepted event and is never retroactively moved by late arrivals
-- `active_installs` counts unique installs active in each UTC day bucket, supports only day granularity, and accepts the same D2 filter/grouping vocabulary as the other session metrics
+- `active_installs` counts unique installs whose session starts fall inside each returned bucket
+- `active_installs` supports `day`, `week`, `month`, and `year`
+- `week` buckets start on UTC ISO Mondays; `month` and `year` buckets start on the first UTC day of the calendar month or year
+- daily `active_installs` reads stay authoritative on `session_active_install_slices`; week/month/year read from worker-built range cuboids rebuilt off queued touched calendar buckets
 - filtered or grouped `active_installs` slices may overlap, so grouped totals are not guaranteed to add back up to the ungrouped distinct-install total
 
 ## SDK Direction

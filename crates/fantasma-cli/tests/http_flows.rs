@@ -91,7 +91,6 @@ impl TestServer {
                 delete(revoke_key),
             )
             .route("/v1/metrics/events", get(event_metrics))
-            .route("/v1/metrics/events/total", get(total_event_metrics))
             .route("/v1/metrics/events/top", get(top_events))
             .route("/v1/metrics/events/catalog", get(event_catalog))
             .route("/v1/metrics/sessions", get(session_metrics))
@@ -752,7 +751,7 @@ async fn metrics_sessions_active_installs_json_uses_stored_read_key() {
 }
 
 #[tokio::test]
-async fn metrics_sessions_active_installs_rejects_hour_granularity_locally() {
+async fn metrics_sessions_active_installs_accepts_week_granularity_locally() {
     let server = TestServer::spawn().await;
     let mut config = server.read_config();
     let profile = config.instances.get_mut("prod").unwrap();
@@ -768,7 +767,7 @@ async fn metrics_sessions_active_installs_rejects_hour_granularity_locally() {
     );
     save_config(&server.config_path, &config).expect("save config");
 
-    let hour_error = server
+    server
         .app
         .run(server.parse(&[
             "metrics",
@@ -776,27 +775,64 @@ async fn metrics_sessions_active_installs_rejects_hour_granularity_locally() {
             "--metric",
             "active_installs",
             "--granularity",
-            "hour",
+            "week",
             "--start",
-            "2026-03-01T00:00:00Z",
+            "2026-03-03",
             "--end",
-            "2026-03-01T00:00:00Z",
+            "2026-03-10",
             "--json",
         ]))
         .await
-        .expect_err("hour granularity should fail");
-    assert!(
-        hour_error
-            .to_string()
-            .contains("active_installs only supports day granularity")
-    );
+        .expect("week granularity should be accepted");
 
     let records = server.records();
     assert!(
-        !records
+        records
             .iter()
             .any(|record| record.path == "/v1/metrics/sessions"),
-        "local validation should reject hourly active_installs before any metrics request"
+        "local validation should allow weekly active_installs before any metrics request"
+    );
+}
+
+#[tokio::test]
+async fn metrics_sessions_count_rejects_week_granularity_locally() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: "fg_rd_created".to_owned(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    let error = server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "sessions",
+            "--metric",
+            "count",
+            "--granularity",
+            "week",
+            "--start",
+            "2026-03-03",
+            "--end",
+            "2026-03-10",
+            "--json",
+        ]))
+        .await
+        .expect_err("week granularity should fail for count");
+
+    assert!(
+        error
+            .to_string()
+            .contains("only active_installs supports week/month/year granularity")
     );
 }
 
@@ -1331,7 +1367,7 @@ async fn metrics_events_rejects_malformed_filters_before_request() {
 }
 
 #[tokio::test]
-async fn metrics_events_total_text_renders_series_rows() {
+async fn metrics_events_rejects_count_without_event_before_request() {
     let server = TestServer::spawn().await;
     let mut config = server.read_config();
     let profile = config.instances.get_mut("prod").unwrap();
@@ -1341,17 +1377,17 @@ async fn metrics_events_total_text_renders_series_rows() {
         fantasma_cli::config::StoredReadKey {
             key_id: server.read_key_id,
             name: "cli-read".to_owned(),
-            secret: "fg_rd_created".to_owned(),
+            secret: server.read_key_secret.clone(),
             created_at: "2026-03-13T12:00:00Z".to_owned(),
         },
     );
     save_config(&server.config_path, &config).expect("save config");
 
-    let output = server
+    let error = server
         .app
         .run(server.parse(&[
             "metrics",
-            "events-total",
+            "events",
             "--metric",
             "count",
             "--granularity",
@@ -1360,15 +1396,50 @@ async fn metrics_events_total_text_renders_series_rows() {
             "2026-03-01",
             "--end",
             "2026-03-02",
-            "--filter",
-            "platform=ios",
         ]))
         .await
-        .expect("total event metrics succeed");
+        .expect_err("missing event should fail");
 
-    assert!(output.stdout.contains("{}"));
-    assert!(output.stdout.contains("2026-03-01"));
-    assert!(output.stdout.contains("7"));
+    assert!(error.to_string().contains("count requires --event"));
+    assert!(server.records().is_empty(), "request should not be sent");
+}
+
+#[tokio::test]
+async fn metrics_events_rejects_unknown_metric_before_request() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: server.read_key_secret.clone(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    let error = Cli::try_parse_from([
+        "fantasma",
+        "metrics",
+        "events",
+        "--event",
+        "app_open",
+        "--metric",
+        "total_count",
+        "--granularity",
+        "day",
+        "--start",
+        "2026-03-01",
+        "--end",
+        "2026-03-02",
+    ])
+    .expect_err("unknown metric should fail");
+
+    assert!(error.to_string().contains("invalid value 'total_count'"));
+    assert!(server.records().is_empty(), "request should not be sent");
 }
 
 #[tokio::test]
@@ -1414,58 +1485,6 @@ async fn metrics_events_text_renders_series_rows() {
     assert!(output.stdout.contains("\"platform\":\"ios\""));
     assert!(output.stdout.contains("2026-03-01"));
     assert!(output.stdout.contains("4"));
-}
-
-#[tokio::test]
-async fn metrics_events_total_serializes_filters_exactly() {
-    let server = TestServer::spawn().await;
-    let mut config = server.read_config();
-    let profile = config.instances.get_mut("prod").unwrap();
-    profile.active_project_id = Some(server.project_id);
-    profile.store_read_key(
-        server.project_id,
-        fantasma_cli::config::StoredReadKey {
-            key_id: server.read_key_id,
-            name: "cli-read".to_owned(),
-            secret: server.read_key_secret.clone(),
-            created_at: "2026-03-13T12:00:00Z".to_owned(),
-        },
-    );
-    save_config(&server.config_path, &config).expect("save config");
-
-    server
-        .app
-        .run(server.parse(&[
-            "metrics",
-            "events-total",
-            "--metric",
-            "count",
-            "--granularity",
-            "day",
-            "--start",
-            "2026-03-01",
-            "--end",
-            "2026-03-02",
-            "--filter",
-            "platform=ios",
-            "--filter",
-            "app_version=1.2.3",
-            "--json",
-        ]))
-        .await
-        .expect("total event metrics succeed");
-
-    let records = server.records();
-    let request = records
-        .iter()
-        .find(|record| record.path == "/v1/metrics/events/total")
-        .expect("total event metrics request");
-    assert_eq!(
-        request.query.as_deref(),
-        Some(
-            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.2.3"
-        )
-    );
 }
 
 #[tokio::test]
@@ -2124,51 +2143,11 @@ async fn event_metrics(
             "group_by": ["platform"],
             "series": [
                 {
-                    "dimensions": {
-                        "platform": "ios"
-                    },
+                    "dimensions": { "platform": "ios" },
                     "points": [
                         {
                             "bucket": "2026-03-01",
                             "value": 4
-                        }
-                    ]
-                }
-            ]
-        })),
-    )
-        .into_response()
-}
-
-async fn total_event_metrics(
-    State(state): State<ServerState>,
-    original_uri: OriginalUri,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Some(status) = project_key_status(&state, &headers) {
-        return (status, Json(json!({ "error": status_error(status) }))).into_response();
-    }
-    record_request(
-        &state,
-        "GET",
-        original_uri.path(),
-        original_uri.query(),
-        headers,
-        None,
-    );
-    (
-        StatusCode::OK,
-        Json(json!({
-            "metric": "count",
-            "granularity": "day",
-            "group_by": [],
-            "series": [
-                {
-                    "dimensions": {},
-                    "points": [
-                        {
-                            "bucket": "2026-03-01",
-                            "value": 7
                         }
                     ]
                 }

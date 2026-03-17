@@ -237,7 +237,7 @@ READ_KEY="$(printf '%s' "$PROVISIONED" | python3 -c 'import json,sys; print(json
 ```
 
 Use the ingest key only with `POST /v1/events`. Use the read key only with
-`/v1/metrics/*`, including `GET /v1/metrics/events/total`,
+`/v1/metrics/*`, including `GET /v1/metrics/events`,
 `GET /v1/metrics/events/catalog`, and `GET /v1/metrics/events/top`. Keep the
 script for automation; prefer the CLI for manual operator work.
 
@@ -365,15 +365,6 @@ cargo run -p fantasma-cli -- metrics events \
 ```
 
 ```bash
-cargo run -p fantasma-cli -- metrics events-total \
-  --metric count \
-  --granularity day \
-  --start 2026-01-01 \
-  --end 2026-01-02 \
-  --filter platform=ios
-```
-
-```bash
 cargo run -p fantasma-cli -- metrics events-top \
   --start 2026-01-01 \
   --end 2026-01-02 \
@@ -459,6 +450,11 @@ curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&gran
 
 ```bash
 curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-02&plan=pro&group_by=provider" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
+```
+
+```bash
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&granularity=week&start=2025-12-29&end=2026-01-26" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 

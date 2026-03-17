@@ -1108,6 +1108,153 @@ where
     }
 }
 
+pub async fn fetch_total_event_metrics_cube_rows_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError> {
+    fetch_total_event_metrics_cube_rows_in_executor(
+        &mut **tx,
+        project_id,
+        granularity,
+        start,
+        end,
+        cube_keys,
+        filters,
+    )
+    .await
+}
+
+async fn fetch_total_event_metrics_cube_rows_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    ensure_canonical_cube_keys(cube_keys)?;
+    ensure_filters_belong_to_cube(cube_keys, filters)?;
+
+    match cube_keys.len() {
+        0 => {
+            fetch_total_event_metric_total_rows(executor, project_id, granularity, start, end).await
+        }
+        1 => {
+            fetch_total_event_metric_dim1_rows(
+                executor,
+                project_id,
+                granularity,
+                start,
+                end,
+                cube_keys,
+                filters,
+            )
+            .await
+        }
+        2 => {
+            fetch_total_event_metric_dim2_rows(
+                executor,
+                project_id,
+                granularity,
+                start,
+                end,
+                cube_keys,
+                filters,
+            )
+            .await
+        }
+        other => Err(StoreError::InvariantViolation(format!(
+            "event metrics cube arity must be between 0 and 2, got {other}"
+        ))),
+    }
+}
+
+pub async fn fetch_total_event_metrics_aggregate_cube_rows_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError> {
+    fetch_total_event_metrics_aggregate_cube_rows_in_executor(
+        &mut **tx,
+        project_id,
+        granularity,
+        window,
+        cube_keys,
+        filters,
+        limit,
+    )
+    .await
+}
+
+async fn fetch_total_event_metrics_aggregate_cube_rows_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let (start, end) = window;
+    ensure_canonical_cube_keys(cube_keys)?;
+    ensure_filters_belong_to_cube(cube_keys, filters)?;
+
+    match cube_keys.len() {
+        0 => {
+            fetch_total_event_metric_total_aggregate_rows(
+                executor,
+                project_id,
+                granularity,
+                (start, end),
+            )
+            .await
+        }
+        1 => {
+            fetch_total_event_metric_dim1_aggregate_rows(
+                executor,
+                project_id,
+                granularity,
+                (start, end),
+                cube_keys,
+                filters,
+                limit,
+            )
+            .await
+        }
+        2 => {
+            fetch_total_event_metric_dim2_aggregate_rows(
+                executor,
+                project_id,
+                granularity,
+                (start, end),
+                cube_keys,
+                filters,
+                limit,
+            )
+            .await
+        }
+        other => Err(StoreError::InvariantViolation(format!(
+            "event metrics cube arity must be between 0 and 2, got {other}"
+        ))),
+    }
+}
+
 pub async fn fetch_session_metrics_cube_rows_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
@@ -1430,6 +1577,9 @@ pub async fn fetch_total_event_counts_by_bucket(
     let bucket_expression = match granularity {
         MetricGranularity::Hour => "date_trunc('hour', timestamp)",
         MetricGranularity::Day => "date_trunc('day', timestamp)",
+        MetricGranularity::Week => "date_trunc('week', timestamp)",
+        MetricGranularity::Month => "date_trunc('month', timestamp)",
+        MetricGranularity::Year => "date_trunc('year', timestamp)",
     };
 
     let mut query = QueryBuilder::<Postgres>::new("SELECT ");
@@ -2211,6 +2361,9 @@ fn metric_granularity_from_str(value: &str) -> Result<MetricGranularity, StoreEr
     match value {
         "day" => Ok(MetricGranularity::Day),
         "hour" => Ok(MetricGranularity::Hour),
+        "week" => Ok(MetricGranularity::Week),
+        "month" => Ok(MetricGranularity::Month),
+        "year" => Ok(MetricGranularity::Year),
         other => Err(StoreError::InvariantViolation(format!(
             "unknown metric granularity {other}"
         ))),
@@ -3544,6 +3697,347 @@ where
         .collect())
 }
 
+async fn fetch_total_event_metric_total_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let rows = sqlx::query(
+        r#"
+        SELECT bucket_start, SUM(event_count)::BIGINT AS event_count
+        FROM event_metric_buckets_total
+        WHERE project_id = $1
+          AND granularity = $2
+          AND bucket_start BETWEEN $3 AND $4
+        GROUP BY bucket_start
+        ORDER BY bucket_start ASC
+        "#,
+    )
+    .bind(project_id)
+    .bind(granularity.as_str())
+    .bind(start)
+    .bind(end)
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsCubeRow {
+            bucket_start: row
+                .try_get("bucket_start")
+                .expect("bucket_start column exists"),
+            dimensions: BTreeMap::new(),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_total_event_metric_total_aggregate_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    window: (DateTime<Utc>, DateTime<Utc>),
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let (start, end) = window;
+    let row = sqlx::query(
+        r#"
+        SELECT SUM(event_count)::BIGINT AS event_count
+        FROM event_metric_buckets_total
+        WHERE project_id = $1
+          AND granularity = $2
+          AND bucket_start BETWEEN $3 AND $4
+        "#,
+    )
+    .bind(project_id)
+    .bind(granularity.as_str())
+    .bind(start)
+    .bind(end)
+    .fetch_one(executor)
+    .await?;
+
+    let event_count = row.try_get::<Option<i64>, _>("event_count")?;
+
+    Ok(event_count
+        .map(|event_count| {
+            vec![EventMetricsAggregateCubeRow {
+                dimensions: BTreeMap::new(),
+                event_count: event_count as u64,
+            }]
+        })
+        .unwrap_or_default())
+}
+
+async fn fetch_total_event_metric_dim1_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT bucket_start, dim1_key, dim1_value, SUM(event_count)::BIGINT AS event_count \
+         FROM event_metric_buckets_dim1 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    builder.push(" AND dim1_key = ");
+    builder.push_bind(&cube_keys[0]);
+
+    if let Some(value) = filters.get(&cube_keys[0]) {
+        builder.push(" AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(" GROUP BY bucket_start, dim1_key, dim1_value");
+    builder.push(" ORDER BY bucket_start ASC, dim1_value ASC");
+
+    let rows = builder.build().fetch_all(executor).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsCubeRow {
+            bucket_start: row
+                .try_get("bucket_start")
+                .expect("bucket_start column exists"),
+            dimensions: BTreeMap::from([(
+                row.try_get::<String, _>("dim1_key")
+                    .expect("dim1_key column exists"),
+                row.try_get::<String, _>("dim1_value")
+                    .expect("dim1_value column exists"),
+            )]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_total_event_metric_dim1_aggregate_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let (start, end) = window;
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT dim1_key, dim1_value, SUM(event_count)::BIGINT AS event_count \
+         FROM event_metric_buckets_dim1 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    builder.push(" AND dim1_key = ");
+    builder.push_bind(&cube_keys[0]);
+
+    if let Some(value) = filters.get(&cube_keys[0]) {
+        builder.push(" AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(" GROUP BY dim1_key, dim1_value ORDER BY dim1_value ASC");
+
+    if let Some(limit) = limit {
+        builder.push(" LIMIT ");
+        builder.push_bind(limit as i64);
+    }
+
+    let rows = builder.build().fetch_all(executor).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsAggregateCubeRow {
+            dimensions: BTreeMap::from([(
+                row.try_get::<String, _>("dim1_key")
+                    .expect("dim1_key column exists"),
+                row.try_get::<String, _>("dim1_value")
+                    .expect("dim1_value column exists"),
+            )]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_total_event_metric_dim2_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, SUM(event_count)::BIGINT AS event_count \
+         FROM event_metric_buckets_dim2 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    builder.push(" AND dim1_key = ");
+    builder.push_bind(&cube_keys[0]);
+    builder.push(" AND dim2_key = ");
+    builder.push_bind(&cube_keys[1]);
+
+    if let Some(value) = filters.get(&cube_keys[0]) {
+        builder.push(" AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    if let Some(value) = filters.get(&cube_keys[1]) {
+        builder.push(" AND dim2_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(" GROUP BY bucket_start, dim1_key, dim1_value, dim2_key, dim2_value");
+    builder.push(" ORDER BY bucket_start ASC, dim1_value ASC, dim2_value ASC");
+
+    let rows = builder.build().fetch_all(executor).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsCubeRow {
+            bucket_start: row
+                .try_get("bucket_start")
+                .expect("bucket_start column exists"),
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+            ]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_total_event_metric_dim2_aggregate_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let (start, end) = window;
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT dim1_key, dim1_value, dim2_key, dim2_value, SUM(event_count)::BIGINT AS event_count \
+         FROM event_metric_buckets_dim2 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    builder.push(" AND dim1_key = ");
+    builder.push_bind(&cube_keys[0]);
+    builder.push(" AND dim2_key = ");
+    builder.push_bind(&cube_keys[1]);
+
+    if let Some(value) = filters.get(&cube_keys[0]) {
+        builder.push(" AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    if let Some(value) = filters.get(&cube_keys[1]) {
+        builder.push(" AND dim2_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(
+        " GROUP BY dim1_key, dim1_value, dim2_key, dim2_value \
+          ORDER BY dim1_value ASC, dim2_value ASC",
+    );
+
+    if let Some(limit) = limit {
+        builder.push(" LIMIT ");
+        builder.push_bind(limit as i64);
+    }
+
+    let rows = builder.build().fetch_all(executor).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsAggregateCubeRow {
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+            ]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
 async fn fetch_session_metrics_total_rows<'a, E>(
     executor: E,
     project_id: Uuid,
@@ -4220,8 +4714,14 @@ mod tests {
             )
               AND indexname IN (
                 'idx_event_metric_buckets_total_project_event_bucket',
+                'idx_event_metric_buckets_total_project_bucket',
                 'idx_event_metric_buckets_dim1_project_event_bucket',
+                'idx_event_metric_buckets_dim1_project_bucket',
+                'idx_event_metric_buckets_dim1_project_dim1_value_bucket',
                 'idx_event_metric_buckets_dim2_project_event_bucket',
+                'idx_event_metric_buckets_dim2_project_bucket',
+                'idx_event_metric_buckets_dim2_project_dim1_value_bucket',
+                'idx_event_metric_buckets_dim2_project_dim2_value_bucket',
                 'idx_event_metric_buckets_dim2_project_event_dim1_value_bucket',
                 'idx_event_metric_buckets_dim2_project_event_dim2_value_bucket'
               )
@@ -4319,9 +4819,15 @@ mod tests {
             event_metrics_index_names,
             vec![
                 "idx_event_metric_buckets_dim1_project_event_bucket".to_owned(),
+                "idx_event_metric_buckets_dim1_project_bucket".to_owned(),
+                "idx_event_metric_buckets_dim1_project_dim1_value_bucket".to_owned(),
+                "idx_event_metric_buckets_dim2_project_bucket".to_owned(),
+                "idx_event_metric_buckets_dim2_project_dim1_value_bucket".to_owned(),
+                "idx_event_metric_buckets_dim2_project_dim2_value_bucket".to_owned(),
                 "idx_event_metric_buckets_dim2_project_event_bucket".to_owned(),
                 "idx_event_metric_buckets_dim2_project_event_dim1_value_bucket".to_owned(),
                 "idx_event_metric_buckets_dim2_project_event_dim2_value_bucket".to_owned(),
+                "idx_event_metric_buckets_total_project_bucket".to_owned(),
                 "idx_event_metric_buckets_total_project_event_bucket".to_owned(),
             ]
         );

@@ -155,8 +155,6 @@ pub struct MetricsCommand {
 #[derive(Debug, Subcommand)]
 pub enum MetricsSubcommand {
     Events(EventMetricsArgs),
-    #[command(name = "events-total")]
-    EventsTotal(TotalEventMetricsArgs),
     #[command(name = "events-top")]
     EventsTop(TopEventsArgs),
     #[command(name = "events-catalog")]
@@ -166,11 +164,11 @@ pub enum MetricsSubcommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  fantasma metrics events --event app_open --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider\n  fantasma metrics events --event app_open --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --group-by platform --group-by app_version"
+    after_help = "Examples:\n  fantasma metrics events --event app_open --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider"
 )]
 pub struct EventMetricsArgs {
     #[arg(long)]
-    pub event: String,
+    pub event: Option<String>,
     #[arg(long)]
     pub metric: EventMetricArg,
     #[arg(long)]
@@ -189,22 +187,6 @@ pub struct EventMetricsArgs {
         help = "Repeat up to twice. Combined with filters, the API accepts at most 2 distinct dimensions total."
     )]
     pub group_by: Vec<String>,
-    #[command(flatten)]
-    pub output: ReadOutputArgs,
-}
-
-#[derive(Debug, Args)]
-pub struct TotalEventMetricsArgs {
-    #[arg(long)]
-    pub metric: EventMetricArg,
-    #[arg(long)]
-    pub granularity: MetricGranularityArg,
-    #[arg(long)]
-    pub start: String,
-    #[arg(long)]
-    pub end: String,
-    #[arg(long = "filter")]
-    pub filters: Vec<String>,
     #[command(flatten)]
     pub output: ReadOutputArgs,
 }
@@ -237,7 +219,7 @@ pub struct EventCatalogArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  fantasma metrics sessions --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider\n  fantasma metrics sessions --metric active_installs --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider"
+    after_help = "Examples:\n  fantasma metrics sessions --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider\n  fantasma metrics sessions --metric active_installs --granularity week --start 2026-03-02 --end 2026-03-16 --filter plan=pro --group-by provider"
 )]
 pub struct SessionMetricsArgs {
     #[arg(long)]
@@ -255,7 +237,7 @@ pub struct SessionMetricsArgs {
     pub filters: Vec<String>,
     #[arg(
         long = "group-by",
-        help = "Repeat up to twice. Combined with filters, the API accepts at most 2 distinct dimensions total. active_installs still requires --granularity day."
+        help = "Repeat up to twice. Combined with filters, the API accepts at most 2 distinct dimensions total."
     )]
     pub group_by: Vec<String>,
     #[command(flatten)]
@@ -288,4 +270,7 @@ pub enum SessionMetricArg {
 pub enum MetricGranularityArg {
     Hour,
     Day,
+    Week,
+    Month,
+    Year,
 }
