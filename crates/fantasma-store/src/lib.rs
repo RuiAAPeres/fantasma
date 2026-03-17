@@ -148,6 +148,8 @@ pub struct SessionRecord {
     pub duration_seconds: i32,
     pub platform: Platform,
     pub app_version: Option<String>,
+    pub os_version: Option<String>,
+    pub properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -187,6 +189,19 @@ pub struct SessionDailyInstallDelta {
     pub day: NaiveDate,
     pub install_id: String,
     pub session_count: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionActiveInstallSliceDelta {
+    pub project_id: Uuid,
+    pub day: NaiveDate,
+    pub install_id: String,
+    pub platform: String,
+    pub app_version: Option<String>,
+    pub app_version_is_null: bool,
+    pub os_version: Option<String>,
+    pub os_version_is_null: bool,
+    pub properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,38 +257,6 @@ pub struct EventMetricBucketDim2Delta {
     pub dim1_value: String,
     pub dim2_key: String,
     pub dim2_value: String,
-    pub event_count: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventMetricBucketDim3Delta {
-    pub project_id: Uuid,
-    pub granularity: MetricGranularity,
-    pub bucket_start: DateTime<Utc>,
-    pub event_name: String,
-    pub dim1_key: String,
-    pub dim1_value: String,
-    pub dim2_key: String,
-    pub dim2_value: String,
-    pub dim3_key: String,
-    pub dim3_value: String,
-    pub event_count: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventMetricBucketDim4Delta {
-    pub project_id: Uuid,
-    pub granularity: MetricGranularity,
-    pub bucket_start: DateTime<Utc>,
-    pub event_name: String,
-    pub dim1_key: String,
-    pub dim1_value: String,
-    pub dim2_key: String,
-    pub dim2_value: String,
-    pub dim3_key: String,
-    pub dim3_value: String,
-    pub dim4_key: String,
-    pub dim4_value: String,
     pub event_count: i64,
 }
 
@@ -347,6 +330,8 @@ pub struct InstallFirstSeenRecord {
     pub first_seen_at: DateTime<Utc>,
     pub platform: Platform,
     pub app_version: Option<String>,
+    pub os_version: Option<String>,
+    pub properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -810,88 +795,6 @@ pub async fn upsert_event_metric_buckets_dim2_in_tx(
     Ok(())
 }
 
-pub async fn upsert_event_metric_buckets_dim3_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    deltas: &[EventMetricBucketDim3Delta],
-) -> Result<(), StoreError> {
-    if deltas.is_empty() {
-        return Ok(());
-    }
-
-    for chunk in deltas.chunks(max_rows_per_batched_statement(11)) {
-        let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO event_metric_buckets_dim3 \
-             (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count) ",
-        );
-        builder.push_values(chunk, |mut separated, delta| {
-            separated.push_bind(delta.project_id);
-            separated.push_bind(delta.granularity.as_str());
-            separated.push_bind(delta.bucket_start);
-            separated.push_bind(&delta.event_name);
-            separated.push_bind(&delta.dim1_key);
-            separated.push_bind(&delta.dim1_value);
-            separated.push_bind(&delta.dim2_key);
-            separated.push_bind(&delta.dim2_value);
-            separated.push_bind(&delta.dim3_key);
-            separated.push_bind(&delta.dim3_value);
-            separated.push_bind(delta.event_count);
-        });
-        builder.push(
-            " ON CONFLICT \
-              (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value) \
-              DO UPDATE SET \
-              event_count = event_metric_buckets_dim3.event_count + EXCLUDED.event_count, \
-              updated_at = now()",
-        );
-
-        builder.build().execute(&mut **tx).await?;
-    }
-
-    Ok(())
-}
-
-pub async fn upsert_event_metric_buckets_dim4_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    deltas: &[EventMetricBucketDim4Delta],
-) -> Result<(), StoreError> {
-    if deltas.is_empty() {
-        return Ok(());
-    }
-
-    for chunk in deltas.chunks(max_rows_per_batched_statement(13)) {
-        let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO event_metric_buckets_dim4 \
-             (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, event_count) ",
-        );
-        builder.push_values(chunk, |mut separated, delta| {
-            separated.push_bind(delta.project_id);
-            separated.push_bind(delta.granularity.as_str());
-            separated.push_bind(delta.bucket_start);
-            separated.push_bind(&delta.event_name);
-            separated.push_bind(&delta.dim1_key);
-            separated.push_bind(&delta.dim1_value);
-            separated.push_bind(&delta.dim2_key);
-            separated.push_bind(&delta.dim2_value);
-            separated.push_bind(&delta.dim3_key);
-            separated.push_bind(&delta.dim3_value);
-            separated.push_bind(&delta.dim4_key);
-            separated.push_bind(&delta.dim4_value);
-            separated.push_bind(delta.event_count);
-        });
-        builder.push(
-            " ON CONFLICT \
-              (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value) \
-              DO UPDATE SET \
-              event_count = event_metric_buckets_dim4.event_count + EXCLUDED.event_count, \
-              updated_at = now()",
-        );
-
-        builder.build().execute(&mut **tx).await?;
-    }
-
-    Ok(())
-}
-
 pub async fn upsert_session_metric_totals_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     deltas: &[SessionMetricTotalDelta],
@@ -1017,9 +920,11 @@ pub async fn insert_install_first_seen_in_tx(
             first_seen_event_id,
             first_seen_at,
             platform,
-            app_version
+            app_version,
+            os_version,
+            properties
         )
-        VALUES ($1, $2, $3, $4, $5, $6)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (project_id, install_id) DO NOTHING
         "#,
     )
@@ -1029,6 +934,8 @@ pub async fn insert_install_first_seen_in_tx(
     .bind(record.first_seen_at)
     .bind(platform_as_str(&record.platform))
     .bind(&record.app_version)
+    .bind(&record.os_version)
+    .bind(sqlx::types::Json(record.properties.clone()))
     .execute(&mut **tx)
     .await?;
 
@@ -1112,34 +1019,8 @@ where
             )
             .await
         }
-        3 => {
-            fetch_event_metrics_dim3_rows(
-                executor,
-                project_id,
-                granularity,
-                event_name,
-                start,
-                end,
-                cube_keys,
-                filters,
-            )
-            .await
-        }
-        4 => {
-            fetch_event_metrics_dim4_rows(
-                executor,
-                project_id,
-                granularity,
-                event_name,
-                start,
-                end,
-                cube_keys,
-                filters,
-            )
-            .await
-        }
         other => Err(StoreError::InvariantViolation(format!(
-            "event metrics cube arity must be between 0 and 4, got {other}"
+            "event metrics cube arity must be between 0 and 2, got {other}"
         ))),
     }
 }
@@ -1221,34 +1102,8 @@ where
             )
             .await
         }
-        3 => {
-            fetch_event_metrics_dim3_aggregate_rows(
-                executor,
-                project_id,
-                granularity,
-                event_name,
-                (start, end),
-                cube_keys,
-                filters,
-                limit,
-            )
-            .await
-        }
-        4 => {
-            fetch_event_metrics_dim4_aggregate_rows(
-                executor,
-                project_id,
-                granularity,
-                event_name,
-                (start, end),
-                cube_keys,
-                filters,
-                limit,
-            )
-            .await
-        }
         other => Err(StoreError::InvariantViolation(format!(
-            "event metrics cube arity must be between 0 and 4, got {other}"
+            "event metrics cube arity must be between 0 and 2, got {other}"
         ))),
     }
 }
@@ -1658,7 +1513,7 @@ where
     let row = sqlx::query(
         r#"
         SELECT project_id, install_id, session_id, session_start, session_end,
-               event_count, duration_seconds, platform, app_version
+               event_count, duration_seconds, platform, app_version, os_version, properties
         FROM sessions
         WHERE project_id = $1
           AND install_id = $2
@@ -1684,7 +1539,7 @@ pub async fn fetch_sessions_overlapping_window_in_tx(
     let rows = sqlx::query(
         r#"
         SELECT project_id, install_id, session_id, session_start, session_end,
-               event_count, duration_seconds, platform, app_version
+               event_count, duration_seconds, platform, app_version, os_version, properties
         FROM sessions
         WHERE project_id = $1
           AND install_id = $2
@@ -1772,7 +1627,9 @@ pub async fn load_tail_sessions_for_installs_in_tx(
             s.event_count, \
             s.duration_seconds, \
             s.platform, \
-            s.app_version \
+            s.app_version, \
+            s.os_version, \
+            s.properties \
           FROM install_session_state state \
           INNER JOIN requested r \
             ON state.project_id = r.project_id \
@@ -2388,9 +2245,11 @@ pub async fn insert_session_in_tx(
             event_count,
             duration_seconds,
             platform,
-            app_version
+            app_version,
+            os_version,
+            properties
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         "#,
     )
     .bind(session.project_id)
@@ -2402,6 +2261,8 @@ pub async fn insert_session_in_tx(
     .bind(session.duration_seconds)
     .bind(platform_as_str(&session.platform))
     .bind(&session.app_version)
+    .bind(&session.os_version)
+    .bind(sqlx::types::Json(session.properties.clone()))
     .execute(&mut **tx)
     .await?;
 
@@ -2418,7 +2279,7 @@ pub async fn insert_sessions_in_tx(
 
     let mut builder = QueryBuilder::<Postgres>::new(
         "INSERT INTO sessions \
-         (project_id, install_id, session_id, session_start, session_end, event_count, duration_seconds, platform, app_version) ",
+         (project_id, install_id, session_id, session_start, session_end, event_count, duration_seconds, platform, app_version, os_version, properties) ",
     );
     builder.push_values(sessions, |mut separated, session| {
         separated
@@ -2430,7 +2291,9 @@ pub async fn insert_sessions_in_tx(
             .push_bind(session.event_count)
             .push_bind(session.duration_seconds)
             .push_bind(platform_as_str(&session.platform))
-            .push_bind(&session.app_version);
+            .push_bind(&session.app_version)
+            .push_bind(&session.os_version)
+            .push_bind(sqlx::types::Json(session.properties.clone()));
     });
     let result = builder.build().execute(&mut **tx).await?;
 
@@ -2600,6 +2463,113 @@ pub async fn upsert_session_daily_install_deltas_in_tx(
             })
         })
         .collect())
+}
+
+pub async fn upsert_session_active_install_slices_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deltas: &[SessionActiveInstallSliceDelta],
+) -> Result<u64, StoreError> {
+    if deltas.is_empty() {
+        return Ok(0);
+    }
+
+    let mut inserted_rows = 0;
+    for chunk in deltas.chunks(max_rows_per_batched_statement(9)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_active_install_slices \
+             (project_id, day, install_id, platform, app_version, app_version_is_null, os_version, os_version_is_null, properties) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated
+                .push_bind(delta.project_id)
+                .push_bind(delta.day)
+                .push_bind(&delta.install_id)
+                .push_bind(&delta.platform)
+                .push_bind(delta.app_version.as_deref().unwrap_or(""))
+                .push_bind(delta.app_version_is_null)
+                .push_bind(delta.os_version.as_deref().unwrap_or(""))
+                .push_bind(delta.os_version_is_null)
+                .push_bind(sqlx::types::Json(delta.properties.clone()));
+        });
+        builder.push(" ON CONFLICT DO NOTHING");
+        inserted_rows += builder.build().execute(&mut **tx).await?.rows_affected();
+    }
+
+    Ok(inserted_rows)
+}
+
+pub async fn rebuild_session_active_install_slices_days_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    days: &[NaiveDate],
+) -> Result<(), StoreError> {
+    let days = days
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if days.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        DELETE FROM session_active_install_slices
+        WHERE project_id = $1
+          AND day = ANY($2)
+        "#,
+    )
+    .bind(project_id)
+    .bind(&days)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        WITH scoped_sessions AS MATERIALIZED (
+            SELECT
+                project_id,
+                DATE(session_start AT TIME ZONE 'UTC') AS day,
+                install_id,
+                platform,
+                app_version,
+                os_version,
+                properties
+            FROM sessions
+            WHERE project_id = $1
+              AND DATE(session_start AT TIME ZONE 'UTC') = ANY($2)
+        )
+        INSERT INTO session_active_install_slices (
+            project_id,
+            day,
+            install_id,
+            platform,
+            app_version,
+            app_version_is_null,
+            os_version,
+            os_version_is_null,
+            properties
+        )
+        SELECT DISTINCT
+            project_id,
+            day,
+            install_id,
+            platform::TEXT,
+            COALESCE(app_version, ''),
+            app_version IS NULL,
+            COALESCE(os_version, ''),
+            os_version IS NULL,
+            COALESCE(properties, '{}'::jsonb)
+        FROM scoped_sessions
+        "#,
+    )
+    .bind(project_id)
+    .bind(&days)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
 }
 
 pub async fn upsert_session_daily_deltas_in_tx(
@@ -3179,6 +3149,45 @@ pub async fn count_active_installs(
     Ok(count as u64)
 }
 
+pub async fn fetch_active_install_metrics_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<SessionMetricsCubeRow>, StoreError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT day, active_installs
+        FROM session_daily
+        WHERE project_id = $1
+          AND day BETWEEN $2::date AND $3::date
+        ORDER BY day ASC
+        "#,
+    )
+    .bind(project_id)
+    .bind(start.date_naive())
+    .bind(end.date_naive())
+    .fetch_all(&mut **tx)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| SessionMetricsCubeRow {
+            bucket_start: DateTime::from_naive_utc_and_offset(
+                row.try_get::<NaiveDate, _>("day")
+                    .expect("day column exists")
+                    .and_hms_opt(0, 0, 0)
+                    .expect("midnight is a valid UTC datetime"),
+                Utc,
+            ),
+            dimensions: BTreeMap::new(),
+            value: row
+                .try_get::<i64, _>("active_installs")
+                .expect("active_installs column exists") as u64,
+        })
+        .collect())
+}
+
 async fn fetch_event_metrics_total_rows<'a, E>(
     executor: E,
     project_id: Uuid,
@@ -3526,392 +3535,6 @@ where
                         .expect("dim2_key column exists"),
                     row.try_get::<String, _>("dim2_value")
                         .expect("dim2_value column exists"),
-                ),
-            ]),
-            event_count: row
-                .try_get::<i64, _>("event_count")
-                .expect("event_count column exists") as u64,
-        })
-        .collect())
-}
-
-async fn fetch_event_metrics_dim3_rows<'a, E>(
-    executor: E,
-    project_id: Uuid,
-    granularity: MetricGranularity,
-    event_name: &str,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    cube_keys: &[String],
-    filters: &BTreeMap<String, String>,
-) -> Result<Vec<EventMetricsCubeRow>, StoreError>
-where
-    E: sqlx::Executor<'a, Database = Postgres>,
-{
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "SELECT bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count \
-         FROM event_metric_buckets_dim3 \
-         WHERE project_id = ",
-    );
-    builder.push_bind(project_id);
-    builder.push(" AND granularity = ");
-    builder.push_bind(granularity.as_str());
-    builder.push(" AND event_name = ");
-    builder.push_bind(event_name);
-    builder.push(" AND bucket_start BETWEEN ");
-    builder.push_bind(start);
-    builder.push(" AND ");
-    builder.push_bind(end);
-    builder.push(" AND dim1_key = ");
-    builder.push_bind(&cube_keys[0]);
-    builder.push(" AND dim2_key = ");
-    builder.push_bind(&cube_keys[1]);
-    builder.push(" AND dim3_key = ");
-    builder.push_bind(&cube_keys[2]);
-
-    if let Some(value) = filters.get(&cube_keys[0]) {
-        builder.push(" AND dim1_value = ");
-        builder.push_bind(value);
-    }
-
-    if let Some(value) = filters.get(&cube_keys[1]) {
-        builder.push(" AND dim2_value = ");
-        builder.push_bind(value);
-    }
-
-    if let Some(value) = filters.get(&cube_keys[2]) {
-        builder.push(" AND dim3_value = ");
-        builder.push_bind(value);
-    }
-
-    builder.push(" ORDER BY bucket_start ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC");
-
-    let rows = builder.build().fetch_all(executor).await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| EventMetricsCubeRow {
-            bucket_start: row
-                .try_get("bucket_start")
-                .expect("bucket_start column exists"),
-            dimensions: BTreeMap::from([
-                (
-                    row.try_get::<String, _>("dim1_key")
-                        .expect("dim1_key column exists"),
-                    row.try_get::<String, _>("dim1_value")
-                        .expect("dim1_value column exists"),
-                ),
-                (
-                    row.try_get::<String, _>("dim2_key")
-                        .expect("dim2_key column exists"),
-                    row.try_get::<String, _>("dim2_value")
-                        .expect("dim2_value column exists"),
-                ),
-                (
-                    row.try_get::<String, _>("dim3_key")
-                        .expect("dim3_key column exists"),
-                    row.try_get::<String, _>("dim3_value")
-                        .expect("dim3_value column exists"),
-                ),
-            ]),
-            event_count: row
-                .try_get::<i64, _>("event_count")
-                .expect("event_count column exists") as u64,
-        })
-        .collect())
-}
-
-async fn fetch_event_metrics_dim3_aggregate_rows<'a, E>(
-    executor: E,
-    project_id: Uuid,
-    granularity: MetricGranularity,
-    event_name: &str,
-    window: (DateTime<Utc>, DateTime<Utc>),
-    cube_keys: &[String],
-    filters: &BTreeMap<String, String>,
-    limit: Option<usize>,
-) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
-where
-    E: sqlx::Executor<'a, Database = Postgres>,
-{
-    let (start, end) = window;
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "SELECT dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, \
-                SUM(event_count)::BIGINT AS event_count \
-         FROM event_metric_buckets_dim3 \
-         WHERE project_id = ",
-    );
-    builder.push_bind(project_id);
-    builder.push(" AND granularity = ");
-    builder.push_bind(granularity.as_str());
-    builder.push(" AND event_name = ");
-    builder.push_bind(event_name);
-    builder.push(" AND bucket_start BETWEEN ");
-    builder.push_bind(start);
-    builder.push(" AND ");
-    builder.push_bind(end);
-    builder.push(" AND dim1_key = ");
-    builder.push_bind(&cube_keys[0]);
-    builder.push(" AND dim2_key = ");
-    builder.push_bind(&cube_keys[1]);
-    builder.push(" AND dim3_key = ");
-    builder.push_bind(&cube_keys[2]);
-
-    if let Some(value) = filters.get(&cube_keys[0]) {
-        builder.push(" AND dim1_value = ");
-        builder.push_bind(value);
-    }
-
-    if let Some(value) = filters.get(&cube_keys[1]) {
-        builder.push(" AND dim2_value = ");
-        builder.push_bind(value);
-    }
-
-    if let Some(value) = filters.get(&cube_keys[2]) {
-        builder.push(" AND dim3_value = ");
-        builder.push_bind(value);
-    }
-
-    builder.push(
-        " GROUP BY dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value \
-          ORDER BY dim1_value ASC, dim2_value ASC, dim3_value ASC",
-    );
-
-    if let Some(limit) = limit {
-        builder.push(" LIMIT ");
-        builder.push_bind(limit as i64);
-    }
-
-    let rows = builder.build().fetch_all(executor).await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| EventMetricsAggregateCubeRow {
-            dimensions: BTreeMap::from([
-                (
-                    row.try_get::<String, _>("dim1_key")
-                        .expect("dim1_key column exists"),
-                    row.try_get::<String, _>("dim1_value")
-                        .expect("dim1_value column exists"),
-                ),
-                (
-                    row.try_get::<String, _>("dim2_key")
-                        .expect("dim2_key column exists"),
-                    row.try_get::<String, _>("dim2_value")
-                        .expect("dim2_value column exists"),
-                ),
-                (
-                    row.try_get::<String, _>("dim3_key")
-                        .expect("dim3_key column exists"),
-                    row.try_get::<String, _>("dim3_value")
-                        .expect("dim3_value column exists"),
-                ),
-            ]),
-            event_count: row
-                .try_get::<i64, _>("event_count")
-                .expect("event_count column exists") as u64,
-        })
-        .collect())
-}
-
-async fn fetch_event_metrics_dim4_rows<'a, E>(
-    executor: E,
-    project_id: Uuid,
-    granularity: MetricGranularity,
-    event_name: &str,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    cube_keys: &[String],
-    filters: &BTreeMap<String, String>,
-) -> Result<Vec<EventMetricsCubeRow>, StoreError>
-where
-    E: sqlx::Executor<'a, Database = Postgres>,
-{
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "SELECT bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, event_count \
-         FROM event_metric_buckets_dim4 \
-         WHERE project_id = ",
-    );
-    builder.push_bind(project_id);
-    builder.push(" AND granularity = ");
-    builder.push_bind(granularity.as_str());
-    builder.push(" AND event_name = ");
-    builder.push_bind(event_name);
-    builder.push(" AND bucket_start BETWEEN ");
-    builder.push_bind(start);
-    builder.push(" AND ");
-    builder.push_bind(end);
-    builder.push(" AND dim1_key = ");
-    builder.push_bind(&cube_keys[0]);
-    builder.push(" AND dim2_key = ");
-    builder.push_bind(&cube_keys[1]);
-    builder.push(" AND dim3_key = ");
-    builder.push_bind(&cube_keys[2]);
-    builder.push(" AND dim4_key = ");
-    builder.push_bind(&cube_keys[3]);
-
-    if let Some(value) = filters.get(&cube_keys[0]) {
-        builder.push(" AND dim1_value = ");
-        builder.push_bind(value);
-    }
-
-    if let Some(value) = filters.get(&cube_keys[1]) {
-        builder.push(" AND dim2_value = ");
-        builder.push_bind(value);
-    }
-
-    if let Some(value) = filters.get(&cube_keys[2]) {
-        builder.push(" AND dim3_value = ");
-        builder.push_bind(value);
-    }
-
-    if let Some(value) = filters.get(&cube_keys[3]) {
-        builder.push(" AND dim4_value = ");
-        builder.push_bind(value);
-    }
-
-    builder.push(
-        " ORDER BY bucket_start ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC, dim4_value ASC",
-    );
-
-    let rows = builder.build().fetch_all(executor).await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| EventMetricsCubeRow {
-            bucket_start: row
-                .try_get("bucket_start")
-                .expect("bucket_start column exists"),
-            dimensions: BTreeMap::from([
-                (
-                    row.try_get::<String, _>("dim1_key")
-                        .expect("dim1_key column exists"),
-                    row.try_get::<String, _>("dim1_value")
-                        .expect("dim1_value column exists"),
-                ),
-                (
-                    row.try_get::<String, _>("dim2_key")
-                        .expect("dim2_key column exists"),
-                    row.try_get::<String, _>("dim2_value")
-                        .expect("dim2_value column exists"),
-                ),
-                (
-                    row.try_get::<String, _>("dim3_key")
-                        .expect("dim3_key column exists"),
-                    row.try_get::<String, _>("dim3_value")
-                        .expect("dim3_value column exists"),
-                ),
-                (
-                    row.try_get::<String, _>("dim4_key")
-                        .expect("dim4_key column exists"),
-                    row.try_get::<String, _>("dim4_value")
-                        .expect("dim4_value column exists"),
-                ),
-            ]),
-            event_count: row
-                .try_get::<i64, _>("event_count")
-                .expect("event_count column exists") as u64,
-        })
-        .collect())
-}
-
-async fn fetch_event_metrics_dim4_aggregate_rows<'a, E>(
-    executor: E,
-    project_id: Uuid,
-    granularity: MetricGranularity,
-    event_name: &str,
-    window: (DateTime<Utc>, DateTime<Utc>),
-    cube_keys: &[String],
-    filters: &BTreeMap<String, String>,
-    limit: Option<usize>,
-) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
-where
-    E: sqlx::Executor<'a, Database = Postgres>,
-{
-    let (start, end) = window;
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "SELECT dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, \
-                SUM(event_count)::BIGINT AS event_count \
-         FROM event_metric_buckets_dim4 \
-         WHERE project_id = ",
-    );
-    builder.push_bind(project_id);
-    builder.push(" AND granularity = ");
-    builder.push_bind(granularity.as_str());
-    builder.push(" AND event_name = ");
-    builder.push_bind(event_name);
-    builder.push(" AND bucket_start BETWEEN ");
-    builder.push_bind(start);
-    builder.push(" AND ");
-    builder.push_bind(end);
-    builder.push(" AND dim1_key = ");
-    builder.push_bind(&cube_keys[0]);
-    builder.push(" AND dim2_key = ");
-    builder.push_bind(&cube_keys[1]);
-    builder.push(" AND dim3_key = ");
-    builder.push_bind(&cube_keys[2]);
-    builder.push(" AND dim4_key = ");
-    builder.push_bind(&cube_keys[3]);
-
-    if let Some(value) = filters.get(&cube_keys[0]) {
-        builder.push(" AND dim1_value = ");
-        builder.push_bind(value);
-    }
-
-    if let Some(value) = filters.get(&cube_keys[1]) {
-        builder.push(" AND dim2_value = ");
-        builder.push_bind(value);
-    }
-
-    if let Some(value) = filters.get(&cube_keys[2]) {
-        builder.push(" AND dim3_value = ");
-        builder.push_bind(value);
-    }
-
-    if let Some(value) = filters.get(&cube_keys[3]) {
-        builder.push(" AND dim4_value = ");
-        builder.push_bind(value);
-    }
-
-    builder.push(
-        " GROUP BY dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value \
-          ORDER BY dim1_value ASC, dim2_value ASC, dim3_value ASC, dim4_value ASC",
-    );
-
-    if let Some(limit) = limit {
-        builder.push(" LIMIT ");
-        builder.push_bind(limit as i64);
-    }
-
-    let rows = builder.build().fetch_all(executor).await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| EventMetricsAggregateCubeRow {
-            dimensions: BTreeMap::from([
-                (
-                    row.try_get::<String, _>("dim1_key")
-                        .expect("dim1_key column exists"),
-                    row.try_get::<String, _>("dim1_value")
-                        .expect("dim1_value column exists"),
-                ),
-                (
-                    row.try_get::<String, _>("dim2_key")
-                        .expect("dim2_key column exists"),
-                    row.try_get::<String, _>("dim2_value")
-                        .expect("dim2_value column exists"),
-                ),
-                (
-                    row.try_get::<String, _>("dim3_key")
-                        .expect("dim3_key column exists"),
-                    row.try_get::<String, _>("dim3_value")
-                        .expect("dim3_value column exists"),
-                ),
-                (
-                    row.try_get::<String, _>("dim4_key")
-                        .expect("dim4_key column exists"),
-                    row.try_get::<String, _>("dim4_value")
-                        .expect("dim4_value column exists"),
                 ),
             ]),
             event_count: row
@@ -4321,6 +3944,11 @@ fn session_from_row(row: sqlx::postgres::PgRow) -> Result<SessionRecord, StoreEr
         duration_seconds: row.try_get("duration_seconds")?,
         platform: platform_from_str(&row.try_get::<String, _>("platform")?)?,
         app_version: row.try_get("app_version")?,
+        os_version: row.try_get("os_version")?,
+        properties: row
+            .try_get::<Option<sqlx::types::Json<BTreeMap<String, String>>>, _>("properties")?
+            .map(|json| json.0)
+            .unwrap_or_default(),
     })
 }
 
@@ -4345,6 +3973,7 @@ fn session_metric_value_column(metric: SessionMetric) -> &'static str {
         SessionMetric::Count => "session_count",
         SessionMetric::DurationTotal => "duration_total_seconds",
         SessionMetric::NewInstalls => "new_installs",
+        SessionMetric::ActiveInstalls => unreachable!("active_installs uses session_daily reads"),
     }
 }
 
@@ -4491,6 +4120,8 @@ mod tests {
                 .num_seconds() as i32,
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
+            os_version: Some("18.3".to_owned()),
+            properties: BTreeMap::new(),
         }
     }
 
@@ -4585,25 +4216,14 @@ mod tests {
             WHERE tablename IN (
                 'event_metric_buckets_total',
                 'event_metric_buckets_dim1',
-                'event_metric_buckets_dim2',
-                'event_metric_buckets_dim3',
-                'event_metric_buckets_dim4'
+                'event_metric_buckets_dim2'
             )
               AND indexname IN (
                 'idx_event_metric_buckets_total_project_event_bucket',
                 'idx_event_metric_buckets_dim1_project_event_bucket',
                 'idx_event_metric_buckets_dim2_project_event_bucket',
                 'idx_event_metric_buckets_dim2_project_event_dim1_value_bucket',
-                'idx_event_metric_buckets_dim2_project_event_dim2_value_bucket',
-                'idx_event_metric_buckets_dim3_project_event_bucket',
-                'idx_event_metric_buckets_dim3_project_event_dim1_value_bucket',
-                'idx_event_metric_buckets_dim3_project_event_dim2_value_bucket',
-                'idx_event_metric_buckets_dim3_project_event_dim3_value_bucket',
-                'idx_event_metric_buckets_dim4_project_event_bucket',
-                'idx_event_metric_buckets_dim4_project_event_dim1_value_bucket',
-                'idx_event_metric_buckets_dim4_project_event_dim2_value_bucket',
-                'idx_event_metric_buckets_dim4_project_event_dim3_value_bucket',
-                'idx_event_metric_buckets_dim4_project_event_dim4_value_bucket'
+                'idx_event_metric_buckets_dim2_project_event_dim2_value_bucket'
               )
             ORDER BY indexname
             "#,
@@ -4645,9 +4265,7 @@ mod tests {
             WHERE table_name IN (
                 'event_metric_buckets_total',
                 'event_metric_buckets_dim1',
-                'event_metric_buckets_dim2',
-                'event_metric_buckets_dim3',
-                'event_metric_buckets_dim4'
+                'event_metric_buckets_dim2'
             )
             "#,
         )
@@ -4704,21 +4322,12 @@ mod tests {
                 "idx_event_metric_buckets_dim2_project_event_bucket".to_owned(),
                 "idx_event_metric_buckets_dim2_project_event_dim1_value_bucket".to_owned(),
                 "idx_event_metric_buckets_dim2_project_event_dim2_value_bucket".to_owned(),
-                "idx_event_metric_buckets_dim3_project_event_bucket".to_owned(),
-                "idx_event_metric_buckets_dim3_project_event_dim1_value_bucket".to_owned(),
-                "idx_event_metric_buckets_dim3_project_event_dim2_value_bucket".to_owned(),
-                "idx_event_metric_buckets_dim3_project_event_dim3_value_bucket".to_owned(),
-                "idx_event_metric_buckets_dim4_project_event_bucket".to_owned(),
-                "idx_event_metric_buckets_dim4_project_event_dim1_value_bucket".to_owned(),
-                "idx_event_metric_buckets_dim4_project_event_dim2_value_bucket".to_owned(),
-                "idx_event_metric_buckets_dim4_project_event_dim3_value_bucket".to_owned(),
-                "idx_event_metric_buckets_dim4_project_event_dim4_value_bucket".to_owned(),
                 "idx_event_metric_buckets_total_project_event_bucket".to_owned(),
             ]
         );
         assert!(session_table_exists);
         assert!(session_daily_table_exists);
-        assert_eq!(event_metrics_table_count, 5);
+        assert_eq!(event_metrics_table_count, 3);
         assert!(os_version_column_exists);
         assert_eq!(removed_identity_columns, vec!["session_id".to_owned()]);
     }
@@ -4848,205 +4457,6 @@ mod tests {
                 .iter()
                 .any(|name| name == "idx_event_metric_buckets_dim2_project_event_dim2_value_bucket"),
             "dim2 read path should use the dim2 value index, got {index_names:?} from {plan:#}"
-        );
-    }
-
-    #[sqlx::test]
-    async fn event_metrics_dim3_reads_use_bounded_read_indexes(pool: PgPool) {
-        run_migrations(&pool).await.expect("migrations succeed");
-        ensure_local_project(&pool, Some(&bootstrap_config()))
-            .await
-            .expect("seed project");
-
-        sqlx::query(
-            r#"
-            INSERT INTO event_metric_buckets_dim3 (
-                project_id,
-                granularity,
-                bucket_start,
-                event_name,
-                dim1_key,
-                dim1_value,
-                dim2_key,
-                dim2_value,
-                dim3_key,
-                dim3_value,
-                event_count
-            )
-            SELECT
-                $1,
-                'day',
-                DATE '2026-01-01' + day_offset,
-                'app_open',
-                'app_version',
-                '1.' || version_offset || '.0',
-                'provider',
-                'provider-' || provider_offset,
-                'region',
-                'region-' || region_offset,
-                1
-            FROM generate_series(0, 19) AS day_offset
-            CROSS JOIN generate_series(0, 4) AS version_offset
-            CROSS JOIN generate_series(0, 49) AS provider_offset
-            CROSS JOIN generate_series(0, 7) AS region_offset
-            "#,
-        )
-        .bind(project_id())
-        .execute(&pool)
-        .await
-        .expect("insert dim3 rows");
-        sqlx::query("ANALYZE event_metric_buckets_dim3")
-            .execute(&pool)
-            .await
-            .expect("analyze dim3 table");
-
-        let row = sqlx::query(
-            r#"
-            EXPLAIN (FORMAT JSON)
-            SELECT bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count
-            FROM event_metric_buckets_dim3
-            WHERE project_id = $1
-              AND granularity = $2
-              AND event_name = $3
-              AND bucket_start BETWEEN $4 AND $5
-              AND dim1_key = $6
-              AND dim2_key = $7
-              AND dim3_key = $8
-              AND dim3_value = $9
-            ORDER BY bucket_start ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC
-            "#,
-        )
-        .bind(project_id())
-        .bind(MetricGranularity::Day.as_str())
-        .bind("app_open")
-        .bind(timestamp(24 * 60 * 4))
-        .bind(timestamp(24 * 60 * 11))
-        .bind("app_version")
-        .bind("provider")
-        .bind("region")
-        .bind("region-3")
-        .fetch_one(&pool)
-        .await
-        .expect("explain dim3 query");
-        let plan = row
-            .try_get::<Value, _>(0)
-            .expect("EXPLAIN returns json plan");
-        let root = explain_plan_root(&plan);
-        let mut index_names = Vec::new();
-        collect_plan_index_names(root, &mut index_names);
-
-        assert!(
-            !plan_contains_node_type(root, "Seq Scan"),
-            "dim3 read path should avoid sequential scans: {plan:#}"
-        );
-        assert!(
-            index_names
-                .iter()
-                .any(|name| name == "idx_event_metric_buckets_dim3_project_event_dim3_value_bucket"),
-            "dim3 read path should use the dim3 value index, got {index_names:?} from {plan:#}"
-        );
-    }
-
-    #[sqlx::test]
-    async fn event_metric_bucket_dim4_reads_use_bounded_read_indexes(pool: PgPool) {
-        run_migrations(&pool).await.expect("migrations succeed");
-        ensure_local_project(&pool, Some(&bootstrap_config()))
-            .await
-            .expect("seed project");
-
-        sqlx::query(
-            r#"
-            INSERT INTO event_metric_buckets_dim4 (
-                project_id,
-                granularity,
-                bucket_start,
-                event_name,
-                dim1_key,
-                dim1_value,
-                dim2_key,
-                dim2_value,
-                dim3_key,
-                dim3_value,
-                dim4_key,
-                dim4_value,
-                event_count
-            )
-            SELECT
-                $1,
-                'day',
-                DATE '2026-01-01' + day_offset,
-                'app_open',
-                'app_version',
-                '1.' || version_offset || '.0',
-                'plan',
-                CASE WHEN plan_offset = 0 THEN 'free' ELSE 'pro' END,
-                'provider',
-                'provider-' || provider_offset,
-                'region',
-                'region-' || region_offset,
-                1
-            FROM generate_series(0, 19) AS day_offset
-            CROSS JOIN generate_series(0, 4) AS version_offset
-            CROSS JOIN generate_series(0, 1) AS plan_offset
-            CROSS JOIN generate_series(0, 49) AS provider_offset
-            CROSS JOIN generate_series(0, 7) AS region_offset
-            "#,
-        )
-        .bind(project_id())
-        .execute(&pool)
-        .await
-        .expect("insert dim4 bucket rows");
-        sqlx::query("ANALYZE event_metric_buckets_dim4")
-            .execute(&pool)
-            .await
-            .expect("analyze dim4 bucket table");
-
-        let row = sqlx::query(
-            r#"
-            EXPLAIN (FORMAT JSON)
-            SELECT bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, event_count
-            FROM event_metric_buckets_dim4
-            WHERE project_id = $1
-              AND granularity = $2
-              AND event_name = $3
-              AND bucket_start BETWEEN $4 AND $5
-              AND dim1_key = $6
-              AND dim2_key = $7
-              AND dim3_key = $8
-              AND dim4_key = $9
-              AND dim2_value = $10
-            ORDER BY bucket_start ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC, dim4_value ASC
-            "#,
-        )
-        .bind(project_id())
-        .bind(MetricGranularity::Day.as_str())
-        .bind("app_open")
-        .bind(timestamp(24 * 60 * 4))
-        .bind(timestamp(24 * 60 * 11))
-        .bind("app_version")
-        .bind("plan")
-        .bind("provider")
-        .bind("region")
-        .bind("pro")
-        .fetch_one(&pool)
-        .await
-        .expect("explain dim4 bucket query");
-        let plan = row
-            .try_get::<Value, _>(0)
-            .expect("EXPLAIN returns json plan");
-        let root = explain_plan_root(&plan);
-        let mut index_names = Vec::new();
-        collect_plan_index_names(root, &mut index_names);
-
-        assert!(
-            !plan_contains_node_type(root, "Seq Scan"),
-            "dim4 bucket read path should avoid sequential scans: {plan:#}"
-        );
-        assert!(
-            index_names
-                .iter()
-                .any(|name| name == "idx_event_metric_buckets_dim4_project_event_dim2_value_bucket"),
-            "dim4 bucket read path should use the dim2 value index, got {index_names:?} from {plan:#}"
         );
     }
 
@@ -5204,279 +4614,6 @@ mod tests {
         assert_eq!(
             row.try_get::<i64, _>("total_count").expect("total_count"),
             7_282
-        );
-    }
-
-    #[sqlx::test]
-    async fn event_metric_dim3_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
-        run_migrations(&pool).await.expect("migrations succeed");
-        ensure_local_project(&pool, Some(&bootstrap_config()))
-            .await
-            .expect("seed project");
-
-        let deltas = (0..6_000)
-            .map(|index| EventMetricBucketDim3Delta {
-                project_id: project_id(),
-                granularity: MetricGranularity::Hour,
-                bucket_start: timestamp(60),
-                event_name: "app_open".to_owned(),
-                dim1_key: "app_version".to_owned(),
-                dim1_value: "1.0.0".to_owned(),
-                dim2_key: "plan".to_owned(),
-                dim2_value: "pro".to_owned(),
-                dim3_key: "provider".to_owned(),
-                dim3_value: format!("provider-{index:04}"),
-                event_count: 1,
-            })
-            .collect::<Vec<_>>();
-
-        let mut tx = pool.begin().await.expect("begin tx");
-        upsert_event_metric_buckets_dim3_in_tx(&mut tx, &deltas)
-            .await
-            .expect("large dim3 upsert should succeed");
-        tx.commit().await.expect("commit tx");
-
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(*)::BIGINT AS row_count, COALESCE(SUM(event_count), 0)::BIGINT AS total_count
-            FROM event_metric_buckets_dim3
-            WHERE project_id = $1
-              AND granularity = $2
-              AND bucket_start = $3
-              AND event_name = $4
-            "#,
-        )
-        .bind(project_id())
-        .bind(MetricGranularity::Hour.as_str())
-        .bind(timestamp(60))
-        .bind("app_open")
-        .fetch_one(&pool)
-        .await
-        .expect("fetch dim3 counts");
-
-        assert_eq!(
-            row.try_get::<i64, _>("row_count").expect("row_count"),
-            6_000
-        );
-        assert_eq!(
-            row.try_get::<i64, _>("total_count").expect("total_count"),
-            6_000
-        );
-    }
-
-    #[sqlx::test]
-    async fn event_metric_dim4_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
-        run_migrations(&pool).await.expect("migrations succeed");
-        ensure_local_project(&pool, Some(&bootstrap_config()))
-            .await
-            .expect("seed project");
-
-        let row_count = max_rows_per_batched_statement(13) + 1;
-        let deltas = (0..row_count)
-            .map(|index| EventMetricBucketDim4Delta {
-                project_id: project_id(),
-                granularity: MetricGranularity::Hour,
-                bucket_start: timestamp(60),
-                event_name: "app_open".to_owned(),
-                dim1_key: "app_version".to_owned(),
-                dim1_value: "1.0.0".to_owned(),
-                dim2_key: "plan".to_owned(),
-                dim2_value: "pro".to_owned(),
-                dim3_key: "provider".to_owned(),
-                dim3_value: format!("provider-{index:04}"),
-                dim4_key: "region".to_owned(),
-                dim4_value: "eu".to_owned(),
-                event_count: 1,
-            })
-            .collect::<Vec<_>>();
-
-        let mut tx = pool.begin().await.expect("begin tx");
-        upsert_event_metric_buckets_dim4_in_tx(&mut tx, &deltas)
-            .await
-            .expect("large dim4 upsert should succeed");
-        tx.commit().await.expect("commit tx");
-
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(*)::BIGINT AS row_count, COALESCE(SUM(event_count), 0)::BIGINT AS total_count
-            FROM event_metric_buckets_dim4
-            WHERE project_id = $1
-              AND granularity = $2
-              AND bucket_start = $3
-              AND event_name = $4
-            "#,
-        )
-        .bind(project_id())
-        .bind(MetricGranularity::Hour.as_str())
-        .bind(timestamp(60))
-        .bind("app_open")
-        .fetch_one(&pool)
-        .await
-        .expect("fetch dim4 counts");
-
-        assert_eq!(
-            row.try_get::<i64, _>("row_count").expect("row_count"),
-            row_count as i64
-        );
-        assert_eq!(
-            row.try_get::<i64, _>("total_count").expect("total_count"),
-            row_count as i64
-        );
-    }
-
-    #[sqlx::test]
-    async fn event_metric_dim3_conflicts_accumulate_across_chunk_boundaries(pool: PgPool) {
-        run_migrations(&pool).await.expect("migrations succeed");
-        ensure_local_project(&pool, Some(&bootstrap_config()))
-            .await
-            .expect("seed project");
-
-        let chunk_rows = max_rows_per_batched_statement(11);
-        let deltas = (0..(chunk_rows + 1))
-            .map(|index| {
-                let provider = if index == 0 || index == chunk_rows {
-                    "strava".to_owned()
-                } else {
-                    format!("provider-{index:04}")
-                };
-
-                EventMetricBucketDim3Delta {
-                    project_id: project_id(),
-                    granularity: MetricGranularity::Hour,
-                    bucket_start: timestamp(60),
-                    event_name: "app_open".to_owned(),
-                    dim1_key: "app_version".to_owned(),
-                    dim1_value: "1.0.0".to_owned(),
-                    dim2_key: "plan".to_owned(),
-                    dim2_value: "pro".to_owned(),
-                    dim3_key: "provider".to_owned(),
-                    dim3_value: provider,
-                    event_count: 1,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut tx = pool.begin().await.expect("begin tx");
-        upsert_event_metric_buckets_dim3_in_tx(&mut tx, &deltas)
-            .await
-            .expect("cross-chunk dim3 conflict upsert should succeed");
-        tx.commit().await.expect("commit tx");
-
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(*)::BIGINT AS row_count, COALESCE(SUM(event_count), 0)::BIGINT AS total_count
-            FROM event_metric_buckets_dim3
-            WHERE project_id = $1
-              AND granularity = $2
-              AND bucket_start = $3
-              AND event_name = $4
-              AND dim1_key = $5
-              AND dim1_value = $6
-              AND dim2_key = $7
-              AND dim2_value = $8
-              AND dim3_key = $9
-              AND dim3_value = $10
-            "#,
-        )
-        .bind(project_id())
-        .bind(MetricGranularity::Hour.as_str())
-        .bind(timestamp(60))
-        .bind("app_open")
-        .bind("app_version")
-        .bind("1.0.0")
-        .bind("plan")
-        .bind("pro")
-        .bind("provider")
-        .bind("strava")
-        .fetch_one(&pool)
-        .await
-        .expect("fetch dim3 conflict counts");
-
-        assert_eq!(row.try_get::<i64, _>("row_count").expect("row_count"), 1);
-        assert_eq!(
-            row.try_get::<i64, _>("total_count").expect("total_count"),
-            2
-        );
-    }
-
-    #[sqlx::test]
-    async fn event_metric_dim4_conflicts_accumulate_across_chunk_boundaries(pool: PgPool) {
-        run_migrations(&pool).await.expect("migrations succeed");
-        ensure_local_project(&pool, Some(&bootstrap_config()))
-            .await
-            .expect("seed project");
-
-        let chunk_rows = max_rows_per_batched_statement(13);
-        let deltas = (0..(chunk_rows + 1))
-            .map(|index| {
-                let provider = if index == 0 || index == chunk_rows {
-                    "strava".to_owned()
-                } else {
-                    format!("provider-{index:04}")
-                };
-
-                EventMetricBucketDim4Delta {
-                    project_id: project_id(),
-                    granularity: MetricGranularity::Hour,
-                    bucket_start: timestamp(60),
-                    event_name: "app_open".to_owned(),
-                    dim1_key: "app_version".to_owned(),
-                    dim1_value: "1.0.0".to_owned(),
-                    dim2_key: "plan".to_owned(),
-                    dim2_value: "pro".to_owned(),
-                    dim3_key: "provider".to_owned(),
-                    dim3_value: provider,
-                    dim4_key: "region".to_owned(),
-                    dim4_value: "eu".to_owned(),
-                    event_count: 1,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut tx = pool.begin().await.expect("begin tx");
-        upsert_event_metric_buckets_dim4_in_tx(&mut tx, &deltas)
-            .await
-            .expect("cross-chunk dim4 conflict upsert should succeed");
-        tx.commit().await.expect("commit tx");
-
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(*)::BIGINT AS row_count, COALESCE(SUM(event_count), 0)::BIGINT AS total_count
-            FROM event_metric_buckets_dim4
-            WHERE project_id = $1
-              AND granularity = $2
-              AND bucket_start = $3
-              AND event_name = $4
-              AND dim1_key = $5
-              AND dim1_value = $6
-              AND dim2_key = $7
-              AND dim2_value = $8
-              AND dim3_key = $9
-              AND dim3_value = $10
-              AND dim4_key = $11
-              AND dim4_value = $12
-            "#,
-        )
-        .bind(project_id())
-        .bind(MetricGranularity::Hour.as_str())
-        .bind(timestamp(60))
-        .bind("app_open")
-        .bind("app_version")
-        .bind("1.0.0")
-        .bind("plan")
-        .bind("pro")
-        .bind("provider")
-        .bind("strava")
-        .bind("region")
-        .bind("eu")
-        .fetch_one(&pool)
-        .await
-        .expect("fetch dim4 conflict counts");
-
-        assert_eq!(row.try_get::<i64, _>("row_count").expect("row_count"), 1);
-        assert_eq!(
-            row.try_get::<i64, _>("total_count").expect("total_count"),
-            2
         );
     }
 
@@ -5818,7 +4955,7 @@ mod tests {
     }
 
     #[test]
-    fn forward_migration_adds_dim4_bucket_storage_and_cleans_legacy_daily_tables() {
+    fn forward_migration_keeps_event_bucket_storage_at_dim2_and_cleans_legacy_daily_tables() {
         let migration = include_str!("../migrations/0012_event_metric_dim4_cleanup.sql");
 
         assert!(
@@ -5827,30 +4964,13 @@ mod tests {
             ) && migration
                 .contains("idx_event_metric_buckets_dim2_project_event_dim1_value_bucket")
                 && migration
-                    .contains("idx_event_metric_buckets_dim2_project_event_dim2_value_bucket")
-                && migration.contains(
-                    "DROP INDEX IF EXISTS idx_event_metric_buckets_dim3_project_event_bucket"
-                )
-                && migration
-                    .contains("idx_event_metric_buckets_dim3_project_event_dim1_value_bucket")
-                && migration
-                    .contains("idx_event_metric_buckets_dim3_project_event_dim2_value_bucket")
-                && migration
-                    .contains("idx_event_metric_buckets_dim3_project_event_dim3_value_bucket"),
-            "0012 must realign dim2/dim3 bucket indexes to the bounded later-dimension read pattern"
+                    .contains("idx_event_metric_buckets_dim2_project_event_dim2_value_bucket"),
+            "0012 must keep the bounded dim2 event bucket indexes"
         );
         assert!(
-            migration.contains("CREATE TABLE IF NOT EXISTS event_metric_buckets_dim4")
-                && migration.contains("idx_event_metric_buckets_dim4_project_event_bucket")
-                && migration
-                    .contains("idx_event_metric_buckets_dim4_project_event_dim1_value_bucket")
-                && migration
-                    .contains("idx_event_metric_buckets_dim4_project_event_dim2_value_bucket")
-                && migration
-                    .contains("idx_event_metric_buckets_dim4_project_event_dim3_value_bucket")
-                && migration
-                    .contains("idx_event_metric_buckets_dim4_project_event_dim4_value_bucket"),
-            "0012 must add the canonical dim4 bucket table and bounded read indexes"
+            migration.contains("DROP TABLE IF EXISTS event_metric_buckets_dim3")
+                && migration.contains("DROP TABLE IF EXISTS event_metric_buckets_dim4"),
+            "0012 must drop dim3/dim4 event bucket storage in the D2 contract"
         );
         assert!(
             migration.contains("DROP TABLE IF EXISTS event_count_daily_total")
@@ -5879,6 +4999,41 @@ mod tests {
         assert!(
             !migration.contains("UPDATE api_keys"),
             "0008 should not carry legacy api_keys backfill logic in a brand-new stack"
+        );
+    }
+
+    #[test]
+    fn forward_migration_keeps_session_storage_at_dim2_and_adds_snapshot_columns() {
+        let migration = include_str!("../migrations/0015_session_metric_dim4.sql");
+
+        assert!(
+            migration.contains("ALTER TABLE sessions")
+                && migration.contains("ADD COLUMN IF NOT EXISTS os_version TEXT")
+                && migration.contains("ADD COLUMN IF NOT EXISTS properties JSONB"),
+            "0015 must widen sessions with session snapshot dimensions"
+        );
+        assert!(
+            migration.contains("ALTER TABLE install_first_seen")
+                && migration.contains("ADD COLUMN IF NOT EXISTS os_version TEXT")
+                && migration.contains("ADD COLUMN IF NOT EXISTS properties JSONB"),
+            "0015 must widen install_first_seen with first-seen snapshot dimensions"
+        );
+        assert!(
+            !migration.contains("CREATE TABLE IF NOT EXISTS session_metric_buckets_dim3")
+                && !migration.contains("CREATE TABLE IF NOT EXISTS session_metric_buckets_dim4"),
+            "0015 must not retain session dim3/dim4 bucket storage in the D2 contract"
+        );
+    }
+
+    #[test]
+    fn forward_migration_keeps_active_install_slice_membership_storage() {
+        let migration = include_str!("../migrations/0016_session_active_install_membership.sql");
+
+        assert!(
+            migration.contains("CREATE TABLE IF NOT EXISTS session_active_install_slices")
+                && migration.contains("idx_session_active_install_slices_project_day")
+                && migration.contains("idx_session_active_install_slices_project_day_platform"),
+            "0016 must keep the active-install membership table and its bounded day/platform indexes"
         );
     }
 
@@ -6189,6 +5344,26 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn run_migrations_creates_session_active_install_slices_table(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let table_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_name = 'session_active_install_slices'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch active install slices table existence");
+
+        assert!(table_exists);
+    }
+
+    #[sqlx::test]
     async fn run_migrations_create_bucketed_metrics_and_first_seen_tables(pool: PgPool) {
         run_migrations(&pool).await.expect("migrations succeed");
 
@@ -6200,12 +5375,11 @@ mod tests {
                 'event_metric_buckets_total',
                 'event_metric_buckets_dim1',
                 'event_metric_buckets_dim2',
-                'event_metric_buckets_dim3',
-                'event_metric_buckets_dim4',
                 'session_metric_buckets_total',
                 'session_metric_buckets_dim1',
                 'session_metric_buckets_dim2',
-                'install_first_seen'
+                'install_first_seen',
+                'session_active_install_slices'
             )
             ORDER BY table_name ASC
             "#,
@@ -6219,10 +5393,9 @@ mod tests {
             vec![
                 "event_metric_buckets_dim1".to_owned(),
                 "event_metric_buckets_dim2".to_owned(),
-                "event_metric_buckets_dim3".to_owned(),
-                "event_metric_buckets_dim4".to_owned(),
                 "event_metric_buckets_total".to_owned(),
                 "install_first_seen".to_owned(),
+                "session_active_install_slices".to_owned(),
                 "session_metric_buckets_dim1".to_owned(),
                 "session_metric_buckets_dim2".to_owned(),
                 "session_metric_buckets_total".to_owned(),

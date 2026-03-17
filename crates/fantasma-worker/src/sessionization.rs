@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use fantasma_core::Platform;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const SESSION_TIMEOUT_SECS: i64 = 30 * 60;
@@ -11,6 +12,8 @@ pub(crate) struct SessionEvent {
     pub(crate) install_id: String,
     pub(crate) platform: Platform,
     pub(crate) app_version: Option<String>,
+    pub(crate) os_version: Option<String>,
+    pub(crate) properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -101,6 +104,8 @@ fn session_from_event(event: &SessionEvent) -> fantasma_store::SessionRecord {
         duration_seconds: 0,
         platform: event.platform.clone(),
         app_version: event.app_version.clone(),
+        os_version: event.os_version.clone(),
+        properties: event.properties.clone(),
     }
 }
 
@@ -122,6 +127,7 @@ fn session_id(install_id: &str, session_start: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::collections::BTreeMap;
 
     fn project_id() -> Uuid {
         Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a)
@@ -139,6 +145,8 @@ mod tests {
         hour: u32,
         minute: u32,
         app_version: Option<&str>,
+        os_version: Option<&str>,
+        properties: &[(&str, &str)],
     ) -> SessionEvent {
         SessionEvent {
             project_id: project_id(),
@@ -146,15 +154,36 @@ mod tests {
             install_id: install_id.to_owned(),
             platform: Platform::Ios,
             app_version: app_version.map(str::to_owned),
+            os_version: os_version.map(str::to_owned),
+            properties: properties
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
         }
     }
 
     #[test]
     fn keeps_events_within_thirty_minutes_in_one_session() {
         let sessions = derive_sessions(&[
-            event("install-1", 1, 0, 0, Some("1.0.0")),
-            event("install-1", 1, 0, 10, None),
-            event("install-1", 1, 0, 29, Some("1.0.1")),
+            event(
+                "install-1",
+                1,
+                0,
+                0,
+                Some("1.0.0"),
+                Some("18.3"),
+                &[("plan", "pro"), ("provider", "strava")],
+            ),
+            event("install-1", 1, 0, 10, None, None, &[]),
+            event(
+                "install-1",
+                1,
+                0,
+                29,
+                Some("1.0.1"),
+                Some("18.4"),
+                &[("plan", "team"), ("provider", "garmin")],
+            ),
         ]);
 
         assert_eq!(sessions.len(), 1);
@@ -163,13 +192,21 @@ mod tests {
         assert_eq!(sessions[0].event_count, 3);
         assert_eq!(sessions[0].duration_seconds, 29 * 60);
         assert_eq!(sessions[0].app_version.as_deref(), Some("1.0.0"));
+        assert_eq!(sessions[0].os_version.as_deref(), Some("18.3"));
+        assert_eq!(
+            sessions[0].properties,
+            BTreeMap::from([
+                ("plan".to_owned(), "pro".to_owned()),
+                ("provider".to_owned(), "strava".to_owned())
+            ])
+        );
     }
 
     #[test]
     fn splits_sessions_when_gap_exceeds_thirty_minutes() {
         let sessions = derive_sessions(&[
-            event("install-1", 1, 0, 0, Some("1.0.0")),
-            event("install-1", 1, 0, 31, Some("1.0.0")),
+            event("install-1", 1, 0, 0, Some("1.0.0"), Some("18.3"), &[]),
+            event("install-1", 1, 0, 31, Some("1.0.0"), Some("18.3"), &[]),
         ]);
 
         assert_eq!(sessions.len(), 2);
@@ -180,8 +217,8 @@ mod tests {
     #[test]
     fn crosses_midnight_without_changing_start_day() {
         let sessions = derive_sessions(&[
-            event("install-1", 1, 23, 55, Some("1.0.0")),
-            event("install-1", 2, 0, 20, Some("1.0.1")),
+            event("install-1", 1, 23, 55, Some("1.0.0"), Some("18.3"), &[]),
+            event("install-1", 2, 0, 20, Some("1.0.1"), Some("18.4"), &[]),
         ]);
 
         assert_eq!(sessions.len(), 1);
@@ -203,14 +240,40 @@ mod tests {
             duration_seconds: 10 * 60,
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
+            os_version: Some("18.3".to_owned()),
+            properties: BTreeMap::from([("plan".to_owned(), "pro".to_owned())]),
         };
 
         let appended = derive_append_sessions(
             Some(tail),
             &[
-                event("install-1", 1, 0, 20, Some("1.0.1")),
-                event("install-1", 1, 1, 0, Some("1.1.0")),
-                event("install-1", 1, 1, 10, Some("1.1.1")),
+                event(
+                    "install-1",
+                    1,
+                    0,
+                    20,
+                    Some("1.0.1"),
+                    Some("18.4"),
+                    &[("plan", "team")],
+                ),
+                event(
+                    "install-1",
+                    1,
+                    1,
+                    0,
+                    Some("1.1.0"),
+                    Some("19.0"),
+                    &[("plan", "free")],
+                ),
+                event(
+                    "install-1",
+                    1,
+                    1,
+                    10,
+                    Some("1.1.1"),
+                    Some("19.1"),
+                    &[("plan", "pro")],
+                ),
             ],
         );
 
@@ -219,6 +282,11 @@ mod tests {
         assert_eq!(updated_tail.event_count, 3);
         assert_eq!(updated_tail.duration_seconds, 20 * 60);
         assert_eq!(updated_tail.app_version.as_deref(), Some("1.0.0"));
+        assert_eq!(updated_tail.os_version.as_deref(), Some("18.3"));
+        assert_eq!(
+            updated_tail.properties,
+            BTreeMap::from([("plan".to_owned(), "pro".to_owned())])
+        );
         assert_eq!(appended.new_sessions.len(), 1);
         assert_eq!(appended.new_sessions[0].session_start, timestamp(1, 1, 0));
         assert_eq!(appended.new_sessions[0].session_end, timestamp(1, 1, 10));
@@ -226,6 +294,11 @@ mod tests {
         assert_eq!(
             appended.new_sessions[0].app_version.as_deref(),
             Some("1.1.0")
+        );
+        assert_eq!(appended.new_sessions[0].os_version.as_deref(), Some("19.0"));
+        assert_eq!(
+            appended.new_sessions[0].properties,
+            BTreeMap::from([("plan".to_owned(), "free".to_owned())])
         );
     }
 }

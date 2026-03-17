@@ -109,6 +109,12 @@ Read visibility:
 - `reads-visibility-90d`
 - `reads-visibility-180d`
 
+The read-visibility matrix now includes grouped D2 reads for events plus
+session `count`, `duration_total`, and `new_installs`. Day-level
+dimension-aware `active_installs` reads remain visibility-only and are not
+hard gates, because filtered and grouped active-install slices may overlap by
+design.
+
 Legacy mapping:
 
 - old `append-30d/90d/180d` is now `stress-append-30d/90d/180d`

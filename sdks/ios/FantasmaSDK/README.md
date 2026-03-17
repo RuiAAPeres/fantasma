@@ -35,7 +35,7 @@ Task {
 ```
 
 `track(_:properties:)` only takes the explicit string properties you want on
-the event, with at most 4 keys per event. Property names must match
+the event, with at most 2 keys per event. Property names must match
 `^[a-z][a-z0-9_]{0,62}$` and may not use reserved keys such as `event`,
 `install_id`, `metric`, `granularity`, `start`, `end`, `platform`,
 `app_version`, or `os_version`. The SDK rejects invalid properties before they

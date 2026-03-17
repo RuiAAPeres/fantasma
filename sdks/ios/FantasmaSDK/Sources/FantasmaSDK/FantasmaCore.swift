@@ -83,7 +83,7 @@ private enum EventPropertyValidation {
             return nil
         }
 
-        guard properties.count <= 4 else {
+        guard properties.count <= 2 else {
             throw FantasmaError.invalidPropertyCount
         }
 

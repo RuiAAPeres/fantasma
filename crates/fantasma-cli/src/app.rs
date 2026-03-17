@@ -577,6 +577,7 @@ impl App {
         &self,
         sessions: SessionMetricsArgs,
     ) -> anyhow::Result<CommandOutput> {
+        validate_session_metrics_args(&sessions)?;
         let body = self
             .metrics_request(MetricsRequest {
                 path: "/v1/metrics/sessions",
@@ -913,8 +914,21 @@ impl SessionMetricArg {
             Self::Count => "count",
             Self::DurationTotal => "duration_total",
             Self::NewInstalls => "new_installs",
+            Self::ActiveInstalls => "active_installs",
         }
     }
+}
+
+fn validate_session_metrics_args(args: &SessionMetricsArgs) -> anyhow::Result<()> {
+    if args.metric != SessionMetricArg::ActiveInstalls {
+        return Ok(());
+    }
+
+    if args.granularity != crate::cli::MetricGranularityArg::Day {
+        bail!("active_installs only supports day granularity");
+    }
+
+    Ok(())
 }
 
 impl crate::cli::MetricGranularityArg {

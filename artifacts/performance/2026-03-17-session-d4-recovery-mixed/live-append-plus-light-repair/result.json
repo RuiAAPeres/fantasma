@@ -1,0 +1,59 @@
+{
+  "scenario": "live-append-plus-light-repair",
+  "run_config": {
+    "mode": "iterative",
+    "publication_repetitions": 1,
+    "worker_config": {
+      "session_batch_size": 1000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2,
+      "idle_poll_interval_ms": 250
+    }
+  },
+  "phases": [
+    {
+      "name": "append_uploads",
+      "events_sent": 225000,
+      "elapsed_ms": 203518,
+      "events_per_second": 1105.5487025048262
+    },
+    {
+      "name": "repair_uploads",
+      "events_sent": 180,
+      "elapsed_ms": 42189,
+      "events_per_second": 4.266415042988354
+    }
+  ],
+  "readiness": [
+    {
+      "name": "event_metrics_ready_ms",
+      "elapsed_ms": 7
+    },
+    {
+      "name": "session_metrics_ready_ms",
+      "elapsed_ms": 19
+    },
+    {
+      "name": "derived_metrics_ready_ms",
+      "elapsed_ms": 19
+    }
+  ],
+  "checkpoint_readiness": {
+    "sample_count": 234,
+    "event_metrics_ready_p50_ms": 220,
+    "event_metrics_ready_p95_ms": 329,
+    "event_metrics_ready_max_ms": 425,
+    "session_metrics_ready_p50_ms": 651,
+    "session_metrics_ready_p95_ms": 1784,
+    "session_metrics_ready_max_ms": 5959,
+    "derived_metrics_ready_p50_ms": 651,
+    "derived_metrics_ready_p95_ms": 1784,
+    "derived_metrics_ready_max_ms": 5959
+  },
+  "queries": [],
+  "budget": {
+    "passed": true,
+    "failures": []
+  }
+}

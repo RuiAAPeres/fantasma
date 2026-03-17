@@ -1,0 +1,92 @@
+{
+  "host": {
+    "environment": "local"
+  },
+  "suites": [
+    "representative",
+    "mixed-repair"
+  ],
+  "run_config": {
+    "mode": "iterative",
+    "publication_repetitions": 1,
+    "worker_config": {
+      "session_batch_size": 1000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2,
+      "idle_poll_interval_ms": 250
+    }
+  },
+  "verdict": {
+    "baseline_source": "docs/STATUS.md benchmark usability reset entry (2026-03-15 representative + mixed-repair iterative smokes)",
+    "mixed_repair": {
+      "overall": "worse",
+      "checkpoint_sample_count_matches": true,
+      "checkpoint_derived": "worse",
+      "final_derived": "flat"
+    },
+    "dominant_stage_b_phase": "unchanged",
+    "overall": "worse"
+  },
+  "scenarios": [
+    {
+      "scenario": "live-append-plus-light-repair",
+      "run_config": {
+        "mode": "iterative",
+        "publication_repetitions": 1,
+        "worker_config": {
+          "session_batch_size": 1000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2,
+          "idle_poll_interval_ms": 250
+        }
+      },
+      "phases": [
+        {
+          "name": "append_uploads",
+          "events_sent": 225000,
+          "elapsed_ms": 227878,
+          "events_per_second": 987.3677351323079
+        },
+        {
+          "name": "repair_uploads",
+          "events_sent": 180,
+          "elapsed_ms": 12002,
+          "events_per_second": 14.997181572168552
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 5
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 12
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 12
+        }
+      ],
+      "checkpoint_readiness": {
+        "sample_count": 234,
+        "event_metrics_ready_p50_ms": 220,
+        "event_metrics_ready_p95_ms": 328,
+        "event_metrics_ready_max_ms": 428,
+        "session_metrics_ready_p50_ms": 555,
+        "session_metrics_ready_p95_ms": 1594,
+        "session_metrics_ready_max_ms": 1941,
+        "derived_metrics_ready_p50_ms": 555,
+        "derived_metrics_ready_p95_ms": 1594,
+        "derived_metrics_ready_max_ms": 1941
+      },
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    }
+  ]
+}

@@ -165,6 +165,9 @@ pub enum MetricsSubcommand {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  fantasma metrics events --event app_open --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider\n  fantasma metrics events --event app_open --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --group-by platform --group-by app_version"
+)]
 pub struct EventMetricsArgs {
     #[arg(long)]
     pub event: String,
@@ -176,9 +179,15 @@ pub struct EventMetricsArgs {
     pub start: String,
     #[arg(long)]
     pub end: String,
-    #[arg(long = "filter")]
+    #[arg(
+        long = "filter",
+        help = "Repeat key=value filters. Filters plus group-by may reference at most 2 distinct dimensions total."
+    )]
     pub filters: Vec<String>,
-    #[arg(long = "group-by")]
+    #[arg(
+        long = "group-by",
+        help = "Repeat up to twice. Combined with filters, the API accepts at most 2 distinct dimensions total."
+    )]
     pub group_by: Vec<String>,
     #[command(flatten)]
     pub output: ReadOutputArgs,
@@ -227,6 +236,9 @@ pub struct EventCatalogArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  fantasma metrics sessions --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider\n  fantasma metrics sessions --metric active_installs --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider"
+)]
 pub struct SessionMetricsArgs {
     #[arg(long)]
     pub metric: SessionMetricArg,
@@ -236,9 +248,15 @@ pub struct SessionMetricsArgs {
     pub start: String,
     #[arg(long)]
     pub end: String,
-    #[arg(long = "filter")]
+    #[arg(
+        long = "filter",
+        help = "Repeat key=value filters. Filters plus group-by may reference at most 2 distinct dimensions total."
+    )]
     pub filters: Vec<String>,
-    #[arg(long = "group-by")]
+    #[arg(
+        long = "group-by",
+        help = "Repeat up to twice. Combined with filters, the API accepts at most 2 distinct dimensions total. active_installs still requires --granularity day."
+    )]
     pub group_by: Vec<String>,
     #[command(flatten)]
     pub output: ReadOutputArgs,
@@ -262,6 +280,7 @@ pub enum SessionMetricArg {
     Count,
     DurationTotal,
     NewInstalls,
+    ActiveInstalls,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]

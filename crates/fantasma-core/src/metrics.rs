@@ -40,6 +40,7 @@ pub enum SessionMetric {
     Count,
     DurationTotal,
     NewInstalls,
+    ActiveInstalls,
 }
 
 impl SessionMetric {
@@ -48,6 +49,7 @@ impl SessionMetric {
             Self::Count => "count",
             Self::DurationTotal => "duration_total",
             Self::NewInstalls => "new_installs",
+            Self::ActiveInstalls => "active_installs",
         }
     }
 }

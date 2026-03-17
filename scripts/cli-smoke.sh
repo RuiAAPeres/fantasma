@@ -81,11 +81,12 @@ extract_line_value() {
 }
 
 poll_metrics() {
-  local deadline metrics_json value
+  local deadline metrics_json value active_json active_value
   deadline=$((SECONDS + TIMEOUT_SECONDS))
 
   while ((SECONDS < deadline)); do
     metrics_json="$(cli metrics sessions --metric count --granularity day --start 2026-01-01 --end 2026-01-01 --json)"
+    active_json="$(cli metrics sessions --metric active_installs --granularity day --start 2026-01-01 --end 2026-01-01 --json)"
     value="$(
       python3 - "$metrics_json" <<'PY'
 import json
@@ -97,9 +98,21 @@ points = series[0]["points"] if series else []
 print(points[0]["value"] if points else "")
 PY
     )"
+    active_value="$(
+      python3 - "$active_json" <<'PY'
+import json
+import sys
 
-    if [[ "$value" == "1" ]]; then
+payload = json.loads(sys.argv[1])
+series = payload.get("series", [])
+points = series[0]["points"] if series else []
+print(points[0]["value"] if points else "")
+PY
+    )"
+
+    if [[ "$value" == "1" && "$active_value" == "1" ]]; then
       printf '%s\n' "$metrics_json"
+      printf '%s\n' "$active_json"
       return 0
     fi
 

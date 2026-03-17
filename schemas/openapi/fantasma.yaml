@@ -9,7 +9,7 @@ info:
     The current public surface covers raw event ingestion, operator-managed
     project provisioning, worker-derived session metrics, and worker-derived
     event metrics. Event properties are explicit string-to-string context with
-    at most 4 keys.
+    at most 2 keys.
 servers:
   - url: http://localhost:8081
     description: Local ingest service
@@ -353,7 +353,7 @@ paths:
           `end_date` fail fast and are never reinterpreted as property filters
 
         `group_by` may be repeated up to twice. The total number of distinct
-        referenced dimensions across filters plus `group_by` is capped at 4.
+        referenced dimensions across filters plus `group_by` is capped at 2.
         Queries exceeding 100 final groups fail with `group_limit_exceeded`.
       x-fantasma-explicit-property-filters:
         type: object
@@ -622,19 +622,36 @@ paths:
       security:
         - ProjectKeyHeader: []
       description: |
-        Session metrics are eventually consistent because the API reads only
-        from worker-built hourly and daily rollups.
+        Session metrics are eventually consistent because the API reads from
+        worker-maintained session-derived state.
 
         Supported public metrics are:
 
         - `count`
         - `duration_total`
         - `new_installs`
+        - `active_installs`
 
-        `group_by` may be repeated up to twice and supports only `platform`
-        and `app_version`. Equality filters are limited to the same
-        dimensions. Legacy public params such as `project_id`, `start_date`,
-        and `end_date` fail fast with `422`.
+        `count`, `duration_total`, and `new_installs` read from worker-built
+        hourly and daily rollups.
+
+        `active_installs` supports only `granularity=day`, but it accepts the
+        same session D2 filter and grouping vocabulary as the other session
+        metrics.
+
+        Built-in session dimensions are `platform`, `app_version`, and
+        `os_version`. Any other non-reserved query key matching
+        `^[a-z][a-z0-9_]{0,62}$` is an equality filter or `group_by`
+        dimension on an explicit string property captured from the session's
+        first event. `group_by` may be repeated up to twice, and the total
+        number of distinct referenced dimensions across filters plus
+        `group_by` is capped at 2. Legacy public params such as `project_id`,
+        `start_date`, and `end_date` fail fast with `422`.
+
+        `new_installs` keeps first-seen assignment fixed once an install is
+        recorded, even if earlier late events arrive later. `active_installs`
+        grouped or filtered slices may overlap, so grouped totals are not
+        guaranteed to sum back to the ungrouped distinct-install total.
       parameters:
         - $ref: '#/components/parameters/SessionMetric'
         - $ref: '#/components/parameters/MetricGranularity'
@@ -643,6 +660,7 @@ paths:
         - $ref: '#/components/parameters/SessionGroupBy'
         - $ref: '#/components/parameters/PlatformFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
+        - $ref: '#/components/parameters/OsVersionFilter'
       responses:
         '200':
           description: Bucketed session metric series using the uniform metrics family response shape.
@@ -660,8 +678,15 @@ paths:
           description: |
             Invalid query. Error envelope is `{ "error": "..." }` with one of:
 
-            - `invalid_request`
-            - `group_limit_exceeded`
+            - `invalid_group_by`
+            - `duplicate_group_by`
+            - `duplicate_query_key`
+            - `invalid_query_key`
+            - `too_many_group_by_dimensions`
+            - `conflicting_dimension_usage`
+            - `too_many_dimensions`
+            - `group_limit_exceeded` for grouped `count`, `duration_total`,
+              `new_installs`, and `active_installs` queries
           content:
             application/json:
               schema:
@@ -729,10 +754,10 @@ components:
         maxItems: 2
         items:
           type: string
-          enum:
-            - platform
-            - app_version
-      description: Repeat up to twice. Only `platform` and `app_version` are supported for session metrics.
+      description: |
+        Repeat up to twice. Built-ins use `platform`, `app_version`, or
+        `os_version`. Explicit properties use canonical keys that match
+        `^[a-z][a-z0-9_]{0,62}$`.
     EventMetric:
       in: query
       name: metric
@@ -751,6 +776,7 @@ components:
           - count
           - duration_total
           - new_installs
+          - active_installs
     MetricGranularity:
       in: query
       name: granularity
@@ -1000,7 +1026,7 @@ components:
         - android
     EventProperties:
       type: object
-      maxProperties: 4
+      maxProperties: 2
       propertyNames:
         allOf:
           - type: string
@@ -1024,7 +1050,7 @@ components:
                 - os_version
       additionalProperties:
         type: string
-      description: Explicit string event context, capped at 4 keys. Reserved keys are rejected, and properties must not be used to reconstruct person-level identity.
+      description: Explicit string event context, capped at 2 keys. Reserved keys are rejected, and properties must not be used to reconstruct person-level identity.
     EventPayload:
       type: object
       description: Install-scoped mobile event payload for Fantasma.

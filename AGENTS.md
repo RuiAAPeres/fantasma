@@ -107,6 +107,7 @@ Fantasma now expects Codex agents to use the installed `superpowers` skills when
 - When the user reports a bug, do not start by patching code. First write a test that reproduces the bug.
 - After the reproducing test exists, use subagents to investigate and attempt fixes when that can reduce iteration time.
 - Do not call a bug fixed unless the reproducing test passes after the change.
+- When a benchmark, smoke run, or manual verification catches a correctness bug, reduce it to the smallest automated regression test you can in the same change. Do not leave the benchmark artifact as the only proof the bug existed.
 - Use `systematic-debugging` for defects, flaky tests, or unexpected runtime behavior instead of guessing at fixes.
 - Use `verification-before-completion` before claiming work is done, fixed, or passing. Do not report success without fresh command output.
 - Before pushing, run the same CI-scope checks your change can affect. At minimum, workspace-affecting Rust changes must run `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`, not just package-scoped checks; new scripts must at least pass `bash -n`.

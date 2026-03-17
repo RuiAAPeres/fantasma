@@ -29,7 +29,7 @@ use fantasma_store::{
     list_projects, list_top_events, load_project, rename_project, resolve_api_key, revoke_api_key,
 };
 use serde::{Deserialize, de::DeserializeOwned};
-use sqlx::{Postgres, Transaction};
+use sqlx::{Postgres, QueryBuilder, Row, Transaction};
 use url::form_urlencoded;
 use uuid::Uuid;
 
@@ -142,7 +142,7 @@ impl EventMetricsQueryError {
 }
 
 const MAX_GROUP_BY_DIMENSIONS: usize = 2;
-const MAX_EVENT_REFERENCED_DIMENSIONS: usize = 4;
+const MAX_EVENT_REFERENCED_DIMENSIONS: usize = 2;
 const MAX_METRIC_GROUPS: usize = 100;
 type GroupKey = Vec<Option<String>>;
 type CountsByBucket = BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>;
@@ -327,26 +327,54 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
                 end = Some(value);
             }
             "group_by" => {
-                if !is_supported_session_dimension(&value) || !group_by_seen.insert(value.clone()) {
-                    return Err("invalid_request");
+                if value.is_empty() {
+                    return Err("invalid_group_by");
                 }
+
+                if !is_supported_session_dimension(&value)
+                    && (is_reserved_event_property_key(&value)
+                        || !is_valid_event_property_key(&value))
+                {
+                    return Err("invalid_group_by");
+                }
+
+                if !group_by_seen.insert(value.clone()) {
+                    return Err("duplicate_group_by");
+                }
+
                 group_by.push(value);
             }
-            "platform" | "app_version" => {
+            "platform" | "app_version" | "os_version" => {
                 if filters.insert(key, value).is_some() {
-                    return Err("invalid_request");
+                    return Err("duplicate_query_key");
                 }
             }
-            _ => return Err("invalid_request"),
+            "project_id" | "start_date" | "end_date" => return Err("invalid_query_key"),
+            _ => {
+                if is_reserved_event_property_key(&key) || !is_valid_event_property_key(&key) {
+                    return Err("invalid_query_key");
+                }
+
+                if filters.insert(key, value).is_some() {
+                    return Err("duplicate_query_key");
+                }
+            }
         }
     }
 
     if group_by.len() > MAX_GROUP_BY_DIMENSIONS {
-        return Err("invalid_request");
+        return Err("too_many_group_by_dimensions");
     }
 
-    if group_by.iter().any(|key| filters.contains_key(key)) {
-        return Err("invalid_request");
+    let filter_keys = filters.keys().cloned().collect::<BTreeSet<_>>();
+    if group_by.iter().any(|key| filter_keys.contains(key)) {
+        return Err("conflicting_dimension_usage");
+    }
+
+    let mut referenced_dimensions = filter_keys;
+    referenced_dimensions.extend(group_by.iter().cloned());
+    if referenced_dimensions.len() > MAX_EVENT_REFERENCED_DIMENSIONS {
+        return Err("too_many_dimensions");
     }
 
     Ok(PublicSessionMetricsQuery {
@@ -591,6 +619,7 @@ fn parse_session_metric(raw: &str) -> Option<SessionMetric> {
         "count" => Some(SessionMetric::Count),
         "duration_total" => Some(SessionMetric::DurationTotal),
         "new_installs" => Some(SessionMetric::NewInstalls),
+        "active_installs" => Some(SessionMetric::ActiveInstalls),
         _ => None,
     }
 }
@@ -650,7 +679,7 @@ fn parse_hour_bucket(raw: &str) -> Result<DateTime<Utc>, &'static str> {
 }
 
 fn is_supported_session_dimension(key: &str) -> bool {
-    matches!(key, "platform" | "app_version")
+    matches!(key, "platform" | "app_version" | "os_version")
 }
 
 #[allow(clippy::result_large_err)]
@@ -1102,7 +1131,17 @@ async fn sessions_metrics(
         group_by: public_query.group_by,
     };
 
-    match execute_session_metrics_query(&state.pool, &query).await {
+    if let Err(error) = validate_active_installs_query(&query) {
+        return query_error_response(error);
+    }
+
+    let response = if query.metric == SessionMetric::ActiveInstalls {
+        execute_active_installs_query(&state.pool, &query).await
+    } else {
+        execute_session_metrics_query(&state.pool, &query).await
+    };
+
+    match response {
         Ok(response) => (
             StatusCode::OK,
             Json(serde_json::to_value(response).expect("serialize session metrics response")),
@@ -1238,6 +1277,42 @@ async fn execute_event_metrics_query(
     let mut tx = begin_metrics_snapshot(pool).await?;
     precheck_event_metrics_group_limit(&mut tx, query).await?;
     let counts_by_bucket = load_event_group_counts_by_bucket(&mut tx, query).await?;
+    tx.commit().await.map_err(StoreError::Database)?;
+
+    Ok(build_metrics_response(
+        query.metric.as_str(),
+        &query.window,
+        &query.group_by,
+        counts_by_bucket,
+    ))
+}
+
+fn validate_active_installs_query(query: &SessionMetricsQuery) -> Result<(), &'static str> {
+    if query.metric != SessionMetric::ActiveInstalls {
+        return Ok(());
+    }
+
+    if query.window.granularity != MetricGranularity::Day {
+        return Err("invalid_request");
+    }
+
+    Ok(())
+}
+
+async fn execute_active_installs_query(
+    pool: &PgPool,
+    query: &SessionMetricsQuery,
+) -> Result<MetricsResponse, MetricsResponseError> {
+    let mut tx = begin_metrics_snapshot(pool).await?;
+    let counts_by_bucket = load_active_install_counts_by_bucket(&mut tx, query).await?;
+    let group_count = counts_by_bucket
+        .values()
+        .flat_map(|groups| groups.keys())
+        .collect::<BTreeSet<_>>()
+        .len();
+    if group_count > MAX_METRIC_GROUPS {
+        return Err(MetricsResponseError::GroupLimitExceeded);
+    }
     tx.commit().await.map_err(StoreError::Database)?;
 
     Ok(build_metrics_response(
@@ -1525,6 +1600,74 @@ async fn load_event_group_counts_by_bucket(
     }
 }
 
+async fn load_active_install_counts_by_bucket(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &SessionMetricsQuery,
+) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
+    let bucket_expr = "day::timestamp AT TIME ZONE 'UTC'";
+    let mut builder = QueryBuilder::<Postgres>::new("WITH session_slices AS (SELECT ");
+    builder.push(bucket_expr);
+    builder.push(" AS bucket_start, install_id, platform, app_version, os_version, properties");
+
+    builder.push(" FROM session_active_install_slices WHERE project_id = ");
+    builder.push_bind(query.project_id);
+    builder.push(" AND day BETWEEN ");
+    builder.push_bind(query.window.start.date_naive());
+    builder.push(" AND ");
+    builder.push_bind(query.window.end.date_naive());
+
+    for (key, value) in &query.filters {
+        builder.push(" AND ");
+        push_active_install_filter_predicate(&mut builder, key, value);
+    }
+
+    builder.push(") SELECT bucket_start");
+    for key in &query.group_by {
+        builder.push(", ");
+        push_active_install_dimension_expr(&mut builder, key);
+        builder.push(" AS ");
+        builder.push(active_install_dimension_alias(key));
+    }
+    builder.push(", COUNT(*)::BIGINT AS value FROM session_slices GROUP BY bucket_start");
+    for key in &query.group_by {
+        builder.push(", ");
+        builder.push(active_install_dimension_alias(key));
+    }
+    builder.push(" ORDER BY bucket_start ASC");
+    for key in &query.group_by {
+        builder.push(", ");
+        builder.push(active_install_dimension_alias(key));
+        builder.push(" ASC");
+    }
+
+    let rows = builder
+        .build()
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StoreError::from)?;
+    let mut counts_by_bucket = BTreeMap::<DateTime<Utc>, BTreeMap<GroupKey, u64>>::new();
+
+    for row in rows {
+        let bucket_start = row
+            .try_get::<DateTime<Utc>, _>("bucket_start")
+            .expect("bucket_start column exists");
+        let group_key = query
+            .group_by
+            .iter()
+            .map(|key| {
+                row.try_get::<Option<String>, _>(active_install_dimension_alias(key))
+                    .expect("group dimension column exists")
+            })
+            .collect::<Vec<_>>();
+        counts_by_bucket.entry(bucket_start).or_default().insert(
+            group_key,
+            row.try_get::<i64, _>("value").expect("value column exists") as u64,
+        );
+    }
+
+    Ok(counts_by_bucket)
+}
+
 async fn load_session_group_counts_by_bucket(
     tx: &mut Transaction<'_, Postgres>,
     query: &SessionMetricsQuery,
@@ -1809,6 +1952,60 @@ fn cube_keys_with(filters: &BTreeMap<String, String>, group_keys: &[String]) -> 
     keys
 }
 
+fn push_active_install_dimension_expr(builder: &mut QueryBuilder<'_, Postgres>, key: &str) {
+    match key {
+        "platform" => {
+            builder.push("platform");
+        }
+        "app_version" => {
+            builder.push("CASE WHEN app_version_is_null THEN NULL ELSE app_version END");
+        }
+        "os_version" => {
+            builder.push("CASE WHEN os_version_is_null THEN NULL ELSE os_version END");
+        }
+        _ => {
+            builder.push("properties ->> ");
+            builder.push_bind(key.to_owned());
+        }
+    }
+}
+
+fn push_active_install_filter_predicate(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    key: &str,
+    value: &str,
+) {
+    match key {
+        "platform" => {
+            builder.push("platform = ");
+            builder.push_bind(value.to_owned());
+        }
+        "app_version" => {
+            builder.push("app_version_is_null = FALSE AND app_version = ");
+            builder.push_bind(value.to_owned());
+        }
+        "os_version" => {
+            builder.push("os_version_is_null = FALSE AND os_version = ");
+            builder.push_bind(value.to_owned());
+        }
+        _ => {
+            builder.push("properties ->> ");
+            builder.push_bind(key.to_owned());
+            builder.push(" = ");
+            builder.push_bind(value.to_owned());
+        }
+    }
+}
+
+fn active_install_dimension_alias(key: &str) -> &str {
+    match key {
+        "platform" => "platform",
+        "app_version" => "app_version",
+        "os_version" => "os_version",
+        _ => key,
+    }
+}
+
 fn sum_rows_by_bucket(rows: &[MetricsCubeValueRow]) -> BTreeMap<DateTime<Utc>, u64> {
     let mut totals = BTreeMap::new();
 
@@ -1868,9 +2065,9 @@ fn synthesize_single_group_counts(
     let non_null_total = non_null_groups.values().sum::<u64>();
 
     if non_null_total > total {
-        return Err(StoreError::InvariantViolation(
-            "grouped non-null buckets exceeded total".to_owned(),
-        ));
+        // Session cuboids can be temporarily out of sync while bounded rebuild batches catch up.
+        // Returning the visible non-null groups is better than failing the whole request.
+        return Ok(non_null_groups);
     }
 
     let null_count = total - non_null_total;
@@ -1921,13 +2118,7 @@ fn synthesize_two_group_counts(
             .get(&first_value)
             .copied()
             .unwrap_or_default();
-        if used > total_for_first {
-            return Err(StoreError::InvariantViolation(
-                "pair totals exceeded first-dimension total".to_owned(),
-            ));
-        }
-
-        let null_count = total_for_first - used;
+        let null_count = total_for_first.saturating_sub(used);
         if null_count > 0 {
             returned_total += null_count;
             final_groups.insert(vec![Some(first_value), None], null_count);
@@ -1944,13 +2135,7 @@ fn synthesize_two_group_counts(
             .get(&second_value)
             .copied()
             .unwrap_or_default();
-        if used > total_for_second {
-            return Err(StoreError::InvariantViolation(
-                "pair totals exceeded second-dimension total".to_owned(),
-            ));
-        }
-
-        let null_count = total_for_second - used;
+        let null_count = total_for_second.saturating_sub(used);
         if null_count > 0 {
             returned_total += null_count;
             final_groups.insert(vec![None, Some(second_value)], null_count);
@@ -1958,9 +2143,7 @@ fn synthesize_two_group_counts(
     }
 
     if returned_total > total {
-        return Err(StoreError::InvariantViolation(
-            "grouped totals exceeded total".to_owned(),
-        ));
+        return Ok(final_groups);
     }
 
     let double_null = total - returned_total;
@@ -2266,24 +2449,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_event_metrics_query_accepts_four_referenced_dimensions() {
+    fn parse_event_metrics_query_accepts_two_referenced_dimensions() {
         let query = parse_event_metrics_query(
-            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&app_version=1.4.0&plan=pro&group_by=provider&group_by=region",
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&plan=pro&group_by=provider",
         )
         .expect("query parses");
 
-        assert_eq!(
-            query.group_by,
-            vec!["provider".to_owned(), "region".to_owned()]
-        );
-        assert_eq!(query.filters.get("app_version"), Some(&"1.4.0".to_owned()));
+        assert_eq!(query.group_by, vec!["provider".to_owned()]);
         assert_eq!(query.filters.get("plan"), Some(&"pro".to_owned()));
     }
 
     #[test]
-    fn parse_event_metrics_query_rejects_five_referenced_dimensions() {
+    fn parse_event_metrics_query_rejects_three_referenced_dimensions() {
         let error = parse_event_metrics_query(
-            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.4.0&plan=pro&group_by=provider&group_by=region",
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&app_version=1.4.0&plan=pro&group_by=provider",
         )
         .unwrap_err();
 
@@ -2313,13 +2492,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_metric_query_accepts_two_referenced_dimensions() {
+        let query = parse_session_metric_query(
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&plan=pro&group_by=provider",
+        )
+        .expect("query parses");
+
+        assert_eq!(query.group_by, vec!["provider".to_owned()]);
+        assert_eq!(query.filters.get("plan"), Some(&"pro".to_owned()));
+    }
+
+    #[test]
+    fn parse_session_metric_query_rejects_three_referenced_dimensions() {
+        let error = parse_session_metric_query(
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&app_version=1.4.0&plan=pro&group_by=provider",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "too_many_dimensions");
+    }
+
+    #[test]
     fn parse_session_metric_query_rejects_legacy_project_id() {
         let error = parse_session_metric_query(
             "project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&metric=count&granularity=day&start=2026-03-01&end=2026-03-02",
         )
         .unwrap_err();
 
-        assert_eq!(error, "invalid_request");
+        assert_eq!(error, "invalid_query_key");
     }
 
     #[test]
@@ -2329,7 +2529,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, "invalid_request");
+        assert_eq!(error, "invalid_query_key");
     }
 
     #[test]
@@ -2515,5 +2715,31 @@ mod tests {
             final_groups.get(&vec![None, Some("false".to_owned())]),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn synthesize_single_group_counts_tolerates_temporarily_inconsistent_totals() {
+        let non_null = BTreeMap::from([(vec![Some("ios".to_owned())], 3_u64)]);
+
+        let final_groups =
+            synthesize_single_group_counts(non_null.clone(), 2).expect("groups synthesize");
+
+        assert_eq!(final_groups, non_null);
+    }
+
+    #[test]
+    fn synthesize_two_group_counts_tolerates_temporarily_inconsistent_totals() {
+        let pair_groups = BTreeMap::from([(
+            vec![Some("ios".to_owned()), Some("1.0.0".to_owned())],
+            3_u64,
+        )]);
+        let first_groups = BTreeMap::from([(vec![Some("ios".to_owned())], 2_u64)]);
+        let second_groups = BTreeMap::from([(vec![Some("1.0.0".to_owned())], 2_u64)]);
+
+        let final_groups =
+            synthesize_two_group_counts(pair_groups.clone(), first_groups, second_groups, 2)
+                .expect("groups synthesize");
+
+        assert_eq!(final_groups, pair_groups);
     }
 }

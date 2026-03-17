@@ -453,6 +453,16 @@ curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=new_installs&granula
 ```
 
 ```bash
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-02" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
+```
+
+```bash
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-02&plan=pro&group_by=provider" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
+```
+
+```bash
 curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02&platform=ios&group_by=provider" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```

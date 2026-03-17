@@ -34,7 +34,7 @@ Task {
 }
 ```
 
-Pass only explicit string properties to `track(_:properties:)`, with at most 4
+Pass only explicit string properties to `track(_:properties:)`, with at most 2
 keys per event. Property names must match `^[a-z][a-z0-9_]{0,62}$` and cannot
 use reserved keys such as `event`, `install_id`, `metric`, `granularity`,
 `start`, `end`, `platform`, `app_version`, or `os_version`. The SDK rejects

@@ -88,7 +88,7 @@ wait_for_http() {
 
 poll_metrics() {
   local deadline now count_response count_compact duration_response duration_compact
-  local installs_response installs_compact event_response event_compact
+  local installs_response installs_compact active_response active_compact event_response event_compact
   local hourly_count_response hourly_count_compact
   deadline=$((SECONDS + TIMEOUT_SECONDS))
 
@@ -102,6 +102,9 @@ poll_metrics() {
     installs_response="$(curl -fsS \
       "http://localhost:8082/v1/metrics/sessions?metric=new_installs&granularity=day&start=2026-01-01&end=2026-01-02" \
       -H "X-Fantasma-Key: ${READ_KEY}" || true)"
+    active_response="$(curl -fsS \
+      "http://localhost:8082/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-02" \
+      -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     hourly_count_response="$(curl -fsS \
       "http://localhost:8082/v1/metrics/sessions?metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z" \
       -H "X-Fantasma-Key: ${READ_KEY}" || true)"
@@ -111,6 +114,7 @@ poll_metrics() {
     count_compact="$(printf '%s' "$count_response" | tr -d '[:space:]')"
     duration_compact="$(printf '%s' "$duration_response" | tr -d '[:space:]')"
     installs_compact="$(printf '%s' "$installs_response" | tr -d '[:space:]')"
+    active_compact="$(printf '%s' "$active_response" | tr -d '[:space:]')"
     hourly_count_compact="$(printf '%s' "$hourly_count_response" | tr -d '[:space:]')"
     event_compact="$(printf '%s' "$event_response" | tr -d '[:space:]')"
 
@@ -124,6 +128,9 @@ poll_metrics() {
           "$installs_compact" == *'"metric":"new_installs"'* &&
           "$installs_compact" == *'"bucket":"2026-01-01","value":1'* &&
           "$installs_compact" == *'"bucket":"2026-01-02","value":0'* &&
+          "$active_compact" == *'"metric":"active_installs"'* &&
+          "$active_compact" == *'"bucket":"2026-01-01","value":1'* &&
+          "$active_compact" == *'"bucket":"2026-01-02","value":0'* &&
           "$hourly_count_compact" == *'"metric":"count"'* &&
           "$hourly_count_compact" == *'"granularity":"hour"'* &&
           "$hourly_count_compact" == *'"bucket":"2026-01-01T00:00:00Z","value":1'* &&
@@ -135,6 +142,7 @@ poll_metrics() {
       printf '%s\n' "$count_response"
       printf '%s\n' "$duration_response"
       printf '%s\n' "$installs_response"
+      printf '%s\n' "$active_response"
       printf '%s\n' "$hourly_count_response"
       printf '%s\n' "$event_response"
       return 0

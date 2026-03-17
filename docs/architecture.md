@@ -196,7 +196,7 @@ Optional event fields:
 
 - `app_version`
 - `os_version`
-- at most 4 explicit string `properties`
+- at most 2 explicit string `properties`
 
 Identity model:
 
@@ -236,16 +236,21 @@ Event metrics:
 - built-in equality filters use `platform`, `app_version`, and `os_version`
 - any other non-reserved query key matching `^[a-z][a-z0-9_]{0,62}$` is an equality filter on an explicit string property
 - `group_by` may be repeated up to twice
-- the total number of distinct referenced dimensions across filters plus `group_by` is capped at 4
+- the total number of distinct referenced dimensions across filters plus `group_by` is capped at 2
 - grouped event metrics synthesize explicit `null` buckets from lower-order cuboids so grouped totals add back up to the filtered total
 
 Session metrics:
 
-- supported public metrics are `count`, `duration_total`, and `new_installs`
-- `group_by` and equality filters are limited to `platform` and `app_version`
+- supported public metrics are `count`, `duration_total`, `new_installs`, and `active_installs`
+- built-in equality filters use `platform`, `app_version`, and `os_version`
+- any other non-reserved query key matching `^[a-z][a-z0-9_]{0,62}$` is an equality filter on an explicit string session property
+- `group_by` may be repeated up to twice
+- the total number of distinct referenced dimensions across filters plus `group_by` is capped at 2
 - session grouped dimensions are fixed from the session's first event
 - `duration_total` is assigned to the bucket where the session starts
 - `new_installs` is assigned once from the install's first accepted event and is never retroactively moved by late arrivals
+- `active_installs` counts unique installs active in each UTC day bucket, supports only day granularity, and accepts the same D2 filter/grouping vocabulary as the other session metrics
+- filtered or grouped `active_installs` slices may overlap, so grouped totals are not guaranteed to add back up to the ungrouped distinct-install total
 
 ## SDK Direction
 
@@ -271,7 +276,7 @@ Current iOS SDK shape:
 - serialize each tracked event to JSON and store it as an immutable SQLite row
 - auto-populate `platform`, `app_version`, and `os_version`
 - upload queued events asynchronously to `POST /v1/events` using an `ingest` key only
-- reject invalid event property maps before they enter the local queue: at most 4 keys, `^[a-z][a-z0-9_]{0,62}$`, and no reserved query or built-in keys such as `metric`, `granularity`, `start`, `end`, `platform`, `app_version`, or `os_version`
+- reject invalid event property maps before they enter the local queue: at most 2 keys, `^[a-z][a-z0-9_]{0,62}$`, and no reserved query or built-in keys such as `metric`, `granularity`, `start`, `end`, `platform`, `app_version`, or `os_version`
 - treat malformed `202 Accepted` envelopes as invalid responses and keep queued rows for later operator-visible handling
 - when `configure(serverURL, writeKey)` changes destination, finish the current upload boundary, discard still-queued rows from that old destination even across relaunches, and only then let future uploads target the new destination
 

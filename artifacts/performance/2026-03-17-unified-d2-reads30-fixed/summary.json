@@ -1,0 +1,279 @@
+{
+  "host": {
+    "environment": "local"
+  },
+  "suites": [
+    "reads-visibility"
+  ],
+  "run_config": {
+    "mode": "iterative",
+    "publication_repetitions": 1,
+    "worker_config": {
+      "session_batch_size": 1000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2,
+      "idle_poll_interval_ms": 250
+    }
+  },
+  "scenarios": [
+    {
+      "scenario": "reads-visibility-30d",
+      "run_config": {
+        "mode": "iterative",
+        "publication_repetitions": 1,
+        "worker_config": {
+          "session_batch_size": 1000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2,
+          "idle_poll_interval_ms": 250
+        }
+      },
+      "phases": [
+        {
+          "name": "seed_ingest",
+          "events_sent": 900000,
+          "elapsed_ms": 30480,
+          "events_per_second": 29527.04001567267
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 229
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 32080
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 32080
+        }
+      ],
+      "queries": [
+        {
+          "name": "events_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 3,
+          "p95_ms": 3,
+          "max_ms": 4
+        },
+        {
+          "name": "events_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 21,
+          "p50_ms": 22,
+          "p95_ms": 22,
+          "max_ms": 24
+        },
+        {
+          "name": "events_count_day_dim2_grouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 2
+        },
+        {
+          "name": "events_count_hour_dim2_grouped",
+          "iterations": 100,
+          "min_ms": 7,
+          "p50_ms": 8,
+          "p95_ms": 8,
+          "max_ms": 9
+        },
+        {
+          "name": "sessions_count_day_grouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 2,
+          "p95_ms": 2,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_count_hour_grouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 14,
+          "p95_ms": 15,
+          "max_ms": 16
+        },
+        {
+          "name": "sessions_count_day_dim2_grouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 2
+        },
+        {
+          "name": "sessions_count_hour_dim2_grouped",
+          "iterations": 100,
+          "min_ms": 7,
+          "p50_ms": 7,
+          "p95_ms": 8,
+          "max_ms": 8
+        },
+        {
+          "name": "sessions_duration_total_day_grouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 2,
+          "max_ms": 2
+        },
+        {
+          "name": "sessions_duration_total_hour_grouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 15,
+          "p95_ms": 15,
+          "max_ms": 16
+        },
+        {
+          "name": "sessions_duration_total_day_dim2_grouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 1
+        },
+        {
+          "name": "sessions_duration_total_hour_dim2_grouped",
+          "iterations": 100,
+          "min_ms": 7,
+          "p50_ms": 7,
+          "p95_ms": 8,
+          "max_ms": 9
+        },
+        {
+          "name": "sessions_new_installs_day_grouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 2,
+          "max_ms": 2
+        },
+        {
+          "name": "sessions_new_installs_hour_grouped",
+          "iterations": 100,
+          "min_ms": 13,
+          "p50_ms": 14,
+          "p95_ms": 15,
+          "max_ms": 15
+        },
+        {
+          "name": "sessions_new_installs_day_dim2_grouped",
+          "iterations": 100,
+          "min_ms": 1,
+          "p50_ms": 1,
+          "p95_ms": 1,
+          "max_ms": 2
+        },
+        {
+          "name": "sessions_new_installs_hour_dim2_grouped",
+          "iterations": 100,
+          "min_ms": 7,
+          "p50_ms": 7,
+          "p95_ms": 8,
+          "max_ms": 20
+        },
+        {
+          "name": "events_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "events_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 2,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_count_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "sessions_count_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_duration_total_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "sessions_duration_total_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        },
+        {
+          "name": "sessions_new_installs_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 0,
+          "p50_ms": 0,
+          "p95_ms": 0,
+          "max_ms": 0
+        },
+        {
+          "name": "sessions_active_installs_day_ungrouped",
+          "iterations": 100,
+          "min_ms": 3,
+          "p50_ms": 4,
+          "p95_ms": 5,
+          "max_ms": 5
+        },
+        {
+          "name": "sessions_active_installs_day_dim2_grouped",
+          "iterations": 100,
+          "min_ms": 5,
+          "p50_ms": 6,
+          "p95_ms": 6,
+          "max_ms": 8
+        },
+        {
+          "name": "sessions_active_installs_day_dim2_filtered",
+          "iterations": 100,
+          "min_ms": 4,
+          "p50_ms": 4,
+          "p95_ms": 5,
+          "max_ms": 5
+        },
+        {
+          "name": "sessions_new_installs_hour_ungrouped",
+          "iterations": 100,
+          "min_ms": 2,
+          "p50_ms": 2,
+          "p95_ms": 3,
+          "max_ms": 3
+        }
+      ],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    }
+  ]
+}

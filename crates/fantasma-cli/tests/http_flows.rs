@@ -702,6 +702,209 @@ async fn metrics_sessions_json_uses_stored_read_key() {
 }
 
 #[tokio::test]
+async fn metrics_sessions_active_installs_json_uses_stored_read_key() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: "fg_rd_created".to_owned(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "sessions",
+            "--metric",
+            "active_installs",
+            "--granularity",
+            "day",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-02",
+            "--json",
+        ]))
+        .await
+        .expect("metrics succeeds");
+
+    let body: Value = serde_json::from_str(&output.stdout).expect("json output");
+    assert_eq!(body["metric"], json!("active_installs"));
+    assert_eq!(body["series"][0]["points"][0]["value"], json!(9));
+
+    let records = server.records();
+    let metrics_request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/sessions")
+        .expect("metrics request");
+    assert_eq!(
+        metrics_request.fantasma_key.as_deref(),
+        Some("fg_rd_created")
+    );
+}
+
+#[tokio::test]
+async fn metrics_sessions_active_installs_rejects_hour_granularity_locally() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: "fg_rd_created".to_owned(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    let hour_error = server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "sessions",
+            "--metric",
+            "active_installs",
+            "--granularity",
+            "hour",
+            "--start",
+            "2026-03-01T00:00:00Z",
+            "--end",
+            "2026-03-01T00:00:00Z",
+            "--json",
+        ]))
+        .await
+        .expect_err("hour granularity should fail");
+    assert!(
+        hour_error
+            .to_string()
+            .contains("active_installs only supports day granularity")
+    );
+
+    let records = server.records();
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.path == "/v1/metrics/sessions"),
+        "local validation should reject hourly active_installs before any metrics request"
+    );
+}
+
+#[tokio::test]
+async fn metrics_sessions_active_installs_serializes_d2_filters_and_group_by_exactly() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: server.read_key_secret.clone(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "sessions",
+            "--metric",
+            "active_installs",
+            "--granularity",
+            "day",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-02",
+            "--filter",
+            "plan=pro",
+            "--group-by",
+            "provider",
+            "--json",
+        ]))
+        .await
+        .expect("active installs metrics succeed");
+
+    let records = server.records();
+    let request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/sessions")
+        .expect("metrics request");
+    assert_eq!(
+        request.query.as_deref(),
+        Some(
+            "metric=active_installs&granularity=day&start=2026-03-01&end=2026-03-02&plan=pro&group_by=provider"
+        )
+    );
+}
+
+#[tokio::test]
+async fn metrics_sessions_serializes_d2_property_filters_and_group_by_exactly() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: server.read_key_secret.clone(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "sessions",
+            "--metric",
+            "count",
+            "--granularity",
+            "day",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-02",
+            "--filter",
+            "plan=pro",
+            "--group-by",
+            "provider",
+            "--json",
+        ]))
+        .await
+        .expect("session metrics succeed");
+
+    let records = server.records();
+    let request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/sessions")
+        .expect("metrics request");
+    assert_eq!(
+        request.query.as_deref(),
+        Some(
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&plan=pro&group_by=provider"
+        )
+    );
+}
+
+#[tokio::test]
 async fn instances_add_use_remove_updates_local_profiles() {
     let server = TestServer::spawn().await;
 
@@ -1266,7 +1469,7 @@ async fn metrics_events_total_serializes_filters_exactly() {
 }
 
 #[tokio::test]
-async fn metrics_events_serializes_filters_and_repeated_group_by_exactly() {
+async fn metrics_events_serializes_d2_filters_and_group_by_exactly() {
     let server = TestServer::spawn().await;
     let mut config = server.read_config();
     let profile = config.instances.get_mut("prod").unwrap();
@@ -1298,13 +1501,9 @@ async fn metrics_events_serializes_filters_and_repeated_group_by_exactly() {
             "--end",
             "2026-03-02",
             "--filter",
-            "platform=ios",
-            "--filter",
-            "app_version=1.2.3",
+            "plan=pro",
             "--group-by",
-            "platform",
-            "--group-by",
-            "app_version",
+            "provider",
             "--json",
         ]))
         .await
@@ -1318,7 +1517,7 @@ async fn metrics_events_serializes_filters_and_repeated_group_by_exactly() {
     assert_eq!(
         request.query.as_deref(),
         Some(
-            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&event=app_open&platform=ios&app_version=1.2.3&group_by=platform&group_by=app_version"
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&event=app_open&plan=pro&group_by=provider"
         )
     );
 }
@@ -1864,6 +2063,13 @@ async fn session_metrics(
     if let Some(status) = project_key_status(&state, &headers) {
         return (status, Json(json!({ "error": status_error(status) }))).into_response();
     }
+    let metric = original_uri
+        .query()
+        .and_then(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find_map(|(key, value)| (key == "metric").then(|| value.into_owned()))
+        })
+        .unwrap_or_else(|| "count".to_owned());
     record_request(
         &state,
         "GET",
@@ -1875,7 +2081,7 @@ async fn session_metrics(
     (
         StatusCode::OK,
         Json(json!({
-            "metric": "count",
+            "metric": metric,
             "granularity": "day",
             "group_by": [],
             "series": [

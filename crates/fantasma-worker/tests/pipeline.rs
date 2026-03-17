@@ -11,7 +11,6 @@ use tower::ServiceExt;
 
 fn scale_like_events(day: &str, install_count: usize) -> Vec<serde_json::Value> {
     let providers = ["strava", "garmin", "polar", "oura"];
-    let regions = ["eu", "us", "apac", "latam"];
     let plans = ["free", "pro", "team"];
     let app_versions = ["1.0.0", "1.1.0", "1.2.0"];
     let os_versions = ["18.3", "18.4"];
@@ -19,7 +18,6 @@ fn scale_like_events(day: &str, install_count: usize) -> Vec<serde_json::Value> 
 
     for install_index in 0..install_count {
         let provider = providers[install_index % providers.len()];
-        let region = regions[(install_index / providers.len()) % regions.len()];
         let plan = plans[install_index % plans.len()];
         let app_version = app_versions[install_index % app_versions.len()];
         let os_version = os_versions[install_index % os_versions.len()];
@@ -32,10 +30,50 @@ fn scale_like_events(day: &str, install_count: usize) -> Vec<serde_json::Value> 
                 "platform": "ios",
                 "app_version": app_version,
                 "os_version": os_version,
+                    "properties": {
+                        "plan": plan,
+                        "provider": provider
+                    }
+            }));
+        }
+    }
+
+    events
+}
+
+fn benchmark_like_session_events(
+    day: &str,
+    day_offset: usize,
+    install_count: usize,
+) -> Vec<serde_json::Value> {
+    let providers = ["strava", "garmin", "polar", "oura"];
+    let plans = ["free", "pro", "team"];
+    let app_versions = ["1.0.0", "1.1.0", "1.2.0", "2.0.0"];
+    let os_versions = ["18.3", "18.4", "18.5", "19.0"];
+    let mut events = Vec::with_capacity(install_count * 4);
+
+    for install_index in 0..install_count {
+        let provider = providers[install_index % providers.len()];
+        let plan = plans[install_index % plans.len()];
+        let app_version = app_versions[(day_offset + install_index) % app_versions.len()];
+        let os_version = os_versions[(day_offset + install_index) % os_versions.len()];
+        let platform = if install_index % 2 == 0 {
+            "ios"
+        } else {
+            "android"
+        };
+
+        for (hour, minute) in [(0, 10), (0, 11), (0, 12), (0, 13)] {
+            events.push(serde_json::json!({
+                "event": "app_open",
+                "timestamp": format!("{day}T{hour:02}:{minute:02}:00Z"),
+                "install_id": format!("bench-install-{install_index:04}"),
+                "platform": platform,
+                "app_version": app_version,
+                "os_version": os_version,
                 "properties": {
                     "plan": plan,
-                    "provider": provider,
-                    "region": region
+                    "provider": provider
                 }
             }));
         }
@@ -51,6 +89,40 @@ async fn response_json(response: axum::response::Response) -> serde_json::Value 
             .expect("read response body"),
     )
     .expect("decode response body")
+}
+
+fn sum_metric_series(series: &serde_json::Value) -> u64 {
+    series
+        .as_array()
+        .expect("metrics series is an array")
+        .iter()
+        .map(|entry| {
+            entry["points"]
+                .as_array()
+                .expect("series points is an array")
+                .iter()
+                .map(|point| point["value"].as_u64().expect("point value is u64"))
+                .sum::<u64>()
+        })
+        .sum()
+}
+
+async fn grouped_session_count_response(
+    api: axum::Router,
+    read_key: &str,
+    start: &str,
+    end: &str,
+) -> axum::response::Response {
+    api.oneshot(
+        Request::get(format!(
+            "/v1/metrics/sessions?metric=count&granularity=day&start={start}&end={end}&group_by=platform&group_by=app_version"
+        ))
+        .header("x-fantasma-key", read_key)
+        .body(Body::empty())
+        .expect("valid grouped session request"),
+    )
+    .await
+    .expect("grouped session request succeeds")
 }
 
 #[derive(Debug, Clone)]
@@ -589,7 +661,7 @@ async fn pipeline_exposes_bucketed_session_metrics_after_worker_batch(pool: PgPo
         })
     );
 
-    let new_installs_response = api
+    let new_installs_response = api.clone()
         .oneshot(
             Request::get(
                 "/v1/metrics/sessions?metric=new_installs&granularity=day&start=2026-01-01&end=2026-01-02",
@@ -611,6 +683,42 @@ async fn pipeline_exposes_bucketed_session_metrics_after_worker_batch(pool: PgPo
         .expect("decode response"),
         serde_json::json!({
             "metric": "new_installs",
+            "granularity": "day",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 1 },
+                        { "bucket": "2026-01-02", "value": 0 }
+                    ]
+                }
+            ]
+        })
+    );
+
+    let active_installs_response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-02",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("api request succeeds");
+
+    assert_eq!(active_installs_response.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(active_installs_response.into_body(), usize::MAX)
+                .await
+                .expect("read response body"),
+        )
+        .expect("decode response"),
+        serde_json::json!({
+            "metric": "active_installs",
             "granularity": "day",
             "group_by": [],
             "series": [
@@ -725,7 +833,7 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
     let daily_response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&os_version=18.3&group_by=provider&group_by=is_paying",
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=provider&group_by=is_paying",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -773,7 +881,7 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn pipeline_exposes_dim4_event_metrics_with_null_buckets(pool: PgPool) {
+async fn pipeline_exposes_dim2_event_metrics_with_null_buckets(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
     let ingest = fantasma_ingest::app(pool.clone());
@@ -800,8 +908,7 @@ async fn pipeline_exposes_dim4_event_metrics_with_null_buckets(pool: PgPool) {
                                 "os_version": "18.3",
                                 "properties": {
                                     "plan": "pro",
-                                    "provider": "strava",
-                                    "region": "eu"
+                                    "provider": "strava"
                                 }
                             },
                             {
@@ -812,8 +919,7 @@ async fn pipeline_exposes_dim4_event_metrics_with_null_buckets(pool: PgPool) {
                                 "app_version": "1.4.0",
                                 "os_version": "18.3",
                                 "properties": {
-                                    "plan": "pro",
-                                    "provider": "strava"
+                                    "plan": "pro"
                                 }
                             }
                         ]
@@ -834,7 +940,7 @@ async fn pipeline_exposes_dim4_event_metrics_with_null_buckets(pool: PgPool) {
     let response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&app_version=1.4.0&plan=pro&group_by=provider&group_by=region",
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&plan=pro&group_by=provider",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -849,12 +955,11 @@ async fn pipeline_exposes_dim4_event_metrics_with_null_buckets(pool: PgPool) {
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
-            "group_by": ["provider", "region"],
+            "group_by": ["provider"],
             "series": [
                 {
                     "dimensions": {
-                        "provider": "strava",
-                        "region": "eu"
+                        "provider": "strava"
                     },
                     "points": [
                         { "bucket": "2026-03-01", "value": 1 },
@@ -863,12 +968,264 @@ async fn pipeline_exposes_dim4_event_metrics_with_null_buckets(pool: PgPool) {
                 },
                 {
                     "dimensions": {
-                        "provider": "strava",
-                        "region": null
+                        "provider": null
                     },
                     "points": [
                         { "bucket": "2026-03-01", "value": 1 },
                         { "bucket": "2026-03-02", "value": 0 }
+                    ]
+                }
+            ]
+        })
+    );
+}
+
+#[sqlx::test]
+async fn pipeline_rejects_active_installs_invalid_combinations(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    for path in [
+        "/v1/metrics/sessions?metric=active_installs&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T00:00:00Z",
+    ] {
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header("x-fantasma-key", &provisioned.read_key)
+                    .body(Body::empty())
+                    .expect("valid api request"),
+            )
+            .await
+            .expect("api request succeeds");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "error": "invalid_request"
+            })
+        );
+    }
+}
+
+#[sqlx::test]
+async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "app_version": "1.1.0",
+                                "os_version": "18.3",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "strava"
+                                }
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:10:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "app_version": "1.1.0",
+                                "os_version": "18.4",
+                                "properties": {
+                                    "plan": "team",
+                                    "provider": "garmin"
+                                }
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T01:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "app_version": "1.1.0",
+                                "os_version": "18.4",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "garmin"
+                                }
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T01:10:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "app_version": "1.1.0",
+                                "os_version": "18.4",
+                                "properties": {
+                                    "plan": "team",
+                                    "provider": "garmin"
+                                }
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T02:00:00Z",
+                                "install_id": "install-2",
+                                "platform": "ios",
+                                "app_version": "1.1.0",
+                                "os_version": "18.3",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "strava"
+                                }
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T02:10:00Z",
+                                "install_id": "install-2",
+                                "platform": "ios",
+                                "app_version": "1.1.0",
+                                "os_version": "18.3",
+                                "properties": {
+                                    "plan": "pro",
+                                    "provider": "strava"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    fantasma_worker::process_session_batch(&pool, 100)
+        .await
+        .expect("worker batch succeeds");
+
+    let grouped_count_response = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-01&plan=pro&group_by=provider",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("grouped count request succeeds");
+
+    assert_eq!(grouped_count_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(grouped_count_response).await,
+        serde_json::json!({
+            "metric": "count",
+            "granularity": "day",
+            "group_by": ["provider"],
+            "series": [
+                {
+                    "dimensions": {
+                        "provider": "garmin"
+                    },
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 1 }
+                    ]
+                },
+                {
+                    "dimensions": {
+                        "provider": "strava"
+                    },
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 2 }
+                    ]
+                }
+            ]
+        })
+    );
+
+    let filtered_active_installs_response = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-01&plan=pro",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("filtered active installs request succeeds");
+
+    assert_eq!(filtered_active_installs_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(filtered_active_installs_response).await,
+        serde_json::json!({
+            "metric": "active_installs",
+            "granularity": "day",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 3 }
+                    ]
+                }
+            ]
+        })
+    );
+
+    let grouped_active_installs_response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-01&plan=pro&group_by=provider",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("grouped active installs request succeeds");
+
+    assert_eq!(grouped_active_installs_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(grouped_active_installs_response).await,
+        serde_json::json!({
+            "metric": "active_installs",
+            "granularity": "day",
+            "group_by": ["provider"],
+            "series": [
+                {
+                    "dimensions": {
+                        "provider": "garmin"
+                    },
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 1 }
+                    ]
+                },
+                {
+                    "dimensions": {
+                        "provider": "strava"
+                    },
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 2 }
                     ]
                 }
             ]
@@ -962,7 +1319,7 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
 }
 
 #[sqlx::test]
-async fn pipeline_rejects_dim4_event_metrics_queries_that_exceed_group_limit(pool: PgPool) {
+async fn pipeline_rejects_event_metrics_queries_that_exceed_d2_dimension_budget(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
     let ingest = fantasma_ingest::app(pool.clone());
@@ -982,8 +1339,7 @@ async fn pipeline_rejects_dim4_event_metrics_queries_that_exceed_group_limit(poo
                 "os_version": "18.3",
                 "properties": {
                     "plan": "pro",
-                    "provider": format!("provider-{index:03}"),
-                    "region": format!("region-{index:03}")
+                    "provider": format!("provider-{index:03}")
                 }
             })
         })
@@ -1025,7 +1381,7 @@ async fn pipeline_rejects_dim4_event_metrics_queries_that_exceed_group_limit(poo
     let response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-01&app_version=1.4.0&plan=pro&group_by=provider&group_by=region",
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-01&app_version=1.4.0&plan=pro&group_by=provider",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -1038,7 +1394,7 @@ async fn pipeline_rejects_dim4_event_metrics_queries_that_exceed_group_limit(poo
     assert_eq!(
         response_json(response).await,
         serde_json::json!({
-            "error": "group_limit_exceeded"
+            "error": "too_many_dimensions"
         })
     );
 }
@@ -1086,7 +1442,7 @@ async fn pipeline_keeps_grouped_event_metrics_day_queries_200_during_worker_catc
         }
     });
 
-    let query = "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-04-01&end=2026-04-01&platform=ios&group_by=provider&group_by=region";
+    let query = "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-04-01&end=2026-04-01&group_by=provider&group_by=plan";
     let mut saw_internal_server_error = false;
     let mut query_count = 0;
 
@@ -1120,6 +1476,330 @@ async fn pipeline_keeps_grouped_event_metrics_day_queries_200_during_worker_catc
     assert!(
         !saw_internal_server_error,
         "grouped daily event metrics queries should never return internal_server_error while the worker commits bounded batches"
+    );
+}
+
+#[sqlx::test]
+async fn pipeline_returns_grouped_session_platform_app_version_counts(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    for day in ["2026-01-01", "2026-01-02", "2026-01-03"] {
+        let events = scale_like_events(day, 120);
+        for batch in events.chunks(100) {
+            let ingest_response = ingest
+                .clone()
+                .oneshot(
+                    Request::post("/v1/events")
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("x-fantasma-key", &provisioned.ingest_key)
+                        .body(Body::from(
+                            serde_json::json!({ "events": batch.to_vec() }).to_string(),
+                        ))
+                        .expect("valid ingest request"),
+                )
+                .await
+                .expect("ingest request succeeds");
+
+            assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+        }
+    }
+
+    loop {
+        let event_processed = fantasma_worker::process_event_metrics_batch(&pool, 200)
+            .await
+            .expect("event worker batch succeeds");
+        let session_processed = fantasma_worker::process_session_batch(&pool, 200)
+            .await
+            .expect("session worker batch succeeds");
+        if event_processed == 0 && session_processed == 0 {
+            break;
+        }
+    }
+
+    let response = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-03&group_by=platform&group_by=app_version",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("grouped session request succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[sqlx::test]
+async fn pipeline_returns_grouped_session_platform_app_version_counts_for_benchmark_like_history(
+    pool: PgPool,
+) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    for day_offset in 0..30 {
+        let day = format!("2026-01-{:02}", day_offset + 1);
+        let events = benchmark_like_session_events(&day, day_offset, 120);
+        for batch in events.chunks(100) {
+            let ingest_response = ingest
+                .clone()
+                .oneshot(
+                    Request::post("/v1/events")
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("x-fantasma-key", &provisioned.ingest_key)
+                        .body(Body::from(
+                            serde_json::json!({ "events": batch.to_vec() }).to_string(),
+                        ))
+                        .expect("valid ingest request"),
+                )
+                .await
+                .expect("ingest request succeeds");
+
+            assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+        }
+    }
+
+    loop {
+        let event_processed = fantasma_worker::process_event_metrics_batch(&pool, 1000)
+            .await
+            .expect("event worker batch succeeds");
+        let session_processed = fantasma_worker::process_session_batch(&pool, 1000)
+            .await
+            .expect("session worker batch succeeds");
+        if event_processed == 0 && session_processed == 0 {
+            break;
+        }
+    }
+
+    let response = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-30&group_by=platform&group_by=app_version",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("grouped session request succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[sqlx::test]
+async fn pipeline_keeps_grouped_session_metrics_day_queries_200_during_worker_catchup(
+    pool: PgPool,
+) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    for day_offset in 0..10 {
+        let day = format!("2026-01-{:02}", day_offset + 1);
+        let events = benchmark_like_session_events(&day, day_offset, 120);
+        for batch in events.chunks(100) {
+            let ingest_response = ingest
+                .clone()
+                .oneshot(
+                    Request::post("/v1/events")
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("x-fantasma-key", &provisioned.ingest_key)
+                        .body(Body::from(
+                            serde_json::json!({ "events": batch.to_vec() }).to_string(),
+                        ))
+                        .expect("valid ingest request"),
+                )
+                .await
+                .expect("ingest request succeeds");
+
+            assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+        }
+    }
+
+    let worker_pool = pool.clone();
+    let worker = tokio::spawn(async move {
+        loop {
+            let processed = fantasma_worker::process_session_batch(&worker_pool, 1)
+                .await
+                .expect("session worker batch succeeds");
+            if processed == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    let query = "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-10&group_by=platform&group_by=app_version";
+    let mut saw_internal_server_error = false;
+    let mut query_count = 0;
+
+    while !worker.is_finished() {
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(query)
+                    .header("x-fantasma-key", &provisioned.read_key)
+                    .body(Body::empty())
+                    .expect("valid api request"),
+            )
+            .await
+            .expect("grouped session query succeeds");
+        query_count += 1;
+
+        if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
+            saw_internal_server_error = true;
+            break;
+        }
+
+        tokio::task::yield_now().await;
+    }
+
+    worker.await.expect("worker task joins");
+
+    assert!(
+        query_count > 0,
+        "the regression must issue at least one grouped session query during worker catch-up"
+    );
+    assert!(
+        !saw_internal_server_error,
+        "grouped daily session metrics queries should never return internal_server_error while the session worker commits bounded batches"
+    );
+}
+
+#[sqlx::test]
+async fn pipeline_readiness_poll_for_grouped_session_counts_stays_200_and_converges(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+    let days = 10_u64;
+    let installs_per_day = 120_u64;
+    let expected_total = days * installs_per_day;
+
+    for day_offset in 0..days as usize {
+        let day = format!("2026-01-{:02}", day_offset + 1);
+        let events = benchmark_like_session_events(&day, day_offset, installs_per_day as usize);
+        for batch in events.chunks(100) {
+            let ingest_response = ingest
+                .clone()
+                .oneshot(
+                    Request::post("/v1/events")
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("x-fantasma-key", &provisioned.ingest_key)
+                        .body(Body::from(
+                            serde_json::json!({ "events": batch.to_vec() }).to_string(),
+                        ))
+                        .expect("valid ingest request"),
+                )
+                .await
+                .expect("ingest request succeeds");
+
+            assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+        }
+    }
+
+    let worker_pool = pool.clone();
+    let worker = tokio::spawn(async move {
+        loop {
+            let processed = fantasma_worker::process_session_batch(&worker_pool, 1)
+                .await
+                .expect("session worker batch succeeds");
+            if processed == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    let mut saw_internal_server_error = false;
+    let mut saw_expected_total = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+
+    while tokio::time::Instant::now() < deadline {
+        let response = grouped_session_count_response(
+            api.clone(),
+            &provisioned.read_key,
+            "2026-01-01",
+            "2026-01-10",
+        )
+        .await;
+
+        if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
+            saw_internal_server_error = true;
+            break;
+        }
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        if sum_metric_series(&body["series"]) == expected_total {
+            saw_expected_total = true;
+            break;
+        }
+
+        if worker.is_finished() {
+            let final_poll = grouped_session_count_response(
+                api.clone(),
+                &provisioned.read_key,
+                "2026-01-01",
+                "2026-01-10",
+            )
+            .await;
+            assert_eq!(final_poll.status(), StatusCode::OK);
+            let final_poll_body = response_json(final_poll).await;
+            if sum_metric_series(&final_poll_body["series"]) == expected_total {
+                saw_expected_total = true;
+            }
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    worker.await.expect("worker task joins");
+
+    let final_response = grouped_session_count_response(
+        api.clone(),
+        &provisioned.read_key,
+        "2026-01-01",
+        "2026-01-10",
+    )
+    .await;
+    assert_eq!(final_response.status(), StatusCode::OK);
+    let final_body = response_json(final_response).await;
+
+    assert!(
+        !saw_internal_server_error,
+        "readiness polling must never surface internal_server_error for grouped session queries"
+    );
+    assert_eq!(sum_metric_series(&final_body["series"]), expected_total);
+    assert!(
+        saw_expected_total,
+        "readiness polling must observe the expected grouped session total"
     );
 }
 
@@ -1262,7 +1942,7 @@ async fn pipeline_exposes_grouped_session_metrics_and_rejects_unsupported_dimens
     let unsupported_dimension_response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-01&group_by=os_version",
+                "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-01&group_by=plan-name",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -1350,6 +2030,7 @@ async fn pipeline_keeps_new_installs_fixed_on_first_seen_bucket_after_late_event
         .expect("late worker batch succeeds");
 
     let hourly_new_installs_response = api
+        .clone()
         .oneshot(
             Request::get(
                 "/v1/metrics/sessions?metric=new_installs&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z",
@@ -1379,10 +2060,50 @@ async fn pipeline_keeps_new_installs_fixed_on_first_seen_bucket_after_late_event
             ]
         })
     );
+
+    let grouped_new_installs_response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=new_installs&granularity=day&start=2026-01-01&end=2026-01-01&group_by=app_version",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("grouped new installs request succeeds");
+
+    assert_eq!(grouped_new_installs_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(grouped_new_installs_response).await,
+        serde_json::json!({
+            "metric": "new_installs",
+            "granularity": "day",
+            "group_by": ["app_version"],
+            "series": [
+                {
+                    "dimensions": {
+                        "app_version": "0.9.0"
+                    },
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 0 }
+                    ]
+                },
+                {
+                    "dimensions": {
+                        "app_version": "1.0.0"
+                    },
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 1 }
+                    ]
+                }
+            ]
+        })
+    );
 }
 
 #[sqlx::test]
-async fn pipeline_keeps_grouped_session_app_version_fixed_after_late_event_repair(pool: PgPool) {
+async fn pipeline_moves_grouped_session_app_version_after_late_event_repair(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
     let ingest = fantasma_ingest::app(pool.clone());
@@ -1482,7 +2203,7 @@ async fn pipeline_keeps_grouped_session_app_version_fixed_after_late_event_repai
             "series": [
                 {
                     "dimensions": {
-                        "app_version": null
+                        "app_version": "0.9.0"
                     },
                     "points": [
                         { "bucket": "2026-01-01", "value": 1 }
@@ -1514,7 +2235,7 @@ async fn pipeline_keeps_grouped_session_app_version_fixed_after_late_event_repai
             "series": [
                 {
                     "dimensions": {
-                        "app_version": null
+                        "app_version": "0.9.0"
                     },
                     "points": [
                         { "bucket": "2026-01-01", "value": 20 * 60 }

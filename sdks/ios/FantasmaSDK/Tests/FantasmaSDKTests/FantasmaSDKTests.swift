@@ -175,7 +175,7 @@ struct FantasmaSDKBehaviorTests {
         }
     }
 
-    @Test("track rejects property maps larger than four keys before enqueue")
+    @Test("track rejects property maps larger than two keys before enqueue")
     func trackRejectsTooManyProperties() async throws {
         let harness = TestHarness()
         defer { harness.cleanup() }
@@ -191,9 +191,7 @@ struct FantasmaSDKBehaviorTests {
                 properties: [
                     "screen": "Home",
                     "region": "EU",
-                    "plan": "pro",
-                    "provider": "appstore",
-                    "campaign": "launch"
+                    "plan": "pro"
                 ]
             )
             Issue.record("expected invalidPropertyCount error")

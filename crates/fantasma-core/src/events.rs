@@ -7,7 +7,7 @@ use thiserror::Error;
 
 const MAX_BATCH_SIZE: usize = 100;
 const MAX_EVENT_BYTES: usize = 8 * 1024;
-const MAX_PROPERTIES_KEYS: usize = 4;
+const MAX_PROPERTIES_KEYS: usize = 2;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -342,13 +342,11 @@ mod tests {
         }
 
         #[test]
-        fn allows_four_explicit_properties() {
+        fn allows_two_explicit_properties() {
             let mut event = valid_event();
             event.properties = BTreeMap::from([
                 ("plan".to_owned(), "pro".to_owned()),
                 ("provider".to_owned(), "strava".to_owned()),
-                ("region".to_owned(), "eu".to_owned()),
-                ("screen".to_owned(), "home".to_owned()),
             ]);
 
             let result = event.validate();
@@ -501,7 +499,7 @@ mod tests {
         }
 
         #[test]
-        fn returns_indexed_error_when_more_than_four_properties_are_present() {
+        fn returns_indexed_error_when_more_than_two_properties_are_present() {
             let request: RawEventBatchRequest = serde_json::from_value(serde_json::json!({
                 "events": [
                     {
@@ -512,9 +510,7 @@ mod tests {
                         "properties": {
                             "plan": "pro",
                             "provider": "strava",
-                            "region": "eu",
-                            "screen": "home",
-                            "variant": "a"
+                            "region": "eu"
                         }
                     }
                 ]
@@ -527,7 +523,7 @@ mod tests {
                 result,
                 vec![EventValidationIssue {
                     index: 0,
-                    message: "properties object may contain at most 4 keys".to_owned(),
+                    message: "properties object may contain at most 2 keys".to_owned(),
                 }]
             );
         }
