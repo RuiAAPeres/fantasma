@@ -546,6 +546,48 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/metrics/live_installs:
+    get:
+      tags:
+        - metrics
+      summary: Return the current live install count
+      operationId: getLiveInstalls
+      security:
+        - ProjectKeyHeader: []
+      description: |
+        Returns the current project-wide count of installs whose latest
+        worker-processed raw event `received_at` is within the last 120
+        seconds.
+
+        This is a narrow current-state endpoint, not a bucketed metrics-family
+        query. It accepts no public query parameters. Like the other metrics
+        routes, it is eventually consistent because it reads from worker-owned
+        derived state rather than the ingest path.
+      responses:
+        '200':
+          description: Current live install count.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LiveInstallsResponse'
+        '401':
+          description: Missing, invalid, revoked, or wrong-kind project read key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid query. This route does not accept any public query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while loading live install state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/metrics/sessions:
     get:
       tags:
@@ -1173,6 +1215,26 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/MetricsSeries'
+    LiveInstallsResponse:
+      type: object
+      required:
+        - metric
+        - window_seconds
+        - as_of
+        - value
+      properties:
+        metric:
+          type: string
+          const: live_installs
+        window_seconds:
+          type: integer
+          const: 120
+        as_of:
+          type: string
+          format: date-time
+        value:
+          type: integer
+          minimum: 0
     ErrorResponse:
       type: object
       required:

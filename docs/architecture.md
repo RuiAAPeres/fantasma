@@ -29,8 +29,8 @@ curl / SDK
   -> Rust ingest service
   -> append-only Postgres events_raw table
   -> fantasma-worker
-  -> derived Postgres sessions, session_daily, session_daily_installs, event bucket rollups, session bucket rollups, and install first-seen state
-  -> GET /v1/metrics/events and /v1/metrics/sessions
+  -> derived Postgres sessions, session_daily, session_daily_installs, live_install_state, event bucket rollups, session bucket rollups, and install first-seen state
+  -> GET /v1/metrics/events, /v1/metrics/sessions, and /v1/metrics/live_installs
   -> GET /v1/metrics/events/catalog and /v1/metrics/events/top
   -> query API
 ```
@@ -209,17 +209,21 @@ Identity model:
 
 ## Metrics Query Model
 
-Public metrics use exactly two endpoint shapes:
+Public bucketed metrics use exactly two endpoint shapes:
 
 - `GET /v1/metrics/events`
 - `GET /v1/metrics/sessions`
+
+Public current-state metrics currently add one narrow route:
+
+- `GET /v1/metrics/live_installs`
 
 Public event discovery extends that read surface with:
 
 - `GET /v1/metrics/events/catalog`
 - `GET /v1/metrics/events/top`
 
-Shared query semantics:
+Shared query semantics for the bucketed families:
 
 - authenticated project scope comes from the caller's `read` key
 - `metric`, `granularity`, `start`, and `end` are required
@@ -254,6 +258,15 @@ Session metrics:
 - `week` buckets start on UTC ISO Mondays; `month` and `year` buckets start on the first UTC day of the calendar month or year
 - daily `active_installs` reads stay authoritative on `session_active_install_slices`; week/month/year read from worker-built range cuboids rebuilt off queued touched calendar buckets
 - filtered or grouped `active_installs` slices may overlap, so grouped totals are not guaranteed to add back up to the ungrouped distinct-install total
+
+Current-state metrics:
+
+- `live_installs` returns one project-wide value instead of a bucketed series
+- `live_installs` accepts no public query parameters
+- `live_installs` counts installs whose latest worker-processed raw-event `received_at` is within the last 120 seconds
+- `live_installs` reads from worker-owned `live_install_state`, keyed by `(project_id, install_id)`
+- the existing `event_metrics` lane updates `live_install_state` in the same raw-event batch transaction and offset progression used for event rollups
+- the API returns `as_of` and `value` from one SQL statement so the cutoff clock and the count share the same snapshot
 
 ## SDK Direction
 

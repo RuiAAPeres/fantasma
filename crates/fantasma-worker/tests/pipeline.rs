@@ -851,6 +851,69 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn pipeline_exposes_live_installs_after_event_worker_batch(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "live-install-1",
+                                "platform": "ios"
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "live-install-2",
+                                "platform": "ios"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    fantasma_worker::process_event_metrics_batch(&pool, 100)
+        .await
+        .expect("event worker batch succeeds");
+
+    let live_installs_response = api
+        .oneshot(
+            Request::get("/v1/metrics/live_installs")
+                .header("x-fantasma-key", &provisioned.read_key)
+                .body(Body::empty())
+                .expect("valid live installs request"),
+        )
+        .await
+        .expect("live installs request succeeds");
+    assert_eq!(live_installs_response.status(), StatusCode::OK);
+
+    let body = response_json(live_installs_response).await;
+    assert_eq!(body["metric"], serde_json::json!("live_installs"));
+    assert_eq!(body["window_seconds"], serde_json::json!(120));
+    assert_eq!(body["value"], serde_json::json!(2));
+    assert!(body["as_of"].is_string());
+}
+
+#[sqlx::test]
 async fn pipeline_exposes_dim2_event_metrics_with_null_buckets(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 

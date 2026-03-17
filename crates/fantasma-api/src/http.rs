@@ -18,8 +18,8 @@ use chrono::{
 };
 use fantasma_auth::StaticAdminAuthorizer;
 use fantasma_core::{
-    EventMetric, EventMetricsQuery, MetricGranularity, MetricsBucketWindow, MetricsPoint,
-    MetricsResponse, MetricsSeries, SessionMetric, SessionMetricsQuery,
+    CurrentMetricResponse, EventMetric, EventMetricsQuery, MetricGranularity, MetricsBucketWindow,
+    MetricsPoint, MetricsResponse, MetricsSeries, SessionMetric, SessionMetricsQuery,
     is_reserved_event_property_key, is_valid_event_property_key,
 };
 use fantasma_store::{
@@ -29,7 +29,7 @@ use fantasma_store::{
     fetch_event_metrics_aggregate_cube_rows_in_tx, fetch_event_metrics_cube_rows_in_tx,
     fetch_session_metrics_aggregate_cube_rows_in_tx, fetch_session_metrics_cube_rows_in_tx,
     generate_api_key_secret, list_api_keys, list_event_catalog, list_projects, list_top_events,
-    load_project, rename_project, resolve_api_key, revoke_api_key,
+    load_live_install_count_in_tx, load_project, rename_project, resolve_api_key, revoke_api_key,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use sqlx::{Postgres, QueryBuilder, Row, Transaction};
@@ -96,6 +96,7 @@ struct TopEventsQuery {
 
 const DEFAULT_TOP_EVENTS_LIMIT: i64 = 10;
 const MAX_TOP_EVENTS_LIMIT: i64 = 50;
+const LIVE_INSTALLS_WINDOW_SECONDS: i64 = 120;
 
 pub fn app(pool: PgPool, authorizer: Arc<StaticAdminAuthorizer>) -> Router {
     Router::new()
@@ -119,6 +120,7 @@ pub fn app(pool: PgPool, authorizer: Arc<StaticAdminAuthorizer>) -> Router {
         .route("/v1/metrics/events", get(events_metrics))
         .route("/v1/metrics/events/catalog", get(event_catalog_route))
         .route("/v1/metrics/events/top", get(top_events_route))
+        .route("/v1/metrics/live_installs", get(live_installs_route))
         .route("/v1/metrics/sessions", get(sessions_metrics))
         .with_state(AppState { authorizer, pool })
 }
@@ -387,6 +389,21 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
 
 fn parse_event_catalog_query(raw_query: &str) -> Result<EventDiscoveryQuery, &'static str> {
     parse_event_discovery_query(raw_query, false).map(|(window, _)| window)
+}
+
+fn parse_live_installs_query(raw_query: &str) -> Result<(), &'static str> {
+    if raw_query.is_empty() {
+        return Ok(());
+    }
+
+    if form_urlencoded::parse(raw_query.as_bytes())
+        .next()
+        .is_some()
+    {
+        Err("invalid_query_key")
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_top_events_query(raw_query: &str) -> Result<TopEventsQuery, &'static str> {
@@ -1045,6 +1062,33 @@ async fn sessions_metrics(
     }
 }
 
+async fn live_installs_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> impl IntoResponse {
+    let auth = match authorize_project_key(&state.pool, &headers, ApiKeyKind::Read).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+
+    if let Err(error) = parse_live_installs_query(raw_query.as_deref().unwrap_or_default()) {
+        return query_error_response(error);
+    }
+
+    match execute_live_installs_query(&state.pool, auth.project_id).await {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(response).expect("serialize live installs response")),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(?error, project_id = %auth.project_id, "failed to load live installs");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
 async fn event_catalog_route(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1243,6 +1287,27 @@ async fn execute_session_metrics_query(
         &query.group_by,
         counts_by_bucket,
     ))
+}
+
+async fn execute_live_installs_query(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> Result<CurrentMetricResponse, StoreError> {
+    let mut tx = pool.begin().await.map_err(StoreError::Database)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::Database)?;
+    let (as_of, value) =
+        load_live_install_count_in_tx(&mut tx, project_id, LIVE_INSTALLS_WINDOW_SECONDS).await?;
+    tx.commit().await.map_err(StoreError::Database)?;
+
+    Ok(CurrentMetricResponse {
+        metric: "live_installs".to_owned(),
+        window_seconds: LIVE_INSTALLS_WINDOW_SECONDS as u64,
+        as_of,
+        value,
+    })
 }
 
 async fn begin_metrics_snapshot(
@@ -2452,7 +2517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_exposes_only_metrics_family_routes() {
+    async fn app_exposes_bucketed_metrics_routes_and_live_installs() {
         let pool = PgPool::connect_lazy("postgres://localhost/fantasma").expect("lazy pool");
         let app = super::app(
             pool,
@@ -2479,6 +2544,16 @@ mod tests {
             )
             .await
             .expect("sessions route response");
+        let live_installs_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics/live_installs")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("live installs route response");
         let legacy_paths = [
             "/v1/metrics/events/daily",
             "/v1/metrics/events/aggregate",
@@ -2489,6 +2564,7 @@ mod tests {
 
         assert_ne!(events_family_response.status(), StatusCode::NOT_FOUND);
         assert_ne!(sessions_family_response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(live_installs_response.status(), StatusCode::NOT_FOUND);
         for path in legacy_paths {
             let response = app
                 .clone()
@@ -2853,12 +2929,15 @@ mod tests {
         let project_route_security = spec["paths"]["/v1/projects/{project_id}"]["get"]["security"]
             .as_sequence()
             .expect("project route security");
+        let live_installs_route = &spec["paths"]["/v1/metrics/live_installs"]["get"];
+        let live_installs_200 = &live_installs_route["responses"]["200"];
         let session_metrics_500 = &spec["paths"]["/v1/metrics/sessions"]["get"]["responses"]["500"];
         let explicit_filters =
             &spec["paths"]["/v1/metrics/events"]["get"]["x-fantasma-explicit-property-filters"];
         let platform_filter_schema = &spec["components"]["parameters"]["PlatformFilter"]["schema"];
         let operator_auth = &spec["components"]["securitySchemes"]["OperatorBearerAuth"];
         let project_key_auth = &spec["components"]["securitySchemes"]["ProjectKeyHeader"];
+        let live_installs_schema = &spec["components"]["schemas"]["LiveInstallsResponse"];
         let event_metrics_description = &spec["paths"]["/v1/metrics/events"]["get"]["description"];
         let event_metrics_parameters = spec["paths"]["/v1/metrics/events"]["get"]["parameters"]
             .as_sequence()
@@ -2912,6 +2991,14 @@ mod tests {
             "openapi must publish the top-events route"
         );
         assert!(
+            live_installs_route.is_mapping(),
+            "openapi must publish the live-installs route"
+        );
+        assert!(
+            live_installs_200.is_mapping(),
+            "live-installs route must document a success response"
+        );
+        assert!(
             session_metrics_500.is_mapping(),
             "session metrics route must document internal_server_error"
         );
@@ -2946,6 +3033,14 @@ mod tests {
         assert_eq!(project_key_auth["type"], "apiKey");
         assert_eq!(project_key_auth["in"], "header");
         assert_eq!(project_key_auth["name"], "X-Fantasma-Key");
+        assert_eq!(
+            live_installs_schema["properties"]["metric"]["const"],
+            "live_installs"
+        );
+        assert_eq!(
+            live_installs_schema["properties"]["window_seconds"]["const"],
+            120
+        );
         assert!(
             event_metrics_parameters
                 .iter()

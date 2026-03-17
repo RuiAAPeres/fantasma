@@ -159,6 +159,8 @@ pub enum MetricsSubcommand {
     EventsTop(TopEventsArgs),
     #[command(name = "events-catalog")]
     EventsCatalog(EventCatalogArgs),
+    #[command(name = "live-installs")]
+    LiveInstalls(LiveInstallsArgs),
     Sessions(SessionMetricsArgs),
 }
 
@@ -213,6 +215,12 @@ pub struct EventCatalogArgs {
     pub end: String,
     #[arg(long = "filter")]
     pub filters: Vec<String>,
+    #[command(flatten)]
+    pub output: ReadOutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct LiveInstallsArgs {
     #[command(flatten)]
     pub output: ReadOutputArgs,
 }

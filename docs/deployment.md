@@ -139,6 +139,15 @@ Default host ports:
 - `8081`: ingest
 - `8082`: API
 
+Those defaults can be overridden at Compose render time with:
+
+- `FANTASMA_POSTGRES_PORTS`
+- `FANTASMA_INGEST_PORTS`
+- `FANTASMA_API_PORTS`
+
+Each variable maps directly to one Compose `ports` entry such as
+`127.0.0.1::8082` or `8082:8082`.
+
 Stop the stack and remove volumes:
 
 ```bash
@@ -285,9 +294,16 @@ printed ingest key, polls one CLI metrics query until the derived session count
 appears, and then removes its local images and volumes with
 `--volumes --remove-orphans --rmi local`.
 
+Unlike the main local stack, the CLI smoke helper overrides the Compose port
+bindings to ephemeral loopback host ports and discovers the published ingest
+and API URLs with `docker compose port`. That keeps the disposable smoke stack
+from failing just because local `5432`, `8081`, or `8082` are already in use.
+
 Set `FANTASMA_CLI_SMOKE_PROJECT_NAME` if you need a different stable Compose
 project name for debugging. Set `FANTASMA_CLI_SMOKE_KEEP_STACK=1` if you need
-the CLI smoke stack left running after the script exits.
+the CLI smoke stack left running after the script exits. If you need fixed or
+custom smoke bindings, override `FANTASMA_CLI_SMOKE_POSTGRES_PORTS`,
+`FANTASMA_CLI_SMOKE_INGEST_PORTS`, or `FANTASMA_CLI_SMOKE_API_PORTS`.
 
 ## Docker-Backed Tests
 
@@ -377,6 +393,10 @@ cargo run -p fantasma-cli -- metrics events-catalog \
   --end 2026-01-02
 ```
 
+```bash
+cargo run -p fantasma-cli -- metrics live-installs
+```
+
 If you need raw shell variables for curl-based checks, use the automation
 helper:
 
@@ -455,6 +475,11 @@ curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&gran
 
 ```bash
 curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&granularity=week&start=2025-12-29&end=2026-01-26" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
+```
+
+```bash
+curl -fsS "http://localhost:8082/v1/metrics/live_installs" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 

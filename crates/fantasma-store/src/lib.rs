@@ -130,6 +130,7 @@ pub struct RawEventRecord {
     pub project_id: Uuid,
     pub event_name: String,
     pub timestamp: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
     pub install_id: String,
     pub platform: Platform,
     pub app_version: Option<String>,
@@ -209,6 +210,13 @@ pub struct SessionDailyActiveInstallDelta {
     pub project_id: Uuid,
     pub day: NaiveDate,
     pub active_installs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveInstallStateUpsert {
+    pub project_id: Uuid,
+    pub install_id: String,
+    pub last_received_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1432,7 +1440,7 @@ where
 {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, properties
         FROM events_raw
         WHERE id > $1
         ORDER BY id ASC
@@ -1480,7 +1488,7 @@ where
 {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, properties
         FROM events_raw
         WHERE project_id = $1
           AND install_id = $2
@@ -1617,7 +1625,7 @@ pub async fn fetch_events_for_install_after_id_through_in_tx(
 ) -> Result<Vec<RawEventRecord>, StoreError> {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, properties
         FROM events_raw
         WHERE project_id = $1
           AND install_id = $2
@@ -3232,6 +3240,65 @@ pub async fn save_worker_offset_in_tx(
     Ok(())
 }
 
+pub async fn upsert_live_install_state_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    upserts: &[LiveInstallStateUpsert],
+) -> Result<(), StoreError> {
+    if upserts.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in upserts.chunks(max_rows_per_batched_statement(3)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO live_install_state (project_id, install_id, last_received_at) ",
+        );
+        builder.push_values(chunk, |mut separated, upsert| {
+            separated.push_bind(upsert.project_id);
+            separated.push_bind(&upsert.install_id);
+            separated.push_bind(upsert.last_received_at);
+        });
+        builder.push(
+            " ON CONFLICT (project_id, install_id) DO UPDATE SET \
+              last_received_at = GREATEST(live_install_state.last_received_at, EXCLUDED.last_received_at)",
+        );
+
+        builder.build().execute(&mut **tx).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn load_live_install_count_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    window_seconds: i64,
+) -> Result<(DateTime<Utc>, u64), StoreError> {
+    let row = sqlx::query(
+        r#"
+        WITH snapshot AS (
+            SELECT statement_timestamp() AS as_of
+        )
+        SELECT
+            snapshot.as_of AS as_of,
+            COUNT(live.install_id)::BIGINT AS live_installs
+        FROM snapshot
+        LEFT JOIN live_install_state live
+          ON live.project_id = $1
+         AND live.last_received_at >= snapshot.as_of - ($2::BIGINT * INTERVAL '1 second')
+        GROUP BY snapshot.as_of
+        "#,
+    )
+    .bind(project_id)
+    .bind(window_seconds)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok((
+        row.try_get("as_of")?,
+        row.try_get::<i64, _>("live_installs")? as u64,
+    ))
+}
+
 pub async fn count_sessions(
     pool: &PgPool,
     project_id: Uuid,
@@ -4416,6 +4483,7 @@ fn raw_event_from_row(row: sqlx::postgres::PgRow) -> Result<RawEventRecord, Stor
         project_id: row.try_get("project_id")?,
         event_name: row.try_get("event_name")?,
         timestamp: row.try_get("timestamp")?,
+        received_at: row.try_get("received_at")?,
         install_id: row.try_get("install_id")?,
         platform: platform_from_str(&row.try_get::<String, _>("platform")?)?,
         app_version: row.try_get("app_version")?,
@@ -5543,6 +5611,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn forward_migration_adds_live_install_state_storage() {
+        let migration = include_str!("../migrations/0018_live_installs.sql");
+
+        assert!(
+            migration.contains("CREATE TABLE IF NOT EXISTS live_install_state")
+                && migration.contains("PRIMARY KEY (project_id, install_id)")
+                && migration.contains("last_received_at TIMESTAMPTZ NOT NULL"),
+            "0018 must add live_install_state keyed by project and install"
+        );
+        assert!(
+            migration.contains("idx_live_install_state_project_received_at"),
+            "0018 must add the bounded read index for live install counts"
+        );
+    }
+
     #[sqlx::test]
     async fn run_migrations_extends_api_keys_for_scoped_project_keys(pool: PgPool) {
         run_migrations(&pool).await.expect("migrations succeed");
@@ -5867,6 +5951,139 @@ mod tests {
         .expect("fetch active install slices table existence");
 
         assert!(table_exists);
+    }
+
+    #[sqlx::test]
+    async fn run_migrations_creates_live_install_state_table_and_indexes(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let table_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_name = 'live_install_state'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch live_install_state table existence");
+
+        let index_names = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename = 'live_install_state'
+              AND indexname IN (
+                'live_install_state_pkey',
+                'idx_live_install_state_project_received_at'
+              )
+            ORDER BY indexname ASC
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch live_install_state index names");
+
+        assert!(table_exists);
+        assert_eq!(
+            index_names,
+            vec![
+                "idx_live_install_state_project_received_at".to_owned(),
+                "live_install_state_pkey".to_owned(),
+            ]
+        );
+    }
+
+    #[sqlx::test]
+    async fn live_install_counts_use_bounded_read_indexes(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        sqlx::query(
+            r#"
+            INSERT INTO live_install_state (project_id, install_id, last_received_at)
+            SELECT
+                $1,
+                'install-' || install_offset,
+                TIMESTAMPTZ '2026-01-01T00:00:00Z'
+                    + (install_offset % 60) * INTERVAL '1 minute'
+            FROM generate_series(0, 19999) AS install_offset
+            "#,
+        )
+        .bind(project_id())
+        .execute(&pool)
+        .await
+        .expect("insert live_install_state rows");
+        sqlx::query("ANALYZE live_install_state")
+            .execute(&pool)
+            .await
+            .expect("analyze live_install_state");
+
+        let row = sqlx::query(
+            r#"
+            EXPLAIN (FORMAT JSON)
+            WITH snapshot AS (
+                SELECT TIMESTAMPTZ '2026-01-01T00:59:00Z' AS as_of
+            )
+            SELECT snapshot.as_of, COUNT(live.install_id)::BIGINT
+            FROM snapshot
+            LEFT JOIN live_install_state live
+              ON live.project_id = $1
+             AND live.last_received_at >= snapshot.as_of - INTERVAL '120 seconds'
+            GROUP BY snapshot.as_of
+            "#,
+        )
+        .bind(project_id())
+        .fetch_one(&pool)
+        .await
+        .expect("explain live installs query");
+        let plan = row
+            .try_get::<Value, _>(0)
+            .expect("EXPLAIN returns json plan");
+        let root = explain_plan_root(&plan);
+        let mut index_names = Vec::new();
+        collect_plan_index_names(root, &mut index_names);
+
+        assert!(
+            !plan_contains_node_type(root, "Seq Scan"),
+            "live install count should avoid sequential scans: {plan:#}"
+        );
+        assert!(
+            index_names
+                .iter()
+                .any(|name| name == "idx_live_install_state_project_received_at"),
+            "live install count should use the received_at index, got {index_names:?} from {plan:#}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn live_install_count_as_of_uses_statement_timestamp(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let mut tx = pool.begin().await.expect("begin transaction");
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .expect("set repeatable read");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let lower_bound = Utc::now() - chrono::Duration::milliseconds(200);
+        let (as_of, value) = load_live_install_count_in_tx(&mut tx, project_id(), 120)
+            .await
+            .expect("load live installs");
+
+        assert_eq!(value, 0);
+        assert!(
+            as_of >= lower_bound,
+            "as_of should track the count statement time, got {as_of} with lower bound {lower_bound}"
+        );
     }
 
     #[sqlx::test]

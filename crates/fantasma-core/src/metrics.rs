@@ -106,9 +106,41 @@ pub struct MetricsResponse {
     pub series: Vec<MetricsSeries>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CurrentMetricResponse {
+    pub metric: String,
+    pub window_seconds: u64,
+    pub as_of: DateTime<Utc>,
+    pub value: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_metric_response_serializes_shape() {
+        let response = CurrentMetricResponse {
+            metric: "live_installs".to_owned(),
+            window_seconds: 120,
+            as_of: DateTime::parse_from_rfc3339("2026-03-17T12:00:00Z")
+                .expect("valid timestamp")
+                .with_timezone(&Utc),
+            value: 7,
+        };
+
+        let json = serde_json::to_value(response).expect("serialize response");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "metric": "live_installs",
+                "window_seconds": 120,
+                "as_of": "2026-03-17T12:00:00Z",
+                "value": 7
+            })
+        );
+    }
 
     #[test]
     fn metrics_response_serializes_ungrouped_series_shape() {

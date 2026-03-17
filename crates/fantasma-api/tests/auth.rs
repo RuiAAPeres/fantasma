@@ -229,6 +229,63 @@ async fn ingest_and_metrics_routes_enforce_project_key_kinds(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn live_installs_route_requires_read_key_auth(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (_, ingest_key, read_key) = provision_project(api.clone()).await;
+
+    let missing_auth = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics/live_installs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(missing_auth.status(), StatusCode::UNAUTHORIZED);
+
+    let ingest_auth = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics/live_installs")
+                .header("x-fantasma-key", &ingest_key)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(ingest_auth.status(), StatusCode::UNAUTHORIZED);
+
+    let operator_auth = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics/live_installs")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(operator_auth.status(), StatusCode::UNAUTHORIZED);
+
+    let read_auth = api
+        .oneshot(
+            Request::get("/v1/metrics/live_installs")
+                .header("x-fantasma-key", &read_key)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(read_auth.status(), StatusCode::OK);
+}
+
+#[sqlx::test]
 async fn event_metrics_reject_public_project_id_query_params(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
@@ -382,6 +439,47 @@ async fn session_metrics_reject_public_project_id_query_params(pool: PgPool) {
         response_json(response).await,
         serde_json::json!({ "error": "invalid_request" })
     );
+}
+
+#[sqlx::test]
+async fn live_installs_rejects_public_query_params(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_id, _, read_key) = provision_project(api.clone()).await;
+    let cases = [
+        format!("/v1/metrics/live_installs?project_id={project_id}"),
+        "/v1/metrics/live_installs?metric=live_installs".to_owned(),
+        "/v1/metrics/live_installs?granularity=day".to_owned(),
+        "/v1/metrics/live_installs?start=2026-01-01".to_owned(),
+        "/v1/metrics/live_installs?end=2026-01-01".to_owned(),
+        "/v1/metrics/live_installs?platform=ios".to_owned(),
+        "/v1/metrics/live_installs?plan=pro".to_owned(),
+        "/v1/metrics/live_installs?group_by=platform".to_owned(),
+    ];
+
+    for uri in cases {
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&uri)
+                    .header("x-fantasma-key", &read_key)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response succeeds");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({ "error": "invalid_query_key" }),
+            "{uri}"
+        );
+    }
 }
 
 #[sqlx::test]

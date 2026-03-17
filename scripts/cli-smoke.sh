@@ -6,16 +6,22 @@ COMPOSE_FILE="$ROOT_DIR/infra/docker/compose.yaml"
 PROJECT_NAME="${FANTASMA_CLI_SMOKE_PROJECT_NAME:-fantasma-cli-smoke}"
 ADMIN_TOKEN=""
 INSTANCE_NAME="${FANTASMA_CLI_SMOKE_INSTANCE:-local}"
-API_URL="${FANTASMA_CLI_SMOKE_API_URL:-http://localhost:8082}"
-INGEST_URL="${FANTASMA_CLI_SMOKE_INGEST_URL:-http://localhost:8081}"
+API_URL="${FANTASMA_CLI_SMOKE_API_URL:-}"
+INGEST_URL="${FANTASMA_CLI_SMOKE_INGEST_URL:-}"
 PROJECT_LABEL="${FANTASMA_CLI_SMOKE_PROJECT_NAME_LABEL:-CLI Smoke}"
 TIMEOUT_SECONDS=60
 SLEEP_SECONDS=2
 KEEP_STACK="${FANTASMA_CLI_SMOKE_KEEP_STACK:-0}"
 XDG_CONFIG_HOME="$(mktemp -d)"
+COMPOSE_POSTGRES_PORTS="${FANTASMA_CLI_SMOKE_POSTGRES_PORTS:-127.0.0.1::5432}"
+COMPOSE_INGEST_PORTS="${FANTASMA_CLI_SMOKE_INGEST_PORTS:-127.0.0.1::8081}"
+COMPOSE_API_PORTS="${FANTASMA_CLI_SMOKE_API_PORTS:-127.0.0.1::8082}"
 
 compose() {
-  docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
+  FANTASMA_POSTGRES_PORTS="$COMPOSE_POSTGRES_PORTS" \
+    FANTASMA_INGEST_PORTS="$COMPOSE_INGEST_PORTS" \
+    FANTASMA_API_PORTS="$COMPOSE_API_PORTS" \
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
 }
 
 require_cmd() {
@@ -39,6 +45,32 @@ cli() {
 
 print_logs() {
   compose logs --tail=200 || true
+}
+
+resolve_service_url() {
+  local service="$1"
+  local container_port="$2"
+  local binding
+
+  binding="$(compose port "$service" "$container_port" | tail -n 1)"
+  if [[ -z "$binding" ]]; then
+    echo "failed to resolve published port for ${service}:${container_port}" >&2
+    print_logs >&2
+    exit 1
+  fi
+
+  python3 - "$binding" <<'PY'
+import sys
+
+binding = sys.argv[1].strip()
+if binding.startswith("["):
+    host, _, remainder = binding[1:].partition("]")
+    port = remainder.lstrip(":")
+else:
+    host, port = binding.rsplit(":", 1)
+
+print(f"http://{host}:{port}")
+PY
 }
 
 cleanup() {
@@ -81,12 +113,13 @@ extract_line_value() {
 }
 
 poll_metrics() {
-  local deadline metrics_json value active_json active_value
+  local deadline metrics_json value active_json active_value live_json live_value
   deadline=$((SECONDS + TIMEOUT_SECONDS))
 
   while ((SECONDS < deadline)); do
     metrics_json="$(cli metrics sessions --metric count --granularity day --start 2026-01-01 --end 2026-01-01 --json)"
     active_json="$(cli metrics sessions --metric active_installs --granularity day --start 2026-01-01 --end 2026-01-01 --json)"
+    live_json="$(cli metrics live-installs --json)"
     value="$(
       python3 - "$metrics_json" <<'PY'
 import json
@@ -109,10 +142,20 @@ points = series[0]["points"] if series else []
 print(points[0]["value"] if points else "")
 PY
     )"
+    live_value="$(
+      python3 - "$live_json" <<'PY'
+import json
+import sys
 
-    if [[ "$value" == "1" && "$active_value" == "1" ]]; then
+payload = json.loads(sys.argv[1])
+print(payload.get("value", ""))
+PY
+    )"
+
+    if [[ "$value" == "1" && "$active_value" == "1" && "$live_value" == "1" ]]; then
       printf '%s\n' "$metrics_json"
       printf '%s\n' "$active_json"
+      printf '%s\n' "$live_json"
       return 0
     fi
 
@@ -137,6 +180,12 @@ main() {
 
   compose down --volumes --remove-orphans >/dev/null 2>&1 || true
   compose up -d --build
+  if [[ -z "$INGEST_URL" ]]; then
+    INGEST_URL="$(resolve_service_url fantasma-ingest 8081)"
+  fi
+  if [[ -z "$API_URL" ]]; then
+    API_URL="$(resolve_service_url fantasma-api 8082)"
+  fi
   wait_for_http
 
   cli instances add "$INSTANCE_NAME" --url "$API_URL" >/dev/null

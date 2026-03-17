@@ -94,6 +94,7 @@ impl TestServer {
             .route("/v1/metrics/events/top", get(top_events))
             .route("/v1/metrics/events/catalog", get(event_catalog))
             .route("/v1/metrics/sessions", get(session_metrics))
+            .route("/v1/metrics/live_installs", get(live_installs))
             .with_state(state);
         let router = if base_path == "/" {
             api_router
@@ -748,6 +749,85 @@ async fn metrics_sessions_active_installs_json_uses_stored_read_key() {
         metrics_request.fantasma_key.as_deref(),
         Some("fg_rd_created")
     );
+}
+
+#[test]
+fn metrics_live_installs_subcommand_parses() {
+    let cli = Cli::try_parse_from(["fantasma", "metrics", "live-installs", "--json"])
+        .expect("live-installs subcommand should parse");
+
+    assert!(matches!(
+        cli.command,
+        fantasma_cli::cli::Command::Metrics(fantasma_cli::cli::MetricsCommand {
+            command: fantasma_cli::cli::MetricsSubcommand::LiveInstalls(_),
+        })
+    ));
+}
+
+#[tokio::test]
+async fn metrics_live_installs_json_uses_stored_read_key() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: "fg_rd_created".to_owned(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&["metrics", "live-installs", "--json"]))
+        .await
+        .expect("live installs succeeds");
+
+    let body: Value = serde_json::from_str(&output.stdout).expect("json output");
+    assert_eq!(body["metric"], json!("live_installs"));
+    assert_eq!(body["value"], json!(9));
+    assert_eq!(body["window_seconds"], json!(120));
+
+    let records = server.records();
+    let metrics_request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/live_installs")
+        .expect("live installs request");
+    assert_eq!(
+        metrics_request.fantasma_key.as_deref(),
+        Some("fg_rd_created")
+    );
+    assert_eq!(metrics_request.query, None);
+}
+
+#[tokio::test]
+async fn metrics_live_installs_text_renders_scalar_response() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: "fg_rd_created".to_owned(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&["metrics", "live-installs"]))
+        .await
+        .expect("live installs succeeds");
+
+    assert_eq!(output.stdout, "live_installs\t9\t2026-03-17T12:34:56Z\t120");
 }
 
 #[tokio::test]
@@ -2114,6 +2194,34 @@ async fn session_metrics(
                     ]
                 }
             ]
+        })),
+    )
+        .into_response()
+}
+
+async fn live_installs(
+    State(state): State<ServerState>,
+    original_uri: OriginalUri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(status) = project_key_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
+    }
+    record_request(
+        &state,
+        "GET",
+        original_uri.path(),
+        original_uri.query(),
+        headers,
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "metric": "live_installs",
+            "window_seconds": 120,
+            "as_of": "2026-03-17T12:34:56Z",
+            "value": 9
         })),
     )
         .into_response()

@@ -10,26 +10,28 @@ use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Timelike
 use fantasma_core::MetricGranularity;
 use fantasma_store::{
     EventMetricBucketDim1Delta, EventMetricBucketDim2Delta, EventMetricBucketTotalDelta,
-    InstallFirstSeenRecord, InstallSessionStateRecord, PendingSessionDailyInstallRebuildRecord,
-    PgPool, RawEventRecord, SessionActiveInstallSliceDelta, SessionDailyActiveInstallDelta,
-    SessionDailyDelta, SessionDailyDurationDelta, SessionDailyInstallDelta, SessionRecord,
-    SessionRepairJobRecord, SessionRepairJobUpsert, SessionTailUpdate, StoreError,
-    add_session_daily_duration_deltas_in_tx, claim_and_sweep_pending_session_rebuild_buckets_in_tx,
-    claim_pending_session_repair_jobs_in_tx, complete_session_repair_job_in_tx,
-    delete_sessions_overlapping_window_in_tx, enqueue_session_daily_installs_rebuilds_in_tx,
-    enqueue_session_rebuild_buckets_in_tx, fetch_events_after_in_tx,
-    fetch_events_for_install_after_id_through_in_tx, fetch_events_for_install_between_in_tx,
-    fetch_latest_session_for_install_in_tx, fetch_sessions_overlapping_window_in_tx,
-    insert_install_first_seen_in_tx, insert_session_in_tx, insert_sessions_in_tx,
-    load_install_session_states_in_tx, load_pending_session_daily_install_rebuilds_in_tx,
-    load_session_repair_jobs_for_installs_in_tx, load_tail_sessions_for_installs_in_tx,
-    lock_worker_offset, rebuild_session_active_install_slices_days_in_tx,
+    InstallFirstSeenRecord, InstallSessionStateRecord, LiveInstallStateUpsert,
+    PendingSessionDailyInstallRebuildRecord, PgPool, RawEventRecord,
+    SessionActiveInstallSliceDelta, SessionDailyActiveInstallDelta, SessionDailyDelta,
+    SessionDailyDurationDelta, SessionDailyInstallDelta, SessionRecord, SessionRepairJobRecord,
+    SessionRepairJobUpsert, SessionTailUpdate, StoreError, add_session_daily_duration_deltas_in_tx,
+    claim_and_sweep_pending_session_rebuild_buckets_in_tx, claim_pending_session_repair_jobs_in_tx,
+    complete_session_repair_job_in_tx, delete_sessions_overlapping_window_in_tx,
+    enqueue_session_daily_installs_rebuilds_in_tx, enqueue_session_rebuild_buckets_in_tx,
+    fetch_events_after_in_tx, fetch_events_for_install_after_id_through_in_tx,
+    fetch_events_for_install_between_in_tx, fetch_latest_session_for_install_in_tx,
+    fetch_sessions_overlapping_window_in_tx, insert_install_first_seen_in_tx, insert_session_in_tx,
+    insert_sessions_in_tx, load_install_session_states_in_tx,
+    load_pending_session_daily_install_rebuilds_in_tx, load_session_repair_jobs_for_installs_in_tx,
+    load_tail_sessions_for_installs_in_tx, lock_worker_offset,
+    rebuild_session_active_install_slices_days_in_tx,
     rebuild_session_daily_days_from_pending_install_rebuilds_with_telemetry_in_tx,
     release_session_repair_job_claim_in_tx, save_worker_offset_in_tx, update_session_tail_in_tx,
     upsert_event_metric_buckets_dim1_in_tx, upsert_event_metric_buckets_dim2_in_tx,
     upsert_event_metric_buckets_total_in_tx, upsert_install_session_state_in_tx,
-    upsert_session_active_install_slices_in_tx, upsert_session_daily_deltas_in_tx,
-    upsert_session_daily_install_deltas_in_tx, upsert_session_repair_jobs_in_tx,
+    upsert_live_install_state_in_tx, upsert_session_active_install_slices_in_tx,
+    upsert_session_daily_deltas_in_tx, upsert_session_daily_install_deltas_in_tx,
+    upsert_session_repair_jobs_in_tx,
 };
 use serde::Serialize;
 use sqlx::{Postgres, Row, Transaction};
@@ -1099,10 +1101,12 @@ pub(crate) async fn process_event_metrics_batch_with_config(
     );
     let build_started_at = Instant::now();
     let rollups = build_event_metric_rollups(&batch);
+    let live_install_upserts = build_live_install_state_upserts(&batch);
     trace.add_phase_duration("build_rollups", build_started_at.elapsed());
     trace.add_count("total_delta_rows", rollups.total_deltas.len());
     trace.add_count("dim1_delta_rows", rollups.dim1_deltas.len());
     trace.add_count("dim2_delta_rows", rollups.dim2_deltas.len());
+    trace.add_count("live_install_rows", live_install_upserts.len());
 
     let total_upsert_started_at = Instant::now();
     upsert_event_metric_buckets_total_in_tx(&mut tx, &rollups.total_deltas).await?;
@@ -1113,6 +1117,12 @@ pub(crate) async fn process_event_metrics_batch_with_config(
     let dim2_upsert_started_at = Instant::now();
     upsert_event_metric_buckets_dim2_in_tx(&mut tx, &rollups.dim2_deltas).await?;
     trace.add_phase_duration("upsert_dim2", dim2_upsert_started_at.elapsed());
+    let live_install_upsert_started_at = Instant::now();
+    upsert_live_install_state_in_tx(&mut tx, &live_install_upserts).await?;
+    trace.add_phase_duration(
+        "upsert_live_install_state",
+        live_install_upsert_started_at.elapsed(),
+    );
     let save_offset_started_at = Instant::now();
     save_worker_offset_in_tx(&mut tx, EVENT_METRICS_WORKER_NAME, next_offset).await?;
     trace.add_phase_duration("save_offset", save_offset_started_at.elapsed());
@@ -1269,6 +1279,33 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
             )
             .collect(),
     }
+}
+
+fn build_live_install_state_upserts(batch: &[RawEventRecord]) -> Vec<LiveInstallStateUpsert> {
+    let mut latest_by_install = BTreeMap::<(Uuid, String), DateTime<Utc>>::new();
+
+    for event in batch {
+        let key = (event.project_id, event.install_id.clone());
+        latest_by_install
+            .entry(key)
+            .and_modify(|received_at| {
+                if event.received_at > *received_at {
+                    *received_at = event.received_at;
+                }
+            })
+            .or_insert(event.received_at);
+    }
+
+    latest_by_install
+        .into_iter()
+        .map(
+            |((project_id, install_id), last_received_at)| LiveInstallStateUpsert {
+                project_id,
+                install_id,
+                last_received_at,
+            },
+        )
+        .collect()
 }
 
 fn event_metric_dimensions(event: &RawEventRecord) -> Vec<(String, String)> {
@@ -2840,6 +2877,7 @@ mod tests {
             project_id: project_id(),
             event_name: "app_open".to_owned(),
             timestamp: timestamp(1, 0, 0),
+            received_at: timestamp(1, 0, 1),
             install_id: "install-1".to_owned(),
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
@@ -3259,6 +3297,54 @@ mod tests {
                 .all(|delta| delta.event_count == 1),
             "single events must increment each bounded cube exactly once"
         );
+    }
+
+    #[test]
+    fn live_install_state_updates_keep_latest_received_at_per_install() {
+        let first = RawEventRecord {
+            id: 1,
+            project_id: project_id(),
+            event_name: "app_open".to_owned(),
+            timestamp: timestamp(1, 0, 0),
+            received_at: timestamp(1, 0, 1),
+            install_id: "install-1".to_owned(),
+            platform: Platform::Ios,
+            app_version: Some("1.0.0".to_owned()),
+            os_version: Some("18.3".to_owned()),
+            properties: BTreeMap::new(),
+        };
+        let second = RawEventRecord {
+            id: 2,
+            project_id: project_id(),
+            event_name: "app_open".to_owned(),
+            timestamp: timestamp(1, 0, 0),
+            received_at: timestamp(1, 0, 3),
+            install_id: "install-1".to_owned(),
+            platform: Platform::Ios,
+            app_version: Some("1.0.0".to_owned()),
+            os_version: Some("18.3".to_owned()),
+            properties: BTreeMap::new(),
+        };
+        let third = RawEventRecord {
+            id: 3,
+            project_id: project_id(),
+            event_name: "app_open".to_owned(),
+            timestamp: timestamp(1, 0, 0),
+            received_at: timestamp(1, 0, 2),
+            install_id: "install-2".to_owned(),
+            platform: Platform::Ios,
+            app_version: Some("1.0.0".to_owned()),
+            os_version: Some("18.3".to_owned()),
+            properties: BTreeMap::new(),
+        };
+
+        let updates = build_live_install_state_upserts(&[first, second, third]);
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].install_id, "install-1");
+        assert_eq!(updates[0].last_received_at, timestamp(1, 0, 3));
+        assert_eq!(updates[1].install_id, "install-2");
+        assert_eq!(updates[1].last_received_at, timestamp(1, 0, 2));
     }
 
     #[sqlx::test]
@@ -5414,6 +5500,38 @@ mod tests {
         .expect("count event bucket rows");
 
         assert_eq!(bucket_rows, 2);
+    }
+
+    #[sqlx::test]
+    async fn event_worker_updates_live_install_state(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[event("install-1", 1, 1, 15), event("install-2", 1, 1, 16)],
+        )
+        .await
+        .expect("insert events");
+
+        process_event_metrics_batch(&pool, 100)
+            .await
+            .expect("process batch");
+
+        let live_installs = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM live_install_state
+            WHERE project_id = $1
+            "#,
+        )
+        .bind(project_id())
+        .fetch_one(&pool)
+        .await
+        .expect("count live installs");
+
+        assert_eq!(live_installs, 2);
     }
 
     #[sqlx::test]

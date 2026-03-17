@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -11,8 +11,8 @@ use crate::{
     cli::{
         AuthSubcommand, Cli, Command, EventCatalogArgs, EventMetricArg, EventMetricsArgs,
         InstanceAddArgs, InstanceRemoveArgs, InstanceUseArgs, InstancesSubcommand, KeyCreateArgs,
-        KeyKind, KeysSubcommand, MetricsSubcommand, ProjectsSubcommand, ReadOutputArgs,
-        SessionMetricArg, SessionMetricsArgs, TopEventsArgs,
+        KeyKind, KeysSubcommand, LiveInstallsArgs, MetricsSubcommand, ProjectsSubcommand,
+        ReadOutputArgs, SessionMetricArg, SessionMetricsArgs, TopEventsArgs,
     },
     config::{
         CliConfig, InstanceProfile, StoredReadKey, ensure_secure_persistence_supported,
@@ -105,6 +105,9 @@ impl App {
                 MetricsSubcommand::EventsTop(top) => self.metrics_events_top(top).await,
                 MetricsSubcommand::EventsCatalog(catalog) => {
                     self.metrics_events_catalog(catalog).await
+                }
+                MetricsSubcommand::LiveInstalls(live_installs) => {
+                    self.metrics_live_installs(live_installs).await
                 }
                 MetricsSubcommand::Sessions(sessions) => self.metrics_sessions(sessions).await,
             },
@@ -638,6 +641,14 @@ impl App {
         render_event_catalog_output(body, catalog.output.json)
     }
 
+    async fn metrics_live_installs(
+        &self,
+        live_installs: LiveInstallsArgs,
+    ) -> anyhow::Result<CommandOutput> {
+        let body = self.project_key_get("/v1/metrics/live_installs").await?;
+        render_current_metric_output(body, live_installs.output.json)
+    }
+
     async fn metrics_request(&self, request: MetricsRequest<'_>) -> anyhow::Result<String> {
         let config = load_config(&self.config_path)?;
         let profile = active_instance(&config)?;
@@ -679,6 +690,32 @@ impl App {
             .context("load metrics")?;
         ensure_success(response.status(), "load metrics")?;
         response.text().await.context("read metrics body")
+    }
+
+    async fn project_key_get(&self, path: &str) -> anyhow::Result<String> {
+        let config = load_config(&self.config_path)?;
+        let profile = active_instance(&config)?;
+        let project_id = profile
+            .active_project_id
+            .context(
+                "active project is not configured for the active instance; run `fantasma projects use <project-id>`",
+            )?;
+        let read_key = profile
+            .read_keys
+            .get(&project_id)
+            .context(
+                "read key is not configured for the active project; run `fantasma keys create --kind read --name <key-name>`",
+            )?;
+        let url = api_url(&profile.api_base_url, path).context("build current metric url")?;
+        let response = self
+            .client
+            .get(url)
+            .header("x-fantasma-key", &read_key.secret)
+            .send()
+            .await
+            .context("load current metric")?;
+        ensure_success(response.status(), "load current metric")?;
+        response.text().await.context("read current metric body")
     }
 
     async fn project_key_request(
@@ -973,6 +1010,24 @@ fn render_metrics_output(body: String, json_output: bool) -> anyhow::Result<Comm
     }
     Ok(CommandOutput {
         stdout: lines.join("\n"),
+    })
+}
+
+fn render_current_metric_output(body: String, json_output: bool) -> anyhow::Result<CommandOutput> {
+    if json_output {
+        return Ok(CommandOutput { stdout: body });
+    }
+
+    let response: fantasma_core::CurrentMetricResponse =
+        serde_json::from_str(&body).context("decode current metric body")?;
+    Ok(CommandOutput {
+        stdout: format!(
+            "{}\t{}\t{}\t{}",
+            response.metric,
+            response.value,
+            response.as_of.to_rfc3339_opts(SecondsFormat::Secs, true),
+            response.window_seconds
+        ),
     })
 }
 
