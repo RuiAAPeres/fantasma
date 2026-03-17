@@ -118,7 +118,7 @@ poll_metrics() {
 
   while ((SECONDS < deadline)); do
     metrics_json="$(cli metrics sessions --metric count --granularity day --start 2026-01-01 --end 2026-01-01 --json)"
-    active_json="$(cli metrics sessions --metric active_installs --granularity day --start 2026-01-01 --end 2026-01-01 --json)"
+    active_json="$(cli metrics sessions --metric active_installs --start 2026-01-01 --end 2026-01-01 --interval day --json)"
     live_json="$(cli metrics live-installs --json)"
     value="$(
       python3 - "$metrics_json" <<'PY'

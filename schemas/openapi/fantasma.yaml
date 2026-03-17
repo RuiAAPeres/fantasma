@@ -366,7 +366,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/EventName'
         - $ref: '#/components/parameters/EventMetric'
-        - $ref: '#/components/parameters/MetricGranularity'
+        - $ref: '#/components/parameters/EventMetricGranularity'
         - $ref: '#/components/parameters/MetricStart'
         - $ref: '#/components/parameters/MetricEnd'
         - $ref: '#/components/parameters/EventGroupBy'
@@ -592,7 +592,7 @@ paths:
     get:
       tags:
         - metrics
-      summary: Return worker-derived bucketed session metrics
+      summary: Return worker-derived session metrics
       operationId: getSessionMetrics
       security:
         - ProjectKeyHeader: []
@@ -608,10 +608,13 @@ paths:
         - `active_installs`
 
         `count`, `duration_total`, and `new_installs` read from worker-built
-        hourly and daily rollups.
+        hourly and daily rollups and keep the existing `granularity` contract.
 
-        `active_installs` accepts `granularity=day|week|month|year`. `count`,
-        `duration_total`, and `new_installs` remain `hour|day` only.
+        `active_installs` stays on this route but uses exact inclusive UTC
+        `start` / `end` dates instead of `granularity`. It accepts optional
+        `interval=day|week|month|year`. `week|month|year` windows are
+        calendar-shaped and clipped to the request edges; requests do not need
+        aligned boundaries.
 
         Built-in session dimensions are `platform`, `app_version`, and
         `os_version`. Any other non-reserved query key matching
@@ -624,14 +627,14 @@ paths:
 
         `new_installs` keeps first-seen assignment fixed once an install is
         recorded, even if earlier late events arrive later. `active_installs`
-        counts installs whose session starts fall inside each returned bucket.
-        Week buckets use UTC ISO Mondays; month and year buckets use the first
-        UTC day of the calendar month or year. Grouped or filtered
-        `active_installs` slices may overlap, so grouped totals are not
-        guaranteed to sum back to the ungrouped distinct-install total.
+        counts distinct installs with at least one session whose
+        `session_start` falls inside the exact requested UTC range. Grouped or
+        filtered `active_installs` slices may overlap, so grouped totals are
+        not guaranteed to sum back to the ungrouped distinct-install total.
       parameters:
         - $ref: '#/components/parameters/SessionMetric'
-        - $ref: '#/components/parameters/MetricGranularity'
+        - $ref: '#/components/parameters/SessionMetricGranularity'
+        - $ref: '#/components/parameters/MetricInterval'
         - $ref: '#/components/parameters/MetricStart'
         - $ref: '#/components/parameters/MetricEnd'
         - $ref: '#/components/parameters/SessionGroupBy'
@@ -640,11 +643,13 @@ paths:
         - $ref: '#/components/parameters/OsVersionFilter'
       responses:
         '200':
-          description: Bucketed session metric series using the uniform metrics family response shape.
+          description: Bucketed session metrics for `count`, `duration_total`, and `new_installs`, or exact-range point windows for `active_installs`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MetricsResponse'
+                oneOf:
+                  - $ref: '#/components/schemas/MetricsResponse'
+                  - $ref: '#/components/schemas/ActiveInstallsResponse'
         '401':
           description: Missing, invalid, revoked, or wrong-kind project read key.
           content:
@@ -756,7 +761,7 @@ components:
           - duration_total
           - new_installs
           - active_installs
-    MetricGranularity:
+    EventMetricGranularity:
       in: query
       name: granularity
       required: true
@@ -765,14 +770,34 @@ components:
         enum:
           - hour
           - day
-          - week
-          - month
-          - year
       description: |
-        Bucket granularity. Event metrics and non-`active_installs` session
-        metrics accept only `hour|day`. `active_installs` additionally accepts
-        `week|month|year`. `hour` uses UTC RFC3339 hour-start timestamps.
-        `day|week|month|year` use inclusive UTC `YYYY-MM-DD` bucket starts.
+        Bucket granularity. Required for event metrics. `hour` uses UTC
+        RFC3339 hour-start timestamps. `day` uses inclusive UTC
+        `YYYY-MM-DD` bucket starts.
+    SessionMetricGranularity:
+      in: query
+      name: granularity
+      required: false
+      schema:
+        type: string
+        enum:
+          - hour
+          - day
+      description: |
+        Bucket granularity. Required for session metrics `count`,
+        `duration_total`, and `new_installs`. `hour` uses UTC RFC3339
+        hour-start timestamps. `day` uses inclusive UTC `YYYY-MM-DD` bucket
+        starts. `active_installs` rejects this parameter.
+    MetricInterval:
+      in: query
+      name: interval
+      required: false
+      schema:
+        $ref: '#/components/schemas/MetricIntervalValue'
+      description: |
+        Exact-range intervaling for `metric=active_installs` only. `day` uses
+        UTC day windows. `week|month|year` use calendar-shaped windows clipped
+        to the exact request edges.
     PlatformFilter:
       in: query
       name: platform
@@ -802,10 +827,9 @@ components:
       schema:
         type: string
       description: |
-        Inclusive UTC bucket start. Use RFC3339 `...:00:00Z` hour starts when
-        `granularity=hour`. Use `YYYY-MM-DD` for `day|week|month|year`, with
-        week aligned to a UTC ISO Monday and month/year aligned to the first
-        UTC day of the calendar month or year.
+        Inclusive UTC start. Use RFC3339 `...:00:00Z` hour starts when
+        `granularity=hour`. Use `YYYY-MM-DD` for bucketed day reads and for
+        exact-range `active_installs`.
     MetricEnd:
       in: query
       name: end
@@ -813,10 +837,9 @@ components:
       schema:
         type: string
       description: |
-        Inclusive UTC bucket end. Use RFC3339 `...:00:00Z` hour starts when
-        `granularity=hour`. Use `YYYY-MM-DD` for `day|week|month|year`, with
-        week aligned to a UTC ISO Monday and month/year aligned to the first
-        UTC day of the calendar month or year.
+        Inclusive UTC end. Use RFC3339 `...:00:00Z` hour starts when
+        `granularity=hour`. Use `YYYY-MM-DD` for bucketed day reads and for
+        exact-range `active_installs`.
     EventDiscoveryStart:
       in: query
       name: start
@@ -1165,6 +1188,13 @@ components:
         - week
         - month
         - year
+    MetricIntervalValue:
+      type: string
+      enum:
+        - day
+        - week
+        - month
+        - year
     MetricsPoint:
       type: object
       required:
@@ -1215,6 +1245,58 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/MetricsSeries'
+    ActiveInstallsPoint:
+      type: object
+      required:
+        - start
+        - end
+        - value
+      properties:
+        start:
+          type: string
+        end:
+          type: string
+        value:
+          type: integer
+          minimum: 0
+    ActiveInstallsSeries:
+      type: object
+      required:
+        - dimensions
+        - points
+      properties:
+        dimensions:
+          $ref: '#/components/schemas/MetricsDimensions'
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActiveInstallsPoint'
+    ActiveInstallsResponse:
+      type: object
+      required:
+        - metric
+        - start
+        - end
+        - group_by
+        - series
+      properties:
+        metric:
+          type: string
+          const: active_installs
+        start:
+          type: string
+        end:
+          type: string
+        interval:
+          $ref: '#/components/schemas/MetricIntervalValue'
+        group_by:
+          type: array
+          items:
+            type: string
+        series:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActiveInstallsSeries'
     LiveInstallsResponse:
       type: object
       required:

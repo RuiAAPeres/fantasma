@@ -227,13 +227,15 @@ pub struct LiveInstallsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  fantasma metrics sessions --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider\n  fantasma metrics sessions --metric active_installs --granularity week --start 2026-03-02 --end 2026-03-16 --filter plan=pro --group-by provider"
+    after_help = "Examples:\n  fantasma metrics sessions --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider\n  fantasma metrics sessions --metric active_installs --start 2026-03-01 --end 2026-03-17 --interval week --filter plan=pro --group-by provider"
 )]
 pub struct SessionMetricsArgs {
     #[arg(long)]
     pub metric: SessionMetricArg,
     #[arg(long)]
-    pub granularity: MetricGranularityArg,
+    pub granularity: Option<MetricGranularityArg>,
+    #[arg(long)]
+    pub interval: Option<MetricIntervalArg>,
     #[arg(long)]
     pub start: String,
     #[arg(long)]
@@ -277,6 +279,15 @@ pub enum SessionMetricArg {
 #[value(rename_all = "snake_case")]
 pub enum MetricGranularityArg {
     Hour,
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+pub enum MetricIntervalArg {
     Day,
     Week,
     Month,

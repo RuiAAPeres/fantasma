@@ -670,7 +670,7 @@ async fn pipeline_exposes_bucketed_session_metrics_after_worker_batch(pool: PgPo
     let active_installs_response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-02",
+                "/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-02",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -689,14 +689,14 @@ async fn pipeline_exposes_bucketed_session_metrics_after_worker_batch(pool: PgPo
         .expect("decode response"),
         serde_json::json!({
             "metric": "active_installs",
-            "granularity": "day",
+            "start": "2026-01-01",
+            "end": "2026-01-02",
             "group_by": [],
             "series": [
                 {
                     "dimensions": {},
                     "points": [
-                        { "bucket": "2026-01-01", "value": 1 },
-                        { "bucket": "2026-01-02", "value": 0 }
+                        { "start": "2026-01-01", "end": "2026-01-02", "value": 1 }
                     ]
                 }
             ]
@@ -1014,6 +1014,129 @@ async fn pipeline_exposes_dim2_event_metrics_with_null_buckets(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn pipeline_keeps_active_installs_visible_while_session_backlog_remains(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-03-01T00:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "app_version": "1.4.0",
+                                "os_version": "18.3"
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-03-01T01:00:00Z",
+                                "install_id": "install-2",
+                                "platform": "ios",
+                                "app_version": "1.4.0",
+                                "os_version": "18.3"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    let processed = fantasma_worker::process_session_batch(&pool, 1)
+        .await
+        .expect("session worker batch succeeds");
+    assert_eq!(processed, 1, "test needs a remaining session backlog");
+
+    let count_response = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=count&granularity=day&start=2026-03-01&end=2026-03-01",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid count request"),
+        )
+        .await
+        .expect("count request succeeds");
+
+    assert_eq!(count_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(count_response).await,
+        serde_json::json!({
+            "metric": "count",
+            "granularity": "day",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        { "bucket": "2026-03-01", "value": 1 }
+                    ]
+                }
+            ]
+        })
+    );
+
+    let active_installs_response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=active_installs&start=2026-03-01&end=2026-03-01",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid active installs request"),
+        )
+        .await
+        .expect("active installs request succeeds");
+
+    assert_eq!(active_installs_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(active_installs_response).await,
+        serde_json::json!({
+            "metric": "active_installs",
+            "start": "2026-03-01",
+            "end": "2026-03-01",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        { "start": "2026-03-01", "end": "2026-03-01", "value": 1 }
+                    ]
+                }
+            ]
+        }),
+        "exact-range active_installs should reflect committed session batches even while later raw events remain queued"
+    );
+
+    let remaining = fantasma_worker::process_session_batch(&pool, 1)
+        .await
+        .expect("second session worker batch succeeds");
+    assert_eq!(
+        remaining, 1,
+        "the query should have run while a later raw session batch was still pending"
+    );
+}
+
+#[sqlx::test]
 async fn pipeline_rejects_active_installs_invalid_combinations(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
@@ -1024,9 +1147,9 @@ async fn pipeline_rejects_active_installs_invalid_combinations(pool: PgPool) {
     let provisioned = provision_project(api.clone()).await;
 
     for path in [
-        "/v1/metrics/sessions?metric=active_installs&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T00:00:00Z",
-        "/v1/metrics/sessions?metric=active_installs&granularity=week&start=2026-01-03&end=2026-01-10",
-        "/v1/metrics/sessions?metric=count&granularity=week&start=2026-01-05&end=2026-01-12",
+        "/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-01",
+        "/v1/metrics/sessions?metric=count&granularity=day&interval=day&start=2026-01-01&end=2026-01-01",
+        "/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-05-20&interval=day",
     ] {
         let response = api
             .clone()
@@ -1122,7 +1245,7 @@ async fn pipeline_exposes_weekly_active_installs_with_zero_fill(pool: PgPool) {
     let response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions?metric=active_installs&granularity=week&start=2026-03-02&end=2026-03-16",
+                "/v1/metrics/sessions?metric=active_installs&start=2026-03-01&end=2026-03-17&interval=week",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -1136,15 +1259,18 @@ async fn pipeline_exposes_weekly_active_installs_with_zero_fill(pool: PgPool) {
         response_json(response).await,
         serde_json::json!({
             "metric": "active_installs",
-            "granularity": "week",
+            "start": "2026-03-01",
+            "end": "2026-03-17",
+            "interval": "week",
             "group_by": [],
             "series": [
                 {
                     "dimensions": {},
                     "points": [
-                        { "bucket": "2026-03-02", "value": 1 },
-                        { "bucket": "2026-03-09", "value": 1 },
-                        { "bucket": "2026-03-16", "value": 0 }
+                        { "start": "2026-03-01", "end": "2026-03-01", "value": 0 },
+                        { "start": "2026-03-02", "end": "2026-03-08", "value": 1 },
+                        { "start": "2026-03-09", "end": "2026-03-15", "value": 1 },
+                        { "start": "2026-03-16", "end": "2026-03-17", "value": 0 }
                     ]
                 }
             ]
@@ -1303,7 +1429,7 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
         .clone()
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-01&plan=pro",
+                "/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-01&plan=pro",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -1317,13 +1443,14 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
         response_json(filtered_active_installs_response).await,
         serde_json::json!({
             "metric": "active_installs",
-            "granularity": "day",
+            "start": "2026-01-01",
+            "end": "2026-01-01",
             "group_by": [],
             "series": [
                 {
                     "dimensions": {},
                     "points": [
-                        { "bucket": "2026-01-01", "value": 3 }
+                        { "start": "2026-01-01", "end": "2026-01-01", "value": 2 }
                     ]
                 }
             ]
@@ -1333,7 +1460,7 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
     let grouped_active_installs_response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-01&plan=pro&group_by=provider",
+                "/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-01&plan=pro&group_by=provider",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -1347,7 +1474,8 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
         response_json(grouped_active_installs_response).await,
         serde_json::json!({
             "metric": "active_installs",
-            "granularity": "day",
+            "start": "2026-01-01",
+            "end": "2026-01-01",
             "group_by": ["provider"],
             "series": [
                 {
@@ -1355,7 +1483,7 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
                         "provider": "garmin"
                     },
                     "points": [
-                        { "bucket": "2026-01-01", "value": 1 }
+                        { "start": "2026-01-01", "end": "2026-01-01", "value": 1 }
                     ]
                 },
                 {
@@ -1363,7 +1491,7 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
                         "provider": "strava"
                     },
                     "points": [
-                        { "bucket": "2026-01-01", "value": 2 }
+                        { "start": "2026-01-01", "end": "2026-01-01", "value": 2 }
                     ]
                 }
             ]

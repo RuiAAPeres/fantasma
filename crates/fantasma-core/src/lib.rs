@@ -7,6 +7,8 @@ pub use events::{
     is_reserved_event_property_key, is_valid_event_property_key,
 };
 pub use metrics::{
-    CurrentMetricResponse, EventMetric, EventMetricsQuery, MetricGranularity, MetricsBucketWindow,
+    ActiveInstallsPoint, ActiveInstallsResponse, ActiveInstallsSeries, CurrentMetricResponse,
+    EventMetric, EventMetricsQuery, MetricGranularity, MetricInterval, MetricsBucketWindow,
     MetricsPoint, MetricsResponse, MetricsSeries, SessionMetric, SessionMetricsQuery,
+    SessionMetricsReadResponse,
 };

@@ -718,23 +718,21 @@ async fn metrics_sessions_active_installs_json_uses_stored_read_key() {
     );
     save_config(&server.config_path, &config).expect("save config");
 
-    let output = server
-        .app
-        .run(server.parse(&[
-            "metrics",
-            "sessions",
-            "--metric",
-            "active_installs",
-            "--granularity",
-            "day",
-            "--start",
-            "2026-03-01",
-            "--end",
-            "2026-03-02",
-            "--json",
-        ]))
-        .await
-        .expect("metrics succeeds");
+    let cli = Cli::try_parse_from([
+        "fantasma",
+        "metrics",
+        "sessions",
+        "--metric",
+        "active_installs",
+        "--start",
+        "2026-03-01",
+        "--end",
+        "2026-03-02",
+        "--json",
+    ])
+    .expect("exact-range active_installs should parse");
+
+    let output = server.app.run(cli).await.expect("metrics succeeds");
 
     let body: Value = serde_json::from_str(&output.stdout).expect("json output");
     assert_eq!(body["metric"], json!("active_installs"));
@@ -830,52 +828,77 @@ async fn metrics_live_installs_text_renders_scalar_response() {
     assert_eq!(output.stdout, "live_installs\t9\t2026-03-17T12:34:56Z\t120");
 }
 
-#[tokio::test]
-async fn metrics_sessions_active_installs_accepts_week_granularity_locally() {
-    let server = TestServer::spawn().await;
-    let mut config = server.read_config();
-    let profile = config.instances.get_mut("prod").unwrap();
-    profile.active_project_id = Some(server.project_id);
-    profile.store_read_key(
-        server.project_id,
-        fantasma_cli::config::StoredReadKey {
-            key_id: server.read_key_id,
-            name: "cli-read".to_owned(),
-            secret: "fg_rd_created".to_owned(),
-            created_at: "2026-03-13T12:00:00Z".to_owned(),
-        },
-    );
-    save_config(&server.config_path, &config).expect("save config");
+#[test]
+fn metrics_sessions_active_installs_subcommand_parses_exact_range_without_granularity() {
+    Cli::try_parse_from([
+        "fantasma",
+        "metrics",
+        "sessions",
+        "--metric",
+        "active_installs",
+        "--start",
+        "2026-03-01",
+        "--end",
+        "2026-03-17",
+        "--json",
+    ])
+    .expect("exact-range active_installs should parse without granularity");
+}
 
-    server
-        .app
-        .run(server.parse(&[
-            "metrics",
-            "sessions",
-            "--metric",
-            "active_installs",
-            "--granularity",
-            "week",
-            "--start",
-            "2026-03-03",
-            "--end",
-            "2026-03-10",
-            "--json",
-        ]))
-        .await
-        .expect("week granularity should be accepted");
+#[test]
+fn metrics_sessions_active_installs_subcommand_accepts_interval() {
+    Cli::try_parse_from([
+        "fantasma",
+        "metrics",
+        "sessions",
+        "--metric",
+        "active_installs",
+        "--start",
+        "2026-03-01",
+        "--end",
+        "2026-03-17",
+        "--interval",
+        "week",
+        "--json",
+    ])
+    .expect("active_installs should accept --interval");
+}
 
-    let records = server.records();
+#[test]
+fn metrics_sessions_active_installs_rejects_granularity_flag() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let app = App::new(temp.path().join("fantasma.toml"));
+    let cli = Cli::try_parse_from([
+        "fantasma",
+        "metrics",
+        "sessions",
+        "--metric",
+        "active_installs",
+        "--granularity",
+        "day",
+        "--start",
+        "2026-03-01",
+        "--end",
+        "2026-03-17",
+    ])
+    .expect("active_installs arguments still parse");
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let error = runtime
+        .block_on(app.run(cli))
+        .expect_err("active_installs should reject --granularity locally");
+
+    let rendered = error.to_string();
     assert!(
-        records
-            .iter()
-            .any(|record| record.path == "/v1/metrics/sessions"),
-        "local validation should allow weekly active_installs before any metrics request"
+        rendered.contains("--granularity")
+            || rendered.contains("active_installs")
+            || rendered.contains("interval"),
+        "error should mention the incompatible active_installs granularity flag: {rendered}"
     );
 }
 
 #[tokio::test]
-async fn metrics_sessions_count_rejects_week_granularity_locally() {
+async fn metrics_sessions_active_installs_serializes_exact_range_query() {
     let server = TestServer::spawn().await;
     let mut config = server.read_config();
     let profile = config.instances.get_mut("prod").unwrap();
@@ -885,34 +908,90 @@ async fn metrics_sessions_count_rejects_week_granularity_locally() {
         fantasma_cli::config::StoredReadKey {
             key_id: server.read_key_id,
             name: "cli-read".to_owned(),
-            secret: "fg_rd_created".to_owned(),
+            secret: server.read_key_secret.clone(),
             created_at: "2026-03-13T12:00:00Z".to_owned(),
         },
     );
     save_config(&server.config_path, &config).expect("save config");
 
-    let error = server
-        .app
-        .run(server.parse(&[
-            "metrics",
-            "sessions",
-            "--metric",
-            "count",
-            "--granularity",
-            "week",
-            "--start",
-            "2026-03-03",
-            "--end",
-            "2026-03-10",
-            "--json",
-        ]))
-        .await
-        .expect_err("week granularity should fail for count");
+    let cli = Cli::try_parse_from([
+        "fantasma",
+        "metrics",
+        "sessions",
+        "--metric",
+        "active_installs",
+        "--start",
+        "2026-03-01",
+        "--end",
+        "2026-03-17",
+        "--interval",
+        "week",
+        "--filter",
+        "plan=pro",
+        "--group-by",
+        "provider",
+        "--json",
+    ])
+    .expect("exact-range active_installs should parse");
 
-    assert!(
-        error
-            .to_string()
-            .contains("only active_installs supports week/month/year granularity")
+    server
+        .app
+        .run(cli)
+        .await
+        .expect("active installs metrics succeed");
+
+    let records = server.records();
+    let request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/sessions")
+        .expect("metrics request");
+    assert_eq!(
+        request.query.as_deref(),
+        Some(
+            "metric=active_installs&start=2026-03-01&end=2026-03-17&interval=week&plan=pro&group_by=provider"
+        )
+    );
+}
+
+#[tokio::test]
+async fn metrics_sessions_active_installs_text_renders_exact_range_points() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: server.read_key_secret.clone(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    let cli = Cli::try_parse_from([
+        "fantasma",
+        "metrics",
+        "sessions",
+        "--metric",
+        "active_installs",
+        "--start",
+        "2026-03-01",
+        "--end",
+        "2026-03-17",
+    ])
+    .expect("exact-range active_installs should parse");
+
+    let output = server
+        .app
+        .run(cli)
+        .await
+        .expect("active installs text output succeeds");
+
+    assert_eq!(
+        output.stdout,
+        "dimensions\tstart\tend\tvalue\n{}\t2026-03-01\t2026-03-17\t9"
     );
 }
 
@@ -933,25 +1012,29 @@ async fn metrics_sessions_active_installs_serializes_d2_filters_and_group_by_exa
     );
     save_config(&server.config_path, &config).expect("save config");
 
+    let cli = Cli::try_parse_from([
+        "fantasma",
+        "metrics",
+        "sessions",
+        "--metric",
+        "active_installs",
+        "--start",
+        "2026-03-01",
+        "--end",
+        "2026-03-17",
+        "--interval",
+        "week",
+        "--filter",
+        "plan=pro",
+        "--group-by",
+        "provider",
+        "--json",
+    ])
+    .expect("exact-range active_installs should parse");
+
     server
         .app
-        .run(server.parse(&[
-            "metrics",
-            "sessions",
-            "--metric",
-            "active_installs",
-            "--granularity",
-            "day",
-            "--start",
-            "2026-03-01",
-            "--end",
-            "2026-03-02",
-            "--filter",
-            "plan=pro",
-            "--group-by",
-            "provider",
-            "--json",
-        ]))
+        .run(cli)
         .await
         .expect("active installs metrics succeed");
 
@@ -963,7 +1046,7 @@ async fn metrics_sessions_active_installs_serializes_d2_filters_and_group_by_exa
     assert_eq!(
         request.query.as_deref(),
         Some(
-            "metric=active_installs&granularity=day&start=2026-03-01&end=2026-03-02&plan=pro&group_by=provider"
+            "metric=active_installs&start=2026-03-01&end=2026-03-17&interval=week&plan=pro&group_by=provider"
         )
     );
 }
@@ -2177,26 +2260,52 @@ async fn session_metrics(
         headers,
         None,
     );
-    (
-        StatusCode::OK,
-        Json(json!({
-            "metric": metric,
-            "granularity": "day",
-            "group_by": [],
-            "series": [
-                {
-                    "dimensions": {},
-                    "points": [
-                        {
-                            "bucket": "2026-03-01",
-                            "value": 9
-                        }
-                    ]
-                }
-            ]
-        })),
-    )
-        .into_response()
+    if metric == "active_installs" {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "metric": "active_installs",
+                "start": "2026-03-01",
+                "end": "2026-03-17",
+                "interval": "week",
+                "group_by": [],
+                "series": [
+                    {
+                        "dimensions": {},
+                        "points": [
+                            {
+                                "start": "2026-03-01",
+                                "end": "2026-03-17",
+                                "value": 9
+                            }
+                        ]
+                    }
+                ]
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "metric": metric,
+                "granularity": "day",
+                "group_by": [],
+                "series": [
+                    {
+                        "dimensions": {},
+                        "points": [
+                            {
+                                "bucket": "2026-03-01",
+                                "value": 9
+                            }
+                        ]
+                    }
+                ]
+            })),
+        )
+            .into_response()
+    }
 }
 
 async fn live_installs(

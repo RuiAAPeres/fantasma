@@ -463,18 +463,25 @@ curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=new_installs&granula
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
+`active_installs` stays on `GET /v1/metrics/sessions`, but it uses exact inclusive UTC `start` / `end` plus optional `interval=day|week|month|year` instead of `granularity`. `week|month|year` windows are calendar-shaped and clipped to the request edges.
+
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-02" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-02" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-02&plan=pro&group_by=provider" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-02&plan=pro&group_by=provider" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&granularity=week&start=2025-12-29&end=2026-01-26" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-31&interval=week" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
+```
+
+```bash
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-10&end=2026-03-20&interval=month&plan=pro" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 

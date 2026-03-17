@@ -14,6 +14,26 @@ pub enum MetricGranularity {
     Year,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricInterval {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl MetricInterval {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Year => "year",
+        }
+    }
+}
+
 impl MetricGranularity {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -82,6 +102,7 @@ pub struct SessionMetricsQuery {
     pub project_id: Uuid,
     pub metric: SessionMetric,
     pub window: MetricsBucketWindow,
+    pub interval: Option<MetricInterval>,
     pub filters: BTreeMap<String, String>,
     pub group_by: Vec<String>,
 }
@@ -104,6 +125,37 @@ pub struct MetricsResponse {
     pub granularity: MetricGranularity,
     pub group_by: Vec<String>,
     pub series: Vec<MetricsSeries>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ActiveInstallsPoint {
+    pub start: String,
+    pub end: String,
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ActiveInstallsSeries {
+    pub dimensions: BTreeMap<String, Option<String>>,
+    pub points: Vec<ActiveInstallsPoint>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ActiveInstallsResponse {
+    pub metric: String,
+    pub start: String,
+    pub end: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<MetricInterval>,
+    pub group_by: Vec<String>,
+    pub series: Vec<ActiveInstallsSeries>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SessionMetricsReadResponse {
+    Bucketed(MetricsResponse),
+    ActiveInstalls(ActiveInstallsResponse),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -242,6 +294,48 @@ mod tests {
                         "dimensions": {},
                         "points": [
                             { "bucket": "2026-03-02", "value": 14 }
+                        ]
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn active_installs_response_serializes_exact_range_shape() {
+        let response = ActiveInstallsResponse {
+            metric: "active_installs".to_owned(),
+            start: "2026-03-01".to_owned(),
+            end: "2026-03-17".to_owned(),
+            interval: Some(MetricInterval::Week),
+            group_by: vec!["platform".to_owned()],
+            series: vec![ActiveInstallsSeries {
+                dimensions: BTreeMap::from([("platform".to_owned(), Some("ios".to_owned()))]),
+                points: vec![ActiveInstallsPoint {
+                    start: "2026-03-01".to_owned(),
+                    end: "2026-03-01".to_owned(),
+                    value: 41,
+                }],
+            }],
+        };
+
+        let json = serde_json::to_value(response).expect("serialize response");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "metric": "active_installs",
+                "start": "2026-03-01",
+                "end": "2026-03-17",
+                "interval": "week",
+                "group_by": ["platform"],
+                "series": [
+                    {
+                        "dimensions": {
+                            "platform": "ios"
+                        },
+                        "points": [
+                            { "start": "2026-03-01", "end": "2026-03-01", "value": 41 }
                         ]
                     }
                 ]

@@ -2,14 +2,18 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Cursor,
     time::Duration,
 };
 
 use chrono::{DateTime, NaiveDate, Utc};
 use fantasma_auth::{derive_key_prefix, hash_ingest_key};
 use fantasma_core::{EventPayload, MetricGranularity, Platform, SessionMetric};
+use roaring::RoaringTreemap;
 pub use sqlx::PgPool;
-use sqlx::{Postgres, QueryBuilder, Row, Transaction, migrate::Migrator, postgres::PgPoolOptions};
+use sqlx::{
+    Executor, Postgres, QueryBuilder, Row, Transaction, migrate::Migrator, postgres::PgPoolOptions,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -4614,11 +4618,471 @@ fn resolved_api_key_from_row(row: &sqlx::postgres::PgRow) -> Result<ResolvedApiK
     })
 }
 
+// Active install bitmap helpers
+
+#[derive(Debug, Clone)]
+pub struct ActiveInstallBitmapDim1Input {
+    pub dim1_key: String,
+    pub dim1_value: Option<String>,
+    pub bitmap: RoaringTreemap,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveInstallBitmapDim2Input {
+    pub dim1_key: String,
+    pub dim1_value: Option<String>,
+    pub dim2_key: String,
+    pub dim2_value: Option<String>,
+    pub bitmap: RoaringTreemap,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveInstallBitmapTotalRow {
+    pub day: NaiveDate,
+    pub bitmap: RoaringTreemap,
+    pub cardinality: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveInstallBitmapDim1Row {
+    pub day: NaiveDate,
+    pub dim1_key: String,
+    pub dim1_value: Option<String>,
+    pub bitmap: RoaringTreemap,
+    pub cardinality: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveInstallBitmapDim2Row {
+    pub day: NaiveDate,
+    pub dim1_key: String,
+    pub dim1_value: Option<String>,
+    pub dim2_key: String,
+    pub dim2_value: Option<String>,
+    pub bitmap: RoaringTreemap,
+    pub cardinality: i64,
+}
+
+pub async fn allocate_project_install_ordinals_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_ids: &[String],
+) -> Result<BTreeMap<String, i64>, StoreError> {
+    if install_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let install_ids = install_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    sqlx::query(
+        "INSERT INTO project_install_ordinal_state (project_id) VALUES ($1) ON CONFLICT DO NOTHING",
+    )
+    .bind(project_id)
+    .execute(&mut **tx)
+    .await?;
+
+    let state_row = sqlx::query(
+        "SELECT next_ordinal FROM project_install_ordinal_state WHERE project_id = $1 FOR UPDATE",
+    )
+    .bind(project_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let mut next_ordinal = state_row.try_get::<i64, _>("next_ordinal")?;
+
+    let existing = sqlx::query(
+        "SELECT install_id, ordinal FROM project_install_ordinals WHERE project_id = $1 AND install_id = ANY($2)",
+    )
+    .bind(project_id)
+    .bind(&install_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut ordinals = BTreeMap::new();
+    for row in existing {
+        ordinals.insert(row.try_get("install_id")?, row.try_get("ordinal")?);
+    }
+
+    let mut unique_installs = BTreeSet::new();
+    for install_id in install_ids {
+        unique_installs.insert(install_id.clone());
+    }
+    unique_installs.retain(|install_id| !ordinals.contains_key(install_id));
+
+    if unique_installs.is_empty() {
+        return Ok(ordinals);
+    }
+
+    let assigned_rows: Vec<(String, i64)> = unique_installs
+        .into_iter()
+        .map(|install_id| {
+            let ordinal = next_ordinal;
+            next_ordinal += 1;
+            (install_id, ordinal)
+        })
+        .collect();
+
+    if !assigned_rows.is_empty() {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO project_install_ordinals (project_id, install_id, ordinal) ",
+        );
+        builder.push_values(assigned_rows.iter(), |mut row, (install_id, ordinal)| {
+            row.push_bind(project_id)
+                .push_bind(install_id)
+                .push_bind(*ordinal);
+        });
+        builder.build().execute(&mut **tx).await?;
+
+        sqlx::query(
+            "UPDATE project_install_ordinal_state SET next_ordinal = $1, updated_at = now() WHERE project_id = $2",
+        )
+        .bind(next_ordinal)
+        .bind(project_id)
+        .execute(&mut **tx)
+        .await?;
+
+        for (install_id, ordinal) in assigned_rows {
+            ordinals.insert(install_id, ordinal);
+        }
+    }
+
+    Ok(ordinals)
+}
+
+pub async fn enqueue_active_install_bitmap_rebuild(
+    pool: &PgPool,
+    project_id: Uuid,
+    day: NaiveDate,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO active_install_bitmap_rebuild_queue (project_id, day) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(project_id)
+    .bind(day)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn enqueue_active_install_bitmap_rebuild_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    day: NaiveDate,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO active_install_bitmap_rebuild_queue (project_id, day) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(project_id)
+    .bind(day)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn load_active_install_bitmap_rebuild_queue(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> Result<Vec<NaiveDate>, StoreError> {
+    let rows = sqlx::query_scalar::<_, NaiveDate>(
+        r#"
+        SELECT day
+        FROM active_install_bitmap_rebuild_queue
+        WHERE project_id = $1
+        ORDER BY day ASC
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+pub async fn delete_active_install_bitmap_rebuild_entry(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    day: NaiveDate,
+) -> Result<bool, StoreError> {
+    let result = sqlx::query(
+        "DELETE FROM active_install_bitmap_rebuild_queue WHERE project_id = $1 AND day = $2",
+    )
+    .bind(project_id)
+    .bind(day)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn replace_active_install_day_bitmaps_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    day: NaiveDate,
+    total_bitmap: &RoaringTreemap,
+    dim1_rows: &[ActiveInstallBitmapDim1Input],
+    dim2_rows: &[ActiveInstallBitmapDim2Input],
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "DELETE FROM active_install_daily_bitmaps_total WHERE project_id = $1 AND day = $2",
+    )
+    .bind(project_id)
+    .bind(day)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM active_install_daily_bitmaps_dim1 WHERE project_id = $1 AND day = $2")
+        .bind(project_id)
+        .bind(day)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM active_install_daily_bitmaps_dim2 WHERE project_id = $1 AND day = $2")
+        .bind(project_id)
+        .bind(day)
+        .execute(&mut **tx)
+        .await?;
+
+    if !total_bitmap.is_empty() {
+        let total_bytes = serialize_active_install_bitmap(total_bitmap)?;
+        sqlx::query(
+            "INSERT INTO active_install_daily_bitmaps_total (project_id, day, bitmap, cardinality) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(project_id)
+        .bind(day)
+        .bind(total_bytes)
+        .bind(total_bitmap.len() as i64)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    for row in dim1_rows {
+        let (dim1_value, dim1_value_is_null) = encode_dimension_value(row.dim1_value.as_deref());
+        let bitmap_bytes = serialize_active_install_bitmap(&row.bitmap)?;
+        sqlx::query(
+            "INSERT INTO active_install_daily_bitmaps_dim1 (project_id, day, dim1_key, dim1_value, dim1_value_is_null, bitmap, cardinality) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(project_id)
+        .bind(day)
+        .bind(&row.dim1_key)
+        .bind(dim1_value)
+        .bind(dim1_value_is_null)
+        .bind(bitmap_bytes)
+        .bind(row.bitmap.len() as i64)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    for row in dim2_rows {
+        let (dim1_value, dim1_value_is_null) = encode_dimension_value(row.dim1_value.as_deref());
+        let (dim2_value, dim2_value_is_null) = encode_dimension_value(row.dim2_value.as_deref());
+        let bitmap_bytes = serialize_active_install_bitmap(&row.bitmap)?;
+        sqlx::query(
+            "INSERT INTO active_install_daily_bitmaps_dim2 (project_id, day, dim1_key, dim1_value, dim1_value_is_null, dim2_key, dim2_value, dim2_value_is_null, bitmap, cardinality) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(project_id)
+        .bind(day)
+        .bind(&row.dim1_key)
+        .bind(dim1_value)
+        .bind(dim1_value_is_null)
+        .bind(&row.dim2_key)
+        .bind(dim2_value)
+        .bind(dim2_value_is_null)
+        .bind(bitmap_bytes)
+        .bind(row.bitmap.len() as i64)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub async fn load_active_install_bitmap_totals_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    days: &[NaiveDate],
+) -> Result<Vec<ActiveInstallBitmapTotalRow>, StoreError>
+where
+    E: Executor<'a, Database = Postgres>,
+{
+    if days.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let rows = sqlx::query(
+        "SELECT day, bitmap, cardinality
+        FROM active_install_daily_bitmaps_total
+        WHERE project_id = $1
+          AND day = ANY($2)
+        ORDER BY day ASC",
+    )
+    .bind(project_id)
+    .bind(days)
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let bitmap = deserialize_active_install_bitmap(&row.try_get::<Vec<u8>, _>("bitmap")?)?;
+            Ok(ActiveInstallBitmapTotalRow {
+                day: row.try_get("day")?,
+                bitmap,
+                cardinality: row.try_get("cardinality")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn load_active_install_bitmap_dim1_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    dim1_key: &str,
+    dim1_value: Option<&str>,
+    days: &[NaiveDate],
+) -> Result<Vec<ActiveInstallBitmapDim1Row>, StoreError>
+where
+    E: Executor<'a, Database = Postgres>,
+{
+    if days.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let (value, is_null) = encode_dimension_value(dim1_value);
+    let rows = sqlx::query(
+        "SELECT day, dim1_key, dim1_value, dim1_value_is_null, bitmap, cardinality
+        FROM active_install_daily_bitmaps_dim1
+        WHERE project_id = $1
+          AND day = ANY($2)
+          AND dim1_key = $3
+          AND dim1_value = $4
+          AND dim1_value_is_null = $5
+        ORDER BY day ASC",
+    )
+    .bind(project_id)
+    .bind(days)
+    .bind(dim1_key)
+    .bind(value)
+    .bind(is_null)
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let bitmap = deserialize_active_install_bitmap(&row.try_get::<Vec<u8>, _>("bitmap")?)?;
+            let dim1_value = row.try_get::<String, _>("dim1_value")?;
+            let dim1_value_is_null = row.try_get::<bool, _>("dim1_value_is_null")?;
+            Ok(ActiveInstallBitmapDim1Row {
+                day: row.try_get("day")?,
+                dim1_key: row.try_get("dim1_key")?,
+                dim1_value: decode_dimension_value(&dim1_value, dim1_value_is_null),
+                bitmap,
+                cardinality: row.try_get("cardinality")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn load_active_install_bitmap_dim2_in_executor<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    dim1_key: &str,
+    dim1_value: Option<&str>,
+    dim2_key: &str,
+    dim2_value: Option<&str>,
+    days: &[NaiveDate],
+) -> Result<Vec<ActiveInstallBitmapDim2Row>, StoreError>
+where
+    E: Executor<'a, Database = Postgres>,
+{
+    if days.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let (dim1_encoded, dim1_is_null) = encode_dimension_value(dim1_value);
+    let (dim2_encoded, dim2_is_null) = encode_dimension_value(dim2_value);
+    let rows = sqlx::query(
+        "SELECT day, dim1_key, dim1_value, dim1_value_is_null, dim2_key, dim2_value, dim2_value_is_null, bitmap, cardinality
+        FROM active_install_daily_bitmaps_dim2
+        WHERE project_id = $1
+          AND day = ANY($2)
+          AND dim1_key = $3
+          AND dim1_value = $4
+          AND dim1_value_is_null = $5
+          AND dim2_key = $6
+          AND dim2_value = $7
+          AND dim2_value_is_null = $8
+        ORDER BY day ASC",
+    )
+    .bind(project_id)
+    .bind(days)
+    .bind(dim1_key)
+    .bind(dim1_encoded)
+    .bind(dim1_is_null)
+    .bind(dim2_key)
+    .bind(dim2_encoded)
+    .bind(dim2_is_null)
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let bitmap = deserialize_active_install_bitmap(&row.try_get::<Vec<u8>, _>("bitmap")?)?;
+            let dim1_value = row.try_get::<String, _>("dim1_value")?;
+            let dim1_value_is_null = row.try_get::<bool, _>("dim1_value_is_null")?;
+            let dim2_value = row.try_get::<String, _>("dim2_value")?;
+            let dim2_value_is_null = row.try_get::<bool, _>("dim2_value_is_null")?;
+            Ok(ActiveInstallBitmapDim2Row {
+                day: row.try_get("day")?,
+                dim1_key: row.try_get("dim1_key")?,
+                dim1_value: decode_dimension_value(&dim1_value, dim1_value_is_null),
+                dim2_key: row.try_get("dim2_key")?,
+                dim2_value: decode_dimension_value(&dim2_value, dim2_value_is_null),
+                bitmap,
+                cardinality: row.try_get("cardinality")?,
+            })
+        })
+        .collect()
+}
+
+pub fn serialize_active_install_bitmap(bitmap: &RoaringTreemap) -> Result<Vec<u8>, StoreError> {
+    let mut buffer = Vec::new();
+    bitmap
+        .serialize_into(&mut buffer)
+        .map_err(|err| StoreError::InvariantViolation(format!("serialize bitmap: {err}")))?;
+
+    Ok(buffer)
+}
+
+pub fn deserialize_active_install_bitmap(bytes: &[u8]) -> Result<RoaringTreemap, StoreError> {
+    let mut cursor = Cursor::new(bytes);
+    RoaringTreemap::deserialize_from(&mut cursor)
+        .map_err(|err| StoreError::InvariantViolation(format!("deserialize bitmap: {err}")))
+}
+
+fn encode_dimension_value(value: Option<&str>) -> (String, bool) {
+    match value {
+        Some(text) => (text.to_owned(), false),
+        None => (String::new(), true),
+    }
+}
+
+fn decode_dimension_value(value: &str, is_null: bool) -> Option<String> {
+    if is_null {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
     use fantasma_core::EventPayload;
+    use roaring::RoaringTreemap;
     use serde_json::Value;
 
     fn project_id() -> Uuid {
@@ -4782,14 +5246,8 @@ mod tests {
             )
               AND indexname IN (
                 'idx_event_metric_buckets_total_project_event_bucket',
-                'idx_event_metric_buckets_total_project_bucket',
                 'idx_event_metric_buckets_dim1_project_event_bucket',
-                'idx_event_metric_buckets_dim1_project_bucket',
-                'idx_event_metric_buckets_dim1_project_dim1_value_bucket',
                 'idx_event_metric_buckets_dim2_project_event_bucket',
-                'idx_event_metric_buckets_dim2_project_bucket',
-                'idx_event_metric_buckets_dim2_project_dim1_value_bucket',
-                'idx_event_metric_buckets_dim2_project_dim2_value_bucket',
                 'idx_event_metric_buckets_dim2_project_event_dim1_value_bucket',
                 'idx_event_metric_buckets_dim2_project_event_dim2_value_bucket'
               )
@@ -4887,15 +5345,9 @@ mod tests {
             event_metrics_index_names,
             vec![
                 "idx_event_metric_buckets_dim1_project_event_bucket".to_owned(),
-                "idx_event_metric_buckets_dim1_project_bucket".to_owned(),
-                "idx_event_metric_buckets_dim1_project_dim1_value_bucket".to_owned(),
-                "idx_event_metric_buckets_dim2_project_bucket".to_owned(),
-                "idx_event_metric_buckets_dim2_project_dim1_value_bucket".to_owned(),
-                "idx_event_metric_buckets_dim2_project_dim2_value_bucket".to_owned(),
                 "idx_event_metric_buckets_dim2_project_event_bucket".to_owned(),
                 "idx_event_metric_buckets_dim2_project_event_dim1_value_bucket".to_owned(),
                 "idx_event_metric_buckets_dim2_project_event_dim2_value_bucket".to_owned(),
-                "idx_event_metric_buckets_total_project_bucket".to_owned(),
                 "idx_event_metric_buckets_total_project_event_bucket".to_owned(),
             ]
         );
@@ -4904,6 +5356,279 @@ mod tests {
         assert_eq!(event_metrics_table_count, 3);
         assert!(os_version_column_exists);
         assert_eq!(removed_identity_columns, vec!["session_id".to_owned()]);
+    }
+
+    #[sqlx::test]
+    async fn active_install_bitmap_tables_and_indexes_exist(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        for table in [
+            "project_install_ordinals",
+            "project_install_ordinal_state",
+            "active_install_bitmap_rebuild_queue",
+            "active_install_daily_bitmaps_total",
+            "active_install_daily_bitmaps_dim1",
+            "active_install_daily_bitmaps_dim2",
+        ] {
+            let exists = sqlx::query_scalar::<_, bool>(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_name = $1
+                )
+                "#,
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch table existence");
+
+            assert!(exists, "table {table} exists");
+        }
+
+        let ordinal_index_names = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename = 'project_install_ordinals'
+              AND indexname = 'idx_project_install_ordinals_project_ordinal'
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch ordinal index");
+
+        assert_eq!(
+            ordinal_index_names,
+            vec!["idx_project_install_ordinals_project_ordinal".to_owned()]
+        );
+
+        let dim1_index_names = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename = 'active_install_daily_bitmaps_dim1'
+              AND indexname = 'idx_active_install_daily_bitmaps_dim1_filter'
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch dim1 index");
+
+        assert_eq!(
+            dim1_index_names,
+            vec!["idx_active_install_daily_bitmaps_dim1_filter".to_owned()]
+        );
+
+        let dim2_index_names = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename = 'active_install_daily_bitmaps_dim2'
+              AND indexname IN (
+                'idx_active_install_daily_bitmaps_dim2_filter_dim1',
+                'idx_active_install_daily_bitmaps_dim2_filter_dim2'
+              )
+            ORDER BY indexname
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch dim2 indexes");
+
+        assert_eq!(
+            dim2_index_names,
+            vec![
+                "idx_active_install_daily_bitmaps_dim2_filter_dim1".to_owned(),
+                "idx_active_install_daily_bitmaps_dim2_filter_dim2".to_owned()
+            ]
+        );
+    }
+
+    #[sqlx::test]
+    async fn active_install_bitmap_dim1_filter_index_exists(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let index_names = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename = 'active_install_daily_bitmaps_dim1'
+            ORDER BY indexname
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch dim1 index names");
+
+        assert!(
+            index_names
+                .iter()
+                .any(|name| name == "idx_active_install_daily_bitmaps_dim1_filter"),
+            "dim1 filter index should exist, got {index_names:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn project_install_ordinals_allocate(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let install_ids = vec!["install-ios".to_owned(), "install-android".to_owned()];
+        let ordinals = allocate_project_install_ordinals_in_tx(&mut tx, project_id(), &install_ids)
+            .await
+            .expect("allocate ordinals");
+        assert_eq!(ordinals.len(), 2);
+
+        let ios_ord = *ordinals.get("install-ios").expect("ios ordinal");
+        let android_ord = *ordinals.get("install-android").expect("android ordinal");
+        assert_ne!(ios_ord, android_ord);
+
+        let additional_ids = vec!["install-android".to_owned(), "install-tablet".to_owned()];
+        let ordinals =
+            allocate_project_install_ordinals_in_tx(&mut tx, project_id(), &additional_ids)
+                .await
+                .expect("allocate additional ordinals");
+
+        assert_eq!(ordinals.get("install-android"), Some(&android_ord));
+        let tablet_ord = *ordinals
+            .get("install-tablet")
+            .expect("new ordinal assigned");
+        assert!(tablet_ord > android_ord);
+
+        tx.commit().await.expect("commit tx");
+    }
+
+    #[sqlx::test]
+    async fn active_install_bitmap_rebuild_queue_helpers(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let day = NaiveDate::from_ymd_opt(2026, 3, 1).expect("valid day");
+        enqueue_active_install_bitmap_rebuild(&pool, project_id(), day)
+            .await
+            .expect("enqueue day");
+        enqueue_active_install_bitmap_rebuild(&pool, project_id(), day)
+            .await
+            .expect("enqueue dedup");
+
+        let entries = load_active_install_bitmap_rebuild_queue(&pool, project_id())
+            .await
+            .expect("load queue");
+        assert_eq!(entries, vec![day]);
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let deleted = delete_active_install_bitmap_rebuild_entry(&mut tx, project_id(), day)
+            .await
+            .expect("delete entry");
+        assert!(deleted);
+        tx.commit().await.expect("commit tx");
+
+        let entries = load_active_install_bitmap_rebuild_queue(&pool, project_id())
+            .await
+            .expect("load queue after delete");
+        assert!(entries.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn active_install_bitmaps_replace_and_load(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let day = NaiveDate::from_ymd_opt(2026, 3, 1).expect("valid day");
+        let mut tx = pool.begin().await.expect("begin tx");
+
+        let install_ids = vec!["install-ios".to_owned(), "install-android".to_owned()];
+        let ordinals = allocate_project_install_ordinals_in_tx(&mut tx, project_id(), &install_ids)
+            .await
+            .expect("allocate ordinals");
+        let ios_ord = *ordinals.get("install-ios").expect("ios ordinal");
+        let android_ord = *ordinals.get("install-android").expect("android ordinal");
+
+        let mut total_bitmap = RoaringTreemap::new();
+        total_bitmap.insert(ios_ord as u64);
+        total_bitmap.insert(android_ord as u64);
+
+        replace_active_install_day_bitmaps_in_tx(
+            &mut tx,
+            project_id(),
+            day,
+            &total_bitmap,
+            &[ActiveInstallBitmapDim1Input {
+                dim1_key: "platform".to_owned(),
+                dim1_value: Some("ios".to_owned()),
+                bitmap: {
+                    let mut bitmap = RoaringTreemap::new();
+                    bitmap.insert(ios_ord as u64);
+                    bitmap
+                },
+            }],
+            &[ActiveInstallBitmapDim2Input {
+                dim1_key: "platform".to_owned(),
+                dim1_value: Some("ios".to_owned()),
+                dim2_key: "os_version".to_owned(),
+                dim2_value: None,
+                bitmap: {
+                    let mut bitmap = RoaringTreemap::new();
+                    bitmap.insert(ios_ord as u64);
+                    bitmap
+                },
+            }],
+        )
+        .await
+        .expect("replace day bitmaps");
+
+        tx.commit().await.expect("commit tx");
+
+        let totals = load_active_install_bitmap_totals_in_executor(&pool, project_id(), &[day])
+            .await
+            .expect("load totals");
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].cardinality, 2);
+        assert!(totals[0].bitmap.contains(ios_ord as u64));
+        assert!(totals[0].bitmap.contains(android_ord as u64));
+
+        let dim1_rows = load_active_install_bitmap_dim1_in_executor(
+            &pool,
+            project_id(),
+            "platform",
+            Some("ios"),
+            &[day],
+        )
+        .await
+        .expect("load dim1 rows");
+        assert_eq!(dim1_rows.len(), 1);
+        assert_eq!(dim1_rows[0].cardinality, 1);
+        assert!(dim1_rows[0].bitmap.contains(ios_ord as u64));
+
+        let dim2_rows = load_active_install_bitmap_dim2_in_executor(
+            &pool,
+            project_id(),
+            "platform",
+            Some("ios"),
+            "os_version",
+            None,
+            &[day],
+        )
+        .await
+        .expect("load dim2 rows");
+        assert_eq!(dim2_rows.len(), 1);
+        assert_eq!(dim2_rows[0].cardinality, 1);
+        assert!(dim2_rows[0].bitmap.contains(ios_ord as u64));
     }
 
     #[sqlx::test]
@@ -5627,6 +6352,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn forward_migration_adds_active_install_daily_bitmap_storage() {
+        let migration = include_str!("../migrations/0019_active_install_daily_bitmaps.sql");
+
+        assert!(
+            migration.contains("CREATE TABLE IF NOT EXISTS project_install_ordinals")
+                && migration.contains("CREATE TABLE IF NOT EXISTS project_install_ordinal_state")
+                && migration
+                    .contains("CREATE TABLE IF NOT EXISTS active_install_bitmap_rebuild_queue")
+                && migration
+                    .contains("CREATE TABLE IF NOT EXISTS active_install_daily_bitmaps_total")
+                && migration
+                    .contains("CREATE TABLE IF NOT EXISTS active_install_daily_bitmaps_dim1")
+                && migration
+                    .contains("CREATE TABLE IF NOT EXISTS active_install_daily_bitmaps_dim2"),
+            "0019 must add the active-install bitmap storage family"
+        );
+        assert!(
+            migration.contains("idx_active_install_daily_bitmaps_dim1_filter")
+                && migration.contains("idx_active_install_daily_bitmaps_dim1_value")
+                && migration.contains("idx_active_install_daily_bitmaps_dim2_value")
+                && migration.contains("idx_active_install_daily_bitmaps_dim2_filter_dim1")
+                && migration.contains("idx_active_install_daily_bitmaps_dim2_filter_dim2"),
+            "0019 must keep bounded read indexes for dim1 and dim2 active-install bitmap reads"
+        );
+    }
+
     #[sqlx::test]
     async fn run_migrations_extends_api_keys_for_scoped_project_keys(pool: PgPool) {
         run_migrations(&pool).await.expect("migrations succeed");
@@ -5993,6 +6745,380 @@ mod tests {
                 "idx_live_install_state_project_received_at".to_owned(),
                 "live_install_state_pkey".to_owned(),
             ]
+        );
+    }
+
+    #[sqlx::test]
+    async fn run_migrations_creates_active_install_daily_bitmap_tables_and_indexes(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let tables = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_name IN (
+                'project_install_ordinals',
+                'project_install_ordinal_state',
+                'active_install_bitmap_rebuild_queue',
+                'active_install_daily_bitmaps_total',
+                'active_install_daily_bitmaps_dim1',
+                'active_install_daily_bitmaps_dim2'
+            )
+            ORDER BY table_name ASC
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch active install bitmap tables");
+
+        let indexes = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename IN (
+                'project_install_ordinals',
+                'active_install_daily_bitmaps_dim1',
+                'active_install_daily_bitmaps_dim2'
+            )
+              AND indexname IN (
+                'project_install_ordinals_pkey',
+                'idx_project_install_ordinals_project_ordinal',
+                'idx_active_install_daily_bitmaps_dim1_value',
+                'idx_active_install_daily_bitmaps_dim1_filter',
+                'idx_active_install_daily_bitmaps_dim2_value',
+                'idx_active_install_daily_bitmaps_dim2_filter_dim1',
+                'idx_active_install_daily_bitmaps_dim2_filter_dim2'
+              )
+            ORDER BY indexname ASC
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch active install bitmap indexes");
+
+        assert_eq!(
+            tables,
+            vec![
+                "active_install_bitmap_rebuild_queue".to_owned(),
+                "active_install_daily_bitmaps_dim1".to_owned(),
+                "active_install_daily_bitmaps_dim2".to_owned(),
+                "active_install_daily_bitmaps_total".to_owned(),
+                "project_install_ordinal_state".to_owned(),
+                "project_install_ordinals".to_owned(),
+            ]
+        );
+        assert_eq!(
+            indexes,
+            vec![
+                "idx_active_install_daily_bitmaps_dim1_filter".to_owned(),
+                "idx_active_install_daily_bitmaps_dim1_value".to_owned(),
+                "idx_active_install_daily_bitmaps_dim2_filter_dim1".to_owned(),
+                "idx_active_install_daily_bitmaps_dim2_filter_dim2".to_owned(),
+                "idx_active_install_daily_bitmaps_dim2_value".to_owned(),
+                "idx_project_install_ordinals_project_ordinal".to_owned(),
+                "project_install_ordinals_pkey".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_install_bitmap_serialization_round_trips() {
+        let bitmap = RoaringTreemap::from_iter([1_u64, 17, 999_999]);
+
+        let encoded = serialize_active_install_bitmap(&bitmap).expect("serialize bitmap");
+        let decoded = deserialize_active_install_bitmap(&encoded).expect("deserialize bitmap");
+
+        assert_eq!(decoded, bitmap);
+    }
+
+    #[sqlx::test]
+    async fn allocate_project_install_ordinals_in_tx_assigns_stable_unique_ordinals(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let mut tx = pool.begin().await.expect("begin allocation tx");
+        let first = allocate_project_install_ordinals_in_tx(
+            &mut tx,
+            project_id(),
+            &[
+                "install-b".to_owned(),
+                "install-a".to_owned(),
+                "install-b".to_owned(),
+            ],
+        )
+        .await
+        .expect("allocate first ordinals");
+        let second = allocate_project_install_ordinals_in_tx(
+            &mut tx,
+            project_id(),
+            &["install-a".to_owned(), "install-c".to_owned()],
+        )
+        .await
+        .expect("allocate second ordinals");
+        tx.commit().await.expect("commit allocation tx");
+
+        assert_eq!(first.get("install-a").copied(), Some(0));
+        assert_eq!(first.get("install-b").copied(), Some(1));
+        assert_eq!(second.get("install-a").copied(), Some(0));
+        assert_eq!(second.get("install-c").copied(), Some(2));
+    }
+
+    #[sqlx::test]
+    async fn active_install_bitmap_rebuild_queue_round_trips(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let day_1 = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid day");
+        let day_2 = NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid day");
+
+        enqueue_active_install_bitmap_rebuild(&pool, project_id(), day_2)
+            .await
+            .expect("enqueue later day");
+        enqueue_active_install_bitmap_rebuild(&pool, project_id(), day_1)
+            .await
+            .expect("enqueue earlier day");
+        enqueue_active_install_bitmap_rebuild(&pool, project_id(), day_1)
+            .await
+            .expect("dedupe earlier day");
+
+        assert_eq!(
+            load_active_install_bitmap_rebuild_queue(&pool, project_id())
+                .await
+                .expect("load queue"),
+            vec![day_1, day_2]
+        );
+
+        let mut delete_tx = pool.begin().await.expect("begin delete tx");
+        assert!(
+            delete_active_install_bitmap_rebuild_entry(&mut delete_tx, project_id(), day_1)
+                .await
+                .expect("delete existing queue row")
+        );
+        assert!(
+            !delete_active_install_bitmap_rebuild_entry(&mut delete_tx, project_id(), day_1)
+                .await
+                .expect("delete missing queue row")
+        );
+        delete_tx.commit().await.expect("commit delete tx");
+
+        assert_eq!(
+            load_active_install_bitmap_rebuild_queue(&pool, project_id())
+                .await
+                .expect("load queue after delete"),
+            vec![day_2]
+        );
+    }
+
+    #[sqlx::test]
+    async fn replace_active_install_day_bitmaps_round_trips_through_bitmap_loaders(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid day");
+        let total = RoaringTreemap::from_iter([0_u64, 1, 2]);
+        let dim1_rows = vec![
+            ActiveInstallBitmapDim1Input {
+                dim1_key: "platform".to_owned(),
+                dim1_value: Some("ios".to_owned()),
+                bitmap: RoaringTreemap::from_iter([0_u64, 2]),
+            },
+            ActiveInstallBitmapDim1Input {
+                dim1_key: "app_version".to_owned(),
+                dim1_value: None,
+                bitmap: RoaringTreemap::from_iter([1_u64]),
+            },
+        ];
+        let dim2_rows = vec![ActiveInstallBitmapDim2Input {
+            dim1_key: "app_version".to_owned(),
+            dim1_value: None,
+            dim2_key: "platform".to_owned(),
+            dim2_value: Some("ios".to_owned()),
+            bitmap: RoaringTreemap::from_iter([1_u64]),
+        }];
+
+        let mut tx = pool.begin().await.expect("begin bitmap write tx");
+        replace_active_install_day_bitmaps_in_tx(
+            &mut tx,
+            project_id(),
+            day,
+            &total,
+            &dim1_rows,
+            &dim2_rows,
+        )
+        .await
+        .expect("replace day bitmaps");
+        tx.commit().await.expect("commit bitmap write tx");
+
+        let totals = load_active_install_bitmap_totals_in_executor(&pool, project_id(), &[day])
+            .await
+            .expect("load total bitmaps");
+        let platform_rows = load_active_install_bitmap_dim1_in_executor(
+            &pool,
+            project_id(),
+            "platform",
+            Some("ios"),
+            &[day],
+        )
+        .await
+        .expect("load platform dim1 bitmaps");
+        let null_app_version_rows = load_active_install_bitmap_dim1_in_executor(
+            &pool,
+            project_id(),
+            "app_version",
+            None,
+            &[day],
+        )
+        .await
+        .expect("load null app_version dim1 bitmaps");
+        let dim2 = load_active_install_bitmap_dim2_in_executor(
+            &pool,
+            project_id(),
+            "app_version",
+            None,
+            "platform",
+            Some("ios"),
+            &[day],
+        )
+        .await
+        .expect("load dim2 bitmaps");
+
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].bitmap, total);
+        assert_eq!(totals[0].cardinality, 3);
+        assert_eq!(platform_rows.len(), 1);
+        assert_eq!(platform_rows[0].bitmap, dim1_rows[0].bitmap);
+        assert_eq!(platform_rows[0].cardinality, 2);
+        assert_eq!(null_app_version_rows.len(), 1);
+        assert_eq!(null_app_version_rows[0].bitmap, dim1_rows[1].bitmap);
+        assert_eq!(null_app_version_rows[0].cardinality, 1);
+        assert_eq!(dim2.len(), 1);
+        assert_eq!(dim2[0].bitmap, dim2_rows[0].bitmap);
+        assert_eq!(dim2[0].cardinality, 1);
+    }
+
+    #[sqlx::test]
+    async fn active_install_bitmap_reads_use_bounded_indexes(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid day");
+        let total = RoaringTreemap::from_iter([0_u64]);
+        let dim1_rows = (0..20_000)
+            .map(|offset| ActiveInstallBitmapDim1Input {
+                dim1_key: "platform".to_owned(),
+                dim1_value: Some(format!("platform-{offset}")),
+                bitmap: RoaringTreemap::from_iter([offset as u64]),
+            })
+            .collect::<Vec<_>>();
+        let dim2_rows = (0..20_000)
+            .map(|offset| ActiveInstallBitmapDim2Input {
+                dim1_key: "app_version".to_owned(),
+                dim1_value: Some(format!("app-{offset}")),
+                dim2_key: "platform".to_owned(),
+                dim2_value: Some(format!("platform-{offset}")),
+                bitmap: RoaringTreemap::from_iter([offset as u64]),
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin bitmap seed tx");
+        replace_active_install_day_bitmaps_in_tx(
+            &mut tx,
+            project_id(),
+            day,
+            &total,
+            &dim1_rows,
+            &dim2_rows,
+        )
+        .await
+        .expect("seed bitmap rows");
+        tx.commit().await.expect("commit bitmap seed tx");
+
+        sqlx::query("ANALYZE active_install_daily_bitmaps_dim1")
+            .execute(&pool)
+            .await
+            .expect("analyze dim1");
+        sqlx::query("ANALYZE active_install_daily_bitmaps_dim2")
+            .execute(&pool)
+            .await
+            .expect("analyze dim2");
+
+        let dim1_plan_row = sqlx::query(
+            r#"
+            EXPLAIN (FORMAT JSON)
+            SELECT bitmap
+            FROM active_install_daily_bitmaps_dim1
+            WHERE project_id = $1
+              AND dim1_key = 'platform'
+              AND dim1_value_is_null = FALSE
+              AND dim1_value = 'platform-19999'
+              AND day = ANY($2)
+            "#,
+        )
+        .bind(project_id())
+        .bind(vec![day])
+        .fetch_one(&pool)
+        .await
+        .expect("explain dim1 read");
+        let dim1_plan = dim1_plan_row
+            .try_get::<Value, _>(0)
+            .expect("dim1 explain json");
+        let dim1_root = explain_plan_root(&dim1_plan);
+        let mut dim1_indexes = Vec::new();
+        collect_plan_index_names(dim1_root, &mut dim1_indexes);
+
+        assert!(
+            !plan_contains_node_type(dim1_root, "Seq Scan"),
+            "dim1 bitmap read should avoid sequential scans: {dim1_plan:#}"
+        );
+        assert!(
+            dim1_indexes
+                .iter()
+                .any(|name| name == "idx_active_install_daily_bitmaps_dim1_value"),
+            "dim1 bitmap read should use the value index, got {dim1_indexes:?} from {dim1_plan:#}"
+        );
+
+        let dim2_plan_row = sqlx::query(
+            r#"
+            EXPLAIN (FORMAT JSON)
+            SELECT bitmap
+            FROM active_install_daily_bitmaps_dim2
+            WHERE project_id = $1
+              AND dim1_key = 'app_version'
+              AND dim2_key = 'platform'
+              AND dim2_value_is_null = FALSE
+              AND dim2_value = 'platform-19999'
+              AND day = ANY($2)
+            "#,
+        )
+        .bind(project_id())
+        .bind(vec![day])
+        .fetch_one(&pool)
+        .await
+        .expect("explain dim2 filtered read");
+        let dim2_plan = dim2_plan_row
+            .try_get::<Value, _>(0)
+            .expect("dim2 explain json");
+        let dim2_root = explain_plan_root(&dim2_plan);
+        let mut dim2_indexes = Vec::new();
+        collect_plan_index_names(dim2_root, &mut dim2_indexes);
+
+        assert!(
+            !plan_contains_node_type(dim2_root, "Seq Scan"),
+            "dim2 bitmap read should avoid sequential scans: {dim2_plan:#}"
+        );
+        assert!(
+            dim2_indexes
+                .iter()
+                .any(|name| name == "idx_active_install_daily_bitmaps_dim2_filter_dim2"),
+            "dim2 bitmap read should use the later-dimension filter index, got {dim2_indexes:?} from {dim2_plan:#}"
         );
     }
 

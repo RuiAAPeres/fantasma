@@ -18,7 +18,8 @@ use chrono::{
 };
 use fantasma_auth::StaticAdminAuthorizer;
 use fantasma_core::{
-    CurrentMetricResponse, EventMetric, EventMetricsQuery, MetricGranularity, MetricsBucketWindow,
+    ActiveInstallsPoint, ActiveInstallsResponse, ActiveInstallsSeries, CurrentMetricResponse,
+    EventMetric, EventMetricsQuery, MetricGranularity, MetricInterval, MetricsBucketWindow,
     MetricsPoint, MetricsResponse, MetricsSeries, SessionMetric, SessionMetricsQuery,
     is_reserved_event_property_key, is_valid_event_property_key,
 };
@@ -26,11 +27,14 @@ use fantasma_store::{
     ApiKeyKind, EventCatalogRecord, EventMetricsAggregateCubeRow, EventMetricsCubeRow, PgPool,
     ProjectRecord, ResolvedApiKey, SessionMetricsAggregateCubeRow, SessionMetricsCubeRow,
     StoreError, TopEventRecord, create_api_key, create_project_with_api_key,
-    fetch_event_metrics_aggregate_cube_rows_in_tx, fetch_event_metrics_cube_rows_in_tx,
-    fetch_session_metrics_aggregate_cube_rows_in_tx, fetch_session_metrics_cube_rows_in_tx,
-    generate_api_key_secret, list_api_keys, list_event_catalog, list_projects, list_top_events,
-    load_live_install_count_in_tx, load_project, rename_project, resolve_api_key, revoke_api_key,
+    deserialize_active_install_bitmap, fetch_event_metrics_aggregate_cube_rows_in_tx,
+    fetch_event_metrics_cube_rows_in_tx, fetch_session_metrics_aggregate_cube_rows_in_tx,
+    fetch_session_metrics_cube_rows_in_tx, generate_api_key_secret, list_api_keys,
+    list_event_catalog, list_projects, list_top_events,
+    load_active_install_bitmap_totals_in_executor, load_live_install_count_in_tx, load_project,
+    rename_project, resolve_api_key, revoke_api_key,
 };
+use roaring::RoaringTreemap;
 use serde::{Deserialize, de::DeserializeOwned};
 use sqlx::{Postgres, QueryBuilder, Row, Transaction};
 use url::form_urlencoded;
@@ -57,6 +61,7 @@ struct PublicEventMetricsQuery {
 struct PublicSessionMetricsQuery {
     metric: SessionMetric,
     window: MetricsBucketWindow,
+    interval: Option<MetricInterval>,
     filters: BTreeMap<String, String>,
     group_by: Vec<String>,
 }
@@ -141,6 +146,7 @@ impl EventMetricsQueryError {
 const MAX_GROUP_BY_DIMENSIONS: usize = 2;
 const MAX_EVENT_REFERENCED_DIMENSIONS: usize = 2;
 const MAX_METRIC_GROUPS: usize = 100;
+const MAX_ACTIVE_INSTALL_POINTS: usize = 120;
 type GroupKey = Vec<Option<String>>;
 type CountsByBucket = BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>;
 type SingletonCountsByBucket = (CountsByBucket, CountsByBucket);
@@ -284,6 +290,7 @@ fn parse_event_metrics_query(
 fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQuery, &'static str> {
     let mut metric = None;
     let mut granularity = None;
+    let mut interval = None;
     let mut start = None;
     let mut end = None;
     let mut filters = BTreeMap::new();
@@ -308,6 +315,13 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
                 }
 
                 granularity = Some(parse_metric_granularity(&value).ok_or("invalid_request")?);
+            }
+            "interval" => {
+                if interval.is_some() {
+                    return Err("invalid_request");
+                }
+
+                interval = Some(parse_metric_interval(&value).ok_or("invalid_request")?);
             }
             "start" => {
                 if start.is_some() {
@@ -374,14 +388,37 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
         return Err("too_many_dimensions");
     }
 
+    let metric = metric.ok_or("invalid_request")?;
+    let window = match metric {
+        SessionMetric::ActiveInstalls => {
+            if granularity.is_some() {
+                return Err("invalid_request");
+            }
+
+            parse_active_installs_window(
+                start.as_deref().ok_or("invalid_request")?,
+                end.as_deref().ok_or("invalid_request")?,
+            )
+            .map_err(|_| "invalid_request")?
+        }
+        SessionMetric::Count | SessionMetric::DurationTotal | SessionMetric::NewInstalls => {
+            if interval.is_some() {
+                return Err("invalid_request");
+            }
+
+            parse_metrics_window(
+                granularity.ok_or("invalid_request")?,
+                start.as_deref().ok_or("invalid_request")?,
+                end.as_deref().ok_or("invalid_request")?,
+            )
+            .map_err(|_| "invalid_request")?
+        }
+    };
+
     Ok(PublicSessionMetricsQuery {
-        metric: metric.ok_or("invalid_request")?,
-        window: parse_metrics_window(
-            granularity.ok_or("invalid_request")?,
-            start.as_deref().ok_or("invalid_request")?,
-            end.as_deref().ok_or("invalid_request")?,
-        )
-        .map_err(|_| "invalid_request")?,
+        metric,
+        window,
+        interval,
         filters,
         group_by,
     })
@@ -554,6 +591,16 @@ fn parse_session_metric(raw: &str) -> Option<SessionMetric> {
     }
 }
 
+fn parse_metric_interval(raw: &str) -> Option<MetricInterval> {
+    match raw {
+        "day" => Some(MetricInterval::Day),
+        "week" => Some(MetricInterval::Week),
+        "month" => Some(MetricInterval::Month),
+        "year" => Some(MetricInterval::Year),
+        _ => None,
+    }
+}
+
 fn parse_metric_granularity(raw: &str) -> Option<MetricGranularity> {
     match raw {
         "hour" => Some(MetricGranularity::Hour),
@@ -563,6 +610,24 @@ fn parse_metric_granularity(raw: &str) -> Option<MetricGranularity> {
         "year" => Some(MetricGranularity::Year),
         _ => None,
     }
+}
+
+fn parse_active_installs_window(
+    start: &str,
+    end: &str,
+) -> Result<MetricsBucketWindow, &'static str> {
+    let start = parse_day_bucket(start)?;
+    let end = parse_day_bucket(end)?;
+
+    if start > end {
+        return Err("invalid_time_range");
+    }
+
+    Ok(MetricsBucketWindow {
+        granularity: MetricGranularity::Day,
+        start,
+        end,
+    })
 }
 
 fn parse_metrics_window(
@@ -1032,6 +1097,7 @@ async fn sessions_metrics(
         project_id: auth.project_id,
         metric: public_query.metric,
         window: public_query.window,
+        interval: public_query.interval,
         filters: public_query.filters,
         group_by: public_query.group_by,
     };
@@ -1040,24 +1106,35 @@ async fn sessions_metrics(
         return query_error_response(error);
     }
 
-    let response = if query.metric == SessionMetric::ActiveInstalls {
-        execute_active_installs_query(&state.pool, &query).await
-    } else {
-        execute_session_metrics_query(&state.pool, &query).await
-    };
-
-    match response {
-        Ok(response) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(response).expect("serialize session metrics response")),
-        )
-            .into_response(),
-        Err(MetricsResponseError::GroupLimitExceeded) => {
-            query_error_response("group_limit_exceeded")
+    if query.metric == SessionMetric::ActiveInstalls {
+        match execute_active_installs_query(&state.pool, &query).await {
+            Ok(response) => (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).expect("serialize active installs response")),
+            )
+                .into_response(),
+            Err(MetricsResponseError::GroupLimitExceeded) => {
+                query_error_response("group_limit_exceeded")
+            }
+            Err(MetricsResponseError::Store(error)) => {
+                tracing::error!(?error, "failed to load session metrics");
+                query_error_response("internal_server_error")
+            }
         }
-        Err(MetricsResponseError::Store(error)) => {
-            tracing::error!(?error, "failed to load session metrics");
-            query_error_response("internal_server_error")
+    } else {
+        match execute_session_metrics_query(&state.pool, &query).await {
+            Ok(response) => (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).expect("serialize session metrics response")),
+            )
+                .into_response(),
+            Err(MetricsResponseError::GroupLimitExceeded) => {
+                query_error_response("group_limit_exceeded")
+            }
+            Err(MetricsResponseError::Store(error)) => {
+                tracing::error!(?error, "failed to load session metrics");
+                query_error_response("internal_server_error")
+            }
         }
     }
 }
@@ -1191,6 +1268,12 @@ struct MetricsAggregateValueRow {
     value: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveInstallPointWindow {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
 fn query_error_response(error: &'static str) -> axum::response::Response {
     let status = match error {
         "not_found" => StatusCode::NOT_FOUND,
@@ -1230,14 +1313,18 @@ fn validate_event_metrics_query(query: &EventMetricsQuery) -> Result<(), &'stati
 
 fn validate_active_installs_query(query: &SessionMetricsQuery) -> Result<(), &'static str> {
     match query.metric {
-        SessionMetric::ActiveInstalls => match query.window.granularity {
-            MetricGranularity::Day
-            | MetricGranularity::Week
-            | MetricGranularity::Month
-            | MetricGranularity::Year => Ok(()),
-            MetricGranularity::Hour => Err("invalid_request"),
-        },
+        SessionMetric::ActiveInstalls => {
+            if active_install_point_windows(query)?.len() > MAX_ACTIVE_INSTALL_POINTS {
+                return Err("invalid_request");
+            }
+
+            Ok(())
+        }
         SessionMetric::Count | SessionMetric::DurationTotal | SessionMetric::NewInstalls => {
+            if query.interval.is_some() {
+                return Err("invalid_request");
+            }
+
             match query.window.granularity {
                 MetricGranularity::Hour | MetricGranularity::Day => Ok(()),
                 MetricGranularity::Week | MetricGranularity::Month | MetricGranularity::Year => {
@@ -1251,25 +1338,348 @@ fn validate_active_installs_query(query: &SessionMetricsQuery) -> Result<(), &'s
 async fn execute_active_installs_query(
     pool: &PgPool,
     query: &SessionMetricsQuery,
-) -> Result<MetricsResponse, MetricsResponseError> {
+) -> Result<ActiveInstallsResponse, MetricsResponseError> {
     let mut tx = begin_metrics_snapshot(pool).await?;
-    let counts_by_bucket = load_active_install_counts_by_bucket(&mut tx, query).await?;
-    let group_count = counts_by_bucket
-        .values()
-        .flat_map(|groups| groups.keys())
-        .collect::<BTreeSet<_>>()
-        .len();
+    let windows = active_install_point_windows(query).map_err(|_| {
+        MetricsResponseError::Store(StoreError::InvariantViolation(
+            "active installs point windows must already be validated".to_owned(),
+        ))
+    })?;
+    let mut counts_by_window = BTreeMap::new();
+    let mut groups_seen = BTreeSet::new();
+
+    for window in &windows {
+        let counts = load_active_install_group_counts_for_window(&mut tx, query, window).await?;
+        groups_seen.extend(counts.keys().cloned());
+        counts_by_window.insert(window.start, counts);
+    }
+
+    let group_count = if query.group_by.is_empty() {
+        1
+    } else {
+        groups_seen.len()
+    };
     if group_count > MAX_METRIC_GROUPS {
         return Err(MetricsResponseError::GroupLimitExceeded);
     }
     tx.commit().await.map_err(StoreError::Database)?;
 
-    Ok(build_metrics_response(
-        query.metric.as_str(),
-        &query.window,
-        &query.group_by,
-        counts_by_bucket,
+    Ok(build_active_installs_response(
+        query,
+        &windows,
+        counts_by_window,
     ))
+}
+
+fn active_install_point_windows(
+    query: &SessionMetricsQuery,
+) -> Result<Vec<ActiveInstallPointWindow>, &'static str> {
+    let start = query.window.start.date_naive();
+    let end = query.window.end.date_naive();
+    let interval = query.interval;
+    let mut windows = Vec::new();
+    let mut current = start;
+
+    loop {
+        let point_end = match interval {
+            None => end,
+            Some(MetricInterval::Day) => current,
+            Some(MetricInterval::Week) => end.min(end_of_week(current)),
+            Some(MetricInterval::Month) => end.min(end_of_month(current)),
+            Some(MetricInterval::Year) => end.min(end_of_year(current)),
+        };
+
+        windows.push(ActiveInstallPointWindow {
+            start: day_start(current),
+            end: day_start(point_end),
+        });
+
+        if point_end >= end || interval.is_none() {
+            break;
+        }
+
+        current = point_end
+            .succ_opt()
+            .expect("valid successor within active installs range");
+    }
+
+    Ok(windows)
+}
+
+fn day_start(day: NaiveDate) -> DateTime<Utc> {
+    DateTime::from_naive_utc_and_offset(day.and_hms_opt(0, 0, 0).expect("midnight is valid"), Utc)
+}
+
+fn end_of_week(day: NaiveDate) -> NaiveDate {
+    day + ChronoDuration::days((6 - day.weekday().num_days_from_monday()) as i64)
+}
+
+fn end_of_month(day: NaiveDate) -> NaiveDate {
+    let (year, month) = if day.month() == 12 {
+        (day.year() + 1, 1)
+    } else {
+        (day.year(), day.month() + 1)
+    };
+
+    NaiveDate::from_ymd_opt(year, month, 1)
+        .expect("valid first day of next month")
+        .pred_opt()
+        .expect("month has a valid predecessor")
+}
+
+fn end_of_year(day: NaiveDate) -> NaiveDate {
+    NaiveDate::from_ymd_opt(day.year(), 12, 31).expect("valid last day of year")
+}
+
+async fn load_active_install_group_counts_for_window(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &SessionMetricsQuery,
+    window: &ActiveInstallPointWindow,
+) -> Result<BTreeMap<GroupKey, u64>, MetricsResponseError> {
+    let days = active_install_days(window);
+    let referenced_keys = cube_keys_with(&query.filters, &query.group_by);
+
+    match referenced_keys.len() {
+        0 => {
+            let mut bitmap = RoaringTreemap::new();
+            for row in
+                load_active_install_bitmap_totals_in_executor(&mut **tx, query.project_id, &days)
+                    .await?
+            {
+                bitmap |= row.bitmap;
+            }
+
+            Ok(BTreeMap::from([(Vec::new(), bitmap.len())]))
+        }
+        1 => {
+            load_active_install_dim1_group_counts_for_window(tx, query, &days, &referenced_keys[0])
+                .await
+        }
+        2 => {
+            load_active_install_dim2_group_counts_for_window(
+                tx,
+                query,
+                &days,
+                &referenced_keys[0],
+                &referenced_keys[1],
+            )
+            .await
+        }
+        other => Err(StoreError::InvariantViolation(format!(
+            "active_installs referenced dimension arity must be between 0 and 2, got {other}"
+        ))
+        .into()),
+    }
+}
+
+fn active_install_days(window: &ActiveInstallPointWindow) -> Vec<NaiveDate> {
+    let mut days = Vec::new();
+    let mut day = window.start.date_naive();
+    let end = window.end.date_naive();
+
+    loop {
+        days.push(day);
+        if day >= end {
+            break;
+        }
+        day = day
+            .succ_opt()
+            .expect("active install window days must stay in range");
+    }
+
+    days
+}
+
+async fn load_active_install_dim1_group_counts_for_window(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &SessionMetricsQuery,
+    days: &[NaiveDate],
+    key: &str,
+) -> Result<BTreeMap<GroupKey, u64>, MetricsResponseError> {
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT CASE WHEN dim1_value_is_null THEN NULL ELSE dim1_value END AS dim_value, bitmap \
+         FROM active_install_daily_bitmaps_dim1 WHERE project_id = ",
+    );
+    builder.push_bind(query.project_id);
+    builder.push(" AND day = ANY(");
+    builder.push_bind(days);
+    builder.push(") AND dim1_key = ");
+    builder.push_bind(key);
+
+    if let Some(value) = query.filters.get(key) {
+        builder.push(" AND dim1_value_is_null = FALSE AND dim1_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(" ORDER BY day ASC, dim_value ASC");
+    let rows = builder
+        .build()
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StoreError::from)?;
+
+    let mut bitmaps_by_group = BTreeMap::<GroupKey, RoaringTreemap>::new();
+    for row in rows {
+        let dim_value = row
+            .try_get::<Option<String>, _>("dim_value")
+            .map_err(StoreError::from)?;
+        let bitmap = deserialize_active_install_bitmap(
+            &row.try_get::<Vec<u8>, _>("bitmap")
+                .map_err(StoreError::from)?,
+        )?;
+        let group_key = if query.group_by.is_empty() {
+            Vec::new()
+        } else {
+            vec![dim_value]
+        };
+        let entry = bitmaps_by_group.entry(group_key).or_default();
+        *entry |= bitmap;
+    }
+
+    Ok(active_install_group_counts(bitmaps_by_group))
+}
+
+async fn load_active_install_dim2_group_counts_for_window(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &SessionMetricsQuery,
+    days: &[NaiveDate],
+    key1: &str,
+    key2: &str,
+) -> Result<BTreeMap<GroupKey, u64>, MetricsResponseError> {
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT CASE WHEN dim1_value_is_null THEN NULL ELSE dim1_value END AS dim1_value, \
+         CASE WHEN dim2_value_is_null THEN NULL ELSE dim2_value END AS dim2_value, bitmap \
+         FROM active_install_daily_bitmaps_dim2 WHERE project_id = ",
+    );
+    builder.push_bind(query.project_id);
+    builder.push(" AND day = ANY(");
+    builder.push_bind(days);
+    builder.push(") AND dim1_key = ");
+    builder.push_bind(key1);
+    builder.push(" AND dim2_key = ");
+    builder.push_bind(key2);
+
+    if let Some(value) = query.filters.get(key1) {
+        builder.push(" AND dim1_value_is_null = FALSE AND dim1_value = ");
+        builder.push_bind(value);
+    }
+    if let Some(value) = query.filters.get(key2) {
+        builder.push(" AND dim2_value_is_null = FALSE AND dim2_value = ");
+        builder.push_bind(value);
+    }
+
+    builder.push(" ORDER BY day ASC, dim1_value ASC, dim2_value ASC");
+    let rows = builder
+        .build()
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StoreError::from)?;
+
+    let mut bitmaps_by_group = BTreeMap::<GroupKey, RoaringTreemap>::new();
+    for row in rows {
+        let dim1_value = row
+            .try_get::<Option<String>, _>("dim1_value")
+            .map_err(StoreError::from)?;
+        let dim2_value = row
+            .try_get::<Option<String>, _>("dim2_value")
+            .map_err(StoreError::from)?;
+        let bitmap = deserialize_active_install_bitmap(
+            &row.try_get::<Vec<u8>, _>("bitmap")
+                .map_err(StoreError::from)?,
+        )?;
+        let group_key = query
+            .group_by
+            .iter()
+            .map(|group_key| {
+                if group_key == key1 {
+                    dim1_value.clone()
+                } else {
+                    dim2_value.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let entry = bitmaps_by_group.entry(group_key).or_default();
+        *entry |= bitmap;
+    }
+
+    Ok(active_install_group_counts(bitmaps_by_group))
+}
+
+fn active_install_group_counts(
+    bitmaps_by_group: BTreeMap<GroupKey, RoaringTreemap>,
+) -> BTreeMap<GroupKey, u64> {
+    bitmaps_by_group
+        .into_iter()
+        .map(|(group_key, bitmap)| (group_key, bitmap.len()))
+        .collect()
+}
+
+fn build_active_installs_response(
+    query: &SessionMetricsQuery,
+    windows: &[ActiveInstallPointWindow],
+    counts_by_window: BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>,
+) -> ActiveInstallsResponse {
+    let mut series_by_group = BTreeMap::<GroupKey, BTreeMap<DateTime<Utc>, u64>>::new();
+
+    for (window_start, counts) in counts_by_window {
+        for (group_key, value) in counts {
+            series_by_group
+                .entry(group_key)
+                .or_default()
+                .insert(window_start, value);
+        }
+    }
+
+    let series = if query.group_by.is_empty() {
+        let points_by_window = series_by_group.remove(&Vec::new()).unwrap_or_default();
+        vec![ActiveInstallsSeries {
+            dimensions: BTreeMap::new(),
+            points: windows
+                .iter()
+                .map(|window| ActiveInstallsPoint {
+                    start: format_active_install_day(window.start),
+                    end: format_active_install_day(window.end),
+                    value: points_by_window
+                        .get(&window.start)
+                        .copied()
+                        .unwrap_or_default(),
+                })
+                .collect(),
+        }]
+    } else {
+        let mut grouped = series_by_group.into_iter().collect::<Vec<_>>();
+        grouped.sort_by(|(left, _), (right, _)| compare_group_keys(left, right));
+        grouped
+            .into_iter()
+            .map(|(group_key, points_by_window)| ActiveInstallsSeries {
+                dimensions: dimensions_for_group(&query.group_by, &group_key),
+                points: windows
+                    .iter()
+                    .map(|window| ActiveInstallsPoint {
+                        start: format_active_install_day(window.start),
+                        end: format_active_install_day(window.end),
+                        value: points_by_window
+                            .get(&window.start)
+                            .copied()
+                            .unwrap_or_default(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    };
+
+    ActiveInstallsResponse {
+        metric: query.metric.as_str().to_owned(),
+        start: format_active_install_day(query.window.start),
+        end: format_active_install_day(query.window.end),
+        interval: query.interval,
+        group_by: query.group_by.clone(),
+        series,
+    }
+}
+
+fn format_active_install_day(day: DateTime<Utc>) -> String {
+    day.format("%Y-%m-%d").to_string()
 }
 
 async fn execute_session_metrics_query(
@@ -1570,289 +1980,6 @@ async fn load_event_group_counts_by_bucket(
     }
 }
 
-async fn load_active_install_counts_by_bucket(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &SessionMetricsQuery,
-) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
-    match query.window.granularity {
-        MetricGranularity::Day => load_daily_active_install_counts_by_bucket(tx, query).await,
-        MetricGranularity::Week | MetricGranularity::Month | MetricGranularity::Year => {
-            load_range_active_install_counts_by_bucket(tx, query).await
-        }
-        MetricGranularity::Hour => Err(StoreError::InvariantViolation(
-            "active_installs does not support hour granularity".to_owned(),
-        )
-        .into()),
-    }
-}
-
-async fn load_daily_active_install_counts_by_bucket(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &SessionMetricsQuery,
-) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
-    let bucket_expr = "day::timestamp AT TIME ZONE 'UTC'";
-    let mut builder = QueryBuilder::<Postgres>::new("WITH session_slices AS (SELECT ");
-    builder.push(bucket_expr);
-    builder.push(" AS bucket_start, install_id, platform, app_version, os_version, properties");
-
-    builder.push(" FROM session_active_install_slices WHERE project_id = ");
-    builder.push_bind(query.project_id);
-    builder.push(" AND day BETWEEN ");
-    builder.push_bind(query.window.start.date_naive());
-    builder.push(" AND ");
-    builder.push_bind(query.window.end.date_naive());
-
-    for (key, value) in &query.filters {
-        builder.push(" AND ");
-        push_active_install_filter_predicate(&mut builder, key, value);
-    }
-
-    builder.push(") SELECT bucket_start");
-    for key in &query.group_by {
-        builder.push(", ");
-        push_active_install_dimension_expr(&mut builder, key);
-        builder.push(" AS ");
-        builder.push(active_install_dimension_alias(key));
-    }
-    builder.push(", COUNT(*)::BIGINT AS value FROM session_slices GROUP BY bucket_start");
-    for key in &query.group_by {
-        builder.push(", ");
-        builder.push(active_install_dimension_alias(key));
-    }
-    builder.push(" ORDER BY bucket_start ASC");
-    for key in &query.group_by {
-        builder.push(", ");
-        builder.push(active_install_dimension_alias(key));
-        builder.push(" ASC");
-    }
-
-    let rows = builder
-        .build()
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(StoreError::from)?;
-    let mut counts_by_bucket = BTreeMap::<DateTime<Utc>, BTreeMap<GroupKey, u64>>::new();
-
-    for row in rows {
-        let bucket_start = row
-            .try_get::<DateTime<Utc>, _>("bucket_start")
-            .expect("bucket_start column exists");
-        let group_key = query
-            .group_by
-            .iter()
-            .map(|key| {
-                row.try_get::<Option<String>, _>(active_install_dimension_alias(key))
-                    .expect("group dimension column exists")
-            })
-            .collect::<Vec<_>>();
-        counts_by_bucket.entry(bucket_start).or_default().insert(
-            group_key,
-            row.try_get::<i64, _>("value").expect("value column exists") as u64,
-        );
-    }
-
-    Ok(counts_by_bucket)
-}
-
-async fn load_range_active_install_counts_by_bucket(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &SessionMetricsQuery,
-) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
-    let referenced_keys = cube_keys_with(&query.filters, &query.group_by);
-
-    match referenced_keys.len() {
-        0 => load_range_active_install_total_counts_by_bucket(tx, query).await,
-        1 => load_range_active_install_dim1_counts_by_bucket(tx, query, &referenced_keys[0]).await,
-        2 => {
-            load_range_active_install_dim2_counts_by_bucket(
-                tx,
-                query,
-                &referenced_keys[0],
-                &referenced_keys[1],
-            )
-            .await
-        }
-        other => Err(StoreError::InvariantViolation(format!(
-            "active_installs referenced dimension arity must be between 0 and 2, got {other}"
-        ))
-        .into()),
-    }
-}
-
-async fn load_range_active_install_total_counts_by_bucket(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &SessionMetricsQuery,
-) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
-    let rows = sqlx::query(
-        r#"
-        SELECT bucket_start, active_installs
-        FROM active_install_metric_buckets_total
-        WHERE project_id = $1
-          AND granularity = $2
-          AND bucket_start BETWEEN $3 AND $4
-        ORDER BY bucket_start ASC
-        "#,
-    )
-    .bind(query.project_id)
-    .bind(query.window.granularity.as_str())
-    .bind(query.window.start)
-    .bind(query.window.end)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(StoreError::from)?;
-
-    let mut counts_by_bucket = BTreeMap::<DateTime<Utc>, BTreeMap<GroupKey, u64>>::new();
-    for row in rows {
-        counts_by_bucket
-            .entry(
-                row.try_get("bucket_start")
-                    .expect("bucket_start column exists"),
-            )
-            .or_default()
-            .insert(
-                Vec::new(),
-                row.try_get::<i64, _>("active_installs")
-                    .expect("active_installs column exists") as u64,
-            );
-    }
-
-    Ok(counts_by_bucket)
-}
-
-async fn load_range_active_install_dim1_counts_by_bucket(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &SessionMetricsQuery,
-    key: &str,
-) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "SELECT bucket_start, CASE WHEN dim1_value_is_null THEN NULL ELSE dim1_value END AS dim_value, active_installs \
-         FROM active_install_metric_buckets_dim1 WHERE project_id = ",
-    );
-    builder.push_bind(query.project_id);
-    builder.push(" AND granularity = ");
-    builder.push_bind(query.window.granularity.as_str());
-    builder.push(" AND bucket_start BETWEEN ");
-    builder.push_bind(query.window.start);
-    builder.push(" AND ");
-    builder.push_bind(query.window.end);
-    builder.push(" AND dim1_key = ");
-    builder.push_bind(key);
-
-    if let Some(value) = query.filters.get(key) {
-        builder.push(" AND dim1_value_is_null = FALSE AND dim1_value = ");
-        builder.push_bind(value);
-    }
-
-    builder.push(" ORDER BY bucket_start ASC, dim_value ASC");
-
-    let rows = builder
-        .build()
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(StoreError::from)?;
-    let mut counts_by_bucket = BTreeMap::<DateTime<Utc>, BTreeMap<GroupKey, u64>>::new();
-
-    for row in rows {
-        let group_key = if query.group_by.is_empty() {
-            Vec::new()
-        } else {
-            vec![
-                row.try_get::<Option<String>, _>("dim_value")
-                    .expect("dim_value column exists"),
-            ]
-        };
-        counts_by_bucket
-            .entry(
-                row.try_get("bucket_start")
-                    .expect("bucket_start column exists"),
-            )
-            .or_default()
-            .insert(
-                group_key,
-                row.try_get::<i64, _>("active_installs")
-                    .expect("active_installs column exists") as u64,
-            );
-    }
-
-    Ok(counts_by_bucket)
-}
-
-async fn load_range_active_install_dim2_counts_by_bucket(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &SessionMetricsQuery,
-    key1: &str,
-    key2: &str,
-) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
-    let mut builder = QueryBuilder::<Postgres>::new("SELECT bucket_start");
-    for (index, key) in query.group_by.iter().enumerate() {
-        builder.push(", ");
-        if key == key1 {
-            builder.push("CASE WHEN dim1_value_is_null THEN NULL ELSE dim1_value END");
-        } else {
-            builder.push("CASE WHEN dim2_value_is_null THEN NULL ELSE dim2_value END");
-        }
-        builder.push(" AS group_");
-        builder.push(index.to_string());
-    }
-    builder.push(", active_installs FROM active_install_metric_buckets_dim2 WHERE project_id = ");
-    builder.push_bind(query.project_id);
-    builder.push(" AND granularity = ");
-    builder.push_bind(query.window.granularity.as_str());
-    builder.push(" AND bucket_start BETWEEN ");
-    builder.push_bind(query.window.start);
-    builder.push(" AND ");
-    builder.push_bind(query.window.end);
-    builder.push(" AND dim1_key = ");
-    builder.push_bind(key1);
-    builder.push(" AND dim2_key = ");
-    builder.push_bind(key2);
-
-    if let Some(value) = query.filters.get(key1) {
-        builder.push(" AND dim1_value_is_null = FALSE AND dim1_value = ");
-        builder.push_bind(value);
-    }
-    if let Some(value) = query.filters.get(key2) {
-        builder.push(" AND dim2_value_is_null = FALSE AND dim2_value = ");
-        builder.push_bind(value);
-    }
-
-    builder.push(" ORDER BY bucket_start ASC");
-    for index in 0..query.group_by.len() {
-        builder.push(", group_");
-        builder.push(index.to_string());
-        builder.push(" ASC");
-    }
-
-    let rows = builder
-        .build()
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(StoreError::from)?;
-    let mut counts_by_bucket = BTreeMap::<DateTime<Utc>, BTreeMap<GroupKey, u64>>::new();
-
-    for row in rows {
-        let group_key = (0..query.group_by.len())
-            .map(|index| {
-                row.try_get::<Option<String>, _>(format!("group_{index}").as_str())
-                    .expect("group column exists")
-            })
-            .collect::<Vec<_>>();
-        counts_by_bucket
-            .entry(
-                row.try_get("bucket_start")
-                    .expect("bucket_start column exists"),
-            )
-            .or_default()
-            .insert(
-                group_key,
-                row.try_get::<i64, _>("active_installs")
-                    .expect("active_installs column exists") as u64,
-            );
-    }
-
-    Ok(counts_by_bucket)
-}
-
 async fn load_session_group_counts_by_bucket(
     tx: &mut Transaction<'_, Postgres>,
     query: &SessionMetricsQuery,
@@ -2133,60 +2260,6 @@ fn cube_keys_with(filters: &BTreeMap<String, String>, group_keys: &[String]) -> 
     keys.extend(group_keys.iter().cloned());
     keys.sort();
     keys
-}
-
-fn push_active_install_dimension_expr(builder: &mut QueryBuilder<'_, Postgres>, key: &str) {
-    match key {
-        "platform" => {
-            builder.push("platform");
-        }
-        "app_version" => {
-            builder.push("CASE WHEN app_version_is_null THEN NULL ELSE app_version END");
-        }
-        "os_version" => {
-            builder.push("CASE WHEN os_version_is_null THEN NULL ELSE os_version END");
-        }
-        _ => {
-            builder.push("properties ->> ");
-            builder.push_bind(key.to_owned());
-        }
-    }
-}
-
-fn push_active_install_filter_predicate(
-    builder: &mut QueryBuilder<'_, Postgres>,
-    key: &str,
-    value: &str,
-) {
-    match key {
-        "platform" => {
-            builder.push("platform = ");
-            builder.push_bind(value.to_owned());
-        }
-        "app_version" => {
-            builder.push("app_version_is_null = FALSE AND app_version = ");
-            builder.push_bind(value.to_owned());
-        }
-        "os_version" => {
-            builder.push("os_version_is_null = FALSE AND os_version = ");
-            builder.push_bind(value.to_owned());
-        }
-        _ => {
-            builder.push("properties ->> ");
-            builder.push_bind(key.to_owned());
-            builder.push(" = ");
-            builder.push_bind(value.to_owned());
-        }
-    }
-}
-
-fn active_install_dimension_alias(key: &str) -> &str {
-    match key {
-        "platform" => "platform",
-        "app_version" => "app_version",
-        "os_version" => "os_version",
-        _ => key,
-    }
 }
 
 fn sum_rows_by_bucket(rows: &[MetricsCubeValueRow]) -> BTreeMap<DateTime<Utc>, u64> {
@@ -2742,23 +2815,43 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_metric_query_accepts_weekly_active_installs() {
-        let query = parse_session_metric_query(
-            "metric=active_installs&granularity=week&start=2026-03-02&end=2026-03-09",
-        )
-        .expect("query parses");
+    fn parse_session_metric_query_accepts_exact_range_active_installs() {
+        let query =
+            parse_session_metric_query("metric=active_installs&start=2026-03-01&end=2026-03-17")
+                .expect("query parses");
 
         assert_eq!(query.metric, SessionMetric::ActiveInstalls);
-        assert_eq!(query.window.granularity, MetricGranularity::Week);
         assert_eq!(
             query.window.start,
-            Utc.with_ymd_and_hms(2026, 3, 2, 0, 0, 0)
+            Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0)
                 .single()
                 .expect("start")
         );
         assert_eq!(
             query.window.end,
-            Utc.with_ymd_and_hms(2026, 3, 9, 0, 0, 0)
+            Utc.with_ymd_and_hms(2026, 3, 17, 0, 0, 0)
+                .single()
+                .expect("end")
+        );
+    }
+
+    #[test]
+    fn parse_session_metric_query_accepts_intervaled_active_installs() {
+        let query = parse_session_metric_query(
+            "metric=active_installs&start=2026-03-01&end=2026-03-17&interval=week",
+        )
+        .expect("query parses");
+
+        assert_eq!(query.metric, SessionMetric::ActiveInstalls);
+        assert_eq!(
+            query.window.start,
+            Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0)
+                .single()
+                .expect("start")
+        );
+        assert_eq!(
+            query.window.end,
+            Utc.with_ymd_and_hms(2026, 3, 17, 0, 0, 0)
                 .single()
                 .expect("end")
         );
@@ -2792,6 +2885,47 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "invalid_query_key");
+    }
+
+    #[test]
+    fn parse_session_metric_query_rejects_active_installs_granularity() {
+        let error = parse_session_metric_query(
+            "metric=active_installs&granularity=day&start=2026-03-01&end=2026-03-02",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "invalid_request");
+    }
+
+    #[test]
+    fn parse_session_metric_query_rejects_interval_for_bucket_metrics() {
+        let error = parse_session_metric_query(
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&interval=day",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "invalid_request");
+    }
+
+    #[test]
+    fn validate_active_installs_query_rejects_point_count_over_limit() {
+        let public_query = parse_session_metric_query(
+            "metric=active_installs&start=2026-01-01&end=2026-05-20&interval=day",
+        )
+        .expect("query parses");
+        let query = SessionMetricsQuery {
+            project_id: Uuid::nil(),
+            metric: public_query.metric,
+            window: public_query.window,
+            interval: public_query.interval,
+            filters: public_query.filters,
+            group_by: public_query.group_by,
+        };
+
+        assert_eq!(
+            validate_active_installs_query(&query),
+            Err("invalid_request")
+        );
     }
 
     #[test]
@@ -2931,7 +3065,13 @@ mod tests {
             .expect("project route security");
         let live_installs_route = &spec["paths"]["/v1/metrics/live_installs"]["get"];
         let live_installs_200 = &live_installs_route["responses"]["200"];
+        let session_metrics_route = &spec["paths"]["/v1/metrics/sessions"]["get"];
+        let session_metrics_200 = &session_metrics_route["responses"]["200"]["content"]["application/json"]
+            ["schema"]["oneOf"];
         let session_metrics_500 = &spec["paths"]["/v1/metrics/sessions"]["get"]["responses"]["500"];
+        let session_metrics_parameters = session_metrics_route["parameters"]
+            .as_sequence()
+            .expect("session metrics parameters");
         let explicit_filters =
             &spec["paths"]["/v1/metrics/events"]["get"]["x-fantasma-explicit-property-filters"];
         let platform_filter_schema = &spec["components"]["parameters"]["PlatformFilter"]["schema"];
@@ -2942,6 +3082,9 @@ mod tests {
         let event_metrics_parameters = spec["paths"]["/v1/metrics/events"]["get"]["parameters"]
             .as_sequence()
             .expect("event metrics parameters");
+        let event_metric_granularity = &spec["components"]["parameters"]["EventMetricGranularity"];
+        let session_metric_granularity =
+            &spec["components"]["parameters"]["SessionMetricGranularity"];
         let event_name_description = &spec["components"]["parameters"]["EventName"]["description"];
         let management_security = spec["paths"]["/v1/projects"]["get"]["security"]
             .as_sequence()
@@ -3001,6 +3144,44 @@ mod tests {
         assert!(
             session_metrics_500.is_mapping(),
             "session metrics route must document internal_server_error"
+        );
+        assert!(
+            session_metrics_200
+                .as_sequence()
+                .expect("session metrics oneOf")
+                .iter()
+                .any(|schema| schema["$ref"] == "#/components/schemas/ActiveInstallsResponse"),
+            "session metrics route must publish the exact-range active_installs response shape"
+        );
+        assert!(
+            session_metrics_parameters
+                .iter()
+                .any(|parameter| parameter["$ref"] == "#/components/parameters/MetricInterval"),
+            "session metrics route must document the active_installs interval parameter"
+        );
+        assert!(
+            event_metrics_parameters
+                .iter()
+                .any(|parameter| parameter["$ref"]
+                    == "#/components/parameters/EventMetricGranularity"),
+            "event metrics route must require the event-specific granularity parameter"
+        );
+        assert!(
+            session_metrics_parameters
+                .iter()
+                .any(|parameter| parameter["$ref"]
+                    == "#/components/parameters/SessionMetricGranularity"),
+            "session metrics route must use the conditional granularity parameter"
+        );
+        assert_eq!(
+            event_metric_granularity["required"].as_bool(),
+            Some(true),
+            "event metric granularity must be marked required in OpenAPI"
+        );
+        assert_eq!(
+            session_metric_granularity["required"].as_bool(),
+            Some(false),
+            "session metric granularity must remain conditional in OpenAPI"
         );
         assert!(
             explicit_filters.is_mapping(),

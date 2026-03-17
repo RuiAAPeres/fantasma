@@ -9,14 +9,16 @@ use std::{
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Timelike, Utc};
 use fantasma_core::MetricGranularity;
 use fantasma_store::{
-    EventMetricBucketDim1Delta, EventMetricBucketDim2Delta, EventMetricBucketTotalDelta,
-    InstallFirstSeenRecord, InstallSessionStateRecord, LiveInstallStateUpsert,
-    PendingSessionDailyInstallRebuildRecord, PgPool, RawEventRecord,
-    SessionActiveInstallSliceDelta, SessionDailyActiveInstallDelta, SessionDailyDelta,
-    SessionDailyDurationDelta, SessionDailyInstallDelta, SessionRecord, SessionRepairJobRecord,
+    ActiveInstallBitmapDim1Input, ActiveInstallBitmapDim2Input, EventMetricBucketDim1Delta,
+    EventMetricBucketDim2Delta, EventMetricBucketTotalDelta, InstallFirstSeenRecord,
+    InstallSessionStateRecord, LiveInstallStateUpsert, PendingSessionDailyInstallRebuildRecord,
+    PgPool, RawEventRecord, SessionActiveInstallSliceDelta, SessionDailyActiveInstallDelta,
+    SessionDailyDelta, SessionDailyDurationDelta, SessionDailyInstallDelta, SessionMetricDim1Delta,
+    SessionMetricDim2Delta, SessionMetricTotalDelta, SessionRecord, SessionRepairJobRecord,
     SessionRepairJobUpsert, SessionTailUpdate, StoreError, add_session_daily_duration_deltas_in_tx,
-    claim_and_sweep_pending_session_rebuild_buckets_in_tx, claim_pending_session_repair_jobs_in_tx,
-    complete_session_repair_job_in_tx, delete_sessions_overlapping_window_in_tx,
+    allocate_project_install_ordinals_in_tx, claim_and_sweep_pending_session_rebuild_buckets_in_tx,
+    claim_pending_session_repair_jobs_in_tx, complete_session_repair_job_in_tx,
+    delete_sessions_overlapping_window_in_tx, enqueue_active_install_bitmap_rebuild_in_tx,
     enqueue_session_daily_installs_rebuilds_in_tx, enqueue_session_rebuild_buckets_in_tx,
     fetch_events_after_in_tx, fetch_events_for_install_after_id_through_in_tx,
     fetch_events_for_install_between_in_tx, fetch_latest_session_for_install_in_tx,
@@ -26,13 +28,16 @@ use fantasma_store::{
     load_tail_sessions_for_installs_in_tx, lock_worker_offset,
     rebuild_session_active_install_slices_days_in_tx,
     rebuild_session_daily_days_from_pending_install_rebuilds_with_telemetry_in_tx,
-    release_session_repair_job_claim_in_tx, save_worker_offset_in_tx, update_session_tail_in_tx,
-    upsert_event_metric_buckets_dim1_in_tx, upsert_event_metric_buckets_dim2_in_tx,
-    upsert_event_metric_buckets_total_in_tx, upsert_install_session_state_in_tx,
-    upsert_live_install_state_in_tx, upsert_session_active_install_slices_in_tx,
-    upsert_session_daily_deltas_in_tx, upsert_session_daily_install_deltas_in_tx,
+    release_session_repair_job_claim_in_tx, replace_active_install_day_bitmaps_in_tx,
+    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_event_metric_buckets_dim1_in_tx,
+    upsert_event_metric_buckets_dim2_in_tx, upsert_event_metric_buckets_total_in_tx,
+    upsert_install_session_state_in_tx, upsert_live_install_state_in_tx,
+    upsert_session_active_install_slices_in_tx, upsert_session_daily_deltas_in_tx,
+    upsert_session_daily_install_deltas_in_tx, upsert_session_metric_dim1_in_tx,
+    upsert_session_metric_dim2_in_tx, upsert_session_metric_totals_in_tx,
     upsert_session_repair_jobs_in_tx,
 };
+use roaring::RoaringTreemap;
 use serde::Serialize;
 use sqlx::{Postgres, Row, Transaction};
 use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
@@ -53,7 +58,7 @@ const STAGE_B_TRACE_REBUILD_FINALIZE: &str = "rebuild_finalize";
 static STAGE_B_TRACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static EVENT_LANE_TRACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SESSION_REBUILD_DRAIN_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
-static ACTIVE_INSTALL_RANGE_REBUILD_DRAIN_LOCK: LazyLock<AsyncMutex<()>> =
+static ACTIVE_INSTALL_BITMAP_REBUILD_DRAIN_LOCK: LazyLock<AsyncMutex<()>> =
     LazyLock::new(|| AsyncMutex::new(()));
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -278,7 +283,184 @@ struct IncrementalSessionPlan {
     daily_install_deltas: Vec<SessionDailyInstallDelta>,
     daily_session_counts_by_day: BTreeMap<NaiveDate, i64>,
     daily_duration_deltas_by_day: BTreeMap<NaiveDate, i64>,
-    metric_rebuild_scope: SessionRepairBuckets,
+    active_install_bitmap_days: BTreeSet<NaiveDate>,
+    session_metric_accumulator: SessionMetricAccumulator,
+}
+
+#[derive(Debug, Default)]
+struct SessionMetricAccumulator {
+    totals: BTreeMap<(MetricGranularity, DateTime<Utc>), SessionMetricDeltaValue>,
+    dim1: BTreeMap<(MetricGranularity, DateTime<Utc>, String, String), SessionMetricDeltaValue>,
+    dim2: BTreeMap<SessionMetricDim2Key, SessionMetricDeltaValue>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionMetricDeltaValue {
+    session_count: i64,
+    duration_total_seconds: i64,
+    new_installs: i64,
+}
+
+type SessionMetricDim2Key = (
+    MetricGranularity,
+    DateTime<Utc>,
+    String,
+    String,
+    String,
+    String,
+);
+
+impl SessionMetricAccumulator {
+    fn add_session_delta(
+        &mut self,
+        session: &SessionRecord,
+        session_count_delta: i64,
+        duration_delta: i64,
+    ) {
+        let dimensions = session_metric_dimensions(
+            &session.platform,
+            session.app_version.as_ref(),
+            session.os_version.as_ref(),
+            &session.properties,
+        );
+        self.add_deltas_for_dimensions(
+            session.session_start,
+            &dimensions,
+            session_count_delta,
+            duration_delta,
+            0,
+        );
+    }
+
+    fn add_new_install_delta(&mut self, first_seen: &InstallFirstSeenRecord) {
+        let dimensions = session_metric_dimensions(
+            &first_seen.platform,
+            first_seen.app_version.as_ref(),
+            first_seen.os_version.as_ref(),
+            &first_seen.properties,
+        );
+        self.add_deltas_for_dimensions(first_seen.first_seen_at, &dimensions, 0, 0, 1);
+    }
+
+    fn add_deltas_for_dimensions(
+        &mut self,
+        timestamp: DateTime<Utc>,
+        dimensions: &[(String, String)],
+        session_count_delta: i64,
+        duration_delta: i64,
+        new_installs_delta: i64,
+    ) {
+        for granularity in [MetricGranularity::Day, MetricGranularity::Hour] {
+            let bucket_start = bucket_start_for_granularity(timestamp, granularity);
+            self.totals
+                .entry((granularity, bucket_start))
+                .or_default()
+                .add(session_count_delta, duration_delta, new_installs_delta);
+
+            for (dim1_key, dim1_value) in dimensions {
+                self.dim1
+                    .entry((
+                        granularity,
+                        bucket_start,
+                        dim1_key.clone(),
+                        dim1_value.clone(),
+                    ))
+                    .or_default()
+                    .add(session_count_delta, duration_delta, new_installs_delta);
+            }
+
+            for left in 0..dimensions.len() {
+                for right in (left + 1)..dimensions.len() {
+                    let (dim1_key, dim1_value) = &dimensions[left];
+                    let (dim2_key, dim2_value) = &dimensions[right];
+                    self.dim2
+                        .entry((
+                            granularity,
+                            bucket_start,
+                            dim1_key.clone(),
+                            dim1_value.clone(),
+                            dim2_key.clone(),
+                            dim2_value.clone(),
+                        ))
+                        .or_default()
+                        .add(session_count_delta, duration_delta, new_installs_delta);
+                }
+            }
+        }
+    }
+
+    fn into_store_deltas(
+        self,
+        project_id: Uuid,
+    ) -> (
+        Vec<SessionMetricTotalDelta>,
+        Vec<SessionMetricDim1Delta>,
+        Vec<SessionMetricDim2Delta>,
+    ) {
+        let totals = self
+            .totals
+            .into_iter()
+            .map(
+                |((granularity, bucket_start), value)| SessionMetricTotalDelta {
+                    project_id,
+                    granularity,
+                    bucket_start,
+                    session_count: value.session_count,
+                    duration_total_seconds: value.duration_total_seconds,
+                    new_installs: value.new_installs,
+                },
+            )
+            .collect::<Vec<_>>();
+        let dim1 = self
+            .dim1
+            .into_iter()
+            .map(
+                |((granularity, bucket_start, dim1_key, dim1_value), value)| {
+                    SessionMetricDim1Delta {
+                        project_id,
+                        granularity,
+                        bucket_start,
+                        dim1_key,
+                        dim1_value,
+                        session_count: value.session_count,
+                        duration_total_seconds: value.duration_total_seconds,
+                        new_installs: value.new_installs,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        let dim2 = self
+            .dim2
+            .into_iter()
+            .map(
+                |(
+                    (granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value),
+                    value,
+                )| SessionMetricDim2Delta {
+                    project_id,
+                    granularity,
+                    bucket_start,
+                    dim1_key,
+                    dim1_value,
+                    dim2_key,
+                    dim2_value,
+                    session_count: value.session_count,
+                    duration_total_seconds: value.duration_total_seconds,
+                    new_installs: value.new_installs,
+                },
+            )
+            .collect::<Vec<_>>();
+
+        (totals, dim1, dim2)
+    }
+}
+
+impl SessionMetricDeltaValue {
+    fn add(&mut self, session_count: i64, duration_total_seconds: i64, new_installs: i64) {
+        self.session_count += session_count;
+        self.duration_total_seconds += duration_total_seconds;
+        self.new_installs += new_installs;
+    }
 }
 
 pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usize, StoreError> {
@@ -440,14 +622,19 @@ async fn process_session_batch_inner(
         tx.commit().await.map_err(StoreError::from)?;
         return Err(error);
     }
-    if let Err(error) = drain_pending_active_install_range_rebuild_buckets(pool).await {
-        tx.commit().await.map_err(StoreError::from)?;
-        return Err(error);
-    }
-
     hooks.fail_before_coordinator_finalize()?;
     save_worker_offset_in_tx(&mut tx, SESSION_WORKER_NAME, next_offset).await?;
     tx.commit().await.map_err(StoreError::from)?;
+
+    let mut verify_tx = pool.begin().await.map_err(StoreError::from)?;
+    let caught_up = fetch_events_after_in_tx(&mut verify_tx, next_offset, 1)
+        .await?
+        .is_empty();
+    verify_tx.commit().await.map_err(StoreError::from)?;
+
+    if caught_up {
+        drain_pending_active_install_bitmap_rebuilds(pool).await?;
+    }
 
     Ok(SessionBatchOutcome {
         processed_events,
@@ -871,10 +1058,10 @@ async fn process_session_repair_batch_inner(
 
         return Err(drain_error);
     }
-    if let Err(drain_error) = drain_pending_active_install_range_rebuild_buckets(pool).await {
+    if let Err(drain_error) = drain_pending_active_install_bitmap_rebuilds(pool).await {
         if let Some(batch_error) = batch_error {
             return Err(StoreError::InvariantViolation(format!(
-                "session repair batch failed with {batch_error}; draining active-install range rebuilds also failed with {drain_error}"
+                "session repair batch failed with {batch_error}; draining active-install bitmap rebuilds also failed with {drain_error}"
             )));
         }
 
@@ -1335,6 +1522,33 @@ fn event_metric_dimensions(event: &RawEventRecord) -> Vec<(String, String)> {
     dimensions
 }
 
+fn session_metric_dimensions(
+    platform: &fantasma_core::Platform,
+    app_version: Option<&String>,
+    os_version: Option<&String>,
+    properties: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut dimensions = Vec::with_capacity(3 + properties.len());
+    dimensions.push(("platform".to_owned(), platform_dimension_value(platform)));
+
+    if let Some(app_version) = app_version {
+        dimensions.push(("app_version".to_owned(), app_version.clone()));
+    }
+
+    if let Some(os_version) = os_version {
+        dimensions.push(("os_version".to_owned(), os_version.clone()));
+    }
+
+    dimensions.extend(
+        properties
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    dimensions.sort_by(|left, right| left.0.cmp(&right.0));
+
+    dimensions
+}
+
 fn active_install_slice_delta(session: &SessionRecord) -> SessionActiveInstallSliceDelta {
     SessionActiveInstallSliceDelta {
         project_id: session.project_id,
@@ -1491,7 +1705,8 @@ fn plan_incremental_session_batch(
     let mut daily_session_counts_by_day = BTreeMap::<NaiveDate, i64>::new();
     let mut daily_duration_deltas_by_day = BTreeMap::<NaiveDate, i64>::new();
     let mut daily_install_counts = BTreeMap::<NaiveDate, i32>::new();
-    let mut metric_rebuild_scope = SessionRepairBuckets::default();
+    let mut active_install_bitmap_days = BTreeSet::<NaiveDate>::new();
+    let mut session_metric_accumulator = SessionMetricAccumulator::default();
 
     if let (Some(original_tail), Some(updated_tail)) = (
         original_tail.as_ref(),
@@ -1503,7 +1718,7 @@ fn plan_incremental_session_batch(
             *daily_duration_deltas_by_day
                 .entry(updated_tail.session_start.date_naive())
                 .or_default() += duration_delta;
-            metric_rebuild_scope.insert_session(updated_tail);
+            session_metric_accumulator.add_session_delta(updated_tail, 0, duration_delta);
         }
     }
 
@@ -1513,7 +1728,12 @@ fn plan_incremental_session_batch(
         *daily_duration_deltas_by_day.entry(day).or_default() +=
             i64::from(session.duration_seconds);
         *daily_install_counts.entry(day).or_default() += 1;
-        metric_rebuild_scope.insert_session(session);
+        active_install_bitmap_days.insert(day);
+        session_metric_accumulator.add_session_delta(
+            session,
+            1,
+            i64::from(session.duration_seconds),
+        );
     }
 
     let daily_install_deltas = daily_install_counts
@@ -1534,7 +1754,8 @@ fn plan_incremental_session_batch(
         daily_install_deltas,
         daily_session_counts_by_day,
         daily_duration_deltas_by_day,
-        metric_rebuild_scope,
+        active_install_bitmap_days,
+        session_metric_accumulator,
     })
 }
 
@@ -1552,8 +1773,8 @@ async fn apply_incremental_session_plan(
             .first_seen
             .as_ref()
             .expect("inserted first_seen requires a record");
-        plan.metric_rebuild_scope
-            .insert_timestamp(first_seen.first_seen_at);
+        plan.session_metric_accumulator
+            .add_new_install_delta(first_seen);
     }
 
     if let Some(tail_update) = plan.tail_update.as_ref() {
@@ -1629,16 +1850,17 @@ async fn apply_incremental_session_plan(
         ),
     )?;
 
-    enqueue_touched_session_metric_buckets_in_tx(
+    let (session_total_deltas, session_dim1_deltas, session_dim2_deltas) = plan
+        .session_metric_accumulator
+        .into_store_deltas(plan.next_state.project_id);
+    upsert_session_metric_totals_in_tx(tx, &session_total_deltas).await?;
+    upsert_session_metric_dim1_in_tx(tx, &session_dim1_deltas).await?;
+    upsert_session_metric_dim2_in_tx(tx, &session_dim2_deltas).await?;
+
+    enqueue_touched_active_install_bitmap_rebuilds_in_tx(
         tx,
         plan.next_state.project_id,
-        &plan.metric_rebuild_scope,
-    )
-    .await?;
-    enqueue_touched_active_install_range_buckets_in_tx(
-        tx,
-        plan.next_state.project_id,
-        &plan.metric_rebuild_scope.days,
+        &plan.active_install_bitmap_days,
     )
     .await?;
 
@@ -1832,27 +2054,7 @@ async fn rebuild_touched_session_buckets_in_tx(
     Ok(())
 }
 
-async fn enqueue_touched_session_metric_buckets_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    project_id: Uuid,
-    touched_buckets: &SessionRepairBuckets,
-) -> Result<(), StoreError> {
-    if touched_buckets.is_empty() {
-        return Ok(());
-    }
-
-    let day_bucket_starts = touched_buckets
-        .days
-        .iter()
-        .copied()
-        .map(bucket_start_for_day)
-        .collect::<Vec<_>>();
-    let hour_bucket_starts = touched_buckets.hours.iter().copied().collect::<Vec<_>>();
-    enqueue_session_rebuild_buckets_in_tx(tx, project_id, &day_bucket_starts, &hour_bucket_starts)
-        .await
-}
-
-async fn enqueue_touched_active_install_range_buckets_in_tx(
+async fn enqueue_touched_active_install_bitmap_rebuilds_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
     touched_days: &BTreeSet<NaiveDate>,
@@ -1861,25 +2063,9 @@ async fn enqueue_touched_active_install_range_buckets_in_tx(
         return Ok(());
     }
 
-    let mut pending_rows = Vec::with_capacity(touched_days.len() * 3);
     for day in touched_days {
-        pending_rows.push((MetricGranularity::Week, bucket_start_for_week(*day)));
-        pending_rows.push((MetricGranularity::Month, bucket_start_for_month(*day)));
-        pending_rows.push((MetricGranularity::Year, bucket_start_for_year(*day)));
+        enqueue_active_install_bitmap_rebuild_in_tx(tx, project_id, *day).await?;
     }
-    pending_rows.sort();
-    pending_rows.dedup();
-
-    let mut builder = sqlx::QueryBuilder::<Postgres>::new(
-        "INSERT INTO active_install_range_rebuild_queue (project_id, granularity, bucket_start) ",
-    );
-    builder.push_values(pending_rows, |mut row, (granularity, bucket_start)| {
-        row.push_bind(project_id)
-            .push_bind(granularity.as_str())
-            .push_bind(bucket_start);
-    });
-    builder.push(" ON CONFLICT (project_id, granularity, bucket_start) DO NOTHING");
-    builder.build().execute(&mut **tx).await?;
 
     Ok(())
 }
@@ -1913,7 +2099,8 @@ async fn enqueue_repair_bucket_finalization_in_tx(
     enqueue_session_daily_installs_rebuilds_in_tx(tx, &install_rebuild_rows).await?;
     enqueue_session_rebuild_buckets_in_tx(tx, project_id, &day_bucket_starts, &hour_bucket_starts)
         .await?;
-    enqueue_touched_active_install_range_buckets_in_tx(tx, project_id, &touched_buckets.days).await
+    enqueue_touched_active_install_bitmap_rebuilds_in_tx(tx, project_id, &touched_buckets.days)
+        .await
 }
 
 async fn drain_pending_session_rebuild_buckets(pool: &PgPool) -> Result<(), StoreError> {
@@ -1993,28 +2180,25 @@ async fn drain_pending_session_rebuild_buckets(pool: &PgPool) -> Result<(), Stor
     Ok(())
 }
 
-async fn drain_pending_active_install_range_rebuild_buckets(
-    pool: &PgPool,
-) -> Result<(), StoreError> {
-    let _drain_guard = ACTIVE_INSTALL_RANGE_REBUILD_DRAIN_LOCK.lock().await;
+async fn drain_pending_active_install_bitmap_rebuilds(pool: &PgPool) -> Result<(), StoreError> {
+    let _drain_guard = ACTIVE_INSTALL_BITMAP_REBUILD_DRAIN_LOCK.lock().await;
 
     loop {
         let mut tx = pool.begin().await.map_err(StoreError::from)?;
         let rows = sqlx::query(
             r#"
             WITH claimable AS (
-                SELECT project_id, granularity, bucket_start
-                FROM active_install_range_rebuild_queue
-                ORDER BY project_id ASC, granularity ASC, bucket_start ASC
+                SELECT project_id, day
+                FROM active_install_bitmap_rebuild_queue
+                ORDER BY project_id ASC, day ASC
                 LIMIT 512
                 FOR UPDATE SKIP LOCKED
             )
-            DELETE FROM active_install_range_rebuild_queue AS queue
+            DELETE FROM active_install_bitmap_rebuild_queue AS queue
             USING claimable
             WHERE queue.project_id = claimable.project_id
-              AND queue.granularity = claimable.granularity
-              AND queue.bucket_start = claimable.bucket_start
-            RETURNING queue.project_id, queue.granularity, queue.bucket_start
+              AND queue.day = claimable.day
+            RETURNING queue.project_id, queue.day
             "#,
         )
         .fetch_all(&mut *tx)
@@ -2025,32 +2209,16 @@ async fn drain_pending_active_install_range_rebuild_buckets(
             break;
         }
 
-        let mut buckets_by_scope = BTreeMap::<(Uuid, MetricGranularity), Vec<DateTime<Utc>>>::new();
+        let mut days_by_project = BTreeMap::<Uuid, Vec<NaiveDate>>::new();
         for row in rows {
-            let granularity = match row.try_get::<&str, _>("granularity")? {
-                "week" => MetricGranularity::Week,
-                "month" => MetricGranularity::Month,
-                "year" => MetricGranularity::Year,
-                other => {
-                    return Err(StoreError::InvariantViolation(format!(
-                        "invalid active-install range rebuild granularity {other}"
-                    )));
-                }
-            };
-            buckets_by_scope
-                .entry((row.try_get("project_id")?, granularity))
+            days_by_project
+                .entry(row.try_get("project_id")?)
                 .or_default()
-                .push(row.try_get("bucket_start")?);
+                .push(row.try_get("day")?);
         }
 
-        for ((project_id, granularity), bucket_starts) in buckets_by_scope {
-            rebuild_active_install_range_buckets_in_tx(
-                &mut tx,
-                project_id,
-                granularity,
-                &bucket_starts,
-            )
-            .await?;
+        for (project_id, days) in days_by_project {
+            rebuild_active_install_daily_bitmaps_in_tx(&mut tx, project_id, &days).await?;
         }
 
         tx.commit().await.map_err(StoreError::from)?;
@@ -2059,279 +2227,155 @@ async fn drain_pending_active_install_range_rebuild_buckets(
     Ok(())
 }
 
-async fn rebuild_active_install_range_buckets_in_tx(
+async fn rebuild_active_install_daily_bitmaps_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
-    granularity: MetricGranularity,
-    bucket_starts: &[DateTime<Utc>],
+    days: &[NaiveDate],
 ) -> Result<(), StoreError> {
-    let bucket_starts = bucket_starts
+    let days = days
         .iter()
         .copied()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    if bucket_starts.is_empty() {
+    if days.is_empty() {
         return Ok(());
     }
 
-    debug_assert!(matches!(
-        granularity,
-        MetricGranularity::Week | MetricGranularity::Month | MetricGranularity::Year
-    ));
-
-    for table in [
-        "active_install_metric_buckets_total",
-        "active_install_metric_buckets_dim1",
-        "active_install_metric_buckets_dim2",
-    ] {
-        let sql = format!(
-            "DELETE FROM {table} WHERE project_id = $1 AND granularity = $2 AND bucket_start = ANY($3)"
-        );
-        sqlx::query(&sql)
-            .bind(project_id)
-            .bind(granularity.as_str())
-            .bind(&bucket_starts)
-            .execute(&mut **tx)
-            .await?;
+    for day in days {
+        rebuild_active_install_day_bitmaps_in_tx(tx, project_id, day).await?;
     }
 
-    let bucket_expr = bucket_sql(granularity, "session_start");
-
-    let total_sql = format!(
-        r#"
-        WITH scoped_sessions AS MATERIALIZED (
-            SELECT
-                {bucket_expr} AS bucket_start,
-                install_id
-            FROM sessions
-            WHERE project_id = $1
-              AND {bucket_expr} = ANY($2)
-        ),
-        distinct_installs AS MATERIALIZED (
-            SELECT DISTINCT bucket_start, install_id
-            FROM scoped_sessions
-        )
-        INSERT INTO active_install_metric_buckets_total (
-            project_id,
-            granularity,
-            bucket_start,
-            active_installs
-        )
-        SELECT
-            $1,
-            $3,
-            bucket_start,
-            COUNT(*)::BIGINT AS active_installs
-        FROM distinct_installs
-        GROUP BY bucket_start
-        "#,
-    );
-    sqlx::query(&total_sql)
-        .bind(project_id)
-        .bind(&bucket_starts)
-        .bind(granularity.as_str())
-        .execute(&mut **tx)
-        .await?;
-
-    let dim1_sql = format!(
-        r#"
-        WITH scoped_sessions AS MATERIALIZED (
-            SELECT
-                {bucket_expr} AS bucket_start,
-                install_id,
-                platform,
-                app_version,
-                os_version,
-                properties
-            FROM sessions
-            WHERE project_id = $1
-              AND {bucket_expr} = ANY($2)
-        ),
-        distinct_dims AS MATERIALIZED (
-            SELECT DISTINCT
-                bucket_start,
-                install_id,
-                dim_key,
-                dim_value,
-                dim_value_is_null
-            FROM (
-                SELECT
-                    bucket_start,
-                    install_id,
-                    'platform'::text AS dim_key,
-                    platform::text AS dim_value,
-                    false AS dim_value_is_null
-                FROM scoped_sessions
-                UNION ALL
-                SELECT
-                    bucket_start,
-                    install_id,
-                    'app_version'::text,
-                    COALESCE(app_version, ''),
-                    app_version IS NULL
-                FROM scoped_sessions
-                UNION ALL
-                SELECT
-                    bucket_start,
-                    install_id,
-                    'os_version'::text,
-                    COALESCE(os_version, ''),
-                    os_version IS NULL
-                FROM scoped_sessions
-                UNION ALL
-                SELECT
-                    scoped_sessions.bucket_start,
-                    scoped_sessions.install_id,
-                    props.key,
-                    props.value,
-                    false
-                FROM scoped_sessions
-                CROSS JOIN LATERAL jsonb_each_text(COALESCE(scoped_sessions.properties, '{{}}'::jsonb)) AS props(key, value)
-            ) dims
-        )
-        INSERT INTO active_install_metric_buckets_dim1 (
-            project_id,
-            granularity,
-            bucket_start,
-            dim1_key,
-            dim1_value,
-            dim1_value_is_null,
-            active_installs
-        )
-        SELECT
-            $1,
-            $3,
-            bucket_start,
-            dim_key,
-            dim_value,
-            dim_value_is_null,
-            COUNT(*)::BIGINT AS active_installs
-        FROM distinct_dims
-        GROUP BY bucket_start, dim_key, dim_value, dim_value_is_null
-        "#,
-    );
-    sqlx::query(&dim1_sql)
-        .bind(project_id)
-        .bind(&bucket_starts)
-        .bind(granularity.as_str())
-        .execute(&mut **tx)
-        .await?;
-
-    let dim2_sql = format!(
-        r#"
-        WITH scoped_sessions AS MATERIALIZED (
-            SELECT
-                {bucket_expr} AS bucket_start,
-                install_id,
-                platform,
-                app_version,
-                os_version,
-                properties
-            FROM sessions
-            WHERE project_id = $1
-              AND {bucket_expr} = ANY($2)
-        ),
-        distinct_dims AS MATERIALIZED (
-            SELECT DISTINCT
-                bucket_start,
-                install_id,
-                dim_key,
-                dim_value,
-                dim_value_is_null
-            FROM (
-                SELECT
-                    bucket_start,
-                    install_id,
-                    'platform'::text AS dim_key,
-                    platform::text AS dim_value,
-                    false AS dim_value_is_null
-                FROM scoped_sessions
-                UNION ALL
-                SELECT
-                    bucket_start,
-                    install_id,
-                    'app_version'::text,
-                    COALESCE(app_version, ''),
-                    app_version IS NULL
-                FROM scoped_sessions
-                UNION ALL
-                SELECT
-                    bucket_start,
-                    install_id,
-                    'os_version'::text,
-                    COALESCE(os_version, ''),
-                    os_version IS NULL
-                FROM scoped_sessions
-                UNION ALL
-                SELECT
-                    scoped_sessions.bucket_start,
-                    scoped_sessions.install_id,
-                    props.key,
-                    props.value,
-                    false
-                FROM scoped_sessions
-                CROSS JOIN LATERAL jsonb_each_text(COALESCE(scoped_sessions.properties, '{{}}'::jsonb)) AS props(key, value)
-            ) dims
-        ),
-        distinct_pairs AS MATERIALIZED (
-            SELECT DISTINCT
-                left_dims.bucket_start,
-                left_dims.install_id,
-                left_dims.dim_key AS dim1_key,
-                left_dims.dim_value AS dim1_value,
-                left_dims.dim_value_is_null AS dim1_value_is_null,
-                right_dims.dim_key AS dim2_key,
-                right_dims.dim_value AS dim2_value,
-                right_dims.dim_value_is_null AS dim2_value_is_null
-            FROM distinct_dims AS left_dims
-            INNER JOIN distinct_dims AS right_dims
-                ON left_dims.bucket_start = right_dims.bucket_start
-               AND left_dims.install_id = right_dims.install_id
-               AND left_dims.dim_key < right_dims.dim_key
-        )
-        INSERT INTO active_install_metric_buckets_dim2 (
-            project_id,
-            granularity,
-            bucket_start,
-            dim1_key,
-            dim1_value,
-            dim1_value_is_null,
-            dim2_key,
-            dim2_value,
-            dim2_value_is_null,
-            active_installs
-        )
-        SELECT
-            $1,
-            $3,
-            bucket_start,
-            dim1_key,
-            dim1_value,
-            dim1_value_is_null,
-            dim2_key,
-            dim2_value,
-            dim2_value_is_null,
-            COUNT(*)::BIGINT AS active_installs
-        FROM distinct_pairs
-        GROUP BY
-            bucket_start,
-            dim1_key,
-            dim1_value,
-            dim1_value_is_null,
-            dim2_key,
-            dim2_value,
-            dim2_value_is_null
-        "#,
-    );
-    sqlx::query(&dim2_sql)
-        .bind(project_id)
-        .bind(&bucket_starts)
-        .bind(granularity.as_str())
-        .execute(&mut **tx)
-        .await?;
-
     Ok(())
+}
+
+async fn rebuild_active_install_day_bitmaps_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    day: NaiveDate,
+) -> Result<(), StoreError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            install_id,
+            platform,
+            app_version,
+            app_version_is_null,
+            os_version,
+            os_version_is_null,
+            properties
+        FROM session_active_install_slices
+        WHERE project_id = $1
+          AND day = $2
+        ORDER BY install_id ASC
+        "#,
+    )
+    .bind(project_id)
+    .bind(day)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let install_ids = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("install_id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ordinals = allocate_project_install_ordinals_in_tx(tx, project_id, &install_ids).await?;
+
+    let mut total_bitmap = RoaringTreemap::new();
+    let mut dim1 = BTreeMap::<(String, Option<String>), RoaringTreemap>::new();
+    let mut dim2 =
+        BTreeMap::<(String, Option<String>, String, Option<String>), RoaringTreemap>::new();
+
+    for row in rows {
+        let install_id = row.try_get::<String, _>("install_id")?;
+        let ordinal = ordinals.get(&install_id).copied().ok_or_else(|| {
+            StoreError::InvariantViolation(format!(
+                "missing active-install ordinal for project {project_id} install {install_id}"
+            ))
+        })? as u64;
+        total_bitmap.insert(ordinal);
+
+        let dims = active_install_dimensions_for_slice_row(&row)?;
+        for (key, value) in &dims {
+            dim1.entry((key.clone(), value.clone()))
+                .or_default()
+                .insert(ordinal);
+        }
+        for left in 0..dims.len() {
+            for right in (left + 1)..dims.len() {
+                let (dim1_key, dim1_value) = &dims[left];
+                let (dim2_key, dim2_value) = &dims[right];
+                dim2.entry((
+                    dim1_key.clone(),
+                    dim1_value.clone(),
+                    dim2_key.clone(),
+                    dim2_value.clone(),
+                ))
+                .or_default()
+                .insert(ordinal);
+            }
+        }
+    }
+
+    replace_active_install_day_bitmaps_in_tx(
+        tx,
+        project_id,
+        day,
+        &total_bitmap,
+        &dim1
+            .into_iter()
+            .map(
+                |((dim1_key, dim1_value), bitmap)| ActiveInstallBitmapDim1Input {
+                    dim1_key,
+                    dim1_value,
+                    bitmap,
+                },
+            )
+            .collect::<Vec<_>>(),
+        &dim2
+            .into_iter()
+            .map(|((dim1_key, dim1_value, dim2_key, dim2_value), bitmap)| {
+                ActiveInstallBitmapDim2Input {
+                    dim1_key,
+                    dim1_value,
+                    dim2_key,
+                    dim2_value,
+                    bitmap,
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await
+}
+
+fn active_install_dimensions_for_slice_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Vec<(String, Option<String>)>, StoreError> {
+    let mut dims = BTreeMap::<String, Option<String>>::new();
+    dims.insert("platform".to_owned(), Some(row.try_get("platform")?));
+
+    let app_version: String = row.try_get("app_version")?;
+    let app_version_is_null: bool = row.try_get("app_version_is_null")?;
+    dims.insert(
+        "app_version".to_owned(),
+        (!app_version_is_null).then_some(app_version),
+    );
+
+    let os_version: String = row.try_get("os_version")?;
+    let os_version_is_null: bool = row.try_get("os_version_is_null")?;
+    dims.insert(
+        "os_version".to_owned(),
+        (!os_version_is_null).then_some(os_version),
+    );
+
+    let properties = row
+        .try_get::<sqlx::types::Json<BTreeMap<String, String>>, _>("properties")?
+        .0;
+    for (key, value) in properties {
+        dims.insert(key, Some(value));
+    }
+
+    Ok(dims.into_iter().collect())
 }
 
 async fn load_recompute_window_in_tx(

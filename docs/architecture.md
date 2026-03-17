@@ -29,7 +29,7 @@ curl / SDK
   -> Rust ingest service
   -> append-only Postgres events_raw table
   -> fantasma-worker
-  -> derived Postgres sessions, session_daily, session_daily_installs, live_install_state, event bucket rollups, session bucket rollups, and install first-seen state
+  -> derived Postgres sessions, session_daily, session_daily_installs, session_active_install_slices, active-install daily bitmaps, live_install_state, event bucket rollups, session bucket rollups, and install first-seen state
   -> GET /v1/metrics/events, /v1/metrics/sessions, and /v1/metrics/live_installs
   -> GET /v1/metrics/events/catalog and /v1/metrics/events/top
   -> query API
@@ -66,6 +66,8 @@ Current derived metric:
 - sessions
 - session_daily
 - session_daily_installs
+- session_active_install_slices
+- worker-derived active-install daily bitmaps for exact-range reads
 - worker-derived hourly and daily event metric cuboids
 - worker-derived hourly and daily session metric rollups
 - install first-seen state for `new_installs`
@@ -101,6 +103,9 @@ Current worker behavior:
 - update `install_first_seen` on append with one `INSERT ... ON CONFLICT DO NOTHING` attempt at most and derive `new_installs` from the insert result rather than a read-before-write precheck
 - update `session_daily_installs` once per touched `(project_id, install_id, day)` on append; `active_installs` contributes at most `0/1` per install-day even when `session_count` for that install-day is greater than `1`
 - update `session_daily` from net per-day append deltas only; append-only cross-midnight sessions still keep `duration_total` on the session-start bucket while daily counters remain correct for each affected UTC day
+- keep `session_active_install_slices` authoritative for public `active_installs`: each row represents one install with at least one session whose `session_start` falls on that UTC day under the session's fixed grouped/filterable dimensions
+- queue touched `(project_id, day)` rows for bitmap rebuild whenever append or repair changes `session_active_install_slices`
+- rebuild only the exact touched UTC days for `active_install_daily_bitmaps_total` / `dim1` / `dim2`, replacing each day's rows transactionally from `session_active_install_slices`
 - rebuild only the exact touched UTC days for `session_daily` and `session_daily_installs` after a repair
 - rebuild only the exact touched hourly and daily session metric buckets after repair/backfill session changes
 - keep append and repair intentionally different maintenance paths in this slice: append commits direct deltas, repair/backfill recomputes exact touched windows from source tables
@@ -120,6 +125,8 @@ Current aggregate ownership:
 - `session_repair_jobs` stores install-scoped durable repair frontier state for the queue-driven repair lane
 - `session_daily` stores UTC `DATE` buckets used by bounded session repair and incremental session-count / duration maintenance
 - `session_daily_installs` stores per-day install membership so internal install bookkeeping stays incremental without `COUNT(DISTINCT ...)` rebuilds
+- `session_active_install_slices` stores the worker-owned per-day, per-install, fixed-dimension membership rows that feed public exact-range `active_installs`
+- `active_install_daily_bitmaps_total` / `dim1` / `dim2` store one canonical worker-maintained daily bitmap family for bounded `active_installs` reads across ungrouped, filtered, and grouped queries
 - bounded event metric cuboids store worker-derived hourly and daily series for event counts
 - bounded session metric rollups store worker-derived hourly and daily series for `count`, `duration_total`, and `new_installs`
 - `install_first_seen` fixes each install to the bucket of its first accepted event and never rebuckets late arrivals
@@ -253,10 +260,12 @@ Session metrics:
 - session grouped dimensions are fixed from the session's first event
 - `duration_total` is assigned to the bucket where the session starts
 - `new_installs` is assigned once from the install's first accepted event and is never retroactively moved by late arrivals
-- `active_installs` counts unique installs whose session starts fall inside each returned bucket
-- `active_installs` supports `day`, `week`, `month`, and `year`
-- `week` buckets start on UTC ISO Mondays; `month` and `year` buckets start on the first UTC day of the calendar month or year
-- daily `active_installs` reads stay authoritative on `session_active_install_slices`; week/month/year read from worker-built range cuboids rebuilt off queued touched calendar buckets
+- `count`, `duration_total`, and `new_installs` stay on the bucketed `granularity` contract and still require `granularity`
+- `active_installs` stays under `GET /v1/metrics/sessions` but is not a bucketed metric in the same contract shape
+- `active_installs` requires exact inclusive UTC `start` and `end`, rejects `granularity`, and optionally accepts `interval=day|week|month|year`
+- `active_installs` counts unique installs with at least one session whose `session_start` falls inside the exact requested UTC range or point window
+- `active_installs interval=week|month|year` uses calendar-shaped UTC windows clipped to the request edges; requests do not need to be aligned to calendar boundaries
+- public `active_installs` reads union worker-maintained daily bitmaps across the requested days; there is no separate public week/month/year cuboid family
 - filtered or grouped `active_installs` slices may overlap, so grouped totals are not guaranteed to add back up to the ungrouped distinct-install total
 
 Current-state metrics:

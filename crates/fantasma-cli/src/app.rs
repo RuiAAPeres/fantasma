@@ -580,11 +580,29 @@ impl App {
         sessions: SessionMetricsArgs,
     ) -> anyhow::Result<CommandOutput> {
         validate_session_metrics_args(&sessions)?;
+        let granularity = match sessions.metric {
+            SessionMetricArg::ActiveInstalls => None,
+            SessionMetricArg::Count
+            | SessionMetricArg::DurationTotal
+            | SessionMetricArg::NewInstalls => Some(
+                sessions
+                    .granularity
+                    .expect("validated bucket granularity")
+                    .as_str(),
+            ),
+        };
+        let interval = match sessions.metric {
+            SessionMetricArg::ActiveInstalls => sessions.interval.map(|value| value.as_str()),
+            SessionMetricArg::Count
+            | SessionMetricArg::DurationTotal
+            | SessionMetricArg::NewInstalls => None,
+        };
         let body = self
             .metrics_request(MetricsRequest {
                 path: "/v1/metrics/sessions",
                 metric: sessions.metric.as_str(),
-                granularity: sessions.granularity.as_str(),
+                granularity,
+                interval,
                 start: &sessions.start,
                 end: &sessions.end,
                 event: None,
@@ -601,7 +619,8 @@ impl App {
             .metrics_request(MetricsRequest {
                 path: "/v1/metrics/events",
                 metric: events.metric.as_str(),
-                granularity: events.granularity.as_str(),
+                granularity: Some(events.granularity.as_str()),
+                interval: None,
                 start: &events.start,
                 end: &events.end,
                 event: events.event,
@@ -668,9 +687,14 @@ impl App {
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("metric", request.metric);
-            query.append_pair("granularity", request.granularity);
+            if let Some(granularity) = request.granularity {
+                query.append_pair("granularity", granularity);
+            }
             query.append_pair("start", request.start);
             query.append_pair("end", request.end);
+            if let Some(interval) = request.interval {
+                query.append_pair("interval", interval);
+            }
             if let Some(event) = request.event.as_deref() {
                 query.append_pair("event", event);
             }
@@ -767,7 +791,8 @@ impl App {
 struct MetricsRequest<'a> {
     path: &'a str,
     metric: &'a str,
-    granularity: &'a str,
+    granularity: Option<&'a str>,
+    interval: Option<&'a str>,
     start: &'a str,
     end: &'a str,
     event: Option<String>,
@@ -939,27 +964,31 @@ impl SessionMetricArg {
 
 fn validate_session_metrics_args(args: &SessionMetricsArgs) -> anyhow::Result<()> {
     match args.metric {
-        SessionMetricArg::ActiveInstalls => match args.granularity {
-            crate::cli::MetricGranularityArg::Day
-            | crate::cli::MetricGranularityArg::Week
-            | crate::cli::MetricGranularityArg::Month
-            | crate::cli::MetricGranularityArg::Year => Ok(()),
-            crate::cli::MetricGranularityArg::Hour => {
-                bail!("active_installs does not support hour granularity")
+        SessionMetricArg::ActiveInstalls => {
+            if args.granularity.is_some() {
+                bail!("active_installs uses --interval instead of --granularity")
             }
-        },
+
+            Ok(())
+        }
         SessionMetricArg::Count
         | SessionMetricArg::DurationTotal
-        | SessionMetricArg::NewInstalls => match args.granularity {
-            crate::cli::MetricGranularityArg::Hour | crate::cli::MetricGranularityArg::Day => {
-                Ok(())
+        | SessionMetricArg::NewInstalls => {
+            if args.interval.is_some() {
+                bail!("only active_installs supports --interval")
             }
-            crate::cli::MetricGranularityArg::Week
-            | crate::cli::MetricGranularityArg::Month
-            | crate::cli::MetricGranularityArg::Year => {
-                bail!("only active_installs supports week/month/year granularity")
+
+            match args.granularity {
+                Some(crate::cli::MetricGranularityArg::Hour)
+                | Some(crate::cli::MetricGranularityArg::Day) => Ok(()),
+                Some(
+                    crate::cli::MetricGranularityArg::Week
+                    | crate::cli::MetricGranularityArg::Month
+                    | crate::cli::MetricGranularityArg::Year,
+                ) => bail!("only active_installs supports week/month/year granularity"),
+                None => bail!("session metrics require --granularity"),
             }
-        },
+        }
     }
 }
 
@@ -990,22 +1019,55 @@ impl crate::cli::MetricGranularityArg {
     }
 }
 
+impl crate::cli::MetricIntervalArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Year => "year",
+        }
+    }
+}
+
 fn render_metrics_output(body: String, json_output: bool) -> anyhow::Result<CommandOutput> {
     if json_output {
         return Ok(CommandOutput { stdout: body });
     }
 
-    let response: fantasma_core::MetricsResponse =
+    let response: fantasma_core::SessionMetricsReadResponse =
         serde_json::from_str(&body).context("decode metrics body")?;
     let mut lines = Vec::new();
-    for series in response.series {
-        let dimensions = if series.dimensions.is_empty() {
-            "{}".to_owned()
-        } else {
-            serde_json::to_string(&series.dimensions).context("serialize metric dimensions")?
-        };
-        for point in series.points {
-            lines.push(format!("{dimensions}\t{}\t{}", point.bucket, point.value));
+    match response {
+        fantasma_core::SessionMetricsReadResponse::Bucketed(response) => {
+            for series in response.series {
+                let dimensions = if series.dimensions.is_empty() {
+                    "{}".to_owned()
+                } else {
+                    serde_json::to_string(&series.dimensions)
+                        .context("serialize metric dimensions")?
+                };
+                for point in series.points {
+                    lines.push(format!("{dimensions}\t{}\t{}", point.bucket, point.value));
+                }
+            }
+        }
+        fantasma_core::SessionMetricsReadResponse::ActiveInstalls(response) => {
+            lines.push("dimensions\tstart\tend\tvalue".to_owned());
+            for series in response.series {
+                let dimensions = if series.dimensions.is_empty() {
+                    "{}".to_owned()
+                } else {
+                    serde_json::to_string(&series.dimensions)
+                        .context("serialize metric dimensions")?
+                };
+                for point in series.points {
+                    lines.push(format!(
+                        "{dimensions}\t{}\t{}\t{}",
+                        point.start, point.end, point.value
+                    ));
+                }
+            }
         }
     }
     Ok(CommandOutput {

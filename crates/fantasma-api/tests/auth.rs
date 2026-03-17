@@ -437,7 +437,7 @@ async fn session_metrics_reject_public_project_id_query_params(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         response_json(response).await,
-        serde_json::json!({ "error": "invalid_request" })
+        serde_json::json!({ "error": "invalid_query_key" })
     );
 }
 

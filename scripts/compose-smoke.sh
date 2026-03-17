@@ -103,7 +103,7 @@ poll_metrics() {
       "http://localhost:8082/v1/metrics/sessions?metric=new_installs&granularity=day&start=2026-01-01&end=2026-01-02" \
       -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     active_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/sessions?metric=active_installs&granularity=day&start=2026-01-01&end=2026-01-02" \
+      "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-02&interval=day" \
       -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     hourly_count_response="$(curl -fsS \
       "http://localhost:8082/v1/metrics/sessions?metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z" \
@@ -129,8 +129,10 @@ poll_metrics() {
           "$installs_compact" == *'"bucket":"2026-01-01","value":1'* &&
           "$installs_compact" == *'"bucket":"2026-01-02","value":0'* &&
           "$active_compact" == *'"metric":"active_installs"'* &&
-          "$active_compact" == *'"bucket":"2026-01-01","value":1'* &&
-          "$active_compact" == *'"bucket":"2026-01-02","value":0'* &&
+          "$active_compact" == *'"interval":"day"'* &&
+          "$active_compact" == *'"start":"2026-01-01","end":"2026-01-02"'* &&
+          "$active_compact" == *'"start":"2026-01-01","end":"2026-01-01","value":1'* &&
+          "$active_compact" == *'"start":"2026-01-02","end":"2026-01-02","value":0'* &&
           "$hourly_count_compact" == *'"metric":"count"'* &&
           "$hourly_count_compact" == *'"granularity":"hour"'* &&
           "$hourly_count_compact" == *'"bucket":"2026-01-01T00:00:00Z","value":1'* &&

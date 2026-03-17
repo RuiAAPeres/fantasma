@@ -12,6 +12,7 @@ chrono.workspace = true
 fantasma-auth = { path = "../fantasma-auth" }
 fantasma-core = { path = "../fantasma-core" }
 fantasma-store = { path = "../fantasma-store" }
+roaring = "0.11.3"
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
