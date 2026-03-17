@@ -5745,21 +5745,16 @@ fn docker_compose_command(
 }
 
 fn run_command(command: &mut Command) -> Result<()> {
-    let output = command.output().context("run command")?;
-    if output.status.success() {
+    let status = command.status().context("run command")?;
+    if status.success() {
         return Ok(());
     }
 
-    bail!(
-        "command failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
+    bail!("command failed with status {:?}", status.code())
 }
 
 fn run_best_effort(command: &mut Command) {
-    let _ = command.output();
+    let _ = command.status();
 }
 
 #[cfg(test)]
