@@ -25,7 +25,7 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             idle_poll_interval: Duration::from_millis(250),
-            session_batch_size: 1_000,
+            session_batch_size: 2_000,
             event_batch_size: 5_000,
             session_incremental_concurrency: 8,
             session_repair_concurrency: 2,
@@ -261,7 +261,7 @@ mod tests {
         let config = WorkerConfig::default();
 
         assert_eq!(config.idle_poll_interval, Duration::from_millis(250));
-        assert_eq!(config.session_batch_size, 1_000);
+        assert_eq!(config.session_batch_size, 2_000);
         assert_eq!(config.event_batch_size, 5_000);
         assert_eq!(config.session_incremental_concurrency, 8);
         assert_eq!(config.session_repair_concurrency, 2);

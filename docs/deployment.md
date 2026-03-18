@@ -46,7 +46,7 @@ HTTP service variables:
 Worker variables:
 
 - `FANTASMA_WORKER_IDLE_POLL_INTERVAL_MS`: idle-only sleep interval in milliseconds; defaults to `250`
-- `FANTASMA_WORKER_SESSION_BATCH_SIZE`: raw-event batch size for the `session_apply` lane; defaults to `1000`
+- `FANTASMA_WORKER_SESSION_BATCH_SIZE`: raw-event batch size for the `session_apply` lane; defaults to `2000`
 - `FANTASMA_WORKER_EVENT_BATCH_SIZE`: raw-event batch size for the event-metrics lane; defaults to `5000`
 - `FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY`: bounded parallelism for append-like per-install `session_apply` work; defaults to `8`
 - `FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY`: bounded parallelism for queue-driven `session_repair` work; defaults to `2`

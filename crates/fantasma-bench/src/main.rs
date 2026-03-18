@@ -38,7 +38,7 @@ const SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY: usize = 2;
 const SLO_WARMUP_QUERIES: usize = 10;
 const SLO_MEASURED_QUERIES: usize = 100;
 const DEFAULT_SLO_PUBLICATION_REPETITIONS: usize = 1;
-const DEFAULT_SLO_SESSION_BATCH_SIZE: i64 = 1_000;
+const DEFAULT_SLO_SESSION_BATCH_SIZE: i64 = 2_000;
 const DEFAULT_SLO_EVENT_BATCH_SIZE: i64 = 5_000;
 const DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY: usize = 8;
 const DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY: usize = 2;
@@ -8156,7 +8156,7 @@ mod tests {
             include_str!("../../../infra/docker/compose.yaml"),
             include_str!("../../../infra/docker/compose.bench.yaml"),
         ] {
-            assert!(compose.contains("FANTASMA_WORKER_SESSION_BATCH_SIZE: 1000"));
+            assert!(compose.contains("FANTASMA_WORKER_SESSION_BATCH_SIZE: 2000"));
             assert!(compose.contains("FANTASMA_WORKER_EVENT_BATCH_SIZE: 5000"));
             assert!(compose.contains("FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY: 8"));
             assert!(compose.contains("FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY: 2"));

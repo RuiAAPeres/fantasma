@@ -17,7 +17,7 @@ async fn main() {
             "FANTASMA_WORKER_IDLE_POLL_INTERVAL_MS",
             250,
         )),
-        session_batch_size: parse_env_i64("FANTASMA_WORKER_SESSION_BATCH_SIZE", 1_000),
+        session_batch_size: parse_env_i64("FANTASMA_WORKER_SESSION_BATCH_SIZE", 2_000),
         event_batch_size: parse_env_i64("FANTASMA_WORKER_EVENT_BATCH_SIZE", 5_000),
         session_incremental_concurrency: parse_env_usize(
             "FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY",
