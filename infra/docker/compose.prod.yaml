@@ -1,4 +1,28 @@
 services:
+  postgres:
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${FANTASMA_POSTGRES_SHARED_BUFFERS:-1GB}
+      - -c
+      - effective_cache_size=${FANTASMA_POSTGRES_EFFECTIVE_CACHE_SIZE:-5GB}
+      - -c
+      - maintenance_work_mem=${FANTASMA_POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
+      - -c
+      - wal_buffers=${FANTASMA_POSTGRES_WAL_BUFFERS:-16MB}
+      - -c
+      - max_wal_size=${FANTASMA_POSTGRES_MAX_WAL_SIZE:-4GB}
+      - -c
+      - min_wal_size=${FANTASMA_POSTGRES_MIN_WAL_SIZE:-1GB}
+      - -c
+      - checkpoint_timeout=${FANTASMA_POSTGRES_CHECKPOINT_TIMEOUT:-10min}
+      - -c
+      - checkpoint_completion_target=${FANTASMA_POSTGRES_CHECKPOINT_COMPLETION_TARGET:-0.95}
+      - -c
+      - commit_delay=${FANTASMA_POSTGRES_COMMIT_DELAY_US:-100}
+      - -c
+      - commit_siblings=${FANTASMA_POSTGRES_COMMIT_SIBLINGS:-8}
+
   fantasma-ingest:
     networks:
       default: {}

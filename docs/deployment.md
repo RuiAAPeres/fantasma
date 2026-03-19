@@ -166,12 +166,20 @@ Caddy, keep the local default stack untouched and layer the production override
 on top instead of editing `infra/docker/compose.yaml` directly.
 
 `infra/docker/compose.prod.yaml` attaches `fantasma-api` to an external Docker
-network so the reverse proxy can reach it by a stable alias:
+network so the reverse proxy can reach it by a stable alias, and it also
+applies a write-oriented Postgres runtime profile for the single-host Docker
+deployment:
 
 - external network name defaults to `proxy`
 - API alias defaults to `fantasma-api`
 - both can be overridden with `FANTASMA_PROXY_NETWORK_NAME` and
   `FANTASMA_PROXY_NETWORK_ALIAS`
+- Postgres tuning defaults now ship through the same override:
+  `shared_buffers=1GB`, `effective_cache_size=5GB`,
+  `maintenance_work_mem=256MB`, `wal_buffers=16MB`,
+  `max_wal_size=4GB`, `min_wal_size=1GB`,
+  `checkpoint_timeout=10min`, `checkpoint_completion_target=0.95`,
+  `commit_delay=100`, `commit_siblings=8`
 
 Example production bring-up:
 
@@ -190,6 +198,23 @@ two HTTP services on loopback only, for example:
 - `FANTASMA_POSTGRES_PORTS=127.0.0.1:15432:5432`
 - `FANTASMA_INGEST_PORTS=127.0.0.1:18081:8081`
 - `FANTASMA_API_PORTS=127.0.0.1:18082:8082`
+
+If the production host needs different Postgres runtime values, override the
+production-only defaults with:
+
+- `FANTASMA_POSTGRES_SHARED_BUFFERS`
+- `FANTASMA_POSTGRES_EFFECTIVE_CACHE_SIZE`
+- `FANTASMA_POSTGRES_MAINTENANCE_WORK_MEM`
+- `FANTASMA_POSTGRES_WAL_BUFFERS`
+- `FANTASMA_POSTGRES_MAX_WAL_SIZE`
+- `FANTASMA_POSTGRES_MIN_WAL_SIZE`
+- `FANTASMA_POSTGRES_CHECKPOINT_TIMEOUT`
+- `FANTASMA_POSTGRES_CHECKPOINT_COMPLETION_TARGET`
+- `FANTASMA_POSTGRES_COMMIT_DELAY_US`
+- `FANTASMA_POSTGRES_COMMIT_SIBLINGS`
+
+These remain intentionally conservative on durability: the production override
+does not disable `fsync`, `full_page_writes`, or `synchronous_commit`.
 
 With the override attached, the shared reverse proxy can route
 `api.usefantasma.com` to `fantasma-api:8082` over the shared `proxy` network
