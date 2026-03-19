@@ -38,6 +38,7 @@ struct ServerState {
     records: Arc<Mutex<Vec<RequestRecord>>>,
     project_id: Uuid,
     read_key_id: Uuid,
+    deletion_id: Uuid,
     operator_token: String,
     read_key_secret: String,
 }
@@ -50,6 +51,7 @@ struct TestServer {
     records: Arc<Mutex<Vec<RequestRecord>>>,
     project_id: Uuid,
     read_key_id: Uuid,
+    deletion_id: Uuid,
     operator_token: String,
     read_key_secret: String,
 }
@@ -73,10 +75,12 @@ impl TestServer {
         let records = Arc::new(Mutex::new(Vec::new()));
         let project_id = Uuid::new_v4();
         let read_key_id = Uuid::new_v4();
+        let deletion_id = Uuid::new_v4();
         let state = ServerState {
             records: Arc::clone(&records),
             project_id,
             read_key_id,
+            deletion_id,
             operator_token: operator_token.to_owned(),
             read_key_secret: read_key_secret.to_owned(),
         };
@@ -90,6 +94,15 @@ impl TestServer {
             .route(
                 "/v1/projects/{project_id}/keys/{key_id}",
                 delete(revoke_key),
+            )
+            .route("/v1/projects/{project_id}", delete(delete_project))
+            .route(
+                "/v1/projects/{project_id}/deletions",
+                get(list_project_deletions).post(create_range_deletion),
+            )
+            .route(
+                "/v1/projects/{project_id}/deletions/{deletion_id}",
+                get(get_project_deletion),
             )
             .route("/v1/usage/events", get(usage_events))
             .route("/v1/metrics/events", get(event_metrics))
@@ -126,6 +139,7 @@ impl TestServer {
             records,
             project_id,
             read_key_id,
+            deletion_id,
             operator_token: operator_token.to_owned(),
             read_key_secret: read_key_secret.to_owned(),
         }
@@ -409,6 +423,187 @@ async fn projects_use_persists_active_project_for_later_keys_and_metrics_command
             && record.path == "/v1/metrics/sessions"
             && record.fantasma_key.as_deref() == Some(server.read_key_secret.as_str())
     }));
+}
+
+#[tokio::test]
+async fn projects_delete_uses_active_project() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.operator_token = Some(server.operator_token.clone());
+    profile.active_project_id = Some(server.project_id);
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&["projects", "delete"]))
+        .await
+        .expect("project delete succeeds");
+
+    assert!(output.stdout.contains("project purge queued"));
+    assert!(output.stdout.contains(&server.deletion_id.to_string()));
+
+    let records = server.records();
+    let delete = records
+        .iter()
+        .find(|record| {
+            record.method == "DELETE"
+                && record.path == format!("/v1/projects/{}", server.project_id)
+        })
+        .expect("delete project request");
+    assert_eq!(
+        delete.authorization.as_deref(),
+        Some(format!("Bearer {}", server.operator_token).as_str())
+    );
+}
+
+#[tokio::test]
+async fn project_deletions_list_uses_active_project() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.operator_token = Some(server.operator_token.clone());
+    profile.active_project_id = Some(server.project_id);
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&["projects", "deletions", "list"]))
+        .await
+        .expect("project deletions list succeeds");
+
+    assert!(output.stdout.contains(&server.deletion_id.to_string()));
+    assert!(output.stdout.contains("project_purge"));
+    assert!(output.stdout.contains("CLI Project"));
+
+    let records = server.records();
+    let list = records
+        .iter()
+        .find(|record| {
+            record.method == "GET"
+                && record.path == format!("/v1/projects/{}/deletions", server.project_id)
+        })
+        .expect("list project deletions request");
+    assert_eq!(
+        list.authorization.as_deref(),
+        Some(format!("Bearer {}", server.operator_token).as_str())
+    );
+}
+
+#[tokio::test]
+async fn project_deletions_get_uses_active_project() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.operator_token = Some(server.operator_token.clone());
+    profile.active_project_id = Some(server.project_id);
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&[
+            "projects",
+            "deletions",
+            "get",
+            &server.deletion_id.to_string(),
+        ]))
+        .await
+        .expect("project deletion get succeeds");
+
+    assert!(
+        output
+            .stdout
+            .contains(&format!("deletion id: {}", server.deletion_id))
+    );
+    assert!(
+        output
+            .stdout
+            .contains(&format!("project id: {}", server.project_id))
+    );
+    assert!(output.stdout.contains("kind: project_purge"));
+
+    let records = server.records();
+    let get = records
+        .iter()
+        .find(|record| {
+            record.method == "GET"
+                && record.path
+                    == format!(
+                        "/v1/projects/{}/deletions/{}",
+                        server.project_id, server.deletion_id
+                    )
+        })
+        .expect("get project deletion request");
+    assert_eq!(
+        get.authorization.as_deref(),
+        Some(format!("Bearer {}", server.operator_token).as_str())
+    );
+}
+
+#[tokio::test]
+async fn project_deletions_range_sends_expected_scope() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.operator_token = Some(server.operator_token.clone());
+    profile.active_project_id = Some(server.project_id);
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&[
+            "projects",
+            "deletions",
+            "range",
+            "--start-at",
+            "2026-03-01T00:00:00Z",
+            "--end-before",
+            "2026-03-08T00:00:00Z",
+            "--event",
+            "app_open",
+            "--filter",
+            "platform=ios",
+            "--filter",
+            "app_version=1.2.3",
+            "--property",
+            "plan=pro",
+            "--property",
+            "provider=stripe",
+        ]))
+        .await
+        .expect("range deletion succeeds");
+
+    assert!(output.stdout.contains("range deletion queued"));
+    assert!(output.stdout.contains("kind: range_delete"));
+
+    let records = server.records();
+    let range = records
+        .iter()
+        .find(|record| {
+            record.method == "POST"
+                && record.path == format!("/v1/projects/{}/deletions", server.project_id)
+        })
+        .expect("range deletion request");
+    assert_eq!(
+        range.authorization.as_deref(),
+        Some(format!("Bearer {}", server.operator_token).as_str())
+    );
+    assert_eq!(
+        range.body.as_ref(),
+        Some(&json!({
+            "start_at": "2026-03-01T00:00:00Z",
+            "end_before": "2026-03-08T00:00:00Z",
+            "event": "app_open",
+            "filters": {
+                "app_version": "1.2.3",
+                "platform": "ios"
+            },
+            "properties": {
+                "plan": "pro",
+                "provider": "stripe"
+            }
+        }))
+    );
 }
 
 #[test]
@@ -2662,6 +2857,132 @@ async fn revoke_key(
         None,
     );
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn delete_project(
+    State(state): State<ServerState>,
+    Path(_project_id): Path<Uuid>,
+    original_uri: OriginalUri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(status) = auth_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
+    }
+    record_request(
+        &state,
+        "DELETE",
+        original_uri.path(),
+        original_uri.query(),
+        headers,
+        None,
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "deletion": deletion_payload(&state, "project_purge", Value::Null)
+        })),
+    )
+        .into_response()
+}
+
+async fn list_project_deletions(
+    State(state): State<ServerState>,
+    Path(_project_id): Path<Uuid>,
+    original_uri: OriginalUri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(status) = auth_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
+    }
+    record_request(
+        &state,
+        "GET",
+        original_uri.path(),
+        original_uri.query(),
+        headers,
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "deletions": [deletion_payload(&state, "project_purge", Value::Null)]
+        })),
+    )
+        .into_response()
+}
+
+async fn get_project_deletion(
+    State(state): State<ServerState>,
+    Path((_project_id, _deletion_id)): Path<(Uuid, Uuid)>,
+    original_uri: OriginalUri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(status) = auth_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
+    }
+    record_request(
+        &state,
+        "GET",
+        original_uri.path(),
+        original_uri.query(),
+        headers,
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "deletion": deletion_payload(&state, "project_purge", Value::Null)
+        })),
+    )
+        .into_response()
+}
+
+async fn create_range_deletion(
+    State(state): State<ServerState>,
+    Path(_project_id): Path<Uuid>,
+    original_uri: OriginalUri,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if let Some(status) = auth_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
+    }
+    record_request(
+        &state,
+        "POST",
+        original_uri.path(),
+        original_uri.query(),
+        headers,
+        Some(body.clone()),
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "deletion": deletion_payload(&state, "range_delete", body)
+        })),
+    )
+        .into_response()
+}
+
+fn deletion_payload(state: &ServerState, kind: &str, scope: Value) -> Value {
+    json!({
+        "id": state.deletion_id,
+        "project_id": state.project_id,
+        "project_name": "CLI Project",
+        "kind": kind,
+        "status": "queued",
+        "scope": scope,
+        "created_at": "2026-03-13T12:00:00Z",
+        "started_at": Value::Null,
+        "finished_at": Value::Null,
+        "error_code": Value::Null,
+        "error_message": Value::Null,
+        "deleted_raw_events": 0,
+        "deleted_sessions": 0,
+        "rebuilt_installs": 0,
+        "rebuilt_days": 0,
+        "rebuilt_hours": 0
+    })
 }
 
 fn record_request(

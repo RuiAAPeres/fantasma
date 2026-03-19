@@ -7960,6 +7960,136 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn count_project_processing_leases_ignores_stale_leases(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let project = create_project(&pool, "Lease Freshness Project")
+            .await
+            .expect("create project");
+
+        let fresh_lease = claim_project_processing_lease(
+            &pool,
+            project.id,
+            ProjectProcessingActorKind::Ingest,
+            "fresh-lease",
+        )
+        .await
+        .expect("claim fresh lease");
+
+        sqlx::query(
+            r#"
+            INSERT INTO project_processing_leases (
+                project_id,
+                actor_kind,
+                actor_id,
+                fence_epoch,
+                claimed_at,
+                heartbeat_at
+            )
+            VALUES (
+                $1,
+                'session_apply',
+                'stale-lease',
+                0,
+                now() - ($2 * interval '1 second'),
+                now() - ($2 * interval '1 second')
+            )
+            "#,
+        )
+        .bind(project.id)
+        .bind(PROJECT_PROCESSING_LEASE_STALE_AFTER_SECS + 1)
+        .execute(&pool)
+        .await
+        .expect("insert stale lease");
+
+        let count = count_project_processing_leases_before_epoch(&pool, project.id, 1)
+            .await
+            .expect("count active leases");
+
+        assert_eq!(count, 1);
+
+        release_project_processing_lease(&pool, &fresh_lease)
+            .await
+            .expect("release fresh lease");
+    }
+
+    #[sqlx::test]
+    async fn claim_next_project_deletion_job_skips_blocked_projects(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let blocked_project = create_project(&pool, "Blocked Deletion Project")
+            .await
+            .expect("create blocked project");
+        let runnable_project = create_project(&pool, "Runnable Deletion Project")
+            .await
+            .expect("create runnable project");
+
+        let blocked_lease = claim_project_processing_lease(
+            &pool,
+            blocked_project.id,
+            ProjectProcessingActorKind::Ingest,
+            "blocked-lease",
+        )
+        .await
+        .expect("claim blocked lease");
+
+        sqlx::query(
+            r#"
+            UPDATE projects
+            SET state = 'pending_deletion',
+                fence_epoch = fence_epoch + 1
+            WHERE id = $1
+            "#,
+        )
+        .bind(blocked_project.id)
+        .execute(&pool)
+        .await
+        .expect("advance blocked project fence");
+
+        let blocked_job_id = Uuid::new_v4();
+        let runnable_job_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO project_deletions (
+                id,
+                project_id,
+                project_name,
+                kind,
+                status,
+                scope,
+                created_at
+            )
+            VALUES
+                ($1, $2, $3, 'project_purge', 'queued', NULL, now() - interval '2 seconds'),
+                ($4, $5, $6, 'project_purge', 'queued', NULL, now() - interval '1 second')
+            "#,
+        )
+        .bind(blocked_job_id)
+        .bind(blocked_project.id)
+        .bind(blocked_project.name.clone())
+        .bind(runnable_job_id)
+        .bind(runnable_project.id)
+        .bind(runnable_project.name.clone())
+        .execute(&pool)
+        .await
+        .expect("insert deletion jobs");
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let claimed = claim_next_project_deletion_job_in_tx(&mut tx)
+            .await
+            .expect("claim next deletion job")
+            .expect("runnable job");
+        tx.rollback().await.expect("rollback tx");
+
+        assert_eq!(claimed.id, runnable_job_id);
+        assert_eq!(claimed.project_id, runnable_project.id);
+
+        release_project_processing_lease(&pool, &blocked_lease)
+            .await
+            .expect("release blocked lease");
+    }
+
+    #[sqlx::test]
     async fn insert_events_rejects_non_active_projects(pool: PgPool) {
         run_migrations(&pool).await.expect("migrations succeed");
 

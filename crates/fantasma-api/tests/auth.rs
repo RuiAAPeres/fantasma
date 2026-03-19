@@ -10,7 +10,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use fantasma_auth::StaticAdminAuthorizer;
-use fantasma_store::{PgPool, run_migrations};
+use fantasma_store::{PgPool, create_project, run_migrations};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -746,6 +746,68 @@ async fn delete_project_enqueues_pending_deletion_job_and_is_idempotent(pool: Pg
 }
 
 #[sqlx::test]
+async fn delete_project_returns_latest_successful_historical_purge(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let project = create_project(&pool, "Historical Purge Project")
+        .await
+        .expect("create project");
+    let older_job_id = Uuid::new_v4();
+    let latest_job_id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        INSERT INTO project_deletions (
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope,
+            created_at,
+            finished_at
+        )
+        VALUES
+            ($1, $2, $3, 'project_purge', 'succeeded', NULL, '2026-03-01T00:00:00Z', '2026-03-01T00:05:00Z'),
+            ($4, $2, $3, 'project_purge', 'succeeded', NULL, '2026-03-02T00:00:00Z', '2026-03-02T00:05:00Z')
+        "#,
+    )
+    .bind(older_job_id)
+    .bind(project.id)
+    .bind(project.name.clone())
+    .bind(latest_job_id)
+    .execute(&pool)
+    .await
+    .expect("insert historical purge jobs");
+
+    sqlx::query("DELETE FROM projects WHERE id = $1")
+        .bind(project.id)
+        .execute(&pool)
+        .await
+        .expect("delete project row");
+
+    let response = api
+        .oneshot(
+            Request::delete(format!("/v1/projects/{}", project.id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response_json(response).await;
+    assert_eq!(body["deletion"]["id"], serde_json::json!(latest_job_id));
+    assert_eq!(body["deletion"]["status"], serde_json::json!("succeeded"));
+    assert_eq!(body["deletion"]["kind"], serde_json::json!("project_purge"));
+}
+
+#[sqlx::test]
 async fn range_delete_conflicts_when_project_is_pending_deletion(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
@@ -854,6 +916,113 @@ async fn deletion_list_and_get_return_jobs_for_project(pool: PgPool) {
         fetched["deletion"]["kind"],
         serde_json::json!("project_purge")
     );
+}
+
+#[sqlx::test]
+async fn historical_keys_return_not_found_after_project_row_removal(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let project = create_project(&pool, "Historical Keys Project")
+        .await
+        .expect("create project");
+    let deletion_id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        INSERT INTO project_deletions (
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope,
+            created_at,
+            finished_at
+        )
+        VALUES ($1, $2, $3, 'project_purge', 'succeeded', NULL, now(), now())
+        "#,
+    )
+    .bind(deletion_id)
+    .bind(project.id)
+    .bind(project.name.clone())
+    .execute(&pool)
+    .await
+    .expect("insert historical deletion");
+
+    sqlx::query("DELETE FROM projects WHERE id = $1")
+        .bind(project.id)
+        .execute(&pool)
+        .await
+        .expect("delete project row");
+
+    let keys_response = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{}/keys", project.id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(keys_response.status(), StatusCode::NOT_FOUND);
+
+    let deletions_response = api
+        .oneshot(
+            Request::get(format!("/v1/projects/{}/deletions", project.id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(deletions_response.status(), StatusCode::OK);
+    let body = response_json(deletions_response).await;
+    assert_eq!(body["deletions"][0]["id"], serde_json::json!(deletion_id));
+}
+
+#[sqlx::test]
+async fn deletion_get_returns_not_found_for_mismatched_project(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_a_id, _, _) = provision_project(api.clone()).await;
+    let (project_b_id, _, _) = provision_project(api.clone()).await;
+
+    let delete_response = api
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/projects/{project_a_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(delete_response.status(), StatusCode::ACCEPTED);
+    let deletion = response_json(delete_response).await;
+    let deletion_id = deletion["deletion"]["id"].as_str().expect("deletion id");
+
+    let mismatched_response = api
+        .oneshot(
+            Request::get(format!(
+                "/v1/projects/{project_b_id}/deletions/{deletion_id}"
+            ))
+            .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(mismatched_response.status(), StatusCode::NOT_FOUND);
 }
 
 #[sqlx::test]
