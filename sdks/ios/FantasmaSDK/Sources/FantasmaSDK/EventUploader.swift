@@ -67,6 +67,9 @@ struct EventUploader: Sendable {
         }
 
         guard response.statusCode == 202 else {
+            if response.statusCode == 401 || response.statusCode == 422 {
+                return .blockedDestination
+            }
             if response.statusCode == 409,
                let envelope = try? JSONDecoder().decode(UploadErrorEnvelope.self, from: data),
                envelope.error == "project_pending_deletion"

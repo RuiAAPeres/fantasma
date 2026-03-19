@@ -379,6 +379,52 @@ mod tests {
 
             assert!(result.is_err());
         }
+
+        #[test]
+        fn returns_error_when_payload_exceeds_byte_limit() {
+            let mut event = valid_event();
+            event.event = "a".repeat(8 * 1024);
+
+            let result = event.validate().unwrap_err();
+
+            assert_eq!(result, EventValidationError::EventTooLarge);
+        }
+    }
+
+    mod event_property_key_validation {
+        use super::*;
+
+        #[test]
+        fn accepts_keys_up_to_sixty_three_characters() {
+            let key = format!("a{}", "b".repeat(62));
+
+            let result = is_valid_event_property_key(&key);
+
+            assert!(result);
+        }
+
+        #[test]
+        fn rejects_keys_longer_than_sixty_three_characters() {
+            let key = format!("a{}", "b".repeat(63));
+
+            let result = is_valid_event_property_key(&key);
+
+            assert!(!result);
+        }
+
+        #[test]
+        fn rejects_keys_that_do_not_start_with_a_lowercase_letter() {
+            let result = is_valid_event_property_key("1plan");
+
+            assert!(!result);
+        }
+
+        #[test]
+        fn rejects_empty_keys() {
+            let result = is_valid_event_property_key("");
+
+            assert!(!result);
+        }
     }
 
     mod event_batch_request_validate {

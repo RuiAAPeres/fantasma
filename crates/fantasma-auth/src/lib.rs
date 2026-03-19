@@ -75,10 +75,69 @@ mod tests {
     }
 
     #[test]
+    fn authorize_returns_missing_credentials_when_header_is_absent() {
+        let authorizer = StaticAdminAuthorizer::new("secret-token");
+        let headers = HeaderMap::new();
+
+        let result = authorizer.authorize(&headers);
+
+        assert_eq!(result, Err(AuthError::MissingCredentials));
+    }
+
+    #[test]
+    fn authorize_returns_invalid_credentials_for_wrong_token() {
+        let authorizer = StaticAdminAuthorizer::new("secret-token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION_HEADER,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+
+        let result = authorizer.authorize(&headers);
+
+        assert_eq!(result, Err(AuthError::InvalidCredentials));
+    }
+
+    #[test]
+    fn authorize_returns_invalid_credentials_for_wrong_scheme() {
+        let authorizer = StaticAdminAuthorizer::new("secret-token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION_HEADER,
+            HeaderValue::from_static("Token secret-token"),
+        );
+
+        let result = authorizer.authorize(&headers);
+
+        assert_eq!(result, Err(AuthError::InvalidCredentials));
+    }
+
+    #[test]
+    fn authorize_returns_invalid_credentials_for_non_utf8_header_values() {
+        let authorizer = StaticAdminAuthorizer::new("secret-token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION_HEADER,
+            HeaderValue::from_bytes(b"\xFFsecret-token").expect("valid raw header bytes"),
+        );
+
+        let result = authorizer.authorize(&headers);
+
+        assert_eq!(result, Err(AuthError::InvalidCredentials));
+    }
+
+    #[test]
     fn derive_key_prefix_returns_two_segment_prefix_when_available() {
         let prefix = derive_key_prefix("fg_ing_test");
 
         assert_eq!(prefix, "fg_ing_");
+    }
+
+    #[test]
+    fn derive_key_prefix_falls_back_to_first_eight_characters() {
+        let prefix = derive_key_prefix("abcdefghijk");
+
+        assert_eq!(prefix, "abcdefgh");
     }
 
     #[test]

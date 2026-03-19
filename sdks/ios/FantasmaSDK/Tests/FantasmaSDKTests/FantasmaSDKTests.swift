@@ -275,6 +275,32 @@ struct FantasmaSDKBehaviorTests {
         #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_test")
     }
 
+    @Test("reconfiguring with equivalent scheme host and trailing slash normalization preserves queued rows")
+    func normalizedDestinationEquivalencePreservesQueue() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("screen_view")
+        try await Fantasma.configure(
+            serverURL: URL(string: "HTTP://LOCALHOST:8081///")!,
+            writeKey: " fg_ing_test "
+        )
+        try await Fantasma.flush()
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 0)
+
+        let request = try requireValue(await transport.requests().first)
+        #expect(request.url?.absoluteString == localhostURL().appendingPathComponent("v1/events").absoluteString)
+        #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_test")
+    }
+
     @Test("reconfiguring with a different destination discards queued rows before future uploads")
     func destinationDriftDiscardQueuedRows() async throws {
         let transport = RecordingTransport()
@@ -300,6 +326,32 @@ struct FantasmaSDKBehaviorTests {
         let request = try requireValue(await transport.requests().first)
         #expect(request.url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
         #expect(request.value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
+    }
+
+    @Test("reconfiguring with a different normalized path discards queued rows before future uploads")
+    func normalizedPathDifferenceDiscardsQueuedRows() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("old_event")
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+
+        try await Fantasma.configure(serverURL: pathScopedURL(), writeKey: "fg_ing_test")
+        #expect(try await queue.count() == 0)
+
+        try await Fantasma.track("new_event")
+        try await Fantasma.flush()
+
+        let request = try requireValue(await transport.requests().first)
+        #expect(request.url?.absoluteString == pathScopedURL().appendingPathComponent("v1/events").absoluteString)
     }
 
     @Test("configuring after restart with the same destination preserves persisted queued rows")
@@ -490,6 +542,141 @@ struct FantasmaSDKBehaviorTests {
 
         await Fantasma.resetSharedCoreForTesting()
         await transport.enqueue(response: .success(projectConflictResponse(error: "project_busy")))
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected uploadFailed error")
+        } catch let error as FantasmaError {
+            #expect(error == .uploadFailed)
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+        #expect(try await queue.blockedDestinationSignature() == nil)
+
+        try await Fantasma.flush()
+        #expect(try await queue.count() == 0)
+        #expect(await transport.requests().count == 2)
+    }
+
+    @Test("unauthorized upload failures block automatic retries for the same destination")
+    func unauthorizedBlocksDestinationUntilChanged() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(errorResponse(statusCode: 401, error: "unauthorized")))
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport, uploadBatchSize: 1)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        try await waitUntil {
+            await transport.requests().count == 1
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+        #expect(
+            try await queue.blockedDestinationSignature() == localhostDestinationSignature()
+        )
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected uploadFailed error")
+        } catch let error as FantasmaError {
+            #expect(error == .uploadFailed)
+        }
+        #expect(await transport.requests().count == 1)
+
+        try await Fantasma.track("second_event")
+        try await Task.sleep(nanoseconds: 150_000_000)
+        #expect(await transport.requests().count == 1)
+        #expect(try await queue.count() == 2)
+    }
+
+    @Test("validation upload failures block automatic retries for the same destination")
+    func validationFailureBlocksDestinationUntilChanged() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(errorResponse(statusCode: 422, error: "invalid_request")))
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport, uploadBatchSize: 1)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        try await waitUntil {
+            await transport.requests().count == 1
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+        #expect(
+            try await queue.blockedDestinationSignature() == localhostDestinationSignature()
+        )
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected uploadFailed error")
+        } catch let error as FantasmaError {
+            #expect(error == .uploadFailed)
+        }
+        #expect(await transport.requests().count == 1)
+    }
+
+    @Test("server errors stay retryable without blocking the destination")
+    func serverErrorsRemainRetryable() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(
+            response: .success(errorResponse(statusCode: 500, error: "internal_server_error"))
+        )
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected uploadFailed error")
+        } catch let error as FantasmaError {
+            #expect(error == .uploadFailed)
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+        #expect(try await queue.blockedDestinationSignature() == nil)
+
+        try await Fantasma.flush()
+        #expect(try await queue.count() == 0)
+        #expect(await transport.requests().count == 2)
+    }
+
+    @Test("unrelated conflict responses stay retryable without blocking the destination")
+    func unrelatedConflictRemainsRetryable() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(
+            response: .success(errorResponse(statusCode: 409, error: "project_busy_but_unknown"))
+        )
         await transport.enqueue(response: .success(successResponse(accepted: 1)))
         try await harness.installSharedCore(transport: transport)
 
@@ -1345,8 +1532,23 @@ private func replacementURL() -> URL {
     URL(string: "http://localhost:8082")!
 }
 
+private func pathScopedURL() -> URL {
+    URL(string: "http://localhost:8081/collect")!
+}
+
 private func localhostDestinationSignature() -> String {
     "\(localhostURL().absoluteString)|fg_ing_test"
+}
+
+private func errorResponse(statusCode: Int, error: String) -> (Data, HTTPURLResponse) {
+    let payload = try! JSONEncoder().encode(["error": error])
+    let response = HTTPURLResponse(
+        url: URL(string: "http://localhost:8081/v1/events")!,
+        statusCode: statusCode,
+        httpVersion: nil,
+        headerFields: nil
+    )!
+    return (payload, response)
 }
 
 private func requireValue<T>(_ value: T?) throws -> T {
