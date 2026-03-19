@@ -9,6 +9,6 @@ pub use events::{
 pub use metrics::{
     ActiveInstallsPoint, ActiveInstallsResponse, ActiveInstallsSeries, CurrentMetricResponse,
     EventMetric, EventMetricsQuery, MetricGranularity, MetricInterval, MetricsBucketWindow,
-    MetricsPoint, MetricsResponse, MetricsSeries, SessionMetric, SessionMetricsQuery,
-    SessionMetricsReadResponse,
+    MetricsPoint, MetricsResponse, MetricsSeries, ProjectSummary, SessionMetric,
+    SessionMetricsQuery, SessionMetricsReadResponse, UsageEventsResponse, UsageProjectEvents,
 };

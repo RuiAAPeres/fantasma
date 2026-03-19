@@ -112,6 +112,37 @@ extract_line_value() {
   printf '%s\n' "$text" | awk -F': ' -v label="$label" '$1 == label {print $2}'
 }
 
+assert_usage_events() {
+  local expected_project_id="$1"
+  local usage_start_day="$2"
+  local usage_end_day="$3"
+  local usage_json total_events project_count observed_project_id observed_events
+  usage_json="$(cli usage events --start "$usage_start_day" --end "$usage_end_day" --json)"
+  IFS=$'\t' read -r total_events project_count observed_project_id observed_events <<EOF
+$(python3 - "$usage_json" "$expected_project_id" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+projects = payload.get("projects", [])
+project = projects[0] if projects else {}
+print(
+    f"{payload.get('total_events_processed', '')}\t{len(projects)}\t"
+    f"{project.get('project', {}).get('id', '')}\t{project.get('events_processed', '')}"
+)
+PY
+)
+EOF
+  if [[ "$total_events" == "1" && "$project_count" == "1" && "$observed_project_id" == "$expected_project_id" && "$observed_events" == "1" ]]; then
+    printf '%s\n' "$usage_json"
+    return 0
+  fi
+
+  echo "usage events did not report the expected raw accepted-event total" >&2
+  printf '%s\n' "$usage_json" >&2
+  exit 1
+}
+
 poll_metrics() {
   local deadline metrics_json value active_json active_value live_json live_value
   deadline=$((SECONDS + TIMEOUT_SECONDS))
@@ -167,6 +198,70 @@ PY
   exit 1
 }
 
+assert_zero_match_range_delete() {
+  local project_id="$1"
+  local deadline deletion_json deletion_id get_json status list_json listed_id
+
+  deletion_json="$(
+    cli projects deletions range \
+      --project "$project_id" \
+      --start-at 2027-01-01T00:00:00Z \
+      --end-before 2027-01-02T00:00:00Z \
+      --json
+  )"
+  deletion_id="$(
+    python3 - "$deletion_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+print(payload.get("deletion", {}).get("id", ""))
+PY
+  )"
+
+  if [[ -z "$deletion_id" ]]; then
+    echo "failed to parse deletion id from CLI range-delete output" >&2
+    printf '%s\n' "$deletion_json" >&2
+    exit 1
+  fi
+
+  deadline=$((SECONDS + TIMEOUT_SECONDS))
+  while ((SECONDS < deadline)); do
+    get_json="$(cli projects deletions get "$deletion_id" --project "$project_id" --json)"
+    status="$(
+      python3 - "$get_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+print(payload.get("deletion", {}).get("status", ""))
+PY
+    )"
+    if [[ "$status" == "succeeded" ]]; then
+      list_json="$(cli projects deletions list --project "$project_id" --json)"
+      listed_id="$(
+        python3 - "$list_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+deletions = payload.get("deletions", [])
+print(deletions[0]["id"] if deletions else "")
+PY
+      )"
+      if [[ "$listed_id" == "$deletion_id" ]]; then
+        return 0
+      fi
+    fi
+
+    sleep "$SLEEP_SECONDS"
+  done
+
+  echo "timed out waiting for zero-match range deletion to succeed through the CLI" >&2
+  print_logs >&2
+  exit 1
+}
+
 main() {
   require_cmd cargo
   require_cmd curl
@@ -191,7 +286,7 @@ main() {
   cli instances add "$INSTANCE_NAME" --url "$API_URL" >/dev/null
   cli auth login --instance "$INSTANCE_NAME" --token "$ADMIN_TOKEN" >/dev/null
 
-  local project_output project_id ingest_key
+  local project_output project_id ingest_key usage_start_day usage_end_day
   project_output="$(cli projects create --name "$PROJECT_LABEL" --ingest-key-name cli-smoke-ingest)"
   project_id="$(extract_line_value "project id" "$project_output")"
   ingest_key="$(extract_line_value "ingest key" "$project_output")"
@@ -205,6 +300,7 @@ main() {
   cli projects use "$project_id" >/dev/null
   cli keys create --kind read --name cli-smoke-read >/dev/null
 
+  usage_start_day="$(date -u +%F)"
   curl -fsS -X POST "${INGEST_URL}/v1/events" \
     -H "Content-Type: application/json" \
     -H "X-Fantasma-Key: ${ingest_key}" \
@@ -221,7 +317,11 @@ main() {
       ]
     }' >/dev/null
 
+  usage_end_day="$(date -u +%F)"
+
+  assert_usage_events "$project_id" "$usage_start_day" "$usage_end_day"
   poll_metrics
+  assert_zero_match_range_delete "$project_id"
 }
 
 main "$@"

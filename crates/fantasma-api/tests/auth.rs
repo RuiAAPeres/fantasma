@@ -8,6 +8,7 @@ use axum::{
     },
     response::Response,
 };
+use chrono::{DateTime, Utc};
 use fantasma_auth::StaticAdminAuthorizer;
 use fantasma_store::{PgPool, run_migrations};
 use tower::ServiceExt;
@@ -109,6 +110,49 @@ fn event_payload() -> Body {
         })
         .to_string(),
     )
+}
+
+async fn insert_usage_event(
+    pool: &PgPool,
+    project_id: Uuid,
+    event_name: &str,
+    timestamp: &str,
+    received_at: &str,
+    install_id: &str,
+) {
+    sqlx::query(
+        r#"
+        INSERT INTO events_raw (
+            project_id,
+            event_name,
+            timestamp,
+            received_at,
+            install_id,
+            platform,
+            app_version,
+            os_version,
+            properties
+        )
+        VALUES ($1, $2, $3, $4, $5, 'ios', NULL, NULL, $6)
+        "#,
+    )
+    .bind(project_id)
+    .bind(event_name)
+    .bind(
+        DateTime::parse_from_rfc3339(timestamp)
+            .expect("timestamp")
+            .with_timezone(&Utc),
+    )
+    .bind(
+        DateTime::parse_from_rfc3339(received_at)
+            .expect("received_at")
+            .with_timezone(&Utc),
+    )
+    .bind(install_id)
+    .bind(sqlx::types::Json(serde_json::json!({})))
+    .execute(pool)
+    .await
+    .expect("insert usage event");
 }
 
 #[sqlx::test]
@@ -226,6 +270,237 @@ async fn ingest_and_metrics_routes_enforce_project_key_kinds(pool: PgPool) {
         .await
         .expect("response succeeds");
     assert_eq!(metrics_with_read_key.status(), StatusCode::OK);
+}
+
+#[sqlx::test]
+async fn usage_events_route_requires_operator_auth_and_counts_received_at(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_a, _, read_key_a) = provision_project(api.clone()).await;
+    let (project_b, _, _) = provision_project(api.clone()).await;
+
+    let project_a = Uuid::parse_str(&project_a).expect("project a");
+    let project_b = Uuid::parse_str(&project_b).expect("project b");
+
+    insert_usage_event(
+        &pool,
+        project_a,
+        "app_open",
+        "2026-03-01T00:00:00Z",
+        "2026-03-01T00:00:00Z",
+        "install-a",
+    )
+    .await;
+    insert_usage_event(
+        &pool,
+        project_a,
+        "app_open",
+        "2026-03-01T01:00:00Z",
+        "2026-03-05T00:00:00Z",
+        "install-b",
+    )
+    .await;
+    insert_usage_event(
+        &pool,
+        project_b,
+        "app_open",
+        "2026-02-28T23:00:00Z",
+        "2026-03-01T12:00:00Z",
+        "install-c",
+    )
+    .await;
+
+    let project_key_response = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/usage/events?start=2026-03-01&end=2026-03-01")
+                .header("x-fantasma-key", &read_key_a)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(project_key_response.status(), StatusCode::UNAUTHORIZED);
+
+    let operator_response = api
+        .oneshot(
+            Request::get("/v1/usage/events?start=2026-03-01&end=2026-03-01")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(operator_response.status(), StatusCode::OK);
+
+    let usage = response_json(operator_response).await;
+    assert_eq!(usage["start"], serde_json::json!("2026-03-01"));
+    assert_eq!(usage["end"], serde_json::json!("2026-03-01"));
+    assert_eq!(usage["total_events_processed"], serde_json::json!(2));
+    assert_eq!(
+        usage["projects"].as_array().map(|projects| projects.len()),
+        Some(2)
+    );
+    assert_eq!(
+        usage["projects"][0]["project"]["id"],
+        serde_json::json!(project_a)
+    );
+    assert_eq!(
+        usage["projects"][0]["events_processed"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        usage["projects"][1]["project"]["id"],
+        serde_json::json!(project_b)
+    );
+    assert_eq!(
+        usage["projects"][1]["events_processed"],
+        serde_json::json!(1)
+    );
+}
+
+#[sqlx::test]
+async fn usage_events_route_rejects_missing_invalid_and_project_key_auth(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (_, ingest_key, read_key) = provision_project(api.clone()).await;
+    let uri = "/v1/usage/events?start=2026-03-01&end=2026-03-01";
+
+    let cases = [
+        (
+            "missing auth",
+            Request::get(uri).body(Body::empty()).expect("request"),
+        ),
+        (
+            "invalid bearer",
+            Request::get(uri)
+                .header(AUTHORIZATION, "Bearer fg_pat_wrong")
+                .body(Body::empty())
+                .expect("request"),
+        ),
+        (
+            "ingest key",
+            Request::get(uri)
+                .header("x-fantasma-key", &ingest_key)
+                .body(Body::empty())
+                .expect("request"),
+        ),
+        (
+            "read key",
+            Request::get(uri)
+                .header("x-fantasma-key", &read_key)
+                .body(Body::empty())
+                .expect("request"),
+        ),
+    ];
+
+    for (label, request) in cases {
+        let response = api
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("response succeeds");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{label}");
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({ "error": "unauthorized" }),
+            "{label}"
+        );
+    }
+}
+
+#[sqlx::test]
+async fn usage_events_route_rejects_duplicate_and_invalid_query_keys(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let cases = [
+        (
+            "/v1/usage/events?start=2026-03-01&start=2026-03-02&end=2026-03-31",
+            "duplicate_query_key",
+        ),
+        (
+            "/v1/usage/events?start=2026-03-01&end=2026-03-31&end=2026-04-01",
+            "duplicate_query_key",
+        ),
+        (
+            "/v1/usage/events?project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-03-01&end=2026-03-31",
+            "invalid_query_key",
+        ),
+        (
+            "/v1/usage/events?start=2026-03-01&end=2026-03-31&plan=pro",
+            "invalid_query_key",
+        ),
+    ];
+
+    for (uri, expected_error) in cases {
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(uri)
+                    .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response succeeds");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({ "error": expected_error }),
+            "{uri}"
+        );
+    }
+}
+
+#[sqlx::test]
+async fn usage_events_route_rejects_invalid_time_ranges(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let cases = [
+        "/v1/usage/events?end=2026-03-31",
+        "/v1/usage/events?start=2026-03-01",
+        "/v1/usage/events?start=not-a-date&end=2026-03-31",
+        "/v1/usage/events?start=2026-03-01&end=not-a-date",
+        "/v1/usage/events?start=2026-03-31&end=2026-03-01",
+    ];
+
+    for uri in cases {
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(uri)
+                    .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response succeeds");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({ "error": "invalid_time_range" }),
+            "{uri}"
+        );
+    }
 }
 
 #[sqlx::test]
@@ -368,6 +643,217 @@ async fn management_missing_resources_return_not_found(pool: PgPool) {
         .await
         .expect("response succeeds");
     assert_eq!(revoke_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test]
+async fn management_project_responses_include_lifecycle_state(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_id, _, _) = provision_project(api.clone()).await;
+
+    let list_response = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/projects")
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let listed = response_json(list_response).await;
+    assert_eq!(listed["projects"][0]["state"], serde_json::json!("active"));
+
+    let get_response = api
+        .oneshot(
+            Request::get(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let fetched = response_json(get_response).await;
+    assert_eq!(fetched["project"]["state"], serde_json::json!("active"));
+}
+
+#[sqlx::test]
+async fn delete_project_enqueues_pending_deletion_job_and_is_idempotent(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_id, _, _) = provision_project(api.clone()).await;
+
+    let first_response = api
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(first_response.status(), StatusCode::ACCEPTED);
+    let first = response_json(first_response).await;
+    assert_eq!(
+        first["deletion"]["project_id"],
+        serde_json::json!(project_id)
+    );
+    assert_eq!(
+        first["deletion"]["kind"],
+        serde_json::json!("project_purge")
+    );
+    assert_eq!(first["deletion"]["status"], serde_json::json!("queued"));
+
+    let project_response = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    let project = response_json(project_response).await;
+    assert_eq!(
+        project["project"]["state"],
+        serde_json::json!("pending_deletion")
+    );
+
+    let second_response = api
+        .oneshot(
+            Request::delete(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(second_response.status(), StatusCode::ACCEPTED);
+    let second = response_json(second_response).await;
+    assert_eq!(second["deletion"]["id"], first["deletion"]["id"]);
+}
+
+#[sqlx::test]
+async fn range_delete_conflicts_when_project_is_pending_deletion(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_id, _, _) = provision_project(api.clone()).await;
+
+    let delete_response = api
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(delete_response.status(), StatusCode::ACCEPTED);
+
+    let range_response = api
+        .oneshot(
+            Request::post(format!("/v1/projects/{project_id}/deletions"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "start_at": "2026-03-01T00:00:00Z",
+                        "end_before": "2026-03-08T00:00:00Z",
+                        "event": "app_open",
+                        "filters": {
+                            "platform": "ios"
+                        },
+                        "properties": {
+                            "plan": "pro"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(range_response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(range_response).await,
+        serde_json::json!({ "error": "project_pending_deletion" })
+    );
+}
+
+#[sqlx::test]
+async fn deletion_list_and_get_return_jobs_for_project(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool,
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_id, _, _) = provision_project(api.clone()).await;
+
+    let delete_response = api
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/projects/{project_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    let deletion = response_json(delete_response).await;
+    let deletion_id = deletion["deletion"]["id"]
+        .as_str()
+        .expect("deletion id")
+        .to_owned();
+
+    let list_response = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{project_id}/deletions"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let listed = response_json(list_response).await;
+    assert_eq!(listed["deletions"][0]["id"], serde_json::json!(deletion_id));
+
+    let get_response = api
+        .oneshot(
+            Request::get(format!("/v1/projects/{project_id}/deletions/{deletion_id}"))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let fetched = response_json(get_response).await;
+    assert_eq!(fetched["deletion"]["id"], serde_json::json!(deletion_id));
+    assert_eq!(
+        fetched["deletion"]["kind"],
+        serde_json::json!("project_purge")
+    );
 }
 
 #[sqlx::test]

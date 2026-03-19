@@ -234,6 +234,64 @@ async fn ingest_accepts_valid_batches(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn ingest_returns_project_busy_for_range_deleting_projects(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let provisioned = provision_project(&pool).await;
+    sqlx::query("UPDATE projects SET state = 'range_deleting' WHERE name = 'Ingest Test Project'")
+        .execute(&pool)
+        .await
+        .expect("update project state");
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", provisioned.ingest_key)
+                .body(Body::from(event_batch_body(1)))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({ "error": "project_busy" })
+    );
+}
+
+#[sqlx::test]
+async fn ingest_returns_project_pending_deletion_for_pending_projects(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let provisioned = provision_project(&pool).await;
+    sqlx::query(
+        "UPDATE projects SET state = 'pending_deletion' WHERE name = 'Ingest Test Project'",
+    )
+    .execute(&pool)
+    .await
+    .expect("update project state");
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", provisioned.ingest_key)
+                .body(Body::from(event_batch_body(1)))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({ "error": "project_pending_deletion" })
+    );
+}
+
+#[sqlx::test]
 async fn ingest_accepts_batches_up_to_two_hundred_events(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
     let provisioned = provision_project(&pool).await;

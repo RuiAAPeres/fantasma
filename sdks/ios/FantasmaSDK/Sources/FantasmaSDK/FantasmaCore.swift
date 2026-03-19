@@ -427,6 +427,13 @@ actor FantasmaCore {
             throw FantasmaError.notConfigured
         }
 
+        if try await isCurrentDestinationBlocked() {
+            if allowUnconfigured {
+                return
+            }
+            throw FantasmaError.uploadFailed
+        }
+
         do {
             flushInProgress = true
             defer { flushInProgress = false }
@@ -435,6 +442,15 @@ actor FantasmaCore {
                 if try await applyPendingReconfigurationIfNeeded(allowWhileFlushing: true) {
                     resumeFlushWaiters()
                     return
+                }
+
+                if try await isCurrentDestinationBlocked() {
+                    if allowUnconfigured {
+                        resumeFlushWaiters()
+                        return
+                    }
+                    failFlushWaiters(FantasmaError.uploadFailed)
+                    throw FantasmaError.uploadFailed
                 }
 
                 pendingUpload = false
@@ -463,7 +479,34 @@ actor FantasmaCore {
                 }
 
                 do {
-                    try await uploader.upload(batch, configuration: configuration)
+                    let disposition = try await uploader.upload(batch, configuration: configuration)
+                    switch disposition {
+                    case .success:
+                        break
+                    case .retryableFailure:
+                        do {
+                            _ = try await applyPendingReconfigurationIfNeeded(allowWhileFlushing: true)
+                        } catch {
+                            failFlushWaiters(error)
+                            throw error
+                        }
+
+                        failFlushWaiters(FantasmaError.uploadFailed)
+                        throw FantasmaError.uploadFailed
+                    case .blockedDestination:
+                        try await eventQueue.markBlockedDestinationSignature(
+                            configuration.destinationSignature
+                        )
+                        do {
+                            _ = try await applyPendingReconfigurationIfNeeded(allowWhileFlushing: true)
+                        } catch {
+                            failFlushWaiters(error)
+                            throw error
+                        }
+
+                        failFlushWaiters(FantasmaError.uploadFailed)
+                        throw FantasmaError.uploadFailed
+                    }
                 } catch {
                     do {
                         _ = try await applyPendingReconfigurationIfNeeded(allowWhileFlushing: true)
@@ -513,6 +556,14 @@ actor FantasmaCore {
         pendingReconfiguration = nil
         installTimerIfNeeded()
         installBackgroundFlushTaskIfNeeded()
+    }
+
+    private func isCurrentDestinationBlocked() async throws -> Bool {
+        guard let configuration else {
+            return false
+        }
+
+        return try await eventQueue.blockedDestinationSignature() == configuration.destinationSignature
     }
 
     private func applyPendingReconfigurationIfNeeded(

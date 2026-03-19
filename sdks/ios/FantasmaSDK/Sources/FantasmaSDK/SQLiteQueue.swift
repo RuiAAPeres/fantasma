@@ -24,6 +24,7 @@ internal struct QueuedEventRow: Equatable, Sendable {
 internal actor SQLiteEventQueue {
     private enum QueueStateKey {
         static let destinationSignature = "destination_signature"
+        static let blockedDestinationSignature = "blocked_destination_signature"
     }
 
     private let database: SQLiteDatabaseHandle
@@ -171,6 +172,7 @@ internal actor SQLiteEventQueue {
         try inTransaction {
             try execute("DELETE FROM events;")
             try deleteQueueState(for: QueueStateKey.destinationSignature)
+            try deleteQueueState(for: QueueStateKey.blockedDestinationSignature)
         }
     }
 
@@ -184,6 +186,14 @@ internal actor SQLiteEventQueue {
         }
 
         return try readQueueState(for: QueueStateKey.destinationSignature)
+    }
+
+    func blockedDestinationSignature() throws -> String? {
+        try readQueueState(for: QueueStateKey.blockedDestinationSignature)
+    }
+
+    func markBlockedDestinationSignature(_ signature: String) throws {
+        try writeQueueState(signature, for: QueueStateKey.blockedDestinationSignature)
     }
 
     private func execute(_ sql: String) throws {

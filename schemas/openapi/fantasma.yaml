@@ -7,9 +7,9 @@ info:
     platform.
 
     The current public surface covers raw event ingestion, operator-managed
-    project provisioning, worker-derived session metrics, and worker-derived
-    event metrics. Event properties are explicit string-to-string context with
-    at most 2 keys.
+    project provisioning, operator usage reads, worker-derived session
+    metrics, and worker-derived event metrics. Event properties are explicit
+    string-to-string context with at most 2 keys.
 servers:
   - url: http://localhost:8081
     description: Local ingest service
@@ -217,6 +217,169 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags:
+        - management
+      summary: Start an async full-project purge
+      operationId: deleteProject
+      security:
+        - OperatorBearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectPathId'
+      responses:
+        '202':
+          description: Existing or newly queued purge job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDeletionResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Project not found and no historical successful purge exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Project is already in `range_deleting`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while starting the purge.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/projects/{project_id}/deletions:
+    get:
+      tags:
+        - management
+      summary: List deletion jobs for a project id
+      operationId: listProjectDeletions
+      security:
+        - OperatorBearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectPathId'
+      responses:
+        '200':
+          description: Deletion jobs for the live or historical project id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDeletionListResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Project id has no live row and no deletion history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while listing deletion jobs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      tags:
+        - management
+      summary: Start an async range delete
+      operationId: createProjectRangeDeletion
+      security:
+        - OperatorBearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectPathId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRangeDeletionRequest'
+      responses:
+        '202':
+          description: Newly queued range-delete job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDeletionResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Live project row not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Project is already `range_deleting` or `pending_deletion`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid range-delete scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while starting the range delete.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/projects/{project_id}/deletions/{deletion_id}:
+    get:
+      tags:
+        - management
+      summary: Get one deletion job
+      operationId: getProjectDeletion
+      security:
+        - OperatorBearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectPathId'
+        - $ref: '#/components/parameters/DeletionPathId'
+      responses:
+        '200':
+          description: One deletion job for the project id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDeletionResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Deletion not found under the requested project id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while loading the deletion job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/projects/{project_id}/keys:
     get:
       tags:
@@ -326,6 +489,58 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '500':
           description: Internal server error while revoking the project key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/usage/events:
+    get:
+      tags:
+        - management
+      summary: Return operator-wide accepted event usage
+      operationId: getUsageEvents
+      security:
+        - OperatorBearerAuth: []
+      description: |
+        Returns accepted-event usage for the authenticated operator across all
+        projects in an inclusive UTC `YYYY-MM-DD` window.
+
+        Usage counts raw accepted events by `received_at`, not client event
+        timestamp, so billing windows track accepted traffic rather than late
+        or backdated client timestamps.
+
+        Only `start` and `end` are accepted. Duplicate query keys fail fast
+        with `duplicate_query_key`; legacy public keys such as `project_id`,
+        `start_date`, and `end_date` fail fast with `invalid_query_key`.
+      parameters:
+        - $ref: '#/components/parameters/UsageStart'
+        - $ref: '#/components/parameters/UsageEnd'
+      responses:
+        '200':
+          description: Operator-wide accepted-event usage for the requested window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageEventsResponse'
+        '401':
+          description: Missing or invalid operator bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: |
+            Invalid query. Error envelope is `{ "error": "..." }` with one of:
+
+            - `duplicate_query_key`
+            - `invalid_query_key`
+            - `invalid_time_range`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error while loading usage data.
           content:
             application/json:
               schema:
@@ -684,7 +899,7 @@ components:
     OperatorBearerAuth:
       type: http
       scheme: bearer
-      description: Operator bearer token for `/v1/projects*` management routes.
+      description: Operator bearer token for `/v1/projects*` management routes and `/v1/usage/*` operator reads.
     ProjectKeyHeader:
       type: apiKey
       in: header
@@ -698,6 +913,15 @@ components:
       schema:
         type: string
         format: uuid
+      description: Project identifier.
+    DeletionPathId:
+      in: path
+      name: deletion_id
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Deletion-job identifier.
     KeyPathId:
       in: path
       name: key_id
@@ -705,6 +929,7 @@ components:
       schema:
         type: string
         format: uuid
+      description: Project key identifier.
     EventName:
       in: query
       name: event
@@ -874,6 +1099,31 @@ components:
       required:
         - id
         - name
+        - state
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+        state:
+          $ref: '#/components/schemas/ProjectState'
+        created_at:
+          type: string
+          format: date-time
+    ProjectState:
+      type: string
+      enum:
+        - active
+        - range_deleting
+        - pending_deletion
+    ProjectSummary:
+      type: object
+      required:
+        - id
+        - name
         - created_at
       properties:
         id:
@@ -885,6 +1135,38 @@ components:
         created_at:
           type: string
           format: date-time
+    UsageProjectEvents:
+      type: object
+      required:
+        - project
+        - events_processed
+      properties:
+        project:
+          $ref: '#/components/schemas/ProjectSummary'
+        events_processed:
+          type: integer
+          minimum: 0
+    UsageEventsResponse:
+      type: object
+      required:
+        - start
+        - end
+        - total_events_processed
+        - projects
+      properties:
+        start:
+          type: string
+          format: date
+        end:
+          type: string
+          format: date
+        total_events_processed:
+          type: integer
+          minimum: 0
+        projects:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageProjectEvents'
     ProjectListResponse:
       type: object
       required:
@@ -901,6 +1183,129 @@ components:
       properties:
         project:
           $ref: '#/components/schemas/Project'
+    ProjectDeletionKind:
+      type: string
+      enum:
+        - project_purge
+        - range_delete
+    ProjectDeletionStatus:
+      type: string
+      enum:
+        - queued
+        - running
+        - succeeded
+        - failed
+    ProjectDeletionScope:
+      type:
+        - object
+        - 'null'
+      additionalProperties: false
+      properties:
+        start_at:
+          type: string
+          format: date-time
+        end_before:
+          type: string
+          format: date-time
+        event:
+          type:
+            - string
+            - 'null'
+          minLength: 1
+        filters:
+          type: object
+          additionalProperties:
+            type: string
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+    ProjectDeletion:
+      type: object
+      required:
+        - id
+        - project_id
+        - project_name
+        - kind
+        - status
+        - scope
+        - created_at
+        - started_at
+        - finished_at
+        - error_code
+        - error_message
+        - deleted_raw_events
+        - deleted_sessions
+        - rebuilt_installs
+        - rebuilt_days
+        - rebuilt_hours
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: string
+          format: uuid
+        project_name:
+          type: string
+        kind:
+          $ref: '#/components/schemas/ProjectDeletionKind'
+        status:
+          $ref: '#/components/schemas/ProjectDeletionStatus'
+        scope:
+          $ref: '#/components/schemas/ProjectDeletionScope'
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        finished_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        error_code:
+          type:
+            - string
+            - 'null'
+        error_message:
+          type:
+            - string
+            - 'null'
+        deleted_raw_events:
+          type: integer
+          minimum: 0
+        deleted_sessions:
+          type: integer
+          minimum: 0
+        rebuilt_installs:
+          type: integer
+          minimum: 0
+        rebuilt_days:
+          type: integer
+          minimum: 0
+        rebuilt_hours:
+          type: integer
+          minimum: 0
+    ProjectDeletionResponse:
+      type: object
+      required:
+        - deletion
+      properties:
+        deletion:
+          $ref: '#/components/schemas/ProjectDeletion'
+    ProjectDeletionListResponse:
+      type: object
+      required:
+        - deletions
+      properties:
+        deletions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectDeletion'
     ProjectKeyKind:
       type: string
       enum:
@@ -1030,6 +1435,34 @@ components:
       properties:
         key:
           $ref: '#/components/schemas/ProjectKeyWithSecret'
+    CreateRangeDeletionRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - start_at
+        - end_before
+      properties:
+        start_at:
+          type: string
+          format: date-time
+        end_before:
+          type: string
+          format: date-time
+        event:
+          type:
+            - string
+            - 'null'
+          minLength: 1
+        filters:
+          type: object
+          additionalProperties:
+            type: string
+          description: Allowed keys are `platform`, `app_version`, and `os_version`.
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+          description: Explicit event-property predicates ANDed with the other filters.
     Platform:
       type: string
       enum:
@@ -1195,6 +1628,22 @@ components:
         - week
         - month
         - year
+    UsageStart:
+      in: query
+      name: start
+      required: true
+      schema:
+        type: string
+        format: date
+      description: Inclusive UTC start date for operator usage reads.
+    UsageEnd:
+      in: query
+      name: end
+      required: true
+      schema:
+        type: string
+        format: date
+      description: Inclusive UTC end date for operator usage reads.
     MetricsPoint:
       type: object
       required:

@@ -8,7 +8,7 @@ use tracing::{error, info};
 
 use crate::worker::{
     EVENT_METRICS_WORKER_NAME, SESSION_WORKER_NAME, SessionBatchConfig,
-    process_event_metrics_batch, process_session_batch_with_config,
+    process_event_metrics_batch, process_project_deletion_batch, process_session_batch_with_config,
     process_session_repair_batch_with_config,
 };
 
@@ -38,7 +38,7 @@ impl WorkerConfig {
         let required = self
             .session_incremental_concurrency
             .saturating_add(self.session_repair_concurrency)
-            .saturating_add(5);
+            .saturating_add(6);
         required as u32
     }
 }
@@ -59,10 +59,12 @@ pub(crate) struct LaneRunStats {
 pub async fn run_worker(pool: PgPool, config: WorkerConfig) -> Result<(), StoreError> {
     let session_apply_pool = pool.clone();
     let session_repair_pool = pool.clone();
-    let event_pool = pool;
+    let event_pool = pool.clone();
+    let deletion_pool = pool;
     let session_apply_config = config.clone();
     let session_repair_config = config.clone();
-    let event_config = config;
+    let event_config = config.clone();
+    let deletion_config = config;
 
     tokio::try_join!(
         run_lane_forever(
@@ -90,6 +92,14 @@ pub async fn run_worker(pool: PgPool, config: WorkerConfig) -> Result<(), StoreE
                 let pool = event_pool.clone();
                 let config = event_config.clone();
                 async move { event_metrics_lane_tick(&pool, &config).await }
+            }
+        ),
+        run_lane_forever(
+            "project_deletions",
+            deletion_config.idle_poll_interval,
+            move || {
+                let pool = deletion_pool.clone();
+                async move { project_deletion_lane_tick(&pool).await }
             }
         ),
     )?;
@@ -234,6 +244,16 @@ async fn event_metrics_lane_tick(
     })
 }
 
+async fn project_deletion_lane_tick(pool: &PgPool) -> Result<LaneTickResult, StoreError> {
+    let processed_jobs = process_project_deletion_batch(pool).await?;
+
+    Ok(LaneTickResult {
+        processed_events: processed_jobs,
+        backlog_events: 0,
+        made_progress: processed_jobs > 0,
+    })
+}
+
 async fn lane_backlog(pool: &PgPool, worker_name: &str) -> Result<i64, StoreError> {
     let tail = load_raw_event_tail_id(pool).await?;
     let offset = load_worker_offset(pool, worker_name).await?;
@@ -265,7 +285,7 @@ mod tests {
         assert_eq!(config.event_batch_size, 5_000);
         assert_eq!(config.session_incremental_concurrency, 8);
         assert_eq!(config.session_repair_concurrency, 2);
-        assert_eq!(config.required_db_connections(), 15);
+        assert_eq!(config.required_db_connections(), 16);
     }
 
     #[tokio::test]

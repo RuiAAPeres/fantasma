@@ -20,7 +20,7 @@
 ```text
 operator
   -> fantasma CLI
-  -> GET/POST/PATCH /v1/projects* and GET /v1/metrics/*
+  -> GET/POST/PATCH /v1/projects*, GET /v1/usage/events, and GET /v1/metrics/*
   -> fantasma-api
   -> projects + api_keys in Postgres
 
@@ -74,7 +74,7 @@ Current derived metric:
 
 Current worker behavior:
 
-- run `session_apply`, `session_repair`, and `event_metrics` lanes concurrently inside the same worker process
+- run `session_apply`, `session_repair`, `event_metrics`, and `project_deletions` lanes concurrently inside the same worker process
 - keep a separate `worker_offsets` checkpoint for the raw-offset lanes and hold the claimed offset-row lock for the full batch window until the final offset save commits
 - repoll immediately after progress and sleep only after an idle tick, so busy lanes stay work-conserving
 - poll `events_raw` in batches ordered by raw event id
@@ -117,6 +117,7 @@ Current worker behavior:
 - derive session metric rollups incrementally for `count`, `duration_total`, and `new_installs`
 - keep event-metrics rollups keyed only by canonical string dimensions, never by the full property bag
 - advance a `worker_offsets` checkpoint only after successful writes
+- treat project deletion as an explicit operator-owned job: the API flips project lifecycle state and records an independent `project_deletions` row, then the `project_deletions` lane waits for the existing worker queues to drain before it either rebuilds the narrowed project state for a range delete or explicitly purges every project-owned table before deleting the `projects` row
 
 Current aggregate ownership:
 
@@ -150,10 +151,13 @@ Planned aggregates:
 Responsibilities:
 
 - expose operator-authenticated project/key management routes
+- expose operator-authenticated deletion-job management routes
+- expose operator-authenticated usage reads
 - expose project-scoped query endpoints
 - parse the explicit event-metrics query surface from raw query params
 - read worker-derived aggregates for bucketed analytics queries
 - read raw accepted events for event discovery helpers such as catalog and top-events
+- read raw accepted events for operator usage totals across projects
 - provide a stable public API for first-party and third-party clients
 
 Current operator access pattern:
@@ -165,7 +169,7 @@ Current operator access pattern:
 
 Auth model:
 
-- one static operator bearer token is reserved for `/v1/projects*`
+- one static operator bearer token is reserved for `/v1/projects*` and `/v1/usage/*`
 - project keys are scoped to exactly one project and one key kind
 - `ingest` keys authenticate `POST /v1/events`
 - `read` keys authenticate `/v1/metrics/*`, including the event discovery helpers
@@ -177,6 +181,8 @@ Auth model:
 Core persisted concepts:
 
 - `projects`
+- `project_deletions`
+- `project_processing_leases`
 - `api_keys`
 - `events_raw`
 - `sessions`
@@ -190,6 +196,14 @@ Current `api_keys` shape:
 - keeps only hash plus redacted prefix, never the plaintext key
 - tracks a required `kind` of `ingest` or `read`
 - supports soft revocation through `revoked_at`
+
+Current `projects` lifecycle shape:
+
+- `projects.state` is explicit management/read visibility, not an implicit side effect
+- allowed lifecycle states are `active`, `range_deleting`, and `pending_deletion`
+- `range_deleting` pauses ingest, read-key metrics reads, and project mutations until the delete worker commits the rebuilt state and returns the project to `active`
+- `pending_deletion` is fail-closed: the project row stays visible to operator reads until the purge worker succeeds, but ingest, read-key routes, and management mutations are latched off
+- `project_deletions` keeps historical job rows independent from `projects`, so deletion history survives after full purge removes the project row
 
 Event requirements:
 
@@ -215,6 +229,17 @@ Identity model:
 - built-in event dimensions stay minimal: `platform`, `app_version`, and `os_version`
 
 ## Metrics Query Model
+
+Operator usage reads currently add one narrow raw-event route:
+
+- `GET /v1/usage/events`
+
+Shared usage semantics:
+
+- operator scope comes from the bearer token, not from a public workspace or `project_id` parameter
+- `start` and `end` are required inclusive UTC `YYYY-MM-DD` dates
+- usage counts accepted raw events by `events_raw.received_at`, not by client event `timestamp`
+- responses return one operator-wide total plus per-project rows for projects with non-zero usage in the requested window
 
 Public bucketed metrics use exactly two endpoint shapes:
 

@@ -14,6 +14,7 @@ pub enum Command {
     Auth(AuthCommand),
     Status(ReadOutputArgs),
     Projects(ProjectsCommand),
+    Usage(UsageCommand),
     Keys(KeysCommand),
     Metrics(MetricsCommand),
 }
@@ -80,6 +81,30 @@ pub enum ProjectsSubcommand {
     List(ReadOutputArgs),
     Create(ProjectCreateArgs),
     Use(ProjectUseArgs),
+    Delete(ProjectScopedArgs),
+    Deletions(ProjectDeletionsCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct UsageCommand {
+    #[command(subcommand)]
+    pub command: UsageSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UsageSubcommand {
+    Events(UsageEventsArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = "Examples:\n  fantasma usage events --start 2026-03-01 --end 2026-03-31")]
+pub struct UsageEventsArgs {
+    #[arg(long)]
+    pub start: String,
+    #[arg(long)]
+    pub end: String,
+    #[command(flatten)]
+    pub output: ReadOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -93,6 +118,46 @@ pub struct ProjectCreateArgs {
 #[derive(Debug, Args)]
 pub struct ProjectUseArgs {
     pub project_id: Uuid,
+}
+
+#[derive(Debug, Args)]
+pub struct ProjectDeletionsCommand {
+    #[command(subcommand)]
+    pub command: ProjectDeletionsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProjectDeletionsSubcommand {
+    List(ProjectScopedReadArgs),
+    Get(ProjectDeletionGetArgs),
+    Range(ProjectRangeDeleteArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProjectDeletionGetArgs {
+    pub deletion_id: Uuid,
+    #[arg(long)]
+    pub project: Option<Uuid>,
+    #[command(flatten)]
+    pub output: ReadOutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct ProjectRangeDeleteArgs {
+    #[arg(long)]
+    pub start_at: String,
+    #[arg(long)]
+    pub end_before: String,
+    #[arg(long)]
+    pub event: Option<String>,
+    #[arg(long = "filter")]
+    pub filters: Vec<String>,
+    #[arg(long = "property")]
+    pub properties: Vec<String>,
+    #[arg(long)]
+    pub project: Option<Uuid>,
+    #[command(flatten)]
+    pub output: ReadOutputArgs,
 }
 
 #[derive(Debug, Args)]

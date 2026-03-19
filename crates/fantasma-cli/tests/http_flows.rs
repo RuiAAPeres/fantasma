@@ -16,6 +16,7 @@ use fantasma_cli::{
     cli::Cli,
     config::{CliConfig, load_config, save_config},
 };
+use fantasma_core::{ProjectSummary, UsageProjectEvents};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -90,6 +91,7 @@ impl TestServer {
                 "/v1/projects/{project_id}/keys/{key_id}",
                 delete(revoke_key),
             )
+            .route("/v1/usage/events", get(usage_events))
             .route("/v1/metrics/events", get(event_metrics))
             .route("/v1/metrics/events/top", get(top_events))
             .route("/v1/metrics/events/catalog", get(event_catalog))
@@ -407,6 +409,166 @@ async fn projects_use_persists_active_project_for_later_keys_and_metrics_command
             && record.path == "/v1/metrics/sessions"
             && record.fantasma_key.as_deref() == Some(server.read_key_secret.as_str())
     }));
+}
+
+#[test]
+fn usage_events_subcommand_parses() {
+    let cli = Cli::try_parse_from([
+        "fantasma",
+        "usage",
+        "events",
+        "--start",
+        "2026-03-01",
+        "--end",
+        "2026-03-31",
+        "--json",
+    ])
+    .expect("usage events should parse");
+
+    assert!(matches!(
+        cli.command,
+        fantasma_cli::cli::Command::Usage(fantasma_cli::cli::UsageCommand {
+            command: fantasma_cli::cli::UsageSubcommand::Events(_),
+        })
+    ));
+}
+
+#[tokio::test]
+async fn usage_events_json_uses_operator_token_and_shared_response_shape() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    config.instances.get_mut("prod").unwrap().operator_token = Some("secret-token".to_owned());
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&[
+            "usage",
+            "events",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-31",
+            "--json",
+        ]))
+        .await
+        .expect("usage events succeeds");
+
+    let body: Value = serde_json::from_str(&output.stdout).expect("json output");
+    assert_eq!(body["start"], json!("2026-03-01"));
+    assert_eq!(body["total_events_processed"], json!(12));
+    assert_eq!(body["projects"][0]["events_processed"], json!(12));
+    assert_eq!(
+        body["projects"][0]["project"]["id"],
+        json!(server.project_id)
+    );
+
+    let records = server.records();
+    let usage_request = records
+        .iter()
+        .find(|record| record.path == "/v1/usage/events")
+        .expect("usage request");
+    assert_eq!(
+        usage_request.authorization.as_deref(),
+        Some("Bearer secret-token")
+    );
+    assert_eq!(
+        usage_request.query.as_deref(),
+        Some("start=2026-03-01&end=2026-03-31")
+    );
+}
+
+#[tokio::test]
+async fn usage_events_json_preserves_raw_api_payload() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    config.instances.get_mut("prod").unwrap().operator_token = Some("secret-token".to_owned());
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&[
+            "usage",
+            "events",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-31",
+            "--json",
+        ]))
+        .await
+        .expect("usage events succeeds");
+
+    let body: Value = serde_json::from_str(&output.stdout).expect("json output");
+    assert_eq!(body["api_revision"], json!("2026-03-19"));
+}
+
+#[tokio::test]
+async fn usage_events_text_renders_total_and_project_rows_without_project_context() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    config.instances.get_mut("prod").unwrap().operator_token = Some("secret-token".to_owned());
+    config.instances.get_mut("prod").unwrap().active_project_id = None;
+    config.instances.get_mut("prod").unwrap().read_keys.clear();
+    save_config(&server.config_path, &config).expect("save config");
+
+    let output = server
+        .app
+        .run(server.parse(&[
+            "usage",
+            "events",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-31",
+        ]))
+        .await
+        .expect("usage events succeeds");
+
+    assert_eq!(
+        output.stdout,
+        format!(
+            "events processed\t12\n{}\tUsage Project\t2026-03-10T12:00:00Z\t12",
+            server.project_id
+        )
+    );
+}
+
+#[tokio::test]
+async fn usage_events_uses_operator_token_even_without_active_project() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    config.instances.get_mut("prod").unwrap().operator_token = Some("secret-token".to_owned());
+    config.instances.get_mut("prod").unwrap().active_project_id = None;
+    config.instances.get_mut("prod").unwrap().read_keys.clear();
+    save_config(&server.config_path, &config).expect("save config");
+
+    server
+        .app
+        .run(server.parse(&[
+            "usage",
+            "events",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-31",
+            "--json",
+        ]))
+        .await
+        .expect("usage events succeeds");
+
+    let records = server.records();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.path == "/v1/usage/events")
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.path != "/v1/metrics/sessions"),
+        "usage should not require the worker-derived metrics read path"
+    );
 }
 
 #[tokio::test]
@@ -2111,6 +2273,7 @@ async fn list_projects(
                 {
                     "id": state.project_id,
                     "name": "CLI Project",
+                    "state": "active",
                     "created_at": "2026-03-13T12:00:00Z"
                 }
             ]
@@ -2142,6 +2305,7 @@ async fn create_project(
             "project": {
                 "id": state.project_id,
                 "name": "CLI Project",
+                "state": "active",
                 "created_at": "2026-03-13T12:00:00Z"
             },
             "ingest_key": {
@@ -2437,6 +2601,44 @@ async fn event_catalog(
                     "last_seen_at": "2026-03-01T08:00:00Z"
                 }
             ]
+        })),
+    )
+        .into_response()
+}
+
+async fn usage_events(
+    State(state): State<ServerState>,
+    original_uri: OriginalUri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(status) = auth_status(&state, &headers) {
+        return (status, Json(json!({ "error": status_error(status) }))).into_response();
+    }
+    record_request(
+        &state,
+        "GET",
+        original_uri.path(),
+        original_uri.query(),
+        headers,
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "start": "2026-03-01",
+            "end": "2026-03-31",
+            "total_events_processed": 12,
+            "projects": [UsageProjectEvents {
+                project: ProjectSummary {
+                    id: state.project_id,
+                    name: "Usage Project".to_owned(),
+                    created_at: chrono::DateTime::parse_from_rfc3339("2026-03-10T12:00:00Z")
+                        .expect("created_at")
+                        .with_timezone(&chrono::Utc),
+                },
+                events_processed: 12,
+            }],
+            "api_revision": "2026-03-19",
         })),
     )
         .into_response()

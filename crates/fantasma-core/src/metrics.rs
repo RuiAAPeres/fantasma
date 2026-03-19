@@ -128,6 +128,27 @@ pub struct MetricsResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProjectSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UsageProjectEvents {
+    pub project: ProjectSummary,
+    pub events_processed: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UsageEventsResponse {
+    pub start: String,
+    pub end: String,
+    pub total_events_processed: u64,
+    pub projects: Vec<UsageProjectEvents>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ActiveInstallsPoint {
     pub start: String,
     pub end: String,
@@ -337,6 +358,65 @@ mod tests {
                         "points": [
                             { "start": "2026-03-01", "end": "2026-03-01", "value": 41 }
                         ]
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn project_summary_serializes_shape() {
+        let project = ProjectSummary {
+            id: Uuid::parse_str("6b6d5b17-1d6e-4c9c-b6cb-4f6d95bfa2cf").expect("project id"),
+            name: "Usage Project".to_owned(),
+            created_at: DateTime::parse_from_rfc3339("2026-03-10T12:00:00Z")
+                .expect("created_at")
+                .with_timezone(&Utc),
+        };
+
+        assert_eq!(
+            serde_json::to_value(project).expect("serialize project"),
+            serde_json::json!({
+                "id": "6b6d5b17-1d6e-4c9c-b6cb-4f6d95bfa2cf",
+                "name": "Usage Project",
+                "created_at": "2026-03-10T12:00:00Z"
+            })
+        );
+    }
+
+    #[test]
+    fn usage_events_response_serializes_shape() {
+        let response = UsageEventsResponse {
+            start: "2026-03-01".to_owned(),
+            end: "2026-03-31".to_owned(),
+            total_events_processed: 12,
+            projects: vec![UsageProjectEvents {
+                project: ProjectSummary {
+                    id: Uuid::parse_str("6b6d5b17-1d6e-4c9c-b6cb-4f6d95bfa2cf")
+                        .expect("project id"),
+                    name: "Usage Project".to_owned(),
+                    created_at: DateTime::parse_from_rfc3339("2026-03-10T12:00:00Z")
+                        .expect("created_at")
+                        .with_timezone(&Utc),
+                },
+                events_processed: 12,
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).expect("serialize usage response"),
+            serde_json::json!({
+                "start": "2026-03-01",
+                "end": "2026-03-31",
+                "total_events_processed": 12,
+                "projects": [
+                    {
+                        "project": {
+                            "id": "6b6d5b17-1d6e-4c9c-b6cb-4f6d95bfa2cf",
+                            "name": "Usage Project",
+                            "created_at": "2026-03-10T12:00:00Z"
+                        },
+                        "events_processed": 12
                     }
                 ]
             })

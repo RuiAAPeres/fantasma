@@ -51,6 +51,7 @@ Worker variables:
 - `FANTASMA_WORKER_EVENT_BATCH_SIZE`: raw-event batch size for the event-metrics lane; defaults to `5000`
 - `FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY`: bounded parallelism for append-like per-install `session_apply` work; defaults to `8`
 - `FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY`: bounded parallelism for queue-driven `session_repair` work; defaults to `2`
+- project deletions run in the same worker process through the `project_deletions` lane; there is no separate deletion service in the default stack
 
 Current Compose defaults:
 
@@ -91,10 +92,13 @@ They do not seed a project or create API keys at startup. Provisioning happens
 through the operator management API after the stack is healthy.
 
 There is no separate migration job in the default stack. The worker keeps one
-process but runs independent `session_apply`,
-`session_repair`, and `event_metrics` lanes internally. `session_apply` is the
-only owner of the raw `"sessions"` offset, while `session_repair` drains the
-durable install-scoped repair frontier independently of that raw offset. Each
+process but runs independent `session_apply`, `session_repair`,
+`event_metrics`, and `project_deletions` lanes internally. `session_apply` is
+the only owner of the raw `"sessions"` offset, while `session_repair` drains
+the durable install-scoped repair frontier independently of that raw offset.
+The deletion lane consumes queued `project_deletions` jobs, waits for the
+current project-scoped worker backlog to drain, and then either performs a
+transactional range delete plus rebuild or an explicit full-project purge. Each
 lane repolls immediately after useful work and only sleeps after an idle tick.
 
 ## Operator Workflow
@@ -112,6 +116,12 @@ works end to end.
 The first operator bearer token still comes from deployment configuration such
 as `FANTASMA_ADMIN_TOKEN`. Fantasma does not expose a separate bootstrap or
 account-creation flow in this slice.
+
+Deletion workflow through the CLI:
+
+- `fantasma projects delete <project-id>` starts an async full purge and immediately moves the project to `pending_deletion`
+- `fantasma projects deletions range --project <project-id> --start-at ... --end-before ...` starts an async range delete and immediately moves the project to `range_deleting`
+- `fantasma projects deletions list --project <project-id>` and `fantasma projects deletions get <deletion-id> --project <project-id>` are the operator-facing inspection path for both live and historical project ids
 
 ## Preconditions
 
@@ -416,8 +426,10 @@ Run the CLI-driven smoke path in its own disposable stack:
 That helper uses the stable `fantasma-cli-smoke` Compose project name, starts
 from a fresh `XDG_CONFIG_HOME`, provisions an instance/profile through the CLI,
 creates a project plus a local `read` key, ingests one sample event with the
-printed ingest key, polls one CLI metrics query until the derived session count
-appears, and then removes its local images and volumes with
+printed ingest key, proves the raw accepted-event operator read through
+`fantasma usage events` immediately after ingest, then polls the worker-derived
+CLI metrics queries until the derived session/live reads appear, and then
+removes its local images and volumes with
 `--volumes --remove-orphans --rmi local`.
 
 Unlike the main local stack, the CLI smoke helper overrides the Compose port
@@ -484,6 +496,18 @@ one yet:
 ```bash
 cargo run -p fantasma-cli -- keys create --kind read --name "manual-read"
 ```
+
+Query raw accepted-event usage through the CLI without selecting a project:
+
+```bash
+cargo run -p fantasma-cli -- usage events \
+  --start 2026-01-01 \
+  --end 2026-01-31
+```
+
+This usage read counts accepted events by `received_at` across all projects on
+the instance. Use it for billing-period totals, then keep the worker-derived
+metrics checks below for the aggregate read-model surface.
 
 Query derived metrics through the CLI:
 

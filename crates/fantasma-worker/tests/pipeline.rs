@@ -5,7 +5,10 @@ use axum::{
     http::{Request, StatusCode},
 };
 use fantasma_auth::StaticAdminAuthorizer;
-use fantasma_store::{PgPool, run_migrations};
+use fantasma_store::{
+    PgPool, ProjectProcessingActorKind, claim_project_processing_lease,
+    release_project_processing_lease, run_migrations,
+};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use tower::ServiceExt;
 
@@ -39,6 +42,571 @@ fn scale_like_events(day: &str, install_count: usize) -> Vec<serde_json::Value> 
     }
 
     events
+}
+
+#[sqlx::test]
+async fn range_delete_worker_rebuilds_state_and_reactivates_project(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-a",
+                                "platform": "ios"
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:10:00Z",
+                                "install_id": "install-a",
+                                "platform": "ios"
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T01:00:00Z",
+                                "install_id": "install-b",
+                                "platform": "ios"
+                            },
+                            {
+                                "event": "purchase_completed",
+                                "timestamp": "2026-01-02T00:00:00Z",
+                                "install_id": "install-a",
+                                "platform": "ios"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    fantasma_worker::process_session_batch(&pool, 100)
+        .await
+        .expect("session worker batch succeeds");
+    fantasma_worker::process_event_metrics_batch(&pool, 100)
+        .await
+        .expect("event metrics worker batch succeeds");
+
+    let create_deletion_response = api
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/projects/{}/deletions", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "start_at": "2026-01-01T00:00:00Z",
+                        "end_before": "2026-01-02T00:00:00Z",
+                        "event": "app_open"
+                    })
+                    .to_string(),
+                ))
+                .expect("valid range-delete request"),
+        )
+        .await
+        .expect("range-delete request succeeds");
+    assert_eq!(create_deletion_response.status(), StatusCode::ACCEPTED);
+    let created_deletion = response_json(create_deletion_response).await;
+    let deletion_id = created_deletion["deletion"]["id"]
+        .as_str()
+        .expect("deletion id")
+        .to_owned();
+
+    let pending_project = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{}", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("valid get-project request"),
+        )
+        .await
+        .expect("project get succeeds");
+    assert_eq!(pending_project.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(pending_project).await["project"]["state"],
+        serde_json::json!("range_deleting")
+    );
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project deletion worker succeeds"),
+        1
+    );
+
+    let reloaded_project = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{}", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("valid get-project request"),
+        )
+        .await
+        .expect("project get succeeds after range delete");
+    assert_eq!(reloaded_project.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(reloaded_project).await["project"]["state"],
+        serde_json::json!("active")
+    );
+
+    let deletion_response = api
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/v1/projects/{}/deletions/{}",
+                provisioned.project_id, deletion_id
+            ))
+            .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+            .body(Body::empty())
+            .expect("valid deletion get request"),
+        )
+        .await
+        .expect("deletion get succeeds");
+    assert_eq!(deletion_response.status(), StatusCode::OK);
+    let deletion = response_json(deletion_response).await;
+    assert_eq!(
+        deletion["deletion"]["status"],
+        serde_json::json!("succeeded")
+    );
+    assert_eq!(
+        deletion["deletion"]["deleted_raw_events"],
+        serde_json::json!(3)
+    );
+
+    let project_id = provisioned
+        .project_id
+        .parse::<uuid::Uuid>()
+        .expect("project id parses");
+    let raw_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events_raw WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count raw events");
+    let session_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count sessions");
+
+    assert_eq!(raw_count, 1);
+    assert_eq!(session_count, 1);
+}
+
+#[sqlx::test]
+async fn project_purge_worker_removes_project_and_keeps_history(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let delete_response = api
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/projects/{}", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("valid delete-project request"),
+        )
+        .await
+        .expect("delete-project request succeeds");
+    assert_eq!(delete_response.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project purge worker succeeds"),
+        1
+    );
+
+    let missing_project = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{}", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("valid get-project request"),
+        )
+        .await
+        .expect("project get succeeds");
+    assert_eq!(missing_project.status(), StatusCode::NOT_FOUND);
+
+    let history_response = api
+        .oneshot(
+            Request::get(format!("/v1/projects/{}/deletions", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("valid deletions list request"),
+        )
+        .await
+        .expect("deletions list succeeds");
+    assert_eq!(history_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(history_response).await["deletions"][0]["status"],
+        serde_json::json!("succeeded")
+    );
+}
+
+#[sqlx::test]
+async fn project_deletion_waits_for_older_processing_leases(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+    let project_id = provisioned
+        .project_id
+        .parse::<uuid::Uuid>()
+        .expect("project id parses");
+
+    let mut leases = Vec::new();
+    for actor_kind in [
+        ProjectProcessingActorKind::Ingest,
+        ProjectProcessingActorKind::SessionApply,
+        ProjectProcessingActorKind::SessionRepair,
+        ProjectProcessingActorKind::EventMetrics,
+        ProjectProcessingActorKind::ProjectPatch,
+        ProjectProcessingActorKind::ApiKeyCreate,
+        ProjectProcessingActorKind::ApiKeyRevoke,
+    ] {
+        let lease = claim_project_processing_lease(
+            &pool,
+            project_id,
+            actor_kind,
+            &format!("held-{}", actor_kind.as_str()),
+        )
+        .await
+        .expect("claim processing lease");
+        leases.push(lease);
+    }
+
+    let create_deletion_response = api
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/projects/{}/deletions", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "start_at": "2026-01-01T00:00:00Z",
+                        "end_before": "2026-01-02T00:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("valid range-delete request"),
+        )
+        .await
+        .expect("range-delete request succeeds");
+    assert_eq!(create_deletion_response.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project deletion worker returns without running while leases remain"),
+        0
+    );
+
+    let blocked_project = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{}", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("valid get-project request"),
+        )
+        .await
+        .expect("project get succeeds while deletion is blocked");
+    assert_eq!(blocked_project.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(blocked_project).await["project"]["state"],
+        serde_json::json!("range_deleting")
+    );
+
+    let blocked_jobs = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{}/deletions", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("valid deletions list request"),
+        )
+        .await
+        .expect("deletions list succeeds");
+    assert_eq!(blocked_jobs.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(blocked_jobs).await["deletions"][0]["status"],
+        serde_json::json!("queued")
+    );
+
+    for lease in &leases {
+        release_project_processing_lease(&pool, lease)
+            .await
+            .expect("release processing lease");
+    }
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project deletion worker runs once older leases clear"),
+        1
+    );
+}
+
+#[sqlx::test]
+async fn project_deletion_waits_while_open_writer_transaction_holds_visible_lease(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+    let project_id = provisioned
+        .project_id
+        .parse::<uuid::Uuid>()
+        .expect("project id parses");
+
+    let lease = claim_project_processing_lease(
+        &pool,
+        project_id,
+        ProjectProcessingActorKind::Ingest,
+        "inflight-ingest",
+    )
+    .await
+    .expect("claim ingest processing lease");
+
+    let mut inflight_tx = pool.begin().await.expect("begin inflight writer tx");
+    sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&mut *inflight_tx)
+        .await
+        .expect("keep writer transaction open");
+
+    let create_deletion_response = api
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/projects/{}/deletions", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "start_at": "2026-01-01T00:00:00Z",
+                        "end_before": "2026-01-02T00:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("valid range-delete request"),
+        )
+        .await
+        .expect("range-delete request succeeds");
+    assert_eq!(create_deletion_response.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project deletion worker returns without running while inflight lease remains"),
+        0
+    );
+
+    inflight_tx
+        .rollback()
+        .await
+        .expect("rollback inflight writer tx");
+    release_project_processing_lease(&pool, &lease)
+        .await
+        .expect("release ingest processing lease");
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project deletion worker runs once inflight lease clears"),
+        1
+    );
+}
+
+#[sqlx::test]
+async fn blocked_deletion_does_not_head_of_line_block_other_projects(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let blocked_project = provision_project(api.clone()).await;
+    let ready_project = provision_project(api.clone()).await;
+    let blocked_project_id = blocked_project
+        .project_id
+        .parse::<uuid::Uuid>()
+        .expect("blocked project id parses");
+
+    let lease = claim_project_processing_lease(
+        &pool,
+        blocked_project_id,
+        ProjectProcessingActorKind::Ingest,
+        "blocked-range-delete",
+    )
+    .await
+    .expect("claim blocking lease");
+
+    let blocked_delete_response = api
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/v1/projects/{}/deletions",
+                blocked_project.project_id
+            ))
+            .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "start_at": "2026-01-01T00:00:00Z",
+                    "end_before": "2026-01-02T00:00:00Z"
+                })
+                .to_string(),
+            ))
+            .expect("valid blocked range-delete request"),
+        )
+        .await
+        .expect("blocked range-delete request succeeds");
+    assert_eq!(blocked_delete_response.status(), StatusCode::ACCEPTED);
+
+    let ready_delete_response = api
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/projects/{}", ready_project.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("valid ready project delete request"),
+        )
+        .await
+        .expect("ready project delete request succeeds");
+    assert_eq!(ready_delete_response.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project deletion worker should process ready project behind blocked one"),
+        1
+    );
+
+    let ready_project_get = api
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/projects/{}", ready_project.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("valid get ready project request"),
+        )
+        .await
+        .expect("ready project get succeeds");
+    assert_eq!(ready_project_get.status(), StatusCode::NOT_FOUND);
+
+    let blocked_jobs = api
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/v1/projects/{}/deletions",
+                blocked_project.project_id
+            ))
+            .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+            .body(Body::empty())
+            .expect("valid blocked project deletions list request"),
+        )
+        .await
+        .expect("blocked project deletions list succeeds");
+    assert_eq!(blocked_jobs.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(blocked_jobs).await["deletions"][0]["status"],
+        serde_json::json!("queued")
+    );
+
+    release_project_processing_lease(&pool, &lease)
+        .await
+        .expect("release blocking lease");
+}
+
+#[sqlx::test]
+async fn stale_processing_leases_do_not_block_deletion_forever(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+    let project_id = provisioned
+        .project_id
+        .parse::<uuid::Uuid>()
+        .expect("project id parses");
+
+    let lease = claim_project_processing_lease(
+        &pool,
+        project_id,
+        ProjectProcessingActorKind::Ingest,
+        "stale-ingest",
+    )
+    .await
+    .expect("claim stale lease");
+
+    sqlx::query(
+        r#"
+        UPDATE project_processing_leases
+        SET claimed_at = now() - interval '2 hours',
+            heartbeat_at = now() - interval '2 hours'
+        WHERE project_id = $1
+          AND actor_kind = $2
+          AND actor_id = $3
+        "#,
+    )
+    .bind(project_id)
+    .bind(ProjectProcessingActorKind::Ingest.as_str())
+    .bind(&lease.actor_id)
+    .execute(&pool)
+    .await
+    .expect("age lease heartbeat");
+
+    let delete_response = api
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/projects/{}", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .body(Body::empty())
+                .expect("valid purge request"),
+        )
+        .await
+        .expect("purge request succeeds");
+    assert_eq!(delete_response.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project deletion worker should ignore stale lease blockers"),
+        1
+    );
 }
 
 fn benchmark_like_session_events(
@@ -127,6 +695,7 @@ async fn grouped_session_count_response(
 
 #[derive(Debug, Clone)]
 struct ProvisionedProject {
+    project_id: String,
     ingest_key: String,
     read_key: String,
 }
@@ -186,6 +755,7 @@ async fn provision_project(api: axum::Router) -> ProvisionedProject {
         .to_owned();
 
     ProvisionedProject {
+        project_id,
         ingest_key,
         read_key,
     }

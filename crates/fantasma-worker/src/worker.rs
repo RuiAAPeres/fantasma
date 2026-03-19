@@ -12,34 +12,41 @@ use fantasma_store::{
     ActiveInstallBitmapDim1Input, ActiveInstallBitmapDim2Input, EventMetricBucketDim1Delta,
     EventMetricBucketDim2Delta, EventMetricBucketTotalDelta, InstallFirstSeenRecord,
     InstallSessionStateRecord, LiveInstallStateUpsert, PendingSessionDailyInstallRebuildRecord,
-    PgPool, RawEventRecord, SessionActiveInstallSliceDelta, SessionDailyActiveInstallDelta,
-    SessionDailyDelta, SessionDailyDurationDelta, SessionDailyInstallDelta, SessionMetricDim1Delta,
+    PgPool, ProjectDeletionKind, ProjectDeletionRecord, ProjectDeletionStats,
+    ProjectProcessingActorKind, ProjectProcessingLease, ProjectState, RawEventRecord,
+    SessionActiveInstallSliceDelta, SessionDailyActiveInstallDelta, SessionDailyDelta,
+    SessionDailyDurationDelta, SessionDailyInstallDelta, SessionMetricDim1Delta,
     SessionMetricDim2Delta, SessionMetricTotalDelta, SessionRecord, SessionRepairJobRecord,
     SessionRepairJobUpsert, SessionTailUpdate, StoreError, add_session_daily_duration_deltas_in_tx,
     allocate_project_install_ordinals_in_tx, claim_and_sweep_pending_session_rebuild_buckets_in_tx,
-    claim_pending_session_repair_jobs_in_tx, complete_session_repair_job_in_tx,
-    delete_sessions_overlapping_window_in_tx, enqueue_active_install_bitmap_rebuild_in_tx,
-    enqueue_session_daily_installs_rebuilds_in_tx, enqueue_session_rebuild_buckets_in_tx,
+    claim_next_project_deletion_job_in_tx, claim_pending_session_repair_jobs_in_tx,
+    claim_project_processing_lease, complete_session_repair_job_in_tx,
+    count_project_processing_leases_before_epoch, delete_sessions_overlapping_window_in_tx,
+    enqueue_active_install_bitmap_rebuild_in_tx, enqueue_session_daily_installs_rebuilds_in_tx,
+    enqueue_session_rebuild_buckets_in_tx, fetch_all_events_for_install_in_tx,
     fetch_events_after_in_tx, fetch_events_for_install_after_id_through_in_tx,
     fetch_events_for_install_between_in_tx, fetch_latest_session_for_install_in_tx,
     fetch_sessions_overlapping_window_in_tx, insert_install_first_seen_in_tx, insert_session_in_tx,
     insert_sessions_in_tx, load_install_session_states_in_tx,
-    load_pending_session_daily_install_rebuilds_in_tx, load_session_repair_jobs_for_installs_in_tx,
-    load_tail_sessions_for_installs_in_tx, lock_worker_offset,
+    load_pending_session_daily_install_rebuilds_in_tx, load_project,
+    load_session_repair_jobs_for_installs_in_tx, load_tail_sessions_for_installs_in_tx,
+    lock_worker_offset, mark_project_deletion_job_succeeded_in_tx,
     rebuild_session_active_install_slices_days_in_tx,
     rebuild_session_daily_days_from_pending_install_rebuilds_with_telemetry_in_tx,
-    release_session_repair_job_claim_in_tx, replace_active_install_day_bitmaps_in_tx,
-    save_worker_offset_in_tx, update_session_tail_in_tx, upsert_event_metric_buckets_dim1_in_tx,
+    rebuild_session_daily_days_in_tx, refresh_project_processing_lease,
+    release_project_processing_lease, release_session_repair_job_claim_in_tx,
+    replace_active_install_day_bitmaps_in_tx, save_worker_offset_in_tx, set_project_state_in_tx,
+    update_session_tail_in_tx, upsert_event_metric_buckets_dim1_in_tx,
     upsert_event_metric_buckets_dim2_in_tx, upsert_event_metric_buckets_total_in_tx,
     upsert_install_session_state_in_tx, upsert_live_install_state_in_tx,
     upsert_session_active_install_slices_in_tx, upsert_session_daily_deltas_in_tx,
     upsert_session_daily_install_deltas_in_tx, upsert_session_metric_dim1_in_tx,
     upsert_session_metric_dim2_in_tx, upsert_session_metric_totals_in_tx,
-    upsert_session_repair_jobs_in_tx,
+    upsert_session_repair_jobs_in_tx, verify_project_processing_lease_in_tx,
 };
 use roaring::RoaringTreemap;
-use serde::Serialize;
-use sqlx::{Postgres, Row, Transaction};
+use serde::{Deserialize, Serialize};
+use sqlx::{Postgres, QueryBuilder, Row, Transaction};
 use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
 use tracing::warn;
 use uuid::Uuid;
@@ -60,6 +67,94 @@ static EVENT_LANE_TRACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex
 static SESSION_REBUILD_DRAIN_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 static ACTIVE_INSTALL_BITMAP_REBUILD_DRAIN_LOCK: LazyLock<AsyncMutex<()>> =
     LazyLock::new(|| AsyncMutex::new(()));
+
+#[derive(Debug, Clone, Deserialize)]
+struct RangeDeletionScope {
+    start_at: DateTime<Utc>,
+    end_before: DateTime<Utc>,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    filters: BTreeMap<String, String>,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+}
+
+async fn claim_worker_project_lease(
+    pool: &PgPool,
+    project_id: Uuid,
+    actor_kind: ProjectProcessingActorKind,
+    actor_id: &str,
+) -> Result<Option<ProjectProcessingLease>, StoreError> {
+    match claim_project_processing_lease(pool, project_id, actor_kind, actor_id).await {
+        Ok(lease) => Ok(Some(lease)),
+        Err(StoreError::ProjectNotFound | StoreError::ProjectNotActive(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn release_worker_project_leases(
+    pool: &PgPool,
+    leases: &[ProjectProcessingLease],
+) -> Result<(), StoreError> {
+    for lease in leases {
+        release_project_processing_lease(pool, lease).await?;
+    }
+
+    Ok(())
+}
+
+async fn refresh_worker_project_leases(
+    pool: &PgPool,
+    leases: &[ProjectProcessingLease],
+) -> Result<(), StoreError> {
+    for lease in leases {
+        refresh_project_processing_lease(pool, lease).await?;
+    }
+
+    Ok(())
+}
+
+fn worker_lease_release_error(
+    context: &str,
+    operation_error: StoreError,
+    release_error: StoreError,
+) -> StoreError {
+    StoreError::InvariantViolation(format!(
+        "{context} failed with {operation_error}; releasing project leases also failed with {release_error}"
+    ))
+}
+
+async fn finalize_worker_project_leases<T>(
+    pool: &PgPool,
+    leases: &[ProjectProcessingLease],
+    result: Result<T, StoreError>,
+    context: &str,
+) -> Result<T, StoreError> {
+    let release_result = release_worker_project_leases(pool, leases).await;
+
+    match (result, release_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(release_error)) => {
+            Err(worker_lease_release_error(context, error, release_error))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeletedRawEvent {
+    install_id: String,
+    event_name: String,
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct RangeDeleteInstallRebuild {
+    deleted_sessions: i64,
+    touched_buckets: SessionRepairBuckets,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct StageBTraceRecord {
@@ -250,7 +345,7 @@ struct RecomputeWindow {
     end: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct SessionRepairBuckets {
     days: BTreeSet<NaiveDate>,
     hours: BTreeSet<DateTime<Utc>>,
@@ -552,79 +647,107 @@ async fn process_session_batch_inner(
     let mut incremental_items = Vec::new();
     let mut repair_items = Vec::new();
     let grouped = group_events(batch);
-    let install_keys = grouped
+    let project_ids = grouped
         .keys()
-        .map(|(project_id, install_id)| (*project_id, install_id.clone()))
-        .collect::<Vec<_>>();
-    let tail_states = load_install_session_states_in_tx(&mut tx, &install_keys).await?;
-    let tail_sessions = load_tail_sessions_for_installs_in_tx(&mut tx, &install_keys).await?;
-    let repair_jobs = load_session_repair_jobs_for_installs_in_tx(&mut tx, &install_keys).await?;
-
-    for ((project_id, install_id), events) in grouped {
-        let tail_state = tail_states.get(&(project_id, install_id.clone())).cloned();
-        let tail_session = tail_sessions
-            .get(&(project_id, install_id.clone()))
-            .cloned();
-        let events = filter_replayed_events(tail_state.as_ref(), events);
-        if events.is_empty() {
-            continue;
-        }
-
-        processed_events += events.len();
-        let highest_processed_event_id = events
-            .iter()
-            .map(|event| event.id)
-            .max()
-            .expect("non-empty install batch has last event");
-        let pending_repair = repair_jobs
-            .get(&(project_id, install_id.clone()))
-            .map(|job| job.target_event_id);
-        let has_pending_repair = pending_repair.is_some_and(|target_event_id| {
-            tail_state
-                .as_ref()
-                .is_none_or(|state| target_event_id > state.last_processed_event_id)
-        });
-
-        if has_pending_repair || needs_exact_day_repair(tail_state.as_ref(), &events) {
-            repair_items.push(SessionRepairEnqueueItem {
-                project_id,
-                install_id,
-                target_event_id: highest_processed_event_id,
-            });
-        } else {
-            incremental_items.push(IncrementalSessionWorkItem {
-                project_id,
-                install_id,
-                events,
-                tail_state,
-                tail_session,
-            });
+        .map(|(project_id, _)| *project_id)
+        .collect::<BTreeSet<_>>();
+    let mut project_leases = Vec::new();
+    let mut claimable_project_ids = BTreeSet::new();
+    for project_id in project_ids {
+        let actor_id =
+            format!("session_apply:{last_processed_event_id}:{next_offset}:{project_id}");
+        if let Some(lease) = claim_worker_project_lease(
+            pool,
+            project_id,
+            ProjectProcessingActorKind::SessionApply,
+            &actor_id,
+        )
+        .await?
+        {
+            claimable_project_ids.insert(project_id);
+            project_leases.push(lease);
         }
     }
+    let result = async {
+        let install_keys = grouped
+            .keys()
+            .map(|(project_id, install_id)| (*project_id, install_id.clone()))
+            .collect::<Vec<_>>();
+        let tail_states = load_install_session_states_in_tx(&mut tx, &install_keys).await?;
+        let tail_sessions = load_tail_sessions_for_installs_in_tx(&mut tx, &install_keys).await?;
+        let repair_jobs =
+            load_session_repair_jobs_for_installs_in_tx(&mut tx, &install_keys).await?;
 
-    let incremental_queue = run_session_incremental_queue(
-        pool.clone(),
-        incremental_items,
-        config.incremental_concurrency,
-    )
-    .await?;
-    if let Some(error) = incremental_queue.error {
-        tx.commit().await.map_err(StoreError::from)?;
-        return Err(error);
-    }
+        for ((project_id, install_id), events) in grouped {
+            if !claimable_project_ids.contains(&project_id) {
+                continue;
+            }
+            let tail_state = tail_states.get(&(project_id, install_id.clone())).cloned();
+            let tail_session = tail_sessions
+                .get(&(project_id, install_id.clone()))
+                .cloned();
+            let events = filter_replayed_events(tail_state.as_ref(), events);
+            if events.is_empty() {
+                continue;
+            }
 
-    if let Err(error) = enqueue_session_repair_items_in_tx(&mut tx, repair_items).await {
-        tx.commit().await.map_err(StoreError::from)?;
-        return Err(error);
-    }
+            processed_events += events.len();
+            let highest_processed_event_id = events
+                .iter()
+                .map(|event| event.id)
+                .max()
+                .expect("non-empty install batch has last event");
+            let pending_repair = repair_jobs
+                .get(&(project_id, install_id.clone()))
+                .map(|job| job.target_event_id);
+            let has_pending_repair = pending_repair.is_some_and(|target_event_id| {
+                tail_state
+                    .as_ref()
+                    .is_none_or(|state| target_event_id > state.last_processed_event_id)
+            });
 
-    if let Err(error) = drain_pending_session_rebuild_buckets(pool).await {
+            if has_pending_repair || needs_exact_day_repair(tail_state.as_ref(), &events) {
+                repair_items.push(SessionRepairEnqueueItem {
+                    project_id,
+                    install_id,
+                    target_event_id: highest_processed_event_id,
+                });
+            } else {
+                incremental_items.push(IncrementalSessionWorkItem {
+                    project_id,
+                    install_id,
+                    events,
+                    tail_state,
+                    tail_session,
+                });
+            }
+        }
+
+        let incremental_queue = run_session_incremental_queue(
+            pool.clone(),
+            incremental_items,
+            config.incremental_concurrency,
+        )
+        .await?;
+        if let Some(error) = incremental_queue.error {
+            return Err(error);
+        }
+        refresh_worker_project_leases(pool, &project_leases).await?;
+
+        enqueue_session_repair_items_in_tx(&mut tx, repair_items).await?;
+        drain_pending_session_rebuild_buckets(pool).await?;
+        refresh_worker_project_leases(pool, &project_leases).await?;
+        hooks.fail_before_coordinator_finalize()?;
+        save_worker_offset_in_tx(&mut tx, SESSION_WORKER_NAME, next_offset).await?;
+        for lease in &project_leases {
+            verify_project_processing_lease_in_tx(&mut tx, lease).await?;
+        }
         tx.commit().await.map_err(StoreError::from)?;
-        return Err(error);
+
+        Ok(())
     }
-    hooks.fail_before_coordinator_finalize()?;
-    save_worker_offset_in_tx(&mut tx, SESSION_WORKER_NAME, next_offset).await?;
-    tx.commit().await.map_err(StoreError::from)?;
+    .await;
+    finalize_worker_project_leases(pool, &project_leases, result, "session apply").await?;
 
     let mut verify_tx = pool.begin().await.map_err(StoreError::from)?;
     let caught_up = fetch_events_after_in_tx(&mut verify_tx, next_offset, 1)
@@ -705,19 +828,42 @@ async fn process_incremental_session_work_item(
     pool: &PgPool,
     item: IncrementalSessionWorkItem,
 ) -> Result<(), StoreError> {
-    let mut tx = pool.begin().await.map_err(StoreError::from)?;
-    process_install_batch_incremental(
-        &mut tx,
+    let actor_id = format!("session_apply:{}:{}", item.project_id, item.install_id);
+    let Some(lease) = claim_worker_project_lease(
+        pool,
         item.project_id,
-        &item.install_id,
-        item.events,
-        item.tail_state,
-        item.tail_session,
+        ProjectProcessingActorKind::SessionApply,
+        &actor_id,
     )
-    .await?;
-    tx.commit().await.map_err(StoreError::from)?;
+    .await?
+    else {
+        return Ok(());
+    };
+    let result = async {
+        let mut tx = pool.begin().await.map_err(StoreError::from)?;
+        process_install_batch_incremental(
+            &mut tx,
+            item.project_id,
+            &item.install_id,
+            item.events,
+            item.tail_state,
+            item.tail_session,
+        )
+        .await?;
+        refresh_project_processing_lease(pool, &lease).await?;
+        verify_project_processing_lease_in_tx(&mut tx, &lease).await?;
+        tx.commit().await.map_err(StoreError::from)?;
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+    let release_result = release_project_processing_lease(pool, &lease).await;
+
+    match (result, release_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
+    }
 }
 
 async fn enqueue_session_repair_items_in_tx(
@@ -900,28 +1046,47 @@ impl SessionRepairBatchHooks {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SessionRepairTaskClaim {
+    job: SessionRepairJobRecord,
+    project_lease: Option<ProjectProcessingLease>,
+}
+
 #[derive(Debug, Default)]
 struct SessionRepairTaskContext {
-    claimed_job: std::sync::Mutex<Option<SessionRepairJobRecord>>,
+    claim: std::sync::Mutex<Option<SessionRepairTaskClaim>>,
 }
 
 impl SessionRepairTaskContext {
     fn set_claimed_job(&self, job: SessionRepairJobRecord) {
         *self
-            .claimed_job
+            .claim
             .lock()
-            .expect("session repair task context lock poisoned") = Some(job);
+            .expect("session repair task context lock poisoned") = Some(SessionRepairTaskClaim {
+            job,
+            project_lease: None,
+        });
     }
 
-    fn clear_claimed_job(&self) {
+    fn set_project_lease(&self, lease: ProjectProcessingLease) {
+        let mut claim = self
+            .claim
+            .lock()
+            .expect("session repair task context lock poisoned");
+        if let Some(claim) = claim.as_mut() {
+            claim.project_lease = Some(lease);
+        }
+    }
+
+    fn clear(&self) {
         *self
-            .claimed_job
+            .claim
             .lock()
             .expect("session repair task context lock poisoned") = None;
     }
 
-    fn claimed_job(&self) -> Option<SessionRepairJobRecord> {
-        self.claimed_job
+    fn claim(&self) -> Option<SessionRepairTaskClaim> {
+        self.claim
             .lock()
             .expect("session repair task context lock poisoned")
             .clone()
@@ -1113,26 +1278,62 @@ async fn process_next_session_repair_job(
         row_mutation_lag_before_claim_ms(&job, claim_started_at.elapsed()),
     );
 
+    let actor_id = format!("session_repair:{}:{}", job.project_id, job.install_id);
+    let Some(lease) = claim_worker_project_lease(
+        pool,
+        job.project_id,
+        ProjectProcessingActorKind::SessionRepair,
+        &actor_id,
+    )
+    .await?
+    else {
+        release_failed_session_repair_claim(pool, &job).await?;
+        task_context.clear();
+        return Ok(SessionRepairTaskResult::default());
+    };
+    task_context.set_project_lease(lease.clone());
+
     hooks.after_claim(&job.install_id).await;
+    refresh_project_processing_lease(pool, &lease).await?;
     let repair_result = async {
         let mut tx = pool.begin().await.map_err(StoreError::from)?;
         process_session_repair_job(&mut tx, job.clone(), &mut trace).await?;
+        refresh_project_processing_lease(pool, &lease).await?;
+        verify_project_processing_lease_in_tx(&mut tx, &lease).await?;
         tx.commit().await.map_err(StoreError::from)
     }
     .await;
+    let release_result = release_project_processing_lease(pool, &lease).await;
     if let Err(error) = repair_result {
-        if let Err(cleanup_error) = release_failed_session_repair_claim(pool, &job).await {
-            return Err(StoreError::InvariantViolation(format!(
-                "repair job for project {} install {} failed with {error}; releasing the claim also failed with {cleanup_error}",
-                job.project_id, job.install_id
-            )));
+        let claim_release_result = release_failed_session_repair_claim(pool, &job).await;
+        match (claim_release_result, release_result) {
+            (Ok(()), Ok(())) => {
+                task_context.clear();
+                return Err(error);
+            }
+            (Err(cleanup_error), Ok(())) => {
+                return Err(StoreError::InvariantViolation(format!(
+                    "repair job for project {} install {} failed with {error}; releasing the claim also failed with {cleanup_error}",
+                    job.project_id, job.install_id
+                )));
+            }
+            (Ok(()), Err(release_error)) => {
+                return Err(StoreError::InvariantViolation(format!(
+                    "repair job for project {} install {} failed with {error}; releasing the project lease also failed with {release_error}",
+                    job.project_id, job.install_id
+                )));
+            }
+            (Err(cleanup_error), Err(release_error)) => {
+                return Err(StoreError::InvariantViolation(format!(
+                    "repair job for project {} install {} failed with {error}; releasing the claim failed with {cleanup_error}; releasing the project lease also failed with {release_error}",
+                    job.project_id, job.install_id
+                )));
+            }
         }
-
-        task_context.clear_claimed_job();
-        return Err(error);
     }
+    release_result?;
 
-    task_context.clear_claimed_job();
+    task_context.clear();
     if let Err(error) = record_stage_b_trace(&trace) {
         warn!(install_id = %job.install_id, target_event_id = job.target_event_id, %error, "failed to record Stage B repair trace");
     }
@@ -1148,14 +1349,31 @@ async fn release_join_error_session_repair_claim(
     let Some(task_context) = task_contexts.get(&task_id) else {
         return Ok(());
     };
-    let Some(job) = task_context.claimed_job() else {
+    let Some(claim) = task_context.claim() else {
         task_contexts.remove(&task_id);
         return Ok(());
     };
 
-    hooks.before_join_error_claim_release(&job.install_id)?;
-    release_failed_session_repair_claim(pool, &job).await?;
-    task_context.clear_claimed_job();
+    hooks.before_join_error_claim_release(&claim.job.install_id)?;
+    let lease_release_result = match claim.project_lease.as_ref() {
+        Some(lease) => release_project_processing_lease(pool, lease).await,
+        None => Ok(()),
+    };
+    let claim_release_result = release_failed_session_repair_claim(pool, &claim.job).await;
+
+    match (claim_release_result, lease_release_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(claim_error), Ok(())) => return Err(claim_error),
+        (Ok(()), Err(lease_error)) => return Err(lease_error),
+        (Err(claim_error), Err(lease_error)) => {
+            return Err(StoreError::InvariantViolation(format!(
+                "releasing join-error cleanup for repair job project {} install {} failed with claim cleanup error {claim_error} and project lease cleanup error {lease_error}",
+                claim.job.project_id, claim.job.install_id
+            )));
+        }
+    }
+
+    task_context.clear();
     task_contexts.remove(&task_id);
 
     Ok(())
@@ -1281,44 +1499,696 @@ pub(crate) async fn process_event_metrics_batch_with_config(
         .last()
         .map(|event| event.id)
         .expect("non-empty batch has last event");
+    let project_ids = batch
+        .iter()
+        .map(|event| event.project_id)
+        .collect::<BTreeSet<_>>();
+    let mut project_leases = Vec::new();
+    let mut claimable_project_ids = BTreeSet::new();
+    for project_id in project_ids {
+        let actor_id =
+            format!("event_metrics:{last_processed_event_id}:{next_offset}:{project_id}");
+        if let Some(lease) = claim_worker_project_lease(
+            pool,
+            project_id,
+            ProjectProcessingActorKind::EventMetrics,
+            &actor_id,
+        )
+        .await?
+        {
+            claimable_project_ids.insert(project_id);
+            project_leases.push(lease);
+        }
+    }
+    let batch = batch
+        .into_iter()
+        .filter(|event| claimable_project_ids.contains(&event.project_id))
+        .collect::<Vec<_>>();
     let mut trace = EventLaneTraceRecord::event_metrics_batch(
         last_processed_event_id,
         next_offset,
-        processed_events,
+        batch.len(),
     );
-    let build_started_at = Instant::now();
-    let rollups = build_event_metric_rollups(&batch);
-    let live_install_upserts = build_live_install_state_upserts(&batch);
-    trace.add_phase_duration("build_rollups", build_started_at.elapsed());
-    trace.add_count("total_delta_rows", rollups.total_deltas.len());
-    trace.add_count("dim1_delta_rows", rollups.dim1_deltas.len());
-    trace.add_count("dim2_delta_rows", rollups.dim2_deltas.len());
-    trace.add_count("live_install_rows", live_install_upserts.len());
+    let result = async {
+        if batch.is_empty() {
+            save_worker_offset_in_tx(&mut tx, EVENT_METRICS_WORKER_NAME, next_offset).await?;
+            tx.commit().await.map_err(StoreError::from)?;
+            return Ok(());
+        }
+        let build_started_at = Instant::now();
+        let rollups = build_event_metric_rollups(&batch);
+        let live_install_upserts = build_live_install_state_upserts(&batch);
+        trace.add_phase_duration("build_rollups", build_started_at.elapsed());
+        trace.add_count("total_delta_rows", rollups.total_deltas.len());
+        trace.add_count("dim1_delta_rows", rollups.dim1_deltas.len());
+        trace.add_count("dim2_delta_rows", rollups.dim2_deltas.len());
+        trace.add_count("live_install_rows", live_install_upserts.len());
+        refresh_worker_project_leases(pool, &project_leases).await?;
 
-    let total_upsert_started_at = Instant::now();
-    upsert_event_metric_buckets_total_in_tx(&mut tx, &rollups.total_deltas).await?;
-    trace.add_phase_duration("upsert_total", total_upsert_started_at.elapsed());
-    let dim1_upsert_started_at = Instant::now();
-    upsert_event_metric_buckets_dim1_in_tx(&mut tx, &rollups.dim1_deltas).await?;
-    trace.add_phase_duration("upsert_dim1", dim1_upsert_started_at.elapsed());
-    let dim2_upsert_started_at = Instant::now();
-    upsert_event_metric_buckets_dim2_in_tx(&mut tx, &rollups.dim2_deltas).await?;
-    trace.add_phase_duration("upsert_dim2", dim2_upsert_started_at.elapsed());
-    let live_install_upsert_started_at = Instant::now();
-    upsert_live_install_state_in_tx(&mut tx, &live_install_upserts).await?;
-    trace.add_phase_duration(
-        "upsert_live_install_state",
-        live_install_upsert_started_at.elapsed(),
-    );
-    let save_offset_started_at = Instant::now();
-    save_worker_offset_in_tx(&mut tx, EVENT_METRICS_WORKER_NAME, next_offset).await?;
-    trace.add_phase_duration("save_offset", save_offset_started_at.elapsed());
-    let commit_started_at = Instant::now();
-    tx.commit().await.map_err(StoreError::from)?;
-    trace.add_phase_duration("commit", commit_started_at.elapsed());
+        let total_upsert_started_at = Instant::now();
+        upsert_event_metric_buckets_total_in_tx(&mut tx, &rollups.total_deltas).await?;
+        trace.add_phase_duration("upsert_total", total_upsert_started_at.elapsed());
+        let dim1_upsert_started_at = Instant::now();
+        upsert_event_metric_buckets_dim1_in_tx(&mut tx, &rollups.dim1_deltas).await?;
+        trace.add_phase_duration("upsert_dim1", dim1_upsert_started_at.elapsed());
+        let dim2_upsert_started_at = Instant::now();
+        upsert_event_metric_buckets_dim2_in_tx(&mut tx, &rollups.dim2_deltas).await?;
+        trace.add_phase_duration("upsert_dim2", dim2_upsert_started_at.elapsed());
+        let live_install_upsert_started_at = Instant::now();
+        upsert_live_install_state_in_tx(&mut tx, &live_install_upserts).await?;
+        trace.add_phase_duration(
+            "upsert_live_install_state",
+            live_install_upsert_started_at.elapsed(),
+        );
+        let save_offset_started_at = Instant::now();
+        save_worker_offset_in_tx(&mut tx, EVENT_METRICS_WORKER_NAME, next_offset).await?;
+        trace.add_phase_duration("save_offset", save_offset_started_at.elapsed());
+        refresh_worker_project_leases(pool, &project_leases).await?;
+        for lease in &project_leases {
+            verify_project_processing_lease_in_tx(&mut tx, lease).await?;
+        }
+        let commit_started_at = Instant::now();
+        tx.commit().await.map_err(StoreError::from)?;
+        trace.add_phase_duration("commit", commit_started_at.elapsed());
+
+        Ok(())
+    }
+    .await;
+    finalize_worker_project_leases(pool, &project_leases, result, "event metrics").await?;
     record_event_lane_trace(&trace)?;
 
     Ok(processed_events)
+}
+
+pub async fn process_project_deletion_batch(pool: &PgPool) -> Result<usize, StoreError> {
+    let mut claim_tx = pool.begin().await.map_err(StoreError::from)?;
+    let Some(job) = claim_next_project_deletion_job_in_tx(&mut claim_tx).await? else {
+        claim_tx.commit().await.map_err(StoreError::from)?;
+        return Ok(0);
+    };
+    claim_tx.commit().await.map_err(StoreError::from)?;
+
+    if !project_deletion_job_is_ready(pool, &job).await? {
+        return Ok(0);
+    }
+
+    let outcome = match job.kind {
+        ProjectDeletionKind::RangeDelete => execute_range_delete(pool, &job).await,
+        ProjectDeletionKind::ProjectPurge => execute_project_purge(pool, &job).await,
+    };
+
+    if let Err(error) = outcome {
+        let error_message = error.to_string();
+        let mut failure_tx = pool.begin().await.map_err(StoreError::from)?;
+        if matches!(job.kind, ProjectDeletionKind::RangeDelete) {
+            set_project_state_in_tx(&mut failure_tx, job.project_id, ProjectState::Active).await?;
+        }
+        fantasma_store::mark_project_deletion_job_failed_in_tx(
+            &mut failure_tx,
+            job.id,
+            match job.kind {
+                ProjectDeletionKind::RangeDelete => "range_delete_failed",
+                ProjectDeletionKind::ProjectPurge => "project_purge_failed",
+            },
+            &error_message,
+        )
+        .await?;
+        failure_tx.commit().await.map_err(StoreError::from)?;
+        return Err(error);
+    }
+
+    Ok(1)
+}
+
+async fn project_deletion_job_is_ready(
+    pool: &PgPool,
+    job: &ProjectDeletionRecord,
+) -> Result<bool, StoreError> {
+    let project = match load_project(pool, job.project_id).await? {
+        Some(project) => {
+            let expected_state = match job.kind {
+                ProjectDeletionKind::RangeDelete => ProjectState::RangeDeleting,
+                ProjectDeletionKind::ProjectPurge => ProjectState::PendingDeletion,
+            };
+            if project.state != expected_state {
+                return Err(StoreError::InvariantViolation(format!(
+                    "project {} is in state {} while deletion job {} expects {}",
+                    job.project_id,
+                    project.state.as_str(),
+                    job.id,
+                    expected_state.as_str()
+                )));
+            }
+            project
+        }
+        None if matches!(job.kind, ProjectDeletionKind::ProjectPurge) => {
+            return Err(StoreError::InvariantViolation(format!(
+                "project purge job {} lost its project row before success was recorded",
+                job.id
+            )));
+        }
+        None => {
+            return Err(StoreError::InvariantViolation(format!(
+                "range-delete job {} has no live project row",
+                job.id
+            )));
+        }
+    };
+
+    Ok(
+        count_project_processing_leases_before_epoch(pool, job.project_id, project.fence_epoch)
+            .await?
+            == 0,
+    )
+}
+
+async fn execute_range_delete(
+    pool: &PgPool,
+    job: &ProjectDeletionRecord,
+) -> Result<(), StoreError> {
+    let scope: RangeDeletionScope = serde_json::from_value(job.scope.clone().ok_or_else(|| {
+        StoreError::InvariantViolation(format!("range-delete job {} is missing scope", job.id))
+    })?)
+    .map_err(|error| {
+        StoreError::InvariantViolation(format!("decode range-delete scope for {}: {error}", job.id))
+    })?;
+
+    let mut tx = pool.begin().await.map_err(StoreError::from)?;
+    let deleted_rows = delete_scoped_raw_events_in_tx(&mut tx, job.project_id, &scope).await?;
+    let deleted_raw_events = deleted_rows.len() as i64;
+
+    for table in [
+        "project_processing_leases",
+        "session_repair_jobs",
+        "session_rebuild_queue",
+        "session_daily_installs_rebuild_queue",
+        "active_install_bitmap_rebuild_queue",
+        "active_install_range_rebuild_queue",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE project_id = $1"))
+            .bind(job.project_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    if deleted_rows.is_empty() {
+        set_project_state_in_tx(&mut tx, job.project_id, ProjectState::Active).await?;
+        mark_project_deletion_job_succeeded_in_tx(&mut tx, job.id, ProjectDeletionStats::default())
+            .await?;
+        tx.commit().await.map_err(StoreError::from)?;
+        return Ok(());
+    }
+
+    let affected_installs = deleted_rows
+        .iter()
+        .map(|row| row.install_id.clone())
+        .collect::<BTreeSet<_>>();
+    let touched_event_names = deleted_rows
+        .iter()
+        .map(|row| row.event_name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut touched_day_buckets = deleted_rows
+        .iter()
+        .map(|row| row.timestamp.date_naive())
+        .collect::<BTreeSet<_>>();
+    let mut touched_hour_buckets = deleted_rows
+        .iter()
+        .map(|row| bucket_start_for_granularity(row.timestamp, MetricGranularity::Hour))
+        .collect::<BTreeSet<_>>();
+
+    let mut deleted_sessions = 0_i64;
+    for install_id in affected_installs.iter() {
+        let rebuild =
+            rebuild_range_deleted_install_in_tx(&mut tx, job.project_id, install_id).await?;
+        deleted_sessions += rebuild.deleted_sessions;
+        touched_day_buckets.extend(rebuild.touched_buckets.days);
+        touched_hour_buckets.extend(rebuild.touched_buckets.hours);
+    }
+
+    let touched_days = touched_day_buckets.iter().copied().collect::<Vec<_>>();
+    if !touched_days.is_empty() {
+        rebuild_session_daily_days_in_tx(&mut tx, job.project_id, &touched_days).await?;
+        rebuild_session_active_install_slices_days_in_tx(&mut tx, job.project_id, &touched_days)
+            .await?;
+        rebuild_active_install_daily_bitmaps_in_tx(&mut tx, job.project_id, &touched_days).await?;
+    }
+
+    let session_day_buckets = touched_days
+        .iter()
+        .copied()
+        .map(bucket_start_for_day)
+        .collect::<Vec<_>>();
+    if !session_day_buckets.is_empty() {
+        rebuild_session_metric_buckets_in_tx(
+            &mut tx,
+            job.project_id,
+            MetricGranularity::Day,
+            &session_day_buckets,
+        )
+        .await?;
+    }
+
+    let session_hour_buckets = touched_hour_buckets.iter().copied().collect::<Vec<_>>();
+    if !session_hour_buckets.is_empty() {
+        rebuild_session_metric_buckets_in_tx(
+            &mut tx,
+            job.project_id,
+            MetricGranularity::Hour,
+            &session_hour_buckets,
+        )
+        .await?;
+    }
+
+    let touched_event_names = touched_event_names.into_iter().collect::<Vec<_>>();
+    if !touched_event_names.is_empty() && !session_day_buckets.is_empty() {
+        rebuild_event_metric_buckets_in_tx(
+            &mut tx,
+            job.project_id,
+            MetricGranularity::Day,
+            &touched_event_names,
+            &session_day_buckets,
+        )
+        .await?;
+    }
+    if !touched_event_names.is_empty() && !session_hour_buckets.is_empty() {
+        rebuild_event_metric_buckets_in_tx(
+            &mut tx,
+            job.project_id,
+            MetricGranularity::Hour,
+            &touched_event_names,
+            &session_hour_buckets,
+        )
+        .await?;
+    }
+
+    set_project_state_in_tx(&mut tx, job.project_id, ProjectState::Active).await?;
+    mark_project_deletion_job_succeeded_in_tx(
+        &mut tx,
+        job.id,
+        ProjectDeletionStats {
+            deleted_raw_events,
+            deleted_sessions,
+            rebuilt_installs: affected_installs.len() as i64,
+            rebuilt_days: touched_day_buckets.len() as i64,
+            rebuilt_hours: touched_hour_buckets.len() as i64,
+        },
+    )
+    .await?;
+    tx.commit().await.map_err(StoreError::from)?;
+
+    Ok(())
+}
+
+async fn execute_project_purge(
+    pool: &PgPool,
+    job: &ProjectDeletionRecord,
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await.map_err(StoreError::from)?;
+    let deleted_raw_events =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events_raw WHERE project_id = $1")
+            .bind(job.project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let deleted_sessions =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions WHERE project_id = $1")
+            .bind(job.project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    for table in [
+        "project_processing_leases",
+        "active_install_range_rebuild_queue",
+        "active_install_metric_buckets_dim2",
+        "active_install_metric_buckets_dim1",
+        "active_install_metric_buckets_total",
+        "active_install_daily_bitmaps_dim2",
+        "active_install_daily_bitmaps_dim1",
+        "active_install_daily_bitmaps_total",
+        "active_install_bitmap_rebuild_queue",
+        "project_install_ordinals",
+        "project_install_ordinal_state",
+        "live_install_state",
+        "session_active_install_slices",
+        "session_repair_jobs",
+        "session_daily_installs_rebuild_queue",
+        "session_rebuild_queue",
+        "install_first_seen",
+        "session_metric_buckets_dim2",
+        "session_metric_buckets_dim1",
+        "session_metric_buckets_total",
+        "event_metric_buckets_dim2",
+        "event_metric_buckets_dim1",
+        "event_metric_buckets_total",
+        "session_daily_installs",
+        "session_daily",
+        "install_session_state",
+        "sessions",
+        "events_raw",
+        "api_keys",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE project_id = $1"))
+            .bind(job.project_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    mark_project_deletion_job_succeeded_in_tx(
+        &mut tx,
+        job.id,
+        ProjectDeletionStats {
+            deleted_raw_events,
+            deleted_sessions,
+            ..ProjectDeletionStats::default()
+        },
+    )
+    .await?;
+
+    sqlx::query("DELETE FROM projects WHERE id = $1")
+        .bind(job.project_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await.map_err(StoreError::from)?;
+    Ok(())
+}
+
+async fn delete_scoped_raw_events_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    scope: &RangeDeletionScope,
+) -> Result<Vec<DeletedRawEvent>, StoreError> {
+    let mut query = QueryBuilder::<Postgres>::new("DELETE FROM events_raw WHERE project_id = ");
+    query.push_bind(project_id);
+    query.push(" AND timestamp >= ");
+    query.push_bind(scope.start_at);
+    query.push(" AND timestamp < ");
+    query.push_bind(scope.end_before);
+
+    if let Some(event_name) = scope.event.as_ref() {
+        query.push(" AND event_name = ");
+        query.push_bind(event_name);
+    }
+
+    for (key, value) in &scope.filters {
+        query.push(" AND ");
+        query.push(key.as_str());
+        query.push(" = ");
+        query.push_bind(value);
+    }
+
+    for (key, value) in &scope.properties {
+        query.push(" AND properties ->> ");
+        query.push_bind(key);
+        query.push(" = ");
+        query.push_bind(value);
+    }
+
+    query.push(" RETURNING install_id, event_name, timestamp");
+
+    let rows = query.build().fetch_all(&mut **tx).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(DeletedRawEvent {
+                install_id: row.try_get("install_id")?,
+                event_name: row.try_get("event_name")?,
+                timestamp: row.try_get("timestamp")?,
+            })
+        })
+        .collect()
+}
+
+async fn rebuild_range_deleted_install_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+) -> Result<RangeDeleteInstallRebuild, StoreError> {
+    let removed_first_seen_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+        r#"
+        DELETE FROM install_first_seen
+        WHERE project_id = $1
+          AND install_id = $2
+        RETURNING first_seen_at
+        "#,
+    )
+    .bind(project_id)
+    .bind(install_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let removed_sessions = sqlx::query(
+        r#"
+        DELETE FROM sessions
+        WHERE project_id = $1
+          AND install_id = $2
+        RETURNING session_start
+        "#,
+    )
+    .bind(project_id)
+    .bind(install_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    sqlx::query("DELETE FROM install_session_state WHERE project_id = $1 AND install_id = $2")
+        .bind(project_id)
+        .bind(install_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM live_install_state WHERE project_id = $1 AND install_id = $2")
+        .bind(project_id)
+        .bind(install_id)
+        .execute(&mut **tx)
+        .await?;
+
+    let mut touched_buckets = SessionRepairBuckets::default();
+    if let Some(first_seen_at) = removed_first_seen_at {
+        touched_buckets.insert_timestamp(first_seen_at);
+    }
+    for row in &removed_sessions {
+        touched_buckets.insert_timestamp(row.try_get("session_start")?);
+    }
+
+    let remaining_raw_events =
+        fetch_all_events_for_install_in_tx(tx, project_id, install_id).await?;
+    if remaining_raw_events.is_empty() {
+        return Ok(RangeDeleteInstallRebuild {
+            deleted_sessions: removed_sessions.len() as i64,
+            touched_buckets,
+        });
+    }
+
+    let rebuilt_sessions = derive_sessions_for_window(&remaining_raw_events);
+    insert_sessions_in_tx(tx, &rebuilt_sessions).await?;
+    for session in &rebuilt_sessions {
+        touched_buckets.insert_session(session);
+    }
+
+    let first_raw_event = remaining_raw_events
+        .first()
+        .expect("remaining install events are not empty");
+    touched_buckets.insert_timestamp(first_raw_event.timestamp);
+    insert_install_first_seen_in_tx(
+        tx,
+        &InstallFirstSeenRecord {
+            project_id,
+            install_id: install_id.to_owned(),
+            first_seen_event_id: first_raw_event.id,
+            first_seen_at: first_raw_event.timestamp,
+            platform: first_raw_event.platform.clone(),
+            app_version: first_raw_event.app_version.clone(),
+            os_version: first_raw_event.os_version.clone(),
+            properties: first_raw_event.properties.clone(),
+        },
+    )
+    .await?;
+
+    let last_raw_event_id = remaining_raw_events
+        .last()
+        .map(|event| event.id)
+        .expect("remaining install events are not empty");
+    let latest_session = rebuilt_sessions
+        .last()
+        .ok_or_else(|| {
+            StoreError::InvariantViolation(format!(
+                "remaining raw events for project {project_id} install {install_id} produced no rebuilt sessions"
+            ))
+        })?;
+    upsert_install_session_state_in_tx(
+        tx,
+        &install_state_from_session(latest_session, last_raw_event_id),
+    )
+    .await?;
+    upsert_live_install_state_in_tx(
+        tx,
+        &[LiveInstallStateUpsert {
+            project_id,
+            install_id: install_id.to_owned(),
+            last_received_at: remaining_raw_events
+                .iter()
+                .map(|event| event.received_at)
+                .max()
+                .expect("remaining install events are not empty"),
+        }],
+    )
+    .await?;
+
+    Ok(RangeDeleteInstallRebuild {
+        deleted_sessions: removed_sessions.len() as i64,
+        touched_buckets,
+    })
+}
+
+async fn rebuild_event_metric_buckets_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    event_names: &[String],
+    bucket_starts: &[DateTime<Utc>],
+) -> Result<(), StoreError> {
+    let event_names = event_names
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let bucket_starts = bucket_starts
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if event_names.is_empty() || bucket_starts.is_empty() {
+        return Ok(());
+    }
+
+    for table in [
+        "event_metric_buckets_total",
+        "event_metric_buckets_dim1",
+        "event_metric_buckets_dim2",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE project_id = $1 AND granularity = $2 AND event_name = ANY($3) AND bucket_start = ANY($4)"
+        ))
+        .bind(project_id)
+        .bind(granularity.as_str())
+        .bind(&event_names)
+        .bind(&bucket_starts)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    let bucket_expr = bucket_sql(granularity, "scope.timestamp");
+    let event_dims = event_dimension_sql("scoped_events");
+
+    sqlx::query(&format!(
+        r#"
+        WITH scoped_events AS MATERIALIZED (
+            SELECT project_id, event_name, {bucket_expr} AS bucket_start
+            FROM events_raw AS scope
+            WHERE scope.project_id = $1
+              AND scope.event_name = ANY($3)
+              AND {bucket_expr} = ANY($4)
+        )
+        INSERT INTO event_metric_buckets_total (
+            project_id, granularity, bucket_start, event_name, event_count
+        )
+        SELECT project_id, $2, bucket_start, event_name, COUNT(*)::BIGINT
+        FROM scoped_events
+        GROUP BY project_id, bucket_start, event_name
+        "#
+    ))
+    .bind(project_id)
+    .bind(granularity.as_str())
+    .bind(&event_names)
+    .bind(&bucket_starts)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(&format!(
+        r#"
+        WITH scoped_events AS MATERIALIZED (
+            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, properties
+            FROM events_raw AS scope
+            WHERE scope.project_id = $1
+              AND scope.event_name = ANY($3)
+              AND {bucket_expr} = ANY($4)
+        )
+        INSERT INTO event_metric_buckets_dim1 (
+            project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, event_count
+        )
+        SELECT
+            scoped_events.project_id,
+            $2,
+            scoped_events.bucket_start,
+            scoped_events.event_name,
+            dims.dim_key,
+            dims.dim_value,
+            COUNT(*)::BIGINT
+        FROM scoped_events
+        CROSS JOIN LATERAL ({event_dims}) AS dims(dim_key, dim_value)
+        GROUP BY
+            scoped_events.project_id,
+            scoped_events.bucket_start,
+            scoped_events.event_name,
+            dims.dim_key,
+            dims.dim_value
+        "#
+    ))
+    .bind(project_id)
+    .bind(granularity.as_str())
+    .bind(&event_names)
+    .bind(&bucket_starts)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(&format!(
+        r#"
+        WITH scoped_events AS MATERIALIZED (
+            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, properties
+            FROM events_raw AS scope
+            WHERE scope.project_id = $1
+              AND scope.event_name = ANY($3)
+              AND {bucket_expr} = ANY($4)
+        ),
+        event_dim_source AS MATERIALIZED (
+            SELECT scoped_events.id, scoped_events.project_id, scoped_events.bucket_start, scoped_events.event_name, dims.dim_key, dims.dim_value
+            FROM scoped_events
+            CROSS JOIN LATERAL ({event_dims}) AS dims(dim_key, dim_value)
+        )
+        INSERT INTO event_metric_buckets_dim2 (
+            project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, event_count
+        )
+        SELECT
+            left_dims.project_id,
+            $2,
+            left_dims.bucket_start,
+            left_dims.event_name,
+            left_dims.dim_key,
+            left_dims.dim_value,
+            right_dims.dim_key,
+            right_dims.dim_value,
+            COUNT(*)::BIGINT
+        FROM event_dim_source left_dims
+        INNER JOIN event_dim_source right_dims
+          ON right_dims.id = left_dims.id
+         AND right_dims.dim_key > left_dims.dim_key
+        GROUP BY
+            left_dims.project_id,
+            left_dims.bucket_start,
+            left_dims.event_name,
+            left_dims.dim_key,
+            left_dims.dim_value,
+            right_dims.dim_key,
+            right_dims.dim_value
+        "#
+    ))
+    .bind(project_id)
+    .bind(granularity.as_str())
+    .bind(&event_names)
+    .bind(&bucket_starts)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -2621,6 +3491,23 @@ fn session_dimension_sql(source_alias: &str) -> String {
     )
 }
 
+fn event_dimension_sql(source_alias: &str) -> String {
+    format!(
+        r#"
+        SELECT 'platform'::text AS dim_key, {source_alias}.platform::text AS dim_value
+        UNION ALL
+        SELECT 'app_version'::text, {source_alias}.app_version
+        WHERE {source_alias}.app_version IS NOT NULL
+        UNION ALL
+        SELECT 'os_version'::text, {source_alias}.os_version
+        WHERE {source_alias}.os_version IS NOT NULL
+        UNION ALL
+        SELECT props.key, props.value
+        FROM jsonb_each_text(COALESCE({source_alias}.properties, '{{}}'::jsonb)) AS props(key, value)
+        "#
+    )
+}
+
 async fn rebuild_session_metric_buckets_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
@@ -2861,8 +3748,7 @@ mod tests {
     use fantasma_store::{
         BootstrapConfig, RawEventRecord, average_session_duration_seconds, count_active_installs,
         count_sessions, fetch_latest_session_for_install, insert_events,
-        load_install_session_state, load_pending_session_rebuild_buckets_in_tx, load_worker_offset,
-        save_worker_offset,
+        load_install_session_state, load_pending_session_rebuild_buckets_in_tx, save_worker_offset,
     };
     use sqlx::Row;
     use tokio::sync::Notify;
@@ -4219,6 +5105,13 @@ mod tests {
             .await
             .expect("reclaim panic-released frontier");
         verify_tx.commit().await.expect("commit panic verify tx");
+        let remaining_leases = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_processing_leases WHERE project_id = $1",
+        )
+        .bind(project_id())
+        .fetch_one(&pool)
+        .await
+        .expect("count remaining project leases");
 
         let queued = queued
             .get(&(project_id(), "install-1".to_owned()))
@@ -4229,6 +5122,7 @@ mod tests {
         assert_eq!(reclaimed[0].install_id, "install-1");
         assert_eq!(reclaimed[0].target_event_id, 3);
         assert!(reclaimed[0].claimed_at.is_some());
+        assert_eq!(remaining_leases, 0);
     }
 
     #[sqlx::test]
@@ -4283,6 +5177,13 @@ mod tests {
             .await
             .expect("reclaim retry-released frontier");
         verify_tx.commit().await.expect("commit retry verify tx");
+        let remaining_leases = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_processing_leases WHERE project_id = $1",
+        )
+        .bind(project_id())
+        .fetch_one(&pool)
+        .await
+        .expect("count remaining project leases after retry cleanup");
 
         let queued = queued
             .get(&(project_id(), "install-1".to_owned()))
@@ -4293,6 +5194,7 @@ mod tests {
         assert_eq!(reclaimed[0].install_id, "install-1");
         assert_eq!(reclaimed[0].target_event_id, 3);
         assert!(reclaimed[0].claimed_at.is_some());
+        assert_eq!(remaining_leases, 0);
     }
 
     #[sqlx::test]
@@ -4717,7 +5619,7 @@ mod tests {
         assert_eq!(hour_zero_duration, 20 * 60);
         assert_eq!(day_duration, 30 * 60);
         assert_eq!(
-            load_worker_offset(&pool, SESSION_WORKER_NAME)
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
                 .await
                 .expect("load session offset"),
             4,
@@ -4762,7 +5664,7 @@ mod tests {
         assert_eq!(session.session_end, timestamp(1, 1, 10));
         assert_eq!(session.duration_seconds, 20 * 60);
         assert_eq!(
-            load_worker_offset(&pool, SESSION_WORKER_NAME)
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
                 .await
                 .expect("load worker offset"),
             1
@@ -4827,7 +5729,7 @@ mod tests {
             }
         );
         assert_eq!(
-            load_worker_offset(&pool, SESSION_WORKER_NAME)
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
                 .await
                 .expect("load advanced worker offset"),
             2
@@ -4881,7 +5783,7 @@ mod tests {
 
         assert!(matches!(error, StoreError::InvariantViolation(_)));
         assert_eq!(
-            load_worker_offset(&pool, SESSION_WORKER_NAME)
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
                 .await
                 .expect("load worker offset"),
             2
@@ -4910,7 +5812,7 @@ mod tests {
 
         assert!(replayed.advanced_offset);
         assert_eq!(
-            load_worker_offset(&pool, SESSION_WORKER_NAME)
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
                 .await
                 .expect("load replayed worker offset"),
             3
@@ -5138,7 +6040,7 @@ mod tests {
             Some(4)
         );
         assert_eq!(
-            load_worker_offset(&pool, SESSION_WORKER_NAME)
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
                 .await
                 .expect("load worker offset"),
             4
@@ -5246,7 +6148,7 @@ mod tests {
 
         assert!(matches!(error, StoreError::InvariantViolation(_)));
         assert_eq!(
-            load_worker_offset(&pool, SESSION_WORKER_NAME)
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
                 .await
                 .expect("load worker offset"),
             0
@@ -5475,7 +6377,7 @@ mod tests {
             0
         );
         assert_eq!(
-            load_worker_offset(&pool, SESSION_WORKER_NAME)
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
                 .await
                 .expect("load offset"),
             2

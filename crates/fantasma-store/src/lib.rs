@@ -8,8 +8,11 @@ use std::{
 
 use chrono::{DateTime, NaiveDate, Utc};
 use fantasma_auth::{derive_key_prefix, hash_ingest_key};
-use fantasma_core::{EventPayload, MetricGranularity, Platform, SessionMetric};
+use fantasma_core::{
+    EventPayload, MetricGranularity, Platform, ProjectSummary, SessionMetric, UsageProjectEvents,
+};
 use roaring::RoaringTreemap;
+use serde_json::Value;
 pub use sqlx::PgPool;
 use sqlx::{
     Executor, Postgres, QueryBuilder, Row, Transaction, migrate::Migrator, postgres::PgPoolOptions,
@@ -20,6 +23,7 @@ use uuid::Uuid;
 const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
 const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+pub const PROJECT_PROCESSING_LEASE_STALE_AFTER_SECS: i64 = 60 * 60;
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 fn max_rows_per_batched_statement(bind_params_per_row: usize) -> usize {
@@ -55,7 +59,136 @@ pub struct BootstrapConfig {
 pub struct ProjectRecord {
     pub id: Uuid,
     pub name: String,
+    pub state: ProjectState,
+    pub fence_epoch: i64,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectState {
+    Active,
+    RangeDeleting,
+    PendingDeletion,
+}
+
+impl ProjectState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::RangeDeleting => "range_deleting",
+            Self::PendingDeletion => "pending_deletion",
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectProcessingActorKind {
+    Ingest,
+    SessionApply,
+    SessionRepair,
+    EventMetrics,
+    ProjectPatch,
+    ApiKeyCreate,
+    ApiKeyRevoke,
+}
+
+impl ProjectProcessingActorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ingest => "ingest",
+            Self::SessionApply => "session_apply",
+            Self::SessionRepair => "session_repair",
+            Self::EventMetrics => "event_metrics",
+            Self::ProjectPatch => "project_patch",
+            Self::ApiKeyCreate => "api_key_create",
+            Self::ApiKeyRevoke => "api_key_revoke",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectProcessingLease {
+    pub project_id: Uuid,
+    pub actor_kind: ProjectProcessingActorKind,
+    pub actor_id: String,
+    pub fence_epoch: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectDeletionKind {
+    ProjectPurge,
+    RangeDelete,
+}
+
+impl ProjectDeletionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProjectPurge => "project_purge",
+            Self::RangeDelete => "range_delete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectDeletionStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl ProjectDeletionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDeletionRecord {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub project_name: String,
+    pub kind: ProjectDeletionKind,
+    pub status: ProjectDeletionStatus,
+    pub scope: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub deleted_raw_events: i64,
+    pub deleted_sessions: i64,
+    pub rebuilt_installs: i64,
+    pub rebuilt_days: i64,
+    pub rebuilt_hours: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProjectDeletionStats {
+    pub deleted_raw_events: i64,
+    pub deleted_sessions: i64,
+    pub rebuilt_installs: i64,
+    pub rebuilt_days: i64,
+    pub rebuilt_hours: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartProjectDeletionResult {
+    Enqueued(Box<ProjectDeletionRecord>),
+    ProjectBusy,
+    ProjectPendingDeletion,
+    NotFound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +257,12 @@ pub enum StoreError {
     Migration(#[from] sqlx::migrate::MigrateError),
     #[error("invalid platform value: {0}")]
     InvalidPlatform(String),
+    #[error("project not found")]
+    ProjectNotFound,
+    #[error("project is not active: {0}")]
+    ProjectNotActive(ProjectState),
+    #[error("project fence changed during mutation")]
+    ProjectFenceChanged,
     #[error("invariant violation: {0}")]
     InvariantViolation(String),
 }
@@ -454,7 +593,7 @@ pub async fn create_project(pool: &PgPool, name: &str) -> Result<ProjectRecord, 
         r#"
         INSERT INTO projects (id, name)
         VALUES ($1, $2)
-        RETURNING id, name, created_at
+        RETURNING id, name, state, fence_epoch, created_at
         "#,
     )
     .bind(Uuid::new_v4())
@@ -478,7 +617,7 @@ pub async fn create_project_with_api_key(
         r#"
         INSERT INTO projects (id, name)
         VALUES ($1, $2)
-        RETURNING id, name, created_at
+        RETURNING id, name, state, fence_epoch, created_at
         "#,
     )
     .bind(Uuid::new_v4())
@@ -512,7 +651,7 @@ pub async fn create_project_with_api_key(
 pub async fn list_projects(pool: &PgPool) -> Result<Vec<ProjectRecord>, StoreError> {
     let rows = sqlx::query(
         r#"
-        SELECT id, name, created_at
+        SELECT id, name, state, fence_epoch, created_at
         FROM projects
         ORDER BY created_at ASC, id ASC
         "#,
@@ -529,7 +668,7 @@ pub async fn load_project(
 ) -> Result<Option<ProjectRecord>, StoreError> {
     let row = sqlx::query(
         r#"
-        SELECT id, name, created_at
+        SELECT id, name, state, fence_epoch, created_at
         FROM projects
         WHERE id = $1
         "#,
@@ -541,25 +680,228 @@ pub async fn load_project(
     row.as_ref().map(project_record_from_row).transpose()
 }
 
+pub async fn claim_project_processing_lease_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    actor_kind: ProjectProcessingActorKind,
+    actor_id: &str,
+) -> Result<ProjectProcessingLease, StoreError> {
+    let project = sqlx::query(
+        r#"
+        SELECT state, fence_epoch
+        FROM projects
+        WHERE id = $1
+        "#,
+    )
+    .bind(project_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some(project) = project else {
+        return Err(StoreError::ProjectNotFound);
+    };
+
+    let state = project_state_from_str(&project.try_get::<String, _>("state")?)?;
+    if state != ProjectState::Active {
+        return Err(StoreError::ProjectNotActive(state));
+    }
+
+    let fence_epoch: i64 = project.try_get("fence_epoch")?;
+    sqlx::query(
+        r#"
+        INSERT INTO project_processing_leases (
+            project_id,
+            actor_kind,
+            actor_id,
+            fence_epoch,
+            claimed_at,
+            heartbeat_at
+        )
+        VALUES ($1, $2, $3, $4, now(), now())
+        ON CONFLICT (project_id, actor_kind, actor_id)
+        DO UPDATE SET
+            fence_epoch = EXCLUDED.fence_epoch,
+            claimed_at = now(),
+            heartbeat_at = now()
+        "#,
+    )
+    .bind(project_id)
+    .bind(actor_kind.as_str())
+    .bind(actor_id)
+    .bind(fence_epoch)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(ProjectProcessingLease {
+        project_id,
+        actor_kind,
+        actor_id: actor_id.to_owned(),
+        fence_epoch,
+    })
+}
+
+pub async fn claim_project_processing_lease(
+    pool: &PgPool,
+    project_id: Uuid,
+    actor_kind: ProjectProcessingActorKind,
+    actor_id: &str,
+) -> Result<ProjectProcessingLease, StoreError> {
+    let mut tx = pool.begin().await?;
+    let lease =
+        claim_project_processing_lease_in_tx(&mut tx, project_id, actor_kind, actor_id).await?;
+    tx.commit().await?;
+
+    Ok(lease)
+}
+
+pub async fn verify_project_processing_lease_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ProjectProcessingLease,
+) -> Result<(), StoreError> {
+    let fence_epoch = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT fence_epoch
+        FROM projects
+        WHERE id = $1
+        "#,
+    )
+    .bind(lease.project_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    match fence_epoch {
+        Some(current_epoch) if current_epoch == lease.fence_epoch => Ok(()),
+        Some(_) | None => Err(StoreError::ProjectFenceChanged),
+    }
+}
+
+pub async fn release_project_processing_lease_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ProjectProcessingLease,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        DELETE FROM project_processing_leases
+        WHERE project_id = $1
+          AND actor_kind = $2
+          AND actor_id = $3
+        "#,
+    )
+    .bind(lease.project_id)
+    .bind(lease.actor_kind.as_str())
+    .bind(&lease.actor_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn release_project_processing_lease(
+    pool: &PgPool,
+    lease: &ProjectProcessingLease,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        DELETE FROM project_processing_leases
+        WHERE project_id = $1
+          AND actor_kind = $2
+          AND actor_id = $3
+        "#,
+    )
+    .bind(lease.project_id)
+    .bind(lease.actor_kind.as_str())
+    .bind(&lease.actor_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn refresh_project_processing_lease(
+    pool: &PgPool,
+    lease: &ProjectProcessingLease,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        UPDATE project_processing_leases
+        SET heartbeat_at = now()
+        WHERE project_id = $1
+          AND actor_kind = $2
+          AND actor_id = $3
+        "#,
+    )
+    .bind(lease.project_id)
+    .bind(lease.actor_kind.as_str())
+    .bind(&lease.actor_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn count_project_processing_leases_before_epoch(
+    pool: &PgPool,
+    project_id: Uuid,
+    fence_epoch: i64,
+) -> Result<i64, StoreError> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM project_processing_leases
+        WHERE project_id = $1
+          AND fence_epoch < $2
+          AND heartbeat_at >= now() - ($3 * interval '1 second')
+        "#,
+    )
+    .bind(project_id)
+    .bind(fence_epoch)
+    .bind(PROJECT_PROCESSING_LEASE_STALE_AFTER_SECS)
+    .fetch_one(pool)
+    .await
+    .map_err(StoreError::from)
+}
+
 pub async fn rename_project(
     pool: &PgPool,
     project_id: Uuid,
     name: &str,
 ) -> Result<Option<ProjectRecord>, StoreError> {
-    let row = sqlx::query(
-        r#"
-        UPDATE projects
-        SET name = $2
-        WHERE id = $1
-        RETURNING id, name, created_at
-        "#,
+    let actor_id = Uuid::new_v4().to_string();
+    let lease = claim_project_processing_lease(
+        pool,
+        project_id,
+        ProjectProcessingActorKind::ProjectPatch,
+        &actor_id,
     )
-    .bind(project_id)
-    .bind(name)
-    .fetch_optional(pool)
     .await?;
 
-    row.as_ref().map(project_record_from_row).transpose()
+    let result = async {
+        let mut tx = pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            UPDATE projects
+            SET name = $2
+            WHERE id = $1
+            RETURNING id, name, state, fence_epoch, created_at
+            "#,
+        )
+        .bind(project_id)
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        verify_project_processing_lease_in_tx(&mut tx, &lease).await?;
+        tx.commit().await?;
+
+        row.as_ref().map(project_record_from_row).transpose()
+    }
+    .await;
+    let release_result = release_project_processing_lease(pool, &lease).await;
+
+    match (result, release_result) {
+        (Ok(project), Ok(())) => Ok(project),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
+    }
 }
 
 pub async fn create_api_key(
@@ -569,25 +911,47 @@ pub async fn create_api_key(
     kind: ApiKeyKind,
     secret: &str,
 ) -> Result<Option<ApiKeyRecord>, StoreError> {
-    let row = sqlx::query(
-        r#"
-        INSERT INTO api_keys (id, project_id, name, kind, key_prefix, key_hash)
-        SELECT $1, projects.id, $2, $3, $4, $5
-        FROM projects
-        WHERE projects.id = $6
-        RETURNING id, project_id, name, kind, key_prefix, created_at, revoked_at
-        "#,
+    let actor_id = Uuid::new_v4().to_string();
+    let lease = claim_project_processing_lease(
+        pool,
+        project_id,
+        ProjectProcessingActorKind::ApiKeyCreate,
+        &actor_id,
     )
-    .bind(Uuid::new_v4())
-    .bind(name)
-    .bind(kind.as_str())
-    .bind(derive_key_prefix(secret))
-    .bind(hash_ingest_key(secret))
-    .bind(project_id)
-    .fetch_optional(pool)
     .await?;
 
-    row.as_ref().map(api_key_record_from_row).transpose()
+    let result = async {
+        let mut tx = pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            INSERT INTO api_keys (id, project_id, name, kind, key_prefix, key_hash)
+            SELECT $1, projects.id, $2, $3, $4, $5
+            FROM projects
+            WHERE projects.id = $6
+            RETURNING id, project_id, name, kind, key_prefix, created_at, revoked_at
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(name)
+        .bind(kind.as_str())
+        .bind(derive_key_prefix(secret))
+        .bind(hash_ingest_key(secret))
+        .bind(project_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        verify_project_processing_lease_in_tx(&mut tx, &lease).await?;
+        tx.commit().await?;
+
+        row.as_ref().map(api_key_record_from_row).transpose()
+    }
+    .await;
+    let release_result = release_project_processing_lease(pool, &lease).await;
+
+    match (result, release_result) {
+        (Ok(key), Ok(())) => Ok(key),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
+    }
 }
 
 pub fn generate_api_key_secret(kind: ApiKeyKind) -> String {
@@ -625,21 +989,43 @@ pub async fn revoke_api_key(
     project_id: Uuid,
     key_id: Uuid,
 ) -> Result<bool, StoreError> {
-    let revoked = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        UPDATE api_keys
-        SET revoked_at = COALESCE(revoked_at, now())
-        WHERE project_id = $1
-          AND id = $2
-        RETURNING id
-        "#,
+    let actor_id = Uuid::new_v4().to_string();
+    let lease = claim_project_processing_lease(
+        pool,
+        project_id,
+        ProjectProcessingActorKind::ApiKeyRevoke,
+        &actor_id,
     )
-    .bind(project_id)
-    .bind(key_id)
-    .fetch_optional(pool)
     .await?;
 
-    Ok(revoked.is_some())
+    let result = async {
+        let mut tx = pool.begin().await?;
+        let revoked = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            UPDATE api_keys
+            SET revoked_at = COALESCE(revoked_at, now())
+            WHERE project_id = $1
+              AND id = $2
+            RETURNING id
+            "#,
+        )
+        .bind(project_id)
+        .bind(key_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        verify_project_processing_lease_in_tx(&mut tx, &lease).await?;
+        tx.commit().await?;
+
+        Ok(revoked.is_some())
+    }
+    .await;
+    let release_result = release_project_processing_lease(pool, &lease).await;
+
+    match (result, release_result) {
+        (Ok(revoked), Ok(())) => Ok(revoked),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
+    }
 }
 
 pub async fn resolve_api_key(
@@ -678,29 +1064,712 @@ pub async fn insert_events(
     project_id: Uuid,
     events: &[EventPayload],
 ) -> Result<u64, StoreError> {
-    let mut builder = QueryBuilder::<sqlx::Postgres>::new(
-        "INSERT INTO events_raw (project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties) ",
-    );
+    let actor_id = Uuid::new_v4().to_string();
+    let lease = claim_project_processing_lease(
+        pool,
+        project_id,
+        ProjectProcessingActorKind::Ingest,
+        &actor_id,
+    )
+    .await?;
 
-    builder.push_values(events, |mut separated, event| {
-        separated.push_bind(project_id);
-        separated.push_bind(&event.event);
-        separated.push_bind(event.timestamp);
-        separated.push_bind(&event.install_id);
-        separated.push_bind(match event.platform {
-            fantasma_core::Platform::Ios => "ios",
-            fantasma_core::Platform::Android => "android",
+    let result = async {
+        let mut tx = pool.begin().await?;
+        let mut builder = QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO events_raw (project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties) ",
+        );
+
+        builder.push_values(events, |mut separated, event| {
+            separated.push_bind(project_id);
+            separated.push_bind(&event.event);
+            separated.push_bind(event.timestamp);
+            separated.push_bind(&event.install_id);
+            separated.push_bind(match event.platform {
+                fantasma_core::Platform::Ios => "ios",
+                fantasma_core::Platform::Android => "android",
+            });
+            separated.push_bind(&event.app_version);
+            separated.push_bind(&event.os_version);
+            separated.push_bind(sqlx::types::Json(
+                serde_json::to_value(&event.properties).expect("serialize event properties"),
+            ));
         });
-        separated.push_bind(&event.app_version);
-        separated.push_bind(&event.os_version);
-        separated.push_bind(sqlx::types::Json(
-            serde_json::to_value(&event.properties).expect("serialize event properties"),
-        ));
-    });
 
-    let result = builder.build().execute(pool).await?;
+        let inserted = builder.build().execute(&mut *tx).await?;
+        verify_project_processing_lease_in_tx(&mut tx, &lease).await?;
+        tx.commit().await?;
 
-    Ok(result.rows_affected())
+        Ok(inserted.rows_affected())
+    }
+    .await;
+    let release_result = release_project_processing_lease(pool, &lease).await;
+
+    match (result, release_result) {
+        (Ok(inserted), Ok(())) => Ok(inserted),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
+    }
+}
+
+pub async fn create_project_deletion_job(
+    pool: &PgPool,
+    project_id: Uuid,
+    kind: ProjectDeletionKind,
+    scope: Option<&Value>,
+) -> Result<Option<ProjectDeletionRecord>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO project_deletions (
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope
+        )
+        SELECT
+            $1,
+            projects.id,
+            projects.name,
+            $2,
+            'queued',
+            $3
+        FROM projects
+        WHERE projects.id = $4
+        RETURNING
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope,
+            created_at,
+            started_at,
+            finished_at,
+            error_code,
+            error_message,
+            deleted_raw_events,
+            deleted_sessions,
+            rebuilt_installs,
+            rebuilt_days,
+            rebuilt_hours
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(kind.as_str())
+    .bind(scope.cloned().map(sqlx::types::Json))
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref()
+        .map(project_deletion_record_from_row)
+        .transpose()
+}
+
+pub async fn enqueue_project_purge(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> Result<StartProjectDeletionResult, StoreError> {
+    let mut tx = pool.begin().await?;
+
+    let project = sqlx::query(
+        r#"
+        SELECT id, name, state, fence_epoch, created_at
+        FROM projects
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(project_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let outcome = match project.as_ref().map(project_record_from_row).transpose()? {
+        Some(project) => match project.state {
+            ProjectState::Active => {
+                let updated = sqlx::query(
+                    r#"
+                    UPDATE projects
+                    SET state = 'pending_deletion',
+                        fence_epoch = fence_epoch + 1
+                    WHERE id = $1
+                    RETURNING id, name, state, fence_epoch, created_at
+                    "#,
+                )
+                .bind(project_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let updated = project_record_from_row(&updated)?;
+                let job = insert_project_deletion_job_in_tx(
+                    &mut tx,
+                    updated.id,
+                    &updated.name,
+                    ProjectDeletionKind::ProjectPurge,
+                    None,
+                )
+                .await?;
+                StartProjectDeletionResult::Enqueued(Box::new(job))
+            }
+            ProjectState::RangeDeleting => StartProjectDeletionResult::ProjectBusy,
+            ProjectState::PendingDeletion => {
+                let latest = load_latest_project_deletion_job_in_tx(
+                    &mut tx,
+                    project_id,
+                    ProjectDeletionKind::ProjectPurge,
+                )
+                .await?;
+                match latest {
+                    Some(job)
+                        if matches!(
+                            job.status,
+                            ProjectDeletionStatus::Queued | ProjectDeletionStatus::Running
+                        ) =>
+                    {
+                        StartProjectDeletionResult::Enqueued(Box::new(job))
+                    }
+                    Some(job) if job.status == ProjectDeletionStatus::Failed => {
+                        let retried = insert_project_deletion_job_in_tx(
+                            &mut tx,
+                            project.id,
+                            &project.name,
+                            ProjectDeletionKind::ProjectPurge,
+                            None,
+                        )
+                        .await?;
+                        StartProjectDeletionResult::Enqueued(Box::new(retried))
+                    }
+                    Some(job) => StartProjectDeletionResult::Enqueued(Box::new(job)),
+                    None => {
+                        let queued = insert_project_deletion_job_in_tx(
+                            &mut tx,
+                            project.id,
+                            &project.name,
+                            ProjectDeletionKind::ProjectPurge,
+                            None,
+                        )
+                        .await?;
+                        StartProjectDeletionResult::Enqueued(Box::new(queued))
+                    }
+                }
+            }
+        },
+        None => {
+            let latest = load_latest_successful_project_deletion(
+                pool,
+                project_id,
+                ProjectDeletionKind::ProjectPurge,
+            )
+            .await?;
+            match latest {
+                Some(job) => StartProjectDeletionResult::Enqueued(Box::new(job)),
+                None => StartProjectDeletionResult::NotFound,
+            }
+        }
+    };
+
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+pub async fn enqueue_range_deletion(
+    pool: &PgPool,
+    project_id: Uuid,
+    scope: &Value,
+) -> Result<StartProjectDeletionResult, StoreError> {
+    let mut tx = pool.begin().await?;
+
+    let project = sqlx::query(
+        r#"
+        SELECT id, name, state, fence_epoch, created_at
+        FROM projects
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(project_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(project) = project.as_ref().map(project_record_from_row).transpose()? else {
+        tx.commit().await?;
+        return Ok(StartProjectDeletionResult::NotFound);
+    };
+
+    let outcome = match project.state {
+        ProjectState::Active => {
+            let updated = sqlx::query(
+                r#"
+                UPDATE projects
+                SET state = 'range_deleting',
+                    fence_epoch = fence_epoch + 1
+                WHERE id = $1
+                RETURNING id, name, state, fence_epoch, created_at
+                "#,
+            )
+            .bind(project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let updated = project_record_from_row(&updated)?;
+            let job = insert_project_deletion_job_in_tx(
+                &mut tx,
+                updated.id,
+                &updated.name,
+                ProjectDeletionKind::RangeDelete,
+                Some(scope),
+            )
+            .await?;
+            StartProjectDeletionResult::Enqueued(Box::new(job))
+        }
+        ProjectState::RangeDeleting => StartProjectDeletionResult::ProjectBusy,
+        ProjectState::PendingDeletion => StartProjectDeletionResult::ProjectPendingDeletion,
+    };
+
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+pub async fn list_project_deletion_jobs(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> Result<Option<Vec<ProjectDeletionRecord>>, StoreError> {
+    let project_exists = load_project(pool, project_id).await?.is_some();
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope,
+            created_at,
+            started_at,
+            finished_at,
+            error_code,
+            error_message,
+            deleted_raw_events,
+            deleted_sessions,
+            rebuilt_installs,
+            rebuilt_days,
+            rebuilt_hours
+        FROM project_deletions
+        WHERE project_id = $1
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    if !project_exists && rows.is_empty() {
+        return Ok(None);
+    }
+
+    rows.iter()
+        .map(project_deletion_record_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+pub async fn load_project_deletion_job(
+    pool: &PgPool,
+    project_id: Uuid,
+    deletion_id: Uuid,
+) -> Result<Option<ProjectDeletionRecord>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope,
+            created_at,
+            started_at,
+            finished_at,
+            error_code,
+            error_message,
+            deleted_raw_events,
+            deleted_sessions,
+            rebuilt_installs,
+            rebuilt_days,
+            rebuilt_hours
+        FROM project_deletions
+        WHERE project_id = $1
+          AND id = $2
+        "#,
+    )
+    .bind(project_id)
+    .bind(deletion_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref()
+        .map(project_deletion_record_from_row)
+        .transpose()
+}
+
+async fn insert_project_deletion_job_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    project_name: &str,
+    kind: ProjectDeletionKind,
+    scope: Option<&Value>,
+) -> Result<ProjectDeletionRecord, StoreError> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO project_deletions (
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope
+        )
+        VALUES ($1, $2, $3, $4, 'queued', $5)
+        RETURNING
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope,
+            created_at,
+            started_at,
+            finished_at,
+            error_code,
+            error_message,
+            deleted_raw_events,
+            deleted_sessions,
+            rebuilt_installs,
+            rebuilt_days,
+            rebuilt_hours
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(project_id)
+    .bind(project_name)
+    .bind(kind.as_str())
+    .bind(scope.cloned().map(sqlx::types::Json))
+    .fetch_one(&mut **tx)
+    .await?;
+
+    project_deletion_record_from_row(&row)
+}
+
+async fn load_latest_project_deletion_job_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    kind: ProjectDeletionKind,
+) -> Result<Option<ProjectDeletionRecord>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope,
+            created_at,
+            started_at,
+            finished_at,
+            error_code,
+            error_message,
+            deleted_raw_events,
+            deleted_sessions,
+            rebuilt_installs,
+            rebuilt_days,
+            rebuilt_hours
+        FROM project_deletions
+        WHERE project_id = $1
+          AND kind = $2
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(project_id)
+    .bind(kind.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    row.as_ref()
+        .map(project_deletion_record_from_row)
+        .transpose()
+}
+
+pub async fn load_latest_successful_project_deletion(
+    pool: &PgPool,
+    project_id: Uuid,
+    kind: ProjectDeletionKind,
+) -> Result<Option<ProjectDeletionRecord>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope,
+            created_at,
+            started_at,
+            finished_at,
+            error_code,
+            error_message,
+            deleted_raw_events,
+            deleted_sessions,
+            rebuilt_installs,
+            rebuilt_days,
+            rebuilt_hours
+        FROM project_deletions
+        WHERE project_id = $1
+          AND kind = $2
+          AND status = 'succeeded'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(project_id)
+    .bind(kind.as_str())
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref()
+        .map(project_deletion_record_from_row)
+        .transpose()
+}
+
+pub async fn claim_next_project_deletion_job_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<Option<ProjectDeletionRecord>, StoreError> {
+    if let Some(row) = sqlx::query(
+        r#"
+        SELECT
+            deletions.id,
+            deletions.project_id,
+            deletions.project_name,
+            deletions.kind,
+            deletions.status,
+            deletions.scope,
+            deletions.created_at,
+            deletions.started_at,
+            deletions.finished_at,
+            deletions.error_code,
+            deletions.error_message,
+            deletions.deleted_raw_events,
+            deletions.deleted_sessions,
+            deletions.rebuilt_installs,
+            deletions.rebuilt_days,
+            deletions.rebuilt_hours
+        FROM project_deletions AS deletions
+        LEFT JOIN projects ON projects.id = deletions.project_id
+        WHERE deletions.status = 'running'
+          AND (
+                projects.id IS NULL
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM project_processing_leases AS leases
+                    WHERE leases.project_id = deletions.project_id
+                      AND leases.fence_epoch < projects.fence_epoch
+                      AND leases.heartbeat_at >= now() - ($1 * interval '1 second')
+                )
+              )
+        ORDER BY deletions.started_at ASC NULLS FIRST, deletions.created_at ASC, deletions.id ASC
+        LIMIT 1
+        FOR UPDATE OF deletions SKIP LOCKED
+        "#,
+    )
+    .bind(PROJECT_PROCESSING_LEASE_STALE_AFTER_SECS)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        return project_deletion_record_from_row(&row).map(Some);
+    }
+
+    let row = sqlx::query(
+        r#"
+        WITH claimable AS (
+            SELECT deletions.id
+            FROM project_deletions AS deletions
+            LEFT JOIN projects ON projects.id = deletions.project_id
+            WHERE deletions.status = 'queued'
+              AND (
+                    projects.id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM project_processing_leases AS leases
+                        WHERE leases.project_id = deletions.project_id
+                          AND leases.fence_epoch < projects.fence_epoch
+                          AND leases.heartbeat_at >= now() - ($1 * interval '1 second')
+                    )
+                  )
+            ORDER BY deletions.created_at ASC, deletions.id ASC
+            LIMIT 1
+            FOR UPDATE OF deletions SKIP LOCKED
+        )
+        UPDATE project_deletions AS deletions
+        SET status = 'running',
+            started_at = COALESCE(deletions.started_at, now()),
+            finished_at = NULL,
+            error_code = NULL,
+            error_message = NULL
+        FROM claimable
+        WHERE deletions.id = claimable.id
+        RETURNING
+            deletions.id,
+            deletions.project_id,
+            deletions.project_name,
+            deletions.kind,
+            deletions.status,
+            deletions.scope,
+            deletions.created_at,
+            deletions.started_at,
+            deletions.finished_at,
+            deletions.error_code,
+            deletions.error_message,
+            deletions.deleted_raw_events,
+            deletions.deleted_sessions,
+            deletions.rebuilt_installs,
+            deletions.rebuilt_days,
+            deletions.rebuilt_hours
+        "#,
+    )
+    .bind(PROJECT_PROCESSING_LEASE_STALE_AFTER_SECS)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    row.as_ref()
+        .map(project_deletion_record_from_row)
+        .transpose()
+}
+
+pub async fn load_project_deletion_job_by_id(
+    pool: &PgPool,
+    deletion_id: Uuid,
+) -> Result<Option<ProjectDeletionRecord>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            id,
+            project_id,
+            project_name,
+            kind,
+            status,
+            scope,
+            created_at,
+            started_at,
+            finished_at,
+            error_code,
+            error_message,
+            deleted_raw_events,
+            deleted_sessions,
+            rebuilt_installs,
+            rebuilt_days,
+            rebuilt_hours
+        FROM project_deletions
+        WHERE id = $1
+        "#,
+    )
+    .bind(deletion_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref()
+        .map(project_deletion_record_from_row)
+        .transpose()
+}
+
+pub async fn mark_project_deletion_job_succeeded_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deletion_id: Uuid,
+    stats: ProjectDeletionStats,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        UPDATE project_deletions
+        SET status = 'succeeded',
+            finished_at = now(),
+            error_code = NULL,
+            error_message = NULL,
+            deleted_raw_events = $2,
+            deleted_sessions = $3,
+            rebuilt_installs = $4,
+            rebuilt_days = $5,
+            rebuilt_hours = $6
+        WHERE id = $1
+        "#,
+    )
+    .bind(deletion_id)
+    .bind(stats.deleted_raw_events)
+    .bind(stats.deleted_sessions)
+    .bind(stats.rebuilt_installs)
+    .bind(stats.rebuilt_days)
+    .bind(stats.rebuilt_hours)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn mark_project_deletion_job_failed(
+    pool: &PgPool,
+    deletion_id: Uuid,
+    error_code: &str,
+    error_message: &str,
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    mark_project_deletion_job_failed_in_tx(&mut tx, deletion_id, error_code, error_message).await?;
+    tx.commit().await?;
+
+    Ok(())
+}
+
+pub async fn mark_project_deletion_job_failed_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deletion_id: Uuid,
+    error_code: &str,
+    error_message: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        UPDATE project_deletions
+        SET status = 'failed',
+            finished_at = now(),
+            error_code = $2,
+            error_message = $3
+        WHERE id = $1
+        "#,
+    )
+    .bind(deletion_id)
+    .bind(error_code)
+    .bind(error_message)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn set_project_state_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    state: ProjectState,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        UPDATE projects
+        SET state = $2
+        WHERE id = $1
+        "#,
+    )
+    .bind(project_id)
+    .bind(state.as_str())
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
 }
 
 pub async fn upsert_event_metric_buckets_total_in_tx(
@@ -1480,6 +2549,28 @@ pub async fn fetch_events_for_install_between_in_tx(
         .await
 }
 
+pub async fn fetch_all_events_for_install_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    install_id: &str,
+) -> Result<Vec<RawEventRecord>, StoreError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, properties
+        FROM events_raw
+        WHERE project_id = $1
+          AND install_id = $2
+        ORDER BY timestamp ASC, id ASC
+        "#,
+    )
+    .bind(project_id)
+    .bind(install_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    rows.into_iter().map(raw_event_from_row).collect()
+}
+
 async fn fetch_events_for_install_between_in_executor<'a, E>(
     executor: E,
     project_id: Uuid,
@@ -1618,6 +2709,68 @@ pub async fn fetch_total_event_counts_by_bucket(
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()
         .map_err(StoreError::Database)
+}
+
+pub async fn list_usage_events(
+    pool: &PgPool,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Result<Vec<UsageProjectEvents>, StoreError> {
+    let start: DateTime<Utc> = DateTime::from_naive_utc_and_offset(
+        start
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid for a NaiveDate"),
+        Utc,
+    );
+    let end_exclusive: DateTime<Utc> = DateTime::from_naive_utc_and_offset(
+        end.succ_opt()
+            .ok_or_else(|| StoreError::InvariantViolation("usage end date overflow".to_owned()))?
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid for a NaiveDate"),
+        Utc,
+    );
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            projects.id,
+            projects.name,
+            projects.created_at,
+            COUNT(events_raw.id)::bigint AS events_processed
+        FROM projects
+        INNER JOIN events_raw
+            ON events_raw.project_id = projects.id
+        WHERE events_raw.received_at >= $1
+          AND events_raw.received_at < $2
+        GROUP BY projects.id, projects.name, projects.created_at
+        ORDER BY events_processed DESC, projects.created_at ASC, projects.id ASC
+        "#,
+    )
+    .bind(start)
+    .bind(end_exclusive)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let events_processed: i64 =
+                row.try_get("events_processed").map_err(StoreError::from)?;
+            if events_processed < 0 {
+                return Err(StoreError::InvariantViolation(
+                    "usage event counts must not be negative".to_owned(),
+                ));
+            }
+
+            Ok(UsageProjectEvents {
+                project: ProjectSummary {
+                    id: row.try_get("id").map_err(StoreError::from)?,
+                    name: row.try_get("name").map_err(StoreError::from)?,
+                    created_at: row.try_get("created_at").map_err(StoreError::from)?,
+                },
+                events_processed: events_processed as u64,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()
 }
 
 pub async fn fetch_events_for_install_after_id_through_in_tx(
@@ -4590,10 +5743,45 @@ fn api_key_kind_from_str(value: &str) -> Result<ApiKeyKind, StoreError> {
     }
 }
 
+fn project_state_from_str(value: &str) -> Result<ProjectState, StoreError> {
+    match value {
+        "active" => Ok(ProjectState::Active),
+        "range_deleting" => Ok(ProjectState::RangeDeleting),
+        "pending_deletion" => Ok(ProjectState::PendingDeletion),
+        other => Err(StoreError::InvariantViolation(format!(
+            "invalid project state: {other}"
+        ))),
+    }
+}
+
+fn project_deletion_kind_from_str(value: &str) -> Result<ProjectDeletionKind, StoreError> {
+    match value {
+        "project_purge" => Ok(ProjectDeletionKind::ProjectPurge),
+        "range_delete" => Ok(ProjectDeletionKind::RangeDelete),
+        other => Err(StoreError::InvariantViolation(format!(
+            "invalid project deletion kind: {other}"
+        ))),
+    }
+}
+
+fn project_deletion_status_from_str(value: &str) -> Result<ProjectDeletionStatus, StoreError> {
+    match value {
+        "queued" => Ok(ProjectDeletionStatus::Queued),
+        "running" => Ok(ProjectDeletionStatus::Running),
+        "succeeded" => Ok(ProjectDeletionStatus::Succeeded),
+        "failed" => Ok(ProjectDeletionStatus::Failed),
+        other => Err(StoreError::InvariantViolation(format!(
+            "invalid project deletion status: {other}"
+        ))),
+    }
+}
+
 fn project_record_from_row(row: &sqlx::postgres::PgRow) -> Result<ProjectRecord, StoreError> {
     Ok(ProjectRecord {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
+        state: project_state_from_str(row.try_get("state")?)?,
+        fence_epoch: row.try_get("fence_epoch")?,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -4615,6 +5803,31 @@ fn resolved_api_key_from_row(row: &sqlx::postgres::PgRow) -> Result<ResolvedApiK
         key_id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,
         kind: api_key_kind_from_str(row.try_get("kind")?)?,
+    })
+}
+
+fn project_deletion_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ProjectDeletionRecord, StoreError> {
+    Ok(ProjectDeletionRecord {
+        id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        project_name: row.try_get("project_name")?,
+        kind: project_deletion_kind_from_str(row.try_get("kind")?)?,
+        status: project_deletion_status_from_str(row.try_get("status")?)?,
+        scope: row
+            .try_get::<Option<sqlx::types::Json<Value>>, _>("scope")?
+            .map(|value| value.0),
+        created_at: row.try_get("created_at")?,
+        started_at: row.try_get("started_at")?,
+        finished_at: row.try_get("finished_at")?,
+        error_code: row.try_get("error_code")?,
+        error_message: row.try_get("error_message")?,
+        deleted_raw_events: row.try_get("deleted_raw_events")?,
+        deleted_sessions: row.try_get("deleted_sessions")?,
+        rebuilt_installs: row.try_get("rebuilt_installs")?,
+        rebuilt_days: row.try_get("rebuilt_days")?,
+        rebuilt_hours: row.try_get("rebuilt_hours")?,
     })
 }
 
@@ -6495,6 +7708,396 @@ mod tests {
         assert_eq!(keys[0].id, key.id);
         assert_eq!(keys[0].name, "bootstrap");
         assert_eq!(keys[0].kind, ApiKeyKind::Ingest);
+    }
+
+    async fn insert_usage_event_row(
+        pool: &PgPool,
+        project_id: Uuid,
+        timestamp: &str,
+        received_at: &str,
+        install_id: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO events_raw (
+                project_id,
+                event_name,
+                timestamp,
+                received_at,
+                install_id,
+                platform,
+                app_version,
+                os_version,
+                properties
+            )
+            VALUES ($1, 'app_open', $2, $3, $4, 'ios', NULL, NULL, $5)
+            "#,
+        )
+        .bind(project_id)
+        .bind(
+            DateTime::parse_from_rfc3339(timestamp)
+                .expect("timestamp")
+                .with_timezone(&Utc),
+        )
+        .bind(
+            DateTime::parse_from_rfc3339(received_at)
+                .expect("received_at")
+                .with_timezone(&Utc),
+        )
+        .bind(install_id)
+        .bind(sqlx::types::Json(serde_json::json!({})))
+        .execute(pool)
+        .await
+        .expect("insert usage event");
+    }
+
+    #[sqlx::test]
+    async fn list_usage_events_counts_received_at_and_omits_empty_projects(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+        let project_c = Uuid::new_v4();
+        let created_at_a = DateTime::parse_from_rfc3339("2026-03-10T09:00:00Z")
+            .expect("created_at_a")
+            .with_timezone(&Utc);
+        let created_at_b = DateTime::parse_from_rfc3339("2026-03-11T09:00:00Z")
+            .expect("created_at_b")
+            .with_timezone(&Utc);
+        let created_at_c = DateTime::parse_from_rfc3339("2026-03-12T09:00:00Z")
+            .expect("created_at_c")
+            .with_timezone(&Utc);
+
+        sqlx::query(
+            r#"
+            INSERT INTO projects (id, name, state, fence_epoch, created_at)
+            VALUES ($1, $2, 'active', 0, $3), ($4, $5, 'active', 0, $6), ($7, $8, 'active', 0, $9)
+            "#,
+        )
+        .bind(project_a)
+        .bind("Usage Project A")
+        .bind(created_at_a)
+        .bind(project_b)
+        .bind("Usage Project B")
+        .bind(created_at_b)
+        .bind(project_c)
+        .bind("Usage Project C")
+        .bind(created_at_c)
+        .execute(&pool)
+        .await
+        .expect("insert projects");
+
+        insert_usage_event_row(
+            &pool,
+            project_a,
+            "2026-03-01T10:00:00Z",
+            "2026-03-01T10:00:00Z",
+            "install-a",
+        )
+        .await;
+        insert_usage_event_row(
+            &pool,
+            project_a,
+            "2026-03-02T10:00:00Z",
+            "2026-03-01T11:00:00Z",
+            "install-b",
+        )
+        .await;
+        insert_usage_event_row(
+            &pool,
+            project_b,
+            "2026-02-28T12:00:00Z",
+            "2026-03-01T12:00:00Z",
+            "install-c",
+        )
+        .await;
+        insert_usage_event_row(
+            &pool,
+            project_b,
+            "2026-03-01T13:00:00Z",
+            "2026-03-04T13:00:00Z",
+            "install-d",
+        )
+        .await;
+
+        let rows = list_usage_events(
+            &pool,
+            NaiveDate::from_ymd_opt(2026, 3, 1).expect("start"),
+            NaiveDate::from_ymd_opt(2026, 3, 1).expect("end"),
+        )
+        .await
+        .expect("list usage events");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].project.id, project_a);
+        assert_eq!(rows[0].project.name, "Usage Project A");
+        assert_eq!(rows[0].events_processed, 2);
+        assert_eq!(rows[1].project.id, project_b);
+        assert_eq!(rows[1].project.name, "Usage Project B");
+        assert_eq!(rows[1].events_processed, 1);
+    }
+
+    #[sqlx::test]
+    async fn list_usage_events_uses_created_at_as_tiebreaker(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let project_early = Uuid::new_v4();
+        let project_late = Uuid::new_v4();
+        let early_created_at = DateTime::parse_from_rfc3339("2026-03-10T09:00:00Z")
+            .expect("early created_at")
+            .with_timezone(&Utc);
+        let late_created_at = DateTime::parse_from_rfc3339("2026-03-11T09:00:00Z")
+            .expect("late created_at")
+            .with_timezone(&Utc);
+
+        sqlx::query(
+            r#"
+            INSERT INTO projects (id, name, state, fence_epoch, created_at)
+            VALUES ($1, $2, 'active', 0, $3), ($4, $5, 'active', 0, $6)
+            "#,
+        )
+        .bind(project_early)
+        .bind("Early Project")
+        .bind(early_created_at)
+        .bind(project_late)
+        .bind("Late Project")
+        .bind(late_created_at)
+        .execute(&pool)
+        .await
+        .expect("insert projects");
+
+        for project_id in [project_late, project_early] {
+            insert_usage_event_row(
+                &pool,
+                project_id,
+                "2026-03-01T10:00:00Z",
+                "2026-03-01T10:00:00Z",
+                "install",
+            )
+            .await;
+        }
+
+        let rows = list_usage_events(
+            &pool,
+            NaiveDate::from_ymd_opt(2026, 3, 1).expect("start"),
+            NaiveDate::from_ymd_opt(2026, 3, 1).expect("end"),
+        )
+        .await
+        .expect("list usage events");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].project.id, project_early);
+        assert_eq!(rows[1].project.id, project_late);
+    }
+
+    #[sqlx::test]
+    async fn projects_default_to_active_state_with_zero_fence_epoch(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let project = create_project(&pool, "Lifecycle Project")
+            .await
+            .expect("create project");
+
+        let row = sqlx::query(
+            r#"
+            SELECT state, fence_epoch
+            FROM projects
+            WHERE id = $1
+            "#,
+        )
+        .bind(project.id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch project lifecycle state");
+
+        let state: String = row.try_get("state").expect("read project state");
+        let fence_epoch: i64 = row.try_get("fence_epoch").expect("read fence epoch");
+
+        assert_eq!(state, "active");
+        assert_eq!(fence_epoch, 0);
+    }
+
+    #[sqlx::test]
+    async fn project_processing_lease_detects_fence_epoch_advance(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let project = create_project(&pool, "Lease Project")
+            .await
+            .expect("create project");
+
+        let lease = claim_project_processing_lease(
+            &pool,
+            project.id,
+            ProjectProcessingActorKind::Ingest,
+            "lease-1",
+        )
+        .await
+        .expect("claim project lease");
+        let mut mutation_tx = pool.begin().await.expect("begin mutation tx");
+
+        sqlx::query(
+            r#"
+            UPDATE projects
+            SET state = 'range_deleting',
+                fence_epoch = fence_epoch + 1
+            WHERE id = $1
+            "#,
+        )
+        .bind(project.id)
+        .execute(&pool)
+        .await
+        .expect("advance project fence");
+
+        let error = verify_project_processing_lease_in_tx(&mut mutation_tx, &lease)
+            .await
+            .expect_err("fence advance should invalidate the lease");
+        assert!(matches!(error, StoreError::ProjectFenceChanged));
+
+        mutation_tx.rollback().await.expect("rollback mutation tx");
+        release_project_processing_lease(&pool, &lease)
+            .await
+            .expect("release project lease");
+    }
+
+    #[sqlx::test]
+    async fn insert_events_rejects_non_active_projects(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        for (state, expected_state) in [
+            ("range_deleting", ProjectState::RangeDeleting),
+            ("pending_deletion", ProjectState::PendingDeletion),
+        ] {
+            let project = create_project(&pool, &format!("Event Gate {state}"))
+                .await
+                .expect("create project");
+            sqlx::query("UPDATE projects SET state = $2 WHERE id = $1")
+                .bind(project.id)
+                .bind(state)
+                .execute(&pool)
+                .await
+                .expect("update project state");
+
+            let error = insert_events(&pool, project.id, &[event("install-1", 0)])
+                .await
+                .expect_err("non-active project should reject inserts");
+            assert!(matches!(
+                error,
+                StoreError::ProjectNotActive(state) if state == expected_state
+            ));
+        }
+    }
+
+    #[sqlx::test]
+    async fn rename_and_key_mutations_reject_non_active_projects(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let active_project = create_project(&pool, "Mutation Gate Active")
+            .await
+            .expect("create project");
+        let key = create_api_key(
+            &pool,
+            active_project.id,
+            "ios",
+            ApiKeyKind::Read,
+            "fg_rd_mutation_gate",
+        )
+        .await
+        .expect("create key")
+        .expect("key exists");
+
+        for (state, expected_state) in [
+            ("range_deleting", ProjectState::RangeDeleting),
+            ("pending_deletion", ProjectState::PendingDeletion),
+        ] {
+            let project = create_project(&pool, &format!("Mutation Gate {state}"))
+                .await
+                .expect("create project");
+            sqlx::query("UPDATE projects SET state = $2 WHERE id = $1")
+                .bind(project.id)
+                .bind(state)
+                .execute(&pool)
+                .await
+                .expect("update project state");
+
+            let rename_error = rename_project(&pool, project.id, "Renamed")
+                .await
+                .expect_err("rename should reject non-active project");
+            assert!(matches!(
+                rename_error,
+                StoreError::ProjectNotActive(state) if state == expected_state
+            ));
+
+            let secret = format!("fg_rd_new_gate_{state}");
+            let create_key_error =
+                create_api_key(&pool, project.id, "ios", ApiKeyKind::Read, &secret)
+                    .await
+                    .expect_err("create key should reject non-active project");
+            assert!(matches!(
+                create_key_error,
+                StoreError::ProjectNotActive(state) if state == expected_state
+            ));
+        }
+
+        sqlx::query("UPDATE projects SET state = 'range_deleting' WHERE id = $1")
+            .bind(active_project.id)
+            .execute(&pool)
+            .await
+            .expect("update active project state");
+
+        let revoke_error = revoke_api_key(&pool, active_project.id, key.id)
+            .await
+            .expect_err("revoke should reject non-active project");
+        assert!(matches!(
+            revoke_error,
+            StoreError::ProjectNotActive(ProjectState::RangeDeleting)
+        ));
+    }
+
+    #[sqlx::test]
+    async fn deletion_history_survives_project_row_removal(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let project = create_project(&pool, "Historical Delete Project")
+            .await
+            .expect("create project");
+
+        sqlx::query(
+            r#"
+            INSERT INTO project_deletions (
+                id,
+                project_id,
+                project_name,
+                kind,
+                status,
+                scope,
+                created_at,
+                finished_at
+            )
+            VALUES ($1, $2, $3, 'project_purge', 'succeeded', NULL, now(), now())
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(project.id)
+        .bind(project.name.clone())
+        .execute(&pool)
+        .await
+        .expect("insert deletion history");
+
+        sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project.id)
+            .execute(&pool)
+            .await
+            .expect("delete project row");
+
+        let remaining = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM project_deletions WHERE project_id = $1",
+        )
+        .bind(project.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count deletion history rows");
+
+        assert_eq!(remaining, 1);
     }
 
     #[sqlx::test]

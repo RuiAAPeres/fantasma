@@ -482,6 +482,117 @@ struct FantasmaSDKBehaviorTests {
         #expect(try await queue.count() == 1)
     }
 
+    @Test("project busy upload failures stay retryable without blocking the destination")
+    func projectBusyDoesNotBlockDestination() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(response: .success(projectConflictResponse(error: "project_busy")))
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected uploadFailed error")
+        } catch let error as FantasmaError {
+            #expect(error == .uploadFailed)
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+        #expect(try await queue.blockedDestinationSignature() == nil)
+
+        try await Fantasma.flush()
+        #expect(try await queue.count() == 0)
+        #expect(await transport.requests().count == 2)
+    }
+
+    @Test("project pending deletion blocks automatic retries and keeps the same destination blocked")
+    func projectPendingDeletionBlocksDestinationUntilChanged() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(
+            response: .success(projectConflictResponse(error: "project_pending_deletion"))
+        )
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport, uploadBatchSize: 1)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        try await waitUntil {
+            await transport.requests().count == 1
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(try await queue.count() == 1)
+        #expect(
+            try await queue.blockedDestinationSignature() == localhostDestinationSignature()
+        )
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected uploadFailed error")
+        } catch let error as FantasmaError {
+            #expect(error == .uploadFailed)
+        }
+        #expect(await transport.requests().count == 1)
+
+        try await Fantasma.track("second_event")
+        try await Task.sleep(nanoseconds: 150_000_000)
+        #expect(await transport.requests().count == 1)
+        #expect(try await queue.count() == 2)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("third_event")
+        try await Task.sleep(nanoseconds: 150_000_000)
+        #expect(await transport.requests().count == 1)
+    }
+
+    @Test("changing the destination clears a blocked pending-deletion latch")
+    func changedDestinationClearsBlockedLatch() async throws {
+        let transport = RecordingTransport()
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        await transport.enqueue(
+            response: .success(projectConflictResponse(error: "project_pending_deletion"))
+        )
+        await transport.enqueue(response: .success(successResponse(accepted: 1)))
+        try await harness.installSharedCore(transport: transport)
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        do {
+            try await Fantasma.flush()
+            Issue.record("expected uploadFailed error")
+        } catch let error as FantasmaError {
+            #expect(error == .uploadFailed)
+        }
+
+        let queue = try harness.makeQueue()
+        #expect(
+            try await queue.blockedDestinationSignature() == localhostDestinationSignature()
+        )
+
+        try await Fantasma.configure(serverURL: replacementURL(), writeKey: "fg_ing_next")
+        try await Fantasma.track("fresh_destination")
+        try await Fantasma.flush()
+
+        #expect(await transport.requests().count == 2)
+        #expect(try await queue.count() == 0)
+    }
+
     @Test("explicit flush waits for a threshold-triggered auto flush already in flight")
     func explicitFlushWaitsForThresholdAutoFlush() async throws {
         let transport = SuspendedTransport()
@@ -1196,6 +1307,17 @@ private func invalidAcceptedResponse(body: Data) -> (Data, HTTPURLResponse) {
         headerFields: nil
     )!
     return (body, response)
+}
+
+private func projectConflictResponse(error: String) -> (Data, HTTPURLResponse) {
+    let payload = try! JSONEncoder().encode(["error": error])
+    let response = HTTPURLResponse(
+        url: URL(string: "http://localhost:8081/v1/events")!,
+        statusCode: 409,
+        httpVersion: nil,
+        headerFields: nil
+    )!
+    return (payload, response)
 }
 
 private func makeFixedDate() -> Date {

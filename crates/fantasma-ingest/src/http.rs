@@ -7,7 +7,10 @@ use axum::{
     routing::{get, post},
 };
 use fantasma_core::{EventAcceptedResponse, EventValidationResponse, RawEventBatchRequest};
-use fantasma_store::{PgPool, insert_events, resolve_project_id_for_ingest_key};
+use fantasma_store::{
+    PgPool, ProjectState, StoreError, insert_events, load_project,
+    resolve_project_id_for_ingest_key,
+};
 
 const INGEST_HEADER: &str = "x-fantasma-key";
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
@@ -66,6 +69,41 @@ async fn ingest_events(
         }
     };
 
+    match load_project(&state.pool, project_id).await {
+        Ok(Some(project)) => match project.state {
+            ProjectState::Active => {}
+            ProjectState::RangeDeleting => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "project_busy" })),
+                )
+                    .into_response();
+            }
+            ProjectState::PendingDeletion => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "project_pending_deletion" })),
+                )
+                    .into_response();
+            }
+        },
+        Ok(None) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "unauthorized" })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(?error, project_id = %project_id, "failed to load project for ingest state gate");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal_server_error" })),
+            )
+                .into_response();
+        }
+    }
+
     let body = match to_bytes(request.into_body(), MAX_PAYLOAD_BYTES).await {
         Ok(body) => body,
         Err(_) => {
@@ -103,6 +141,25 @@ async fn ingest_events(
     };
 
     if let Err(error) = insert_events(&state.pool, project_id, &payload.events).await {
+        let response = match error {
+            StoreError::ProjectNotActive(ProjectState::RangeDeleting)
+            | StoreError::ProjectFenceChanged => Some((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "project_busy" })),
+            )),
+            StoreError::ProjectNotActive(ProjectState::PendingDeletion) => Some((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "project_pending_deletion" })),
+            )),
+            StoreError::ProjectNotFound => Some((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "unauthorized" })),
+            )),
+            _ => None,
+        };
+        if let Some(response) = response {
+            return response.into_response();
+        }
         tracing::error!(?error, "failed to insert accepted events");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

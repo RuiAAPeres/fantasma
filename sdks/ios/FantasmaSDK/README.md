@@ -52,6 +52,8 @@ enter the local queue. The SDK adds `platform`, `app_version`, and
 - Successful `202 Accepted` responses delete uploaded rows from the queue.
 - Failed uploads leave rows in SQLite for later replay.
 - Malformed `202 Accepted` responses are treated as invalid responses and also leave rows queued.
+- `409 project_busy` is treated as a transient upload failure; queued rows stay durable and the SDK will retry on later automatic flushes.
+- `409 project_pending_deletion` is treated as a blocked destination; queued rows stay durable, automatic flushes stop retrying that destination, and only reconfiguring to a different server/write-key pair clears the block.
 - `track(_:properties:)` throws when the SDK has not been configured.
 - `flush()` throws when the SDK has not been configured.
 - The SDK also attempts a periodic flush every 30 seconds when configured.

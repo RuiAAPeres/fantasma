@@ -21,18 +21,20 @@ use fantasma_core::{
     ActiveInstallsPoint, ActiveInstallsResponse, ActiveInstallsSeries, CurrentMetricResponse,
     EventMetric, EventMetricsQuery, MetricGranularity, MetricInterval, MetricsBucketWindow,
     MetricsPoint, MetricsResponse, MetricsSeries, SessionMetric, SessionMetricsQuery,
-    is_reserved_event_property_key, is_valid_event_property_key,
+    UsageEventsResponse, is_reserved_event_property_key, is_valid_event_property_key,
 };
 use fantasma_store::{
     ApiKeyKind, EventCatalogRecord, EventMetricsAggregateCubeRow, EventMetricsCubeRow, PgPool,
-    ProjectRecord, ResolvedApiKey, SessionMetricsAggregateCubeRow, SessionMetricsCubeRow,
-    StoreError, TopEventRecord, create_api_key, create_project_with_api_key,
-    deserialize_active_install_bitmap, fetch_event_metrics_aggregate_cube_rows_in_tx,
+    ProjectDeletionRecord, ProjectRecord, ProjectState, ResolvedApiKey,
+    SessionMetricsAggregateCubeRow, SessionMetricsCubeRow, StartProjectDeletionResult, StoreError,
+    TopEventRecord, create_api_key, create_project_with_api_key, deserialize_active_install_bitmap,
+    enqueue_project_purge, enqueue_range_deletion, fetch_event_metrics_aggregate_cube_rows_in_tx,
     fetch_event_metrics_cube_rows_in_tx, fetch_session_metrics_aggregate_cube_rows_in_tx,
     fetch_session_metrics_cube_rows_in_tx, generate_api_key_secret, list_api_keys,
-    list_event_catalog, list_projects, list_top_events,
-    load_active_install_bitmap_totals_in_executor, load_live_install_count_in_tx, load_project,
-    rename_project, resolve_api_key, revoke_api_key,
+    list_event_catalog, list_project_deletion_jobs, list_projects, list_top_events,
+    list_usage_events, load_active_install_bitmap_totals_in_executor,
+    load_live_install_count_in_tx, load_project, load_project_deletion_job, rename_project,
+    resolve_api_key, revoke_api_key,
 };
 use roaring::RoaringTreemap;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -86,6 +88,18 @@ struct PatchProjectRequest {
     name: String,
 }
 
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRangeDeletionRequest {
+    start_at: DateTime<Utc>,
+    end_before: DateTime<Utc>,
+    event: Option<String>,
+    #[serde(default)]
+    filters: BTreeMap<String, String>,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EventDiscoveryQuery {
     start: DateTime<Utc>,
@@ -97,6 +111,12 @@ struct EventDiscoveryQuery {
 struct TopEventsQuery {
     window: EventDiscoveryQuery,
     limit: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageEventsQuery {
+    start: NaiveDate,
+    end: NaiveDate,
 }
 
 const DEFAULT_TOP_EVENTS_LIMIT: i64 = 10;
@@ -112,7 +132,9 @@ pub fn app(pool: PgPool, authorizer: Arc<StaticAdminAuthorizer>) -> Router {
         )
         .route(
             "/v1/projects/{project_id}",
-            get(get_project_route).patch(patch_project_route),
+            get(get_project_route)
+                .patch(patch_project_route)
+                .delete(delete_project_route),
         )
         .route(
             "/v1/projects/{project_id}/keys",
@@ -122,6 +144,15 @@ pub fn app(pool: PgPool, authorizer: Arc<StaticAdminAuthorizer>) -> Router {
             "/v1/projects/{project_id}/keys/{key_id}",
             delete(revoke_project_key_route),
         )
+        .route(
+            "/v1/projects/{project_id}/deletions",
+            get(list_project_deletions_route).post(create_range_deletion_route),
+        )
+        .route(
+            "/v1/projects/{project_id}/deletions/{deletion_id}",
+            get(get_project_deletion_route),
+        )
+        .route("/v1/usage/events", get(usage_events_route))
         .route("/v1/metrics/events", get(events_metrics))
         .route("/v1/metrics/events/catalog", get(event_catalog_route))
         .route("/v1/metrics/events/top", get(top_events_route))
@@ -285,6 +316,66 @@ fn parse_event_metrics_query(
         filters,
         group_by,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageEventsQueryError(&'static str);
+
+impl UsageEventsQueryError {
+    fn error_code(&self) -> &'static str {
+        self.0
+    }
+}
+
+fn parse_usage_events_query(raw_query: &str) -> Result<UsageEventsQuery, UsageEventsQueryError> {
+    let mut start = None;
+    let mut end = None;
+
+    for (raw_key, raw_value) in form_urlencoded::parse(raw_query.as_bytes()) {
+        let key = raw_key.into_owned();
+        let value = raw_value.into_owned();
+
+        match key.as_str() {
+            "start" => {
+                if start.is_some() {
+                    return Err(UsageEventsQueryError("duplicate_query_key"));
+                }
+
+                start = Some(value);
+            }
+            "end" => {
+                if end.is_some() {
+                    return Err(UsageEventsQueryError("duplicate_query_key"));
+                }
+
+                end = Some(value);
+            }
+            "project_id" | "start_date" | "end_date" => {
+                return Err(UsageEventsQueryError("invalid_query_key"));
+            }
+            _ => return Err(UsageEventsQueryError("invalid_query_key")),
+        }
+    }
+
+    let start = NaiveDate::parse_from_str(
+        start
+            .as_deref()
+            .ok_or(UsageEventsQueryError("invalid_time_range"))?,
+        "%Y-%m-%d",
+    )
+    .map_err(|_| UsageEventsQueryError("invalid_time_range"))?;
+    let end = NaiveDate::parse_from_str(
+        end.as_deref()
+            .ok_or(UsageEventsQueryError("invalid_time_range"))?,
+        "%Y-%m-%d",
+    )
+    .map_err(|_| UsageEventsQueryError("invalid_time_range"))?;
+
+    if start > end {
+        return Err(UsageEventsQueryError("invalid_time_range"));
+    }
+
+    Ok(UsageEventsQuery { start, end })
 }
 
 fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQuery, &'static str> {
@@ -838,6 +929,12 @@ async fn patch_project_route(
         None => return query_error_response("invalid_request"),
     };
 
+    if let Err(response) =
+        require_project_active_for_management_mutation(&state.pool, project_id).await
+    {
+        return response;
+    }
+
     match rename_project(&state.pool, project_id, &project_name).await {
         Ok(Some(project)) => (
             StatusCode::OK,
@@ -848,6 +945,9 @@ async fn patch_project_route(
             .into_response(),
         Ok(None) => query_error_response("not_found"),
         Err(error) => {
+            if let Some(response) = project_mutation_error_response(&error) {
+                return response;
+            }
             tracing::error!(?error, project_id = %project_id, "failed to rename project");
             query_error_response("internal_server_error")
         }
@@ -903,6 +1003,12 @@ async fn create_project_key_route(
         None => return query_error_response("invalid_request"),
     };
 
+    if let Err(response) =
+        require_project_active_for_management_mutation(&state.pool, project_id).await
+    {
+        return response;
+    }
+
     let secret = generate_api_key_secret(kind);
     match create_api_key(&state.pool, project_id, &key_name, kind, &secret).await {
         Ok(Some(key)) => (
@@ -914,6 +1020,9 @@ async fn create_project_key_route(
             .into_response(),
         Ok(None) => query_error_response("not_found"),
         Err(error) => {
+            if let Some(response) = project_mutation_error_response(&error) {
+                return response;
+            }
             tracing::error!(?error, project_id = %project_id, "failed to create project key");
             query_error_response("internal_server_error")
         }
@@ -929,11 +1038,171 @@ async fn revoke_project_key_route(
         return response;
     }
 
+    if let Err(response) =
+        require_project_active_for_management_mutation(&state.pool, project_id).await
+    {
+        return response;
+    }
+
     match revoke_api_key(&state.pool, project_id, key_id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => query_error_response("not_found"),
         Err(error) => {
+            if let Some(response) = project_mutation_error_response(&error) {
+                return response;
+            }
             tracing::error!(?error, project_id = %project_id, key_id = %key_id, "failed to revoke project key");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
+async fn delete_project_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<Uuid>,
+) -> axum::response::Response {
+    if let Err(response) = authorize_operator(&state.authorizer, &headers) {
+        return response;
+    }
+
+    match enqueue_project_purge(&state.pool, project_id).await {
+        Ok(StartProjectDeletionResult::Enqueued(job)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "deletion": project_deletion_json(&job) })),
+        )
+            .into_response(),
+        Ok(StartProjectDeletionResult::ProjectBusy) => query_error_response("project_busy"),
+        Ok(StartProjectDeletionResult::ProjectPendingDeletion) => {
+            query_error_response("project_pending_deletion")
+        }
+        Ok(StartProjectDeletionResult::NotFound) => query_error_response("not_found"),
+        Err(error) => {
+            tracing::error!(?error, project_id = %project_id, "failed to enqueue project purge");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
+async fn create_range_deletion_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<Uuid>,
+    body: Bytes,
+) -> axum::response::Response {
+    if let Err(response) = authorize_operator(&state.authorizer, &headers) {
+        return response;
+    }
+
+    let payload = match parse_json_body::<CreateRangeDeletionRequest>(&body) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+
+    let scope = match validate_range_deletion_request(payload) {
+        Ok(scope) => scope,
+        Err(error) => return query_error_response(error),
+    };
+
+    match enqueue_range_deletion(&state.pool, project_id, &scope).await {
+        Ok(StartProjectDeletionResult::Enqueued(job)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "deletion": project_deletion_json(&job) })),
+        )
+            .into_response(),
+        Ok(StartProjectDeletionResult::ProjectBusy) => query_error_response("project_busy"),
+        Ok(StartProjectDeletionResult::ProjectPendingDeletion) => {
+            query_error_response("project_pending_deletion")
+        }
+        Ok(StartProjectDeletionResult::NotFound) => query_error_response("not_found"),
+        Err(error) => {
+            tracing::error!(?error, project_id = %project_id, "failed to enqueue range deletion");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
+async fn list_project_deletions_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<Uuid>,
+) -> axum::response::Response {
+    if let Err(response) = authorize_operator(&state.authorizer, &headers) {
+        return response;
+    }
+
+    match list_project_deletion_jobs(&state.pool, project_id).await {
+        Ok(Some(deletions)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "deletions": deletions
+                    .iter()
+                    .map(project_deletion_json)
+                    .collect::<Vec<_>>()
+            })),
+        )
+            .into_response(),
+        Ok(None) => query_error_response("not_found"),
+        Err(error) => {
+            tracing::error!(?error, project_id = %project_id, "failed to list project deletions");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
+async fn get_project_deletion_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project_id, deletion_id)): Path<(Uuid, Uuid)>,
+) -> axum::response::Response {
+    if let Err(response) = authorize_operator(&state.authorizer, &headers) {
+        return response;
+    }
+
+    match load_project_deletion_job(&state.pool, project_id, deletion_id).await {
+        Ok(Some(deletion)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "deletion": project_deletion_json(&deletion) })),
+        )
+            .into_response(),
+        Ok(None) => query_error_response("not_found"),
+        Err(error) => {
+            tracing::error!(?error, project_id = %project_id, deletion_id = %deletion_id, "failed to load project deletion");
+            query_error_response("internal_server_error")
+        }
+    }
+}
+
+async fn usage_events_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> axum::response::Response {
+    if let Err(response) = authorize_operator(&state.authorizer, &headers) {
+        return response;
+    }
+
+    let query = match parse_usage_events_query(raw_query.as_deref().unwrap_or_default()) {
+        Ok(query) => query,
+        Err(error) => return query_error_response(error.error_code()),
+    };
+
+    match list_usage_events(&state.pool, query.start, query.end).await {
+        Ok(projects) => (
+            StatusCode::OK,
+            Json(serde_json::json!(UsageEventsResponse {
+                start: query.start.to_string(),
+                end: query.end.to_string(),
+                total_events_processed: projects
+                    .iter()
+                    .map(|project| project.events_processed)
+                    .sum(),
+                projects,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(?error, "failed to load usage events");
             query_error_response("internal_server_error")
         }
     }
@@ -984,6 +1253,57 @@ fn validate_name(raw: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
+fn project_mutation_error_response(error: &StoreError) -> Option<axum::response::Response> {
+    match error {
+        StoreError::ProjectNotFound => Some(query_error_response("not_found")),
+        StoreError::ProjectNotActive(ProjectState::RangeDeleting)
+        | StoreError::ProjectFenceChanged => Some(query_error_response("project_busy")),
+        StoreError::ProjectNotActive(ProjectState::PendingDeletion) => {
+            Some(query_error_response("project_pending_deletion"))
+        }
+        StoreError::ProjectNotActive(ProjectState::Active) => None,
+        _ => None,
+    }
+}
+
+async fn require_project_active_for_management_mutation(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> Result<(), axum::response::Response> {
+    let project = load_project(pool, project_id).await.map_err(|error| {
+        tracing::error!(?error, project_id = %project_id, "failed to load project for management state gate");
+        query_error_response("internal_server_error")
+    })?;
+
+    match project {
+        Some(project) => match project.state {
+            ProjectState::Active => Ok(()),
+            ProjectState::RangeDeleting => Err(query_error_response("project_busy")),
+            ProjectState::PendingDeletion => Err(query_error_response("project_pending_deletion")),
+        },
+        None => Err(query_error_response("not_found")),
+    }
+}
+
+async fn require_project_active_for_read_key_route(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> Result<(), axum::response::Response> {
+    let project = load_project(pool, project_id).await.map_err(|error| {
+        tracing::error!(?error, project_id = %project_id, "failed to load project for read-key state gate");
+        query_error_response("internal_server_error")
+    })?;
+
+    match project {
+        Some(project) => match project.state {
+            ProjectState::Active => Ok(()),
+            ProjectState::RangeDeleting => Err(query_error_response("project_busy")),
+            ProjectState::PendingDeletion => Err(query_error_response("project_pending_deletion")),
+        },
+        None => Err(query_error_response("unauthorized")),
+    }
+}
+
 fn parse_api_key_kind(raw: &str) -> Option<ApiKeyKind> {
     match raw {
         "ingest" => Some(ApiKeyKind::Ingest),
@@ -996,7 +1316,29 @@ fn project_json(project: &ProjectRecord) -> serde_json::Value {
     serde_json::json!({
         "id": project.id,
         "name": project.name,
+        "state": project.state.as_str(),
         "created_at": project.created_at,
+    })
+}
+
+fn project_deletion_json(deletion: &ProjectDeletionRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": deletion.id,
+        "project_id": deletion.project_id,
+        "project_name": deletion.project_name,
+        "kind": deletion.kind.as_str(),
+        "status": deletion.status.as_str(),
+        "scope": deletion.scope,
+        "created_at": deletion.created_at,
+        "started_at": deletion.started_at,
+        "finished_at": deletion.finished_at,
+        "error_code": deletion.error_code,
+        "error_message": deletion.error_message,
+        "deleted_raw_events": deletion.deleted_raw_events,
+        "deleted_sessions": deletion.deleted_sessions,
+        "rebuilt_installs": deletion.rebuilt_installs,
+        "rebuilt_days": deletion.rebuilt_days,
+        "rebuilt_hours": deletion.rebuilt_hours,
     })
 }
 
@@ -1047,6 +1389,12 @@ async fn events_metrics(
         Err(response) => return response,
     };
 
+    if let Err(response) =
+        require_project_active_for_read_key_route(&state.pool, auth.project_id).await
+    {
+        return response;
+    }
+
     let public_query = match parse_event_metrics_query(raw_query.as_deref().unwrap_or_default()) {
         Ok(query) => query,
         Err(error) => return query_error_response(error.error_code()),
@@ -1088,6 +1436,12 @@ async fn sessions_metrics(
         Ok(auth) => auth,
         Err(response) => return response,
     };
+
+    if let Err(response) =
+        require_project_active_for_read_key_route(&state.pool, auth.project_id).await
+    {
+        return response;
+    }
 
     let public_query = match parse_session_metric_query(raw_query.as_deref().unwrap_or_default()) {
         Ok(query) => query,
@@ -1148,6 +1502,12 @@ async fn live_installs_route(
         Ok(auth) => auth,
         Err(response) => return response,
     };
+
+    if let Err(response) =
+        require_project_active_for_read_key_route(&state.pool, auth.project_id).await
+    {
+        return response;
+    }
 
     if let Err(error) = parse_live_installs_query(raw_query.as_deref().unwrap_or_default()) {
         return query_error_response(error);
@@ -1278,11 +1638,46 @@ fn query_error_response(error: &'static str) -> axum::response::Response {
     let status = match error {
         "not_found" => StatusCode::NOT_FOUND,
         "unauthorized" => StatusCode::UNAUTHORIZED,
+        "project_busy" | "project_pending_deletion" => StatusCode::CONFLICT,
         "internal_server_error" => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::UNPROCESSABLE_ENTITY,
     };
 
     (status, Json(serde_json::json!({ "error": error }))).into_response()
+}
+
+fn validate_range_deletion_request(
+    payload: CreateRangeDeletionRequest,
+) -> Result<serde_json::Value, &'static str> {
+    if payload.start_at >= payload.end_before {
+        return Err("invalid_request");
+    }
+
+    if payload
+        .event
+        .as_ref()
+        .is_some_and(|event| event.trim().is_empty())
+    {
+        return Err("invalid_request");
+    }
+
+    if payload
+        .filters
+        .keys()
+        .any(|key| !matches!(key.as_str(), "platform" | "app_version" | "os_version"))
+    {
+        return Err("invalid_request");
+    }
+
+    if payload
+        .properties
+        .keys()
+        .any(|key| is_reserved_event_property_key(key) || !is_valid_event_property_key(key))
+    {
+        return Err("invalid_request");
+    }
+
+    serde_json::to_value(payload).map_err(|_| "invalid_request")
 }
 
 async fn execute_event_metrics_query(
@@ -2627,6 +3022,16 @@ mod tests {
             )
             .await
             .expect("live installs route response");
+        let usage_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/usage/events?start=2026-03-01&end=2026-03-01")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("usage route response");
         let legacy_paths = [
             "/v1/metrics/events/daily",
             "/v1/metrics/events/aggregate",
@@ -2638,6 +3043,7 @@ mod tests {
         assert_ne!(events_family_response.status(), StatusCode::NOT_FOUND);
         assert_ne!(sessions_family_response.status(), StatusCode::NOT_FOUND);
         assert_ne!(live_installs_response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(usage_response.status(), StatusCode::NOT_FOUND);
         for path in legacy_paths {
             let response = app
                 .clone()
@@ -2695,6 +3101,57 @@ mod tests {
                     .expect("end"),
             }
         );
+    }
+
+    #[test]
+    fn parse_usage_events_query_accepts_exact_date_bounds() {
+        let query =
+            parse_usage_events_query("start=2026-03-01&end=2026-03-31").expect("query parses");
+
+        assert_eq!(
+            query.start,
+            NaiveDate::from_ymd_opt(2026, 3, 1).expect("start")
+        );
+        assert_eq!(
+            query.end,
+            NaiveDate::from_ymd_opt(2026, 3, 31).expect("end")
+        );
+    }
+
+    #[test]
+    fn parse_usage_events_query_rejects_duplicate_start() {
+        let error = parse_usage_events_query("start=2026-03-01&start=2026-03-02&end=2026-03-31")
+            .unwrap_err();
+
+        assert_eq!(error.error_code(), "duplicate_query_key");
+    }
+
+    #[test]
+    fn parse_usage_events_query_rejects_duplicate_end() {
+        let error =
+            parse_usage_events_query("start=2026-03-01&end=2026-03-31&end=2026-04-01").unwrap_err();
+
+        assert_eq!(error.error_code(), "duplicate_query_key");
+    }
+
+    #[test]
+    fn parse_usage_events_query_rejects_legacy_and_unknown_keys() {
+        for raw_query in [
+            "project_id=9bad8b88-5e7a-44ed-98ce-4cf9ddde713a&start=2026-03-01&end=2026-03-31",
+            "start_date=2026-03-01&start=2026-03-01&end=2026-03-31",
+            "end_date=2026-03-31&start=2026-03-01&end=2026-03-31",
+            "start=2026-03-01&end=2026-03-31&plan=pro",
+        ] {
+            let error = parse_usage_events_query(raw_query).unwrap_err();
+            assert_eq!(error.error_code(), "invalid_query_key");
+        }
+    }
+
+    #[test]
+    fn parse_usage_events_query_rejects_invalid_time_range() {
+        let error = parse_usage_events_query("start=2026-03-31&end=2026-03-01").unwrap_err();
+
+        assert_eq!(error.error_code(), "invalid_time_range");
     }
 
     #[test]
@@ -3060,6 +3517,11 @@ mod tests {
         let top_parameters = spec["paths"]["/v1/metrics/events/top"]["get"]["parameters"]
             .as_sequence()
             .expect("top-events parameters");
+        let usage_route = &spec["paths"]["/v1/usage/events"]["get"];
+        let usage_200 = &usage_route["responses"]["200"];
+        let usage_security = usage_route["security"]
+            .as_sequence()
+            .expect("usage security");
         let project_route_security = spec["paths"]["/v1/projects/{project_id}"]["get"]["security"]
             .as_sequence()
             .expect("project route security");
@@ -3077,6 +3539,9 @@ mod tests {
         let platform_filter_schema = &spec["components"]["parameters"]["PlatformFilter"]["schema"];
         let operator_auth = &spec["components"]["securitySchemes"]["OperatorBearerAuth"];
         let project_key_auth = &spec["components"]["securitySchemes"]["ProjectKeyHeader"];
+        let usage_response_schema = &spec["components"]["schemas"]["UsageEventsResponse"];
+        let usage_project_schema = &spec["components"]["schemas"]["UsageProjectEvents"];
+        let project_schema = &spec["components"]["schemas"]["ProjectSummary"];
         let live_installs_schema = &spec["components"]["schemas"]["LiveInstallsResponse"];
         let event_metrics_description = &spec["paths"]["/v1/metrics/events"]["get"]["description"];
         let event_metrics_parameters = spec["paths"]["/v1/metrics/events"]["get"]["parameters"]
@@ -3116,6 +3581,14 @@ mod tests {
         assert!(
             event_metrics_500.is_mapping(),
             "event metrics route must document internal_server_error"
+        );
+        assert!(
+            usage_route.is_mapping(),
+            "openapi must publish the operator usage route"
+        );
+        assert!(
+            usage_200.is_mapping(),
+            "usage route must document a success response"
         );
         assert!(
             spec["paths"]["/v1/projects/{project_id}"]["patch"].is_mapping(),
@@ -3211,9 +3684,27 @@ mod tests {
         assert_eq!(platform_filter_schema["type"], "string");
         assert_eq!(operator_auth["type"], "http");
         assert_eq!(operator_auth["scheme"], "bearer");
+        assert!(
+            operator_auth["description"]
+                .as_str()
+                .expect("operator auth description")
+                .contains("/v1/usage/*"),
+            "operator auth description must include usage routes"
+        );
         assert_eq!(project_key_auth["type"], "apiKey");
         assert_eq!(project_key_auth["in"], "header");
         assert_eq!(project_key_auth["name"], "X-Fantasma-Key");
+        assert_eq!(
+            usage_response_schema["required"]
+                .as_sequence()
+                .map(|required| required.len()),
+            Some(4)
+        );
+        assert_eq!(project_schema["type"], "object");
+        assert!(
+            usage_project_schema["properties"]["project"]["$ref"]
+                == "#/components/schemas/ProjectSummary"
+        );
         assert_eq!(
             live_installs_schema["properties"]["metric"]["const"],
             "live_installs"
@@ -3245,6 +3736,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry["ProjectKeyHeader"].is_sequence()),
             "metrics routes must document project-key auth"
+        );
+        assert!(
+            usage_security
+                .iter()
+                .any(|entry| entry["OperatorBearerAuth"].is_sequence()),
+            "usage routes must document operator bearer auth"
         );
         assert!(
             catalog_security

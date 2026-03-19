@@ -1,5 +1,15 @@
 import Foundation
 
+enum UploadDisposition: Sendable, Equatable {
+    case success
+    case retryableFailure
+    case blockedDestination
+}
+
+private struct UploadErrorEnvelope: Decodable {
+    let error: String
+}
+
 struct EventUploader: Sendable {
     private let queue: SQLiteEventQueue
     private let transport: FantasmaTransport
@@ -35,7 +45,7 @@ struct EventUploader: Sendable {
         return UploadBatch(rowIDs: ids, body: body, count: rows.count)
     }
 
-    func upload(_ batch: UploadBatch, configuration: FantasmaConfiguration) async throws {
+    func upload(_ batch: UploadBatch, configuration: FantasmaConfiguration) async throws -> UploadDisposition {
         var request = URLRequest(url: configuration.serverURL.appendingPathComponent("v1/events"))
         request.httpMethod = "POST"
         request.httpBody = batch.body
@@ -51,13 +61,19 @@ struct EventUploader: Sendable {
             if error == .invalidResponse {
                 throw error
             }
-            throw FantasmaError.uploadFailed
+            return .retryableFailure
         } catch {
-            throw FantasmaError.uploadFailed
+            return .retryableFailure
         }
 
         guard response.statusCode == 202 else {
-            throw FantasmaError.uploadFailed
+            if response.statusCode == 409,
+               let envelope = try? JSONDecoder().decode(UploadErrorEnvelope.self, from: data),
+               envelope.error == "project_pending_deletion"
+            {
+                return .blockedDestination
+            }
+            return .retryableFailure
         }
 
         let accepted: AcceptedResponse
@@ -72,5 +88,6 @@ struct EventUploader: Sendable {
         }
 
         try await queue.delete(ids: batch.rowIDs)
+        return .success
     }
 }

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use chrono::{SecondsFormat, Utc};
+use fantasma_core::UsageEventsResponse;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -11,8 +12,9 @@ use crate::{
     cli::{
         AuthSubcommand, Cli, Command, EventCatalogArgs, EventMetricArg, EventMetricsArgs,
         InstanceAddArgs, InstanceRemoveArgs, InstanceUseArgs, InstancesSubcommand, KeyCreateArgs,
-        KeyKind, KeysSubcommand, LiveInstallsArgs, MetricsSubcommand, ProjectsSubcommand,
-        ReadOutputArgs, SessionMetricArg, SessionMetricsArgs, TopEventsArgs,
+        KeyKind, KeysSubcommand, LiveInstallsArgs, MetricsSubcommand, ProjectDeletionGetArgs,
+        ProjectDeletionsSubcommand, ProjectRangeDeleteArgs, ProjectsSubcommand, ReadOutputArgs,
+        SessionMetricArg, SessionMetricsArgs, TopEventsArgs, UsageEventsArgs, UsageSubcommand,
     },
     config::{
         CliConfig, InstanceProfile, StoredReadKey, ensure_secure_persistence_supported,
@@ -91,6 +93,19 @@ impl App {
                         ),
                     })
                 }
+                ProjectsSubcommand::Delete(delete) => self.delete_project(delete.project).await,
+                ProjectsSubcommand::Deletions(deletions) => match deletions.command {
+                    ProjectDeletionsSubcommand::List(list) => {
+                        self.list_project_deletions(list.project, list.output).await
+                    }
+                    ProjectDeletionsSubcommand::Get(get) => self.get_project_deletion(get).await,
+                    ProjectDeletionsSubcommand::Range(range) => {
+                        self.create_range_deletion(range).await
+                    }
+                },
+            },
+            Command::Usage(usage) => match usage.command {
+                UsageSubcommand::Events(events) => self.usage_events(events).await,
             },
             Command::Keys(keys) => match keys.command {
                 KeysSubcommand::Create(create) => self.create_key(create).await,
@@ -272,7 +287,12 @@ impl App {
         let lines = listed
             .projects
             .into_iter()
-            .map(|project| format!("{}\t{}\t{}", project.id, project.name, project.created_at))
+            .map(|project| {
+                format!(
+                    "{}\t{}\t{}\t{}",
+                    project.id, project.name, project.state, project.created_at
+                )
+            })
             .collect::<Vec<_>>();
         Ok(CommandOutput {
             stdout: lines.join("\n"),
@@ -316,6 +336,209 @@ impl App {
                 created.project.name, created.project.id, created.ingest_key.secret
             ),
         })
+    }
+
+    async fn usage_events(&self, events: UsageEventsArgs) -> anyhow::Result<CommandOutput> {
+        let config = load_config(&self.config_path)?;
+        let profile = active_instance(&config)?;
+        let token = profile
+            .operator_token
+            .as_deref()
+            .context(
+                "operator token is not configured for the active instance; run `fantasma auth login --instance <name> --token <operator-token>`",
+            )?;
+        let url =
+            api_url(&profile.api_base_url, "v1/usage/events").context("build usage events url")?;
+
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token)
+            .query(&[
+                ("start", events.start.as_str()),
+                ("end", events.end.as_str()),
+            ])
+            .send()
+            .await
+            .context("load usage events")?;
+        ensure_success(response.status(), "load usage events")?;
+        let body = response.text().await.context("read usage events body")?;
+        if events.output.json {
+            return Ok(CommandOutput { stdout: body });
+        }
+
+        let response: UsageEventsResponse =
+            serde_json::from_str(&body).context("decode usage events body")?;
+
+        Ok(render_usage_events_output(response))
+    }
+
+    async fn delete_project(&self, project: Option<Uuid>) -> anyhow::Result<CommandOutput> {
+        let config = load_config(&self.config_path)?;
+        let instance = active_instance_name(&config)?.to_owned();
+        let project_id = resolve_project_for_command(&config, &instance, project)?;
+        let profile = active_instance(&config)?;
+        let token = profile
+            .operator_token
+            .as_deref()
+            .context(
+                "operator token is not configured for the active instance; run `fantasma auth login --instance <name> --token <operator-token>`",
+            )?;
+        let url = api_url(&profile.api_base_url, &format!("v1/projects/{project_id}"))
+            .context("build project delete url")?;
+        let response = self
+            .client
+            .delete(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("delete project")?;
+        ensure_success(response.status(), "delete project")?;
+        let body = response
+            .text()
+            .await
+            .context("read project deletion body")?;
+        let deletion: ProjectDeletionEnvelope =
+            serde_json::from_str(&body).context("decode project deletion body")?;
+        Ok(render_deletion_output(
+            deletion.deletion,
+            ReadOutputArgs::default(),
+            Some("project purge queued"),
+            Some(body),
+        ))
+    }
+
+    async fn list_project_deletions(
+        &self,
+        project: Option<Uuid>,
+        output: ReadOutputArgs,
+    ) -> anyhow::Result<CommandOutput> {
+        let config = load_config(&self.config_path)?;
+        let instance = active_instance_name(&config)?.to_owned();
+        let project_id = resolve_project_for_command(&config, &instance, project)?;
+        let profile = active_instance(&config)?;
+        let token = profile
+            .operator_token
+            .as_deref()
+            .context(
+                "operator token is not configured for the active instance; run `fantasma auth login --instance <name> --token <operator-token>`",
+            )?;
+        let url = api_url(
+            &profile.api_base_url,
+            &format!("v1/projects/{project_id}/deletions"),
+        )
+        .context("build project deletion list url")?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("list project deletions")?;
+        ensure_success(response.status(), "list project deletions")?;
+        let body = response
+            .text()
+            .await
+            .context("read project deletion list body")?;
+        if output.json {
+            return Ok(CommandOutput { stdout: body });
+        }
+        let listed: ProjectDeletionListResponse =
+            serde_json::from_str(&body).context("decode project deletion list body")?;
+        let lines = listed
+            .deletions
+            .into_iter()
+            .map(format_deletion_text_line)
+            .collect::<Vec<_>>();
+        Ok(CommandOutput {
+            stdout: lines.join("\n"),
+        })
+    }
+
+    async fn get_project_deletion(
+        &self,
+        args: ProjectDeletionGetArgs,
+    ) -> anyhow::Result<CommandOutput> {
+        let config = load_config(&self.config_path)?;
+        let instance = active_instance_name(&config)?.to_owned();
+        let project_id = resolve_project_for_command(&config, &instance, args.project)?;
+        let profile = active_instance(&config)?;
+        let token = profile
+            .operator_token
+            .as_deref()
+            .context(
+                "operator token is not configured for the active instance; run `fantasma auth login --instance <name> --token <operator-token>`",
+            )?;
+        let url = api_url(
+            &profile.api_base_url,
+            &format!("v1/projects/{project_id}/deletions/{}", args.deletion_id),
+        )
+        .context("build project deletion url")?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("get project deletion")?;
+        ensure_success(response.status(), "get project deletion")?;
+        let body = response
+            .text()
+            .await
+            .context("read project deletion body")?;
+        let deletion: ProjectDeletionEnvelope =
+            serde_json::from_str(&body).context("decode project deletion body")?;
+        Ok(render_deletion_output(
+            deletion.deletion,
+            args.output,
+            None,
+            Some(body),
+        ))
+    }
+
+    async fn create_range_deletion(
+        &self,
+        args: ProjectRangeDeleteArgs,
+    ) -> anyhow::Result<CommandOutput> {
+        let config = load_config(&self.config_path)?;
+        let instance = active_instance_name(&config)?.to_owned();
+        let project_id = resolve_project_for_command(&config, &instance, args.project)?;
+        let profile = active_instance(&config)?;
+        let token = profile
+            .operator_token
+            .as_deref()
+            .context(
+                "operator token is not configured for the active instance; run `fantasma auth login --instance <name> --token <operator-token>`",
+            )?;
+        let url = api_url(
+            &profile.api_base_url,
+            &format!("v1/projects/{project_id}/deletions"),
+        )
+        .context("build range deletion url")?;
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .json(&CreateRangeDeletionRequest {
+                start_at: args.start_at,
+                end_before: args.end_before,
+                event: args.event,
+                filters: parse_key_value_pairs(&args.filters, "filter")?,
+                properties: parse_key_value_pairs(&args.properties, "property")?,
+            })
+            .send()
+            .await
+            .context("create range deletion")?;
+        ensure_success(response.status(), "create range deletion")?;
+        let body = response.text().await.context("read range deletion body")?;
+        let deletion: ProjectDeletionEnvelope =
+            serde_json::from_str(&body).context("decode range deletion body")?;
+        Ok(render_deletion_output(
+            deletion.deletion,
+            args.output,
+            Some("range deletion queued"),
+            Some(body),
+        ))
     }
 
     async fn list_keys(
@@ -905,6 +1128,7 @@ struct KeyListResponse {
 struct ProjectPayload {
     id: Uuid,
     name: String,
+    state: String,
     created_at: String,
 }
 
@@ -922,6 +1146,45 @@ struct KeyMetadata {
     name: String,
     kind: String,
     prefix: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateRangeDeletionRequest {
+    start_at: String,
+    end_before: String,
+    event: Option<String>,
+    filters: std::collections::BTreeMap<String, String>,
+    properties: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectDeletionEnvelope {
+    deletion: ProjectDeletionPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectDeletionListResponse {
+    deletions: Vec<ProjectDeletionPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectDeletionPayload {
+    id: Uuid,
+    project_id: Uuid,
+    project_name: String,
+    kind: String,
+    status: String,
+    scope: Option<serde_json::Value>,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    deleted_raw_events: i64,
+    deleted_sessions: i64,
+    rebuilt_installs: i64,
+    rebuilt_days: i64,
+    rebuilt_hours: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1127,16 +1390,129 @@ fn render_event_catalog_output(body: String, json_output: bool) -> anyhow::Resul
     })
 }
 
+fn render_usage_events_output(response: UsageEventsResponse) -> CommandOutput {
+    let mut lines = vec![format!(
+        "events processed\t{}",
+        response.total_events_processed
+    )];
+
+    for project_events in response.projects {
+        lines.push(format!(
+            "{}\t{}\t{}\t{}",
+            project_events.project.id,
+            project_events.project.name,
+            project_events
+                .project
+                .created_at
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+            project_events.events_processed
+        ));
+    }
+
+    CommandOutput {
+        stdout: lines.join("\n"),
+    }
+}
+
 fn parse_filters(filters: &[String]) -> anyhow::Result<Vec<(String, String)>> {
-    filters
+    Ok(parse_key_value_pairs(filters, "filter")?
+        .into_iter()
+        .collect())
+}
+
+fn parse_key_value_pairs(
+    values: &[String],
+    kind: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    values
         .iter()
-        .map(|filter| {
-            let (key, value) = filter
+        .map(|value| {
+            let (key, parsed) = value
                 .split_once('=')
-                .with_context(|| format!("invalid filter '{filter}', expected key=value"))?;
-            Ok((key.to_owned(), value.to_owned()))
+                .with_context(|| format!("invalid {kind} '{value}', expected key=value"))?;
+            Ok((key.to_owned(), parsed.to_owned()))
         })
         .collect()
+}
+
+fn format_deletion_text_line(deletion: ProjectDeletionPayload) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}",
+        deletion.id, deletion.kind, deletion.status, deletion.project_name, deletion.created_at
+    )
+}
+
+fn render_deletion_output(
+    deletion: ProjectDeletionPayload,
+    output: ReadOutputArgs,
+    prefix: Option<&str>,
+    json_body: Option<String>,
+) -> CommandOutput {
+    if output.json {
+        return CommandOutput {
+            stdout: json_body.unwrap_or_else(|| {
+                serde_json::to_string(&serde_json::json!({
+                    "deletion": {
+                        "id": deletion.id,
+                        "project_id": deletion.project_id,
+                        "project_name": deletion.project_name,
+                        "kind": deletion.kind,
+                        "status": deletion.status,
+                        "scope": deletion.scope,
+                        "created_at": deletion.created_at,
+                        "started_at": deletion.started_at,
+                        "finished_at": deletion.finished_at,
+                        "error_code": deletion.error_code,
+                        "error_message": deletion.error_message,
+                        "deleted_raw_events": deletion.deleted_raw_events,
+                        "deleted_sessions": deletion.deleted_sessions,
+                        "rebuilt_installs": deletion.rebuilt_installs,
+                        "rebuilt_days": deletion.rebuilt_days,
+                        "rebuilt_hours": deletion.rebuilt_hours
+                    }
+                }))
+                .expect("serialize deletion output")
+            }),
+        };
+    }
+
+    let mut lines = Vec::new();
+    if let Some(prefix) = prefix {
+        lines.push(prefix.to_owned());
+    }
+    lines.push(format!("deletion id: {}", deletion.id));
+    lines.push(format!("project id: {}", deletion.project_id));
+    lines.push(format!("project name: {}", deletion.project_name));
+    lines.push(format!("kind: {}", deletion.kind));
+    lines.push(format!("status: {}", deletion.status));
+    lines.push(format!("created_at: {}", deletion.created_at));
+    if let Some(started_at) = deletion.started_at {
+        lines.push(format!("started_at: {started_at}"));
+    }
+    if let Some(finished_at) = deletion.finished_at {
+        lines.push(format!("finished_at: {finished_at}"));
+    }
+    if let Some(error_code) = deletion.error_code {
+        lines.push(format!("error_code: {error_code}"));
+    }
+    if let Some(error_message) = deletion.error_message {
+        lines.push(format!("error_message: {error_message}"));
+    }
+    lines.push(format!(
+        "deleted_raw_events: {}",
+        deletion.deleted_raw_events
+    ));
+    lines.push(format!("deleted_sessions: {}", deletion.deleted_sessions));
+    lines.push(format!("rebuilt_installs: {}", deletion.rebuilt_installs));
+    lines.push(format!("rebuilt_days: {}", deletion.rebuilt_days));
+    lines.push(format!("rebuilt_hours: {}", deletion.rebuilt_hours));
+    if let Some(scope) = deletion.scope {
+        lines.push(format!("scope: {}", scope));
+    }
+
+    CommandOutput {
+        stdout: lines.join("\n"),
+    }
 }
 
 #[derive(Debug, Deserialize)]
