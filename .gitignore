@@ -5,3 +5,6 @@
 /.idea
 /.vscode
 /Cargo.lock
+/.env.production
+/.env.demo
+/.env.local

@@ -227,6 +227,58 @@ behind from earlier local runs, reclaim them explicitly with:
 ./scripts/docker-reclaim.sh
 ```
 
+## Git-Backed Host Deploys
+
+For the live single-host deployment, keep the host checkout as a real git clone
+and deploy pinned commits, not copied files and not a mutable branch tip.
+
+Recommended rule:
+
+- bootstrap the host once into a git-backed checkout
+- keep `.env.production` and `.env.demo` on the host as untracked local files
+- deploy a specific commit SHA in detached-HEAD mode
+- run the prod and demo Compose updates from that pinned revision
+
+First-time host bootstrap from a local checkout:
+
+```bash
+./scripts/bootstrap-host-checkout.sh --host rui@your-host
+```
+
+The bootstrap helper defaults to:
+
+- target dir `/home/rui/fantasma`
+- repo URL `https://github.com/RuiAAPeres/fantasma.git`
+- ref `HEAD` from the local checkout that launched the script
+
+If the target directory already exists but is not a git repo, the helper moves
+it aside to a timestamped backup, clones a fresh checkout, restores host-local
+`.env*` files, and checks out the pinned commit.
+
+Normal deploy from a local checkout:
+
+```bash
+./scripts/deploy-host.sh --host rui@your-host
+```
+
+By default the deploy helper resolves the local checkout `HEAD` commit SHA and
+deploys exactly that revision on the host. Override it explicitly when needed:
+
+```bash
+./scripts/deploy-host.sh --host rui@your-host --ref <commit-sha>
+```
+
+Under the hood the deploy helper:
+
+- runs `git fetch --prune origin`
+- runs `git checkout --detach <commit-sha>`
+- rebuilds and recreates `fantasma-prod`
+- rebuilds and recreates `fantasma-demo`
+
+That keeps early-stage iteration safe even with frequent changes: the deployed
+host always points at one concrete revision, and rollback is just another
+deploy with an older commit SHA.
+
 ## CLI Access
 
 Run the CLI directly from the workspace:
