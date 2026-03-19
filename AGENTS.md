@@ -118,6 +118,7 @@ Fantasma now expects Codex agents to use the installed `superpowers` skills when
 - Do not use git worktrees in this repository. Work in the current checkout even if a generic skill suggests creating a worktree.
 - Keep superpowers usage pragmatic: choose the smallest applicable workflow, but do not skip a clearly relevant skill.
 - Treat this repository as active development and not deployed anywhere unless the user explicitly says otherwise.
+- When the user confirms a checkout is deployed somewhere, treat deployed-file edits as commit-first changes: edit locally, commit locally, push, and then update the deployed checkout from git. Do not patch deployed files over SSH or copy files straight onto the host except during an explicit emergency recovery.
 - Do not raise review findings about backward compatibility, upgrade paths, migration backfills, legacy client support, or existing production databases unless the user explicitly asks for deployment, rollout, upgrade, or compatibility review.
 - Breaking changes are expected in this stage. Review the current intended contract and code correctness, not hypothetical deployed history.
 
