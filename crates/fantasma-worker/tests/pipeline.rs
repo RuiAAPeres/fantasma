@@ -2533,8 +2533,11 @@ async fn pipeline_readiness_poll_for_grouped_session_counts_stays_200_and_conver
         Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
     );
     let provisioned = provision_project(api.clone()).await;
-    let days = 10_u64;
-    let installs_per_day = 120_u64;
+    // The adjacent catch-up regression already proves grouped session queries stay 200 while the
+    // worker advances bounded batches. Keep this readiness-convergence case smaller so it remains
+    // inside the CI timeout budget under workspace-level contention.
+    let days = 4_u64;
+    let installs_per_day = 24_u64;
     let expected_total = days * installs_per_day;
 
     for day_offset in 0..days as usize {
