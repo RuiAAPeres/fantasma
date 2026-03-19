@@ -1,4 +1,11 @@
 services:
+  fantasma-ingest:
+    networks:
+      default: {}
+      proxy:
+        aliases:
+          - ${FANTASMA_INGEST_PROXY_NETWORK_ALIAS:-fantasma-ingest}
+
   fantasma-api:
     networks:
       default: {}
