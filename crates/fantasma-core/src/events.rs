@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-const MAX_BATCH_SIZE: usize = 100;
+const MAX_BATCH_SIZE: usize = 200;
 const MAX_EVENT_BYTES: usize = 8 * 1024;
 const MAX_PROPERTIES_KEYS: usize = 2;
 

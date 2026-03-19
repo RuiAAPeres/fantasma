@@ -46,12 +46,15 @@ enter the local queue. The SDK adds `platform`, `app_version`, and
 
 - Tracked events are persisted to SQLite before upload.
 - `writeKey` must be a project-scoped `ingest` key.
-- Events are uploaded in JSON batches to `POST /v1/events`.
+- Events are uploaded in JSON batches to `POST /v1/events`; the live SDK
+  defaults send up to 100 queued events per request against the server-side
+  200-event cap.
 - Successful `202 Accepted` responses delete uploaded rows from the queue.
 - Failed uploads leave rows in SQLite for later replay.
 - Malformed `202 Accepted` responses are treated as invalid responses and also leave rows queued.
 - `track(_:properties:)` throws when the SDK has not been configured.
 - `flush()` throws when the SDK has not been configured.
+- The SDK also attempts a periodic flush every 30 seconds when configured.
 - The SDK auto-populates `platform`, `app_version`, and `os_version` on each event.
 - Event properties remain explicit string-to-string context you pass in `track(_:properties:)`, and invalid property maps are rejected locally before persistence.
 - The SDK persists one local install identifier, reuses it on every event, and rotates it on `clear()` without mutating already queued rows.

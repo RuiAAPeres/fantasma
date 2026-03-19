@@ -24,13 +24,13 @@ struct FantasmaSDKInternalTests {
         #expect(rows.first?.createdAt == 1)
     }
 
-    @Test("uploader builds a 50 event batch and leaves remainder queued")
+    @Test("uploader builds a 100 event batch and leaves remainder queued")
     func uploaderBatching() async throws {
         let harness = TestHarness()
         defer { harness.cleanup() }
 
         let queue = try harness.makeQueue()
-        for index in 0..<55 {
+        for index in 0..<105 {
             try await queue.enqueue(
                 payload: try harness.payload(event: "button_pressed_\(index)", installId: "install-a"),
                 createdAt: Int64(index),
@@ -39,10 +39,18 @@ struct FantasmaSDKInternalTests {
         }
 
         let uploader = EventUploader(queue: queue, transport: RecordingTransport())
-        let batch = try requireValue(await uploader.makeBatch(limit: 50))
+        let batch = try requireValue(await uploader.makeBatch(limit: 100))
 
-        #expect(batch.rowIDs.count == 50)
-        #expect(try await queue.count() == 55)
+        #expect(batch.rowIDs.count == 100)
+        #expect(try await queue.count() == 105)
+    }
+
+    @Test("live dependencies use 30 second periodic flushes and 100 event uploads")
+    func liveDependenciesDefaults() {
+        let dependencies = FantasmaDependencies.live()
+
+        #expect(dependencies.timerInterval == .seconds(30))
+        #expect(dependencies.uploadBatchSize == 100)
     }
 }
 
@@ -973,7 +981,7 @@ private struct TestHarness {
 
     func installSharedCore(
         transport: FantasmaTransport,
-        uploadBatchSize: Int = 50,
+        uploadBatchSize: Int = 100,
         beforeEnqueue: @escaping @Sendable () async -> Void = {},
         afterBuildBatch: @escaping @Sendable () async -> Void = {},
         beforeUploadBoundary: @escaping @Sendable () async -> Void = {}

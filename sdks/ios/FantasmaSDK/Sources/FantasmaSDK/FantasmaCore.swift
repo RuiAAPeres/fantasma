@@ -182,8 +182,8 @@ struct FantasmaDependencies: Sendable {
                 return "\(version.majorVersion).\(version.minorVersion)"
             },
             newIdentifier: { UUID().uuidString.lowercased() },
-            timerInterval: .seconds(10),
-            uploadBatchSize: 50,
+            timerInterval: .seconds(30),
+            uploadBatchSize: 100,
             beforeEnqueue: {},
             beforeUploadBoundary: {}
         )

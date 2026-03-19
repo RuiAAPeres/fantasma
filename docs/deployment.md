@@ -372,7 +372,9 @@ READ_KEY="$(printf '%s' "$PROVISIONED" | python3 -c 'import json,sys; print(json
 Use the ingest key only with `POST /v1/events`. Use the read key only with
 `/v1/metrics/*`, including `GET /v1/metrics/events`,
 `GET /v1/metrics/events/catalog`, and `GET /v1/metrics/events/top`. Keep the
-script for automation; prefer the CLI for manual operator work.
+script for automation; prefer the CLI for manual operator work. `POST /v1/events`
+accepts at most 200 events per request and still enforces the ingest payload
+size limit separately.
 
 ## Smoke Verification
 

@@ -42,7 +42,7 @@ curl / SDK
 Responsibilities:
 
 - authenticate project-scoped ingest keys
-- validate incoming event batches
+- validate incoming event batches up to 200 events per request
 - batch insert raw events into Postgres
 - acknowledge accepted events with `202 Accepted`
 
@@ -307,8 +307,8 @@ Current iOS SDK shape:
 
 Current upload triggers:
 
-- every 10 seconds
-- when the local queue reaches 50 events
+- every 30 seconds
+- when the local queue reaches 100 events
 - when `flush()` is called
 - when the app enters background
 

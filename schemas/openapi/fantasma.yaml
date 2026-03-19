@@ -26,7 +26,7 @@ paths:
         - ingest
       summary: Ingest a batch of mobile events
       operationId: ingestEvents
-      description: Accepts only project-scoped `ingest` keys.
+      description: Accepts only project-scoped `ingest` keys and up to 200 events per batch.
       security:
         - ProjectKeyHeader: []
       requestBody:
@@ -1107,7 +1107,7 @@ components:
         events:
           type: array
           minItems: 1
-          maxItems: 100
+          maxItems: 200
           items:
             $ref: '#/components/schemas/EventPayload'
     EventValidationIssue:

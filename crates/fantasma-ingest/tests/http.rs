@@ -17,6 +17,20 @@ async fn response_json(response: Response) -> serde_json::Value {
     .expect("decode response body")
 }
 
+fn event_batch_body(count: usize) -> String {
+    serde_json::json!({
+        "events": (0..count)
+            .map(|index| serde_json::json!({
+                "event": "app_open",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "install_id": format!("install-{index}"),
+                "platform": "ios"
+            }))
+            .collect::<Vec<_>>()
+    })
+    .to_string()
+}
+
 struct ProvisionedProject {
     ingest_key: String,
     read_key: String,
@@ -216,5 +230,60 @@ async fn ingest_accepts_valid_batches(pool: PgPool) {
     assert_eq!(
         response_json(response).await,
         serde_json::json!({ "accepted": 1 })
+    );
+}
+
+#[sqlx::test]
+async fn ingest_accepts_batches_up_to_two_hundred_events(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let provisioned = provision_project(&pool).await;
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", provisioned.ingest_key)
+                .body(Body::from(event_batch_body(200)))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({ "accepted": 200 })
+    );
+}
+
+#[sqlx::test]
+async fn ingest_rejects_batches_above_two_hundred_events(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let provisioned = provision_project(&pool).await;
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", provisioned.ingest_key)
+                .body(Body::from(event_batch_body(201)))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "errors": [
+                {
+                    "index": 0,
+                    "message": "batch may contain at most 200 events"
+                }
+            ]
+        })
     );
 }
