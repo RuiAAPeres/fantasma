@@ -233,6 +233,24 @@ The harness starts the benchmark stack in its own Compose project, renders a tem
 - one JSON and one Markdown file per scenario run
 - `summary.json`
 - `summary.md`
+
+## Demo Stack Burst Workflow
+
+When the goal is to measure realistic customer-facing freshness on an already-running demo stack, do not use the isolated `fantasma-bench` Compose path. That path binds the benchmark stack to the local benchmark ports and will collide with already-running services on the host.
+
+Use the checked-in remote workflow instead:
+
+```bash
+./scripts/run-demo-stack-burst-bench.sh --host user@example-host
+```
+
+That wrapper copies [demo-stack-burst-bench.py](/Users/ruiperes/Code/fantasma/scripts/demo-stack-burst-bench.py) to the remote host, reads the remote `.env.demo`, derives the demo loopback ports from `FANTASMA_API_PORTS` and `FANTASMA_INGEST_PORTS`, and benchmarks the three realistic `300`-event burst scenarios directly against the existing demo stack:
+
+- `burst-readiness-300-installs-x1`
+- `burst-readiness-150-installs-x2`
+- `burst-readiness-100-installs-x3`
+
+This is the benchmark path to use for real demo-stack freshness checks. Keep the isolated `fantasma-bench slo` Compose path for local benchmark-stack runs and for the larger stress suites.
 - checkpoint sidecars for representative and mixed-repair scenarios
 - Stage B sidecars for representative, mixed-repair, and stress scenarios when trace data is present
 

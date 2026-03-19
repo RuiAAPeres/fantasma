@@ -80,7 +80,7 @@ Expected:
 
 Document:
 - the production override file
-- the Hetzner-style shared `proxy` network usage
+- the shared external `proxy` network usage
 - the production bring-up command using both Compose files
 - the expectation that Caddy routes `api.usefantasma.com` to alias `fantasma-api`
 

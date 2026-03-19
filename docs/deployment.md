@@ -631,3 +631,20 @@ curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&g
 - architecture and data flow: [`docs/architecture.md`](architecture.md)
 - benchmark-specific commands: [`docs/performance.md`](performance.md)
 - iOS demo walkthrough: [`apps/demo-ios/README.md`](../apps/demo-ios/README.md)
+## Demo Stack Burst Benchmarks
+
+Use the checked-in wrapper below when you want to benchmark realistic burst freshness against an already-running remote demo stack:
+
+```bash
+./scripts/run-demo-stack-burst-bench.sh --host user@example-host
+```
+
+Behavior:
+
+- copies the checked-in Python helper to the remote host temporarily
+- sources the remote `.env.demo`
+- derives the demo loopback ports from `FANTASMA_API_PORTS` and `FANTASMA_INGEST_PORTS`
+- benchmarks the `300`-event burst scenarios directly against `fantasma-demo`
+- removes the remote temp helper on exit
+
+This path exists because the normal isolated `fantasma-bench` Compose stack binds to the benchmark loopback ports and can collide with already-running services on the same host. For live freshness measurements against an existing demo stack, use the wrapper above instead of the isolated benchmark stack.
