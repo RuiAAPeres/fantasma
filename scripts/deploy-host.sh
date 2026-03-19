@@ -6,7 +6,7 @@ HOST=""
 TARGET_DIR="/home/rui/fantasma"
 REF=""
 DEPLOY_PROD=1
-DEPLOY_DEMO=1
+DEPLOY_DEMO=0
 
 usage() {
   cat <<'EOF'
@@ -16,6 +16,8 @@ Options:
   --host USER@HOST   SSH target for the deployment host
   --target-dir DIR   Remote checkout path (default: /home/rui/fantasma)
   --ref REF          Commit SHA, tag, or ref to deploy (default: local HEAD)
+  --with-demo        Also deploy the fantasma-demo stack
+  --demo-only        Deploy only the fantasma-demo stack
   --skip-prod        Do not deploy the fantasma-prod stack
   --skip-demo        Do not deploy the fantasma-demo stack
   --help             Show this message
@@ -42,6 +44,15 @@ while (($# > 0)); do
     --ref)
       REF="$2"
       shift 2
+      ;;
+    --with-demo)
+      DEPLOY_DEMO=1
+      shift
+      ;;
+    --demo-only)
+      DEPLOY_PROD=0
+      DEPLOY_DEMO=1
+      shift
       ;;
     --skip-prod)
       DEPLOY_PROD=0
@@ -73,7 +84,7 @@ if [[ -z "$HOST" ]]; then
 fi
 
 if [[ "$DEPLOY_PROD" -eq 0 && "$DEPLOY_DEMO" -eq 0 ]]; then
-  echo "nothing to deploy: both --skip-prod and --skip-demo were set" >&2
+  echo "nothing to deploy: both target stacks were disabled" >&2
   exit 1
 fi
 

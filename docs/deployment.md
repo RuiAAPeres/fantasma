@@ -272,12 +272,22 @@ Under the hood the deploy helper:
 
 - runs `git fetch --prune origin`
 - runs `git checkout --detach <commit-sha>`
-- rebuilds and recreates `fantasma-prod`
-- rebuilds and recreates `fantasma-demo`
+- rebuilds and recreates `fantasma-prod` by default
+- rebuilds and recreates `fantasma-demo` only when explicitly requested
 
 That keeps early-stage iteration safe even with frequent changes: the deployed
 host always points at one concrete revision, and rollback is just another
 deploy with an older commit SHA.
+
+Demo deploy control:
+
+```bash
+./scripts/deploy-host.sh --host rui@your-host --with-demo
+./scripts/deploy-host.sh --host rui@your-host --demo-only
+```
+
+Use the default prod-only path unless the change actually affects the demo
+stack.
 
 ## CLI Access
 
