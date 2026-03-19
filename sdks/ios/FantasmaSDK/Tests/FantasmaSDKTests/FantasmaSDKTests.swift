@@ -699,19 +699,20 @@ struct FantasmaSDKBehaviorTests {
         #expect(try await queue.count() == 0)
 
         try await Fantasma.track("new_event")
-        let secondFlush = Task {
-            try await Fantasma.flush()
-        }
-        try await waitUntil(timeoutNanoseconds: 250_000_000) {
-            await transport.requests().count == 2
-        }
+        try await transport.waitUntilSendStarts(count: 2)
         let requests = await transport.requests()
         #expect(requests[0].url?.absoluteString == localhostURL().appendingPathComponent("v1/events").absoluteString)
         #expect(requests[0].value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_test")
         #expect(requests[1].url?.absoluteString == replacementURL().appendingPathComponent("v1/events").absoluteString)
         #expect(requests[1].value(forHTTPHeaderField: "X-Fantasma-Key") == "fg_ing_next")
         await transport.release()
-        try await secondFlush.value
+        try await waitUntil {
+            do {
+                return try await queue.count() == 0
+            } catch {
+                return false
+            }
+        }
     }
 
     @Test("reconfiguring during batch assembly discards the prepared old-destination batch before it uploads")
@@ -1011,37 +1012,47 @@ private actor SuspensionGate {
 
 private actor SuspendedTransport: FantasmaTransport {
     private var capturedRequests: [URLRequest] = []
-    private var didStartSend = false
-    private var sendStartedContinuation: CheckedContinuation<Void, Error>?
-    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var sendCount = 0
+    private var sendStartedWaiters: [(targetCount: Int, continuation: CheckedContinuation<Void, Error>)] = []
+    private var releaseContinuations: [CheckedContinuation<Void, Never>] = []
 
     func requests() -> [URLRequest] {
         capturedRequests
     }
 
     func waitUntilSendStarts() async throws {
-        if didStartSend {
+        try await waitUntilSendStarts(count: 1)
+    }
+
+    func waitUntilSendStarts(count targetCount: Int) async throws {
+        if sendCount >= targetCount {
             return
         }
 
         try await withCheckedThrowingContinuation { continuation in
-            sendStartedContinuation = continuation
+            sendStartedWaiters.append((targetCount, continuation))
         }
     }
 
     func release() {
-        releaseContinuation?.resume()
-        releaseContinuation = nil
+        guard !releaseContinuations.isEmpty else {
+            return
+        }
+        let continuation = releaseContinuations.removeFirst()
+        continuation.resume()
     }
 
     func send(request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         capturedRequests.append(request)
-        didStartSend = true
-        sendStartedContinuation?.resume()
-        sendStartedContinuation = nil
+        sendCount += 1
+        let ready = sendStartedWaiters.filter { $0.targetCount <= sendCount }
+        sendStartedWaiters.removeAll { $0.targetCount <= sendCount }
+        for waiter in ready {
+            waiter.continuation.resume()
+        }
 
         await withCheckedContinuation { continuation in
-            releaseContinuation = continuation
+            releaseContinuations.append(continuation)
         }
 
         return successResponse(accepted: 1)
