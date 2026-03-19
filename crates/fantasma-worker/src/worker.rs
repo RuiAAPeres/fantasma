@@ -850,7 +850,6 @@ async fn process_incremental_session_work_item(
             item.tail_session,
         )
         .await?;
-        refresh_project_processing_lease(pool, &lease).await?;
         verify_project_processing_lease_in_tx(&mut tx, &lease).await?;
         tx.commit().await.map_err(StoreError::from)?;
 
@@ -5354,6 +5353,50 @@ mod tests {
         .expect("count memberships");
 
         assert_eq!(memberships, 2);
+    }
+
+    #[sqlx::test]
+    async fn incremental_session_apply_does_not_need_extra_pool_connection_for_lease_refresh(
+        pool: PgPool,
+    ) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[
+                event("install-a", 1, 0, 0),
+                event("install-a", 1, 0, 10),
+                event("install-b", 1, 1, 0),
+                event("install-b", 1, 1, 10),
+                event("install-c", 1, 2, 0),
+                event("install-c", 1, 2, 10),
+                event("install-d", 1, 3, 0),
+                event("install-d", 1, 3, 10),
+            ],
+        )
+        .await
+        .expect("insert events");
+
+        let outcome = process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 4,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("process concurrent incremental batch");
+
+        assert_eq!(
+            outcome,
+            SessionBatchOutcome {
+                processed_events: 8,
+                advanced_offset: true,
+            }
+        );
     }
 
     #[sqlx::test]
