@@ -1,9 +1,10 @@
 # Performance
 
-Fantasma now treats derived-metrics benchmarking as four explicit local suites instead of one window-first benchmark identity:
+Fantasma now treats derived-metrics benchmarking as five explicit local suites instead of one window-first benchmark identity:
 
 - `representative`: realistic live append traffic from many installs sending small blobs over time
 - `mixed-repair`: the same live-shape traffic with a low late/out-of-order rate so repair-path regressions stay visible
+- `burst-readiness`: small realistic bursts that answer the customer question directly: "if a few hundred events land now, how long until sessions show up?"
 - `stress`: the old large append/backfill/repair windows, kept for ceiling and regression visibility
 - `reads-visibility`: grouped read-latency coverage, published separately from the worker-freshness gate
 
@@ -77,7 +78,7 @@ cargo run -p fantasma-bench -- \
 Supported SLO-specific overrides:
 
 - `--mode <iterative|publication>`
-- `--suite <representative|mixed-repair|stress|reads-visibility>`
+- `--suite <representative|mixed-repair|burst-readiness|stress|reads-visibility>`
 - `--scenario <key>`
 - `--publication-repetitions`
 - `--worker-session-batch-size`
@@ -96,6 +97,12 @@ Mixed-repair guardrail:
 
 - `live-append-plus-light-repair`
 - `live-append-plus-repair-hot-project`
+
+Burst readiness:
+
+- `burst-readiness-300-installs-x1`
+- `burst-readiness-150-installs-x2`
+- `burst-readiness-100-installs-x3`
 
 Stress coverage:
 
@@ -150,6 +157,14 @@ Publication checkpoint policy:
 - every offline-flush blob is sampled
 - normal append blobs sample every `20th` append blob
 
+Burst-readiness uses the same query/readiness machinery, but the upload schedule is deliberately tiny and exact:
+
+- `burst-readiness-300-installs-x1`: `300` installs each send `1` event, chunked as `3 x 100` ingest requests
+- `burst-readiness-150-installs-x2`: `150` installs each send `2` events, chunked as `3 x 100` ingest requests
+- `burst-readiness-100-installs-x3`: `100` installs each send `3` events, chunked as `3 x 100` ingest requests
+
+These runs are not the worker default gate. They exist to answer a more realistic product-freshness question than the large stress windows.
+
 Stress keeps the previous large append/backfill/repair windows for ceiling visibility. Reads-visibility keeps the grouped and ungrouped public query matrix for query-path visibility.
 
 ## Readiness And Reporting
@@ -199,7 +214,7 @@ Secondary worker context:
 - dominant Stage B phase under mixed repair
 - end-of-scenario readiness after the upload schedule drains
 
-`stress` remains non-default ceiling coverage. `reads-visibility` remains non-default query coverage.
+`burst-readiness` remains a non-default customer-freshness probe. `stress` remains non-default ceiling coverage. `reads-visibility` remains non-default query coverage.
 
 ## Publication Rule
 

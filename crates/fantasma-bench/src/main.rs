@@ -333,6 +333,7 @@ impl SloWindow {
 enum SloSuite {
     Representative,
     MixedRepair,
+    BurstReadiness,
     Stress,
     ReadsVisibility,
 }
@@ -342,6 +343,7 @@ impl SloSuite {
         match self {
             Self::Representative => "representative",
             Self::MixedRepair => "mixed-repair",
+            Self::BurstReadiness => "burst-readiness",
             Self::Stress => "stress",
             Self::ReadsVisibility => "reads-visibility",
         }
@@ -354,6 +356,9 @@ enum SloScenarioKind {
     LiveAppendOfflineFlush,
     LiveAppendPlusLightRepair,
     LiveAppendPlusRepairHotProject,
+    BurstReadiness300InstallsX1,
+    BurstReadiness150InstallsX2,
+    BurstReadiness100InstallsX3,
     StressAppend,
     StressBackfill,
     StressRepair,
@@ -367,6 +372,9 @@ impl SloScenarioKind {
             Self::LiveAppendPlusLightRepair | Self::LiveAppendPlusRepairHotProject => {
                 SloSuite::MixedRepair
             }
+            Self::BurstReadiness300InstallsX1
+            | Self::BurstReadiness150InstallsX2
+            | Self::BurstReadiness100InstallsX3 => SloSuite::BurstReadiness,
             Self::StressAppend | Self::StressBackfill | Self::StressRepair => SloSuite::Stress,
             Self::ReadsVisibility => SloSuite::ReadsVisibility,
         }
@@ -378,6 +386,9 @@ impl SloScenarioKind {
             Self::LiveAppendOfflineFlush => "live-append-offline-flush",
             Self::LiveAppendPlusLightRepair => "live-append-plus-light-repair",
             Self::LiveAppendPlusRepairHotProject => "live-append-plus-repair-hot-project",
+            Self::BurstReadiness300InstallsX1 => "burst-readiness-300-installs-x1",
+            Self::BurstReadiness150InstallsX2 => "burst-readiness-150-installs-x2",
+            Self::BurstReadiness100InstallsX3 => "burst-readiness-100-installs-x3",
             Self::StressAppend => "append",
             Self::StressBackfill => "backfill",
             Self::StressRepair => "repair",
@@ -400,7 +411,10 @@ impl SloScenarioDefinition {
             SloScenarioKind::LiveAppendSmallBlobs
             | SloScenarioKind::LiveAppendOfflineFlush
             | SloScenarioKind::LiveAppendPlusLightRepair
-            | SloScenarioKind::LiveAppendPlusRepairHotProject => self.kind.key().to_owned(),
+            | SloScenarioKind::LiveAppendPlusRepairHotProject
+            | SloScenarioKind::BurstReadiness300InstallsX1
+            | SloScenarioKind::BurstReadiness150InstallsX2
+            | SloScenarioKind::BurstReadiness100InstallsX3 => self.kind.key().to_owned(),
             SloScenarioKind::StressAppend
             | SloScenarioKind::StressBackfill
             | SloScenarioKind::StressRepair => {
@@ -757,6 +771,10 @@ struct SloExpectationDelta {
     total_duration_seconds: u64,
     total_new_installs: u64,
     total_active_installs: u64,
+    pro_total_events: u64,
+    pro_total_sessions: u64,
+    pro_total_duration_seconds: u64,
+    pro_total_new_installs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1136,6 +1154,10 @@ struct SloExpectation {
     total_duration_seconds: u64,
     total_new_installs: u64,
     total_active_installs: u64,
+    pro_total_events: u64,
+    pro_total_sessions: u64,
+    pro_total_duration_seconds: u64,
+    pro_total_new_installs: u64,
     include_repair_late_events: bool,
 }
 
@@ -1146,6 +1168,10 @@ impl SloExpectation {
         self.total_duration_seconds += delta.total_duration_seconds;
         self.total_new_installs += delta.total_new_installs;
         self.total_active_installs += delta.total_active_installs;
+        self.pro_total_events += delta.pro_total_events;
+        self.pro_total_sessions += delta.pro_total_sessions;
+        self.pro_total_duration_seconds += delta.pro_total_duration_seconds;
+        self.pro_total_new_installs += delta.pro_total_new_installs;
     }
 }
 
@@ -1363,7 +1389,10 @@ async fn execute_slo_scenario(
         SloScenarioKind::LiveAppendSmallBlobs
         | SloScenarioKind::LiveAppendOfflineFlush
         | SloScenarioKind::LiveAppendPlusLightRepair
-        | SloScenarioKind::LiveAppendPlusRepairHotProject => {
+        | SloScenarioKind::LiveAppendPlusRepairHotProject
+        | SloScenarioKind::BurstReadiness300InstallsX1
+        | SloScenarioKind::BurstReadiness150InstallsX2
+        | SloScenarioKind::BurstReadiness100InstallsX3 => {
             run_live_slo_scenario(
                 &client,
                 &project,
@@ -1761,6 +1790,24 @@ fn slo_scenario_definitions(run_config: &SloRunConfig) -> Vec<SloScenarioDefinit
             window: SloWindow::Days30,
             repetitions: representative_repetitions(run_config),
         },
+        SloScenarioDefinition {
+            suite: SloSuite::BurstReadiness,
+            kind: SloScenarioKind::BurstReadiness300InstallsX1,
+            window: SloWindow::Days30,
+            repetitions: representative_repetitions(run_config),
+        },
+        SloScenarioDefinition {
+            suite: SloSuite::BurstReadiness,
+            kind: SloScenarioKind::BurstReadiness150InstallsX2,
+            window: SloWindow::Days30,
+            repetitions: representative_repetitions(run_config),
+        },
+        SloScenarioDefinition {
+            suite: SloSuite::BurstReadiness,
+            kind: SloScenarioKind::BurstReadiness100InstallsX3,
+            window: SloWindow::Days30,
+            repetitions: representative_repetitions(run_config),
+        },
     ];
 
     for window in [SloWindow::Days30, SloWindow::Days90, SloWindow::Days180] {
@@ -1828,6 +1875,7 @@ fn select_requested_slo_scenarios(
     let known_suites = [
         SloSuite::Representative,
         SloSuite::MixedRepair,
+        SloSuite::BurstReadiness,
         SloSuite::Stress,
         SloSuite::ReadsVisibility,
     ]
@@ -1902,6 +1950,7 @@ fn summarized_slo_suites(results: &[SloScenarioResult]) -> Vec<String> {
     for suite in [
         SloSuite::Representative,
         SloSuite::MixedRepair,
+        SloSuite::BurstReadiness,
         SloSuite::Stress,
         SloSuite::ReadsVisibility,
     ] {
@@ -1909,6 +1958,7 @@ fn summarized_slo_suites(results: &[SloScenarioResult]) -> Vec<String> {
             result.scenario.starts_with(match suite {
                 SloSuite::Representative => "live-append-",
                 SloSuite::MixedRepair => "live-append-plus-",
+                SloSuite::BurstReadiness => "burst-readiness-",
                 SloSuite::Stress => "stress-",
                 SloSuite::ReadsVisibility => "reads-visibility-",
             })
@@ -1938,6 +1988,17 @@ fn slo_base_expectation(window: SloWindow) -> SloExpectation {
             * SLO_SESSION_DURATION_SECONDS,
         total_new_installs: SLO_INSTALL_COUNT_PER_DAY as u64,
         total_active_installs: (window.days() * SLO_INSTALL_COUNT_PER_DAY) as u64,
+        pro_total_events: (window.days()
+            * install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "pro")
+            * SLO_EVENTS_PER_INSTALL_PER_DAY) as u64,
+        pro_total_sessions: (window.days()
+            * install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "pro"))
+            as u64,
+        pro_total_duration_seconds: (window.days()
+            * install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "pro"))
+            as u64
+            * SLO_SESSION_DURATION_SECONDS,
+        pro_total_new_installs: install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "pro") as u64,
         include_repair_late_events: false,
     }
 }
@@ -1946,12 +2007,17 @@ fn slo_expectation(scenario: &SloScenarioDefinition) -> SloExpectation {
     let mut expectation = slo_base_expectation(scenario.window);
 
     if matches!(scenario.kind, SloScenarioKind::StressRepair) {
-        let repaired_install_days = (scenario.window.days() * SLO_INSTALL_COUNT_PER_DAY
-            / SLO_REPAIR_INSTALL_MODULUS) as u64;
+        let repaired_install_days = repaired_install_days_for_plan(scenario.window, None) as u64;
+        let repaired_pro_install_days =
+            repaired_install_days_for_plan(scenario.window, Some("pro")) as u64;
         expectation.total_events +=
             repaired_install_days * SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY as u64;
         expectation.total_duration_seconds +=
             repaired_install_days * SLO_REPAIR_DURATION_DELTA_SECONDS;
+        expectation.pro_total_events +=
+            repaired_pro_install_days * SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY as u64;
+        expectation.pro_total_duration_seconds +=
+            repaired_pro_install_days * SLO_REPAIR_DURATION_DELTA_SECONDS;
         expectation.include_repair_late_events = true;
     }
 
@@ -2987,86 +3053,93 @@ async fn slo_queries_ready(
 
 fn expected_total_for_slo_query(
     query: &SloQuerySpec,
-    scenario: &SloScenarioDefinition,
+    _scenario: &SloScenarioDefinition,
     expectation: &SloExpectation,
 ) -> u64 {
     match query.expected_total {
         SloQueryExpectedTotal::Events(SloEventCountExpectation::All) => expectation.total_events,
         SloQueryExpectedTotal::Events(SloEventCountExpectation::FilteredByPlan { plan }) => {
-            filtered_event_total_for_slo_expectation(scenario, expectation, plan)
+            filtered_event_total_for_slo_expectation(expectation, plan)
         }
         SloQueryExpectedTotal::SessionsCount => expectation.total_sessions,
         SloQueryExpectedTotal::SessionsCountFilteredByPlan { plan } => {
-            filtered_session_count_for_slo_expectation(scenario, plan)
+            filtered_session_count_for_slo_expectation(expectation, plan)
         }
         SloQueryExpectedTotal::SessionsDurationTotal => expectation.total_duration_seconds,
         SloQueryExpectedTotal::SessionsDurationTotalFilteredByPlan { plan } => {
-            filtered_session_duration_total_for_slo_expectation(scenario, plan)
+            filtered_session_duration_total_for_slo_expectation(expectation, plan)
         }
         SloQueryExpectedTotal::SessionsNewInstalls => expectation.total_new_installs,
         SloQueryExpectedTotal::SessionsNewInstallsFilteredByPlan { plan } => {
-            filtered_session_new_installs_for_slo_expectation(plan)
+            filtered_session_new_installs_for_slo_expectation(expectation, plan)
         }
         SloQueryExpectedTotal::SessionsActiveInstalls => expectation.total_active_installs,
     }
 }
 
-fn filtered_event_total_for_slo_expectation(
-    scenario: &SloScenarioDefinition,
-    expectation: &SloExpectation,
-    plan: &str,
-) -> u64 {
-    let mut total = 0_u64;
-
-    for day_offset in 0..scenario.window.days() {
-        for install_index in 0..SLO_INSTALL_COUNT_PER_DAY {
-            if !slo_event_matches_plan(install_index, plan) {
-                continue;
-            }
-
-            total += SLO_EVENTS_PER_INSTALL_PER_DAY as u64;
-
-            if expectation.include_repair_late_events
-                && install_index % SLO_REPAIR_INSTALL_MODULUS
-                    == day_offset % SLO_REPAIR_INSTALL_MODULUS
-            {
-                total += SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY as u64;
-            }
-        }
+fn filtered_event_total_for_slo_expectation(expectation: &SloExpectation, plan: &str) -> u64 {
+    match plan {
+        "pro" => expectation.pro_total_events,
+        _ => 0,
     }
-
-    total
 }
 
-fn filtered_session_count_for_slo_expectation(scenario: &SloScenarioDefinition, plan: &str) -> u64 {
-    let mut total = 0_u64;
-
-    for _day_offset in 0..scenario.window.days() {
-        for install_index in 0..SLO_INSTALL_COUNT_PER_DAY {
-            if slo_event_matches_plan(install_index, plan) {
-                total += 1;
-            }
-        }
+fn filtered_session_count_for_slo_expectation(expectation: &SloExpectation, plan: &str) -> u64 {
+    match plan {
+        "pro" => expectation.pro_total_sessions,
+        _ => 0,
     }
-
-    total
 }
 
 fn filtered_session_duration_total_for_slo_expectation(
-    scenario: &SloScenarioDefinition,
+    expectation: &SloExpectation,
     plan: &str,
 ) -> u64 {
-    filtered_session_count_for_slo_expectation(scenario, plan) * SLO_SESSION_DURATION_SECONDS
+    match plan {
+        "pro" => expectation.pro_total_duration_seconds,
+        _ => 0,
+    }
 }
 
-fn filtered_session_new_installs_for_slo_expectation(plan: &str) -> u64 {
-    (0..SLO_INSTALL_COUNT_PER_DAY)
-        .filter(|install_index| slo_event_matches_plan(*install_index, plan))
-        .count() as u64
+fn filtered_session_new_installs_for_slo_expectation(
+    expectation: &SloExpectation,
+    plan: &str,
+) -> u64 {
+    match plan {
+        "pro" => expectation.pro_total_new_installs,
+        _ => 0,
+    }
 }
 
 fn slo_event_matches_plan(install_index: usize, plan: &str) -> bool {
     PLANS[install_index % PLANS.len()] == plan
+}
+
+fn install_count_for_plan(install_count: usize, plan: &str) -> usize {
+    (0..install_count)
+        .filter(|install_index| slo_event_matches_plan(*install_index, plan))
+        .count()
+}
+
+fn repaired_install_days_for_plan(window: SloWindow, plan: Option<&str>) -> usize {
+    let mut repaired = 0usize;
+
+    for day_offset in 0..window.days() {
+        for install_index in 0..SLO_INSTALL_COUNT_PER_DAY {
+            if let Some(plan) = plan
+                && !slo_event_matches_plan(install_index, plan)
+            {
+                continue;
+            }
+
+            if install_index % SLO_REPAIR_INSTALL_MODULUS == day_offset % SLO_REPAIR_INSTALL_MODULUS
+            {
+                repaired += 1;
+            }
+        }
+    }
+
+    repaired
 }
 
 async fn measure_slo_queries(
@@ -4047,6 +4120,15 @@ fn live_slo_schedule(
             build_live_append_blobs(policy, true, true)?,
             build_live_repair_blobs(policy, true)?,
         )),
+        SloScenarioKind::BurstReadiness300InstallsX1 => {
+            Ok((build_burst_readiness_blobs(300, 1)?, Vec::new()))
+        }
+        SloScenarioKind::BurstReadiness150InstallsX2 => {
+            Ok((build_burst_readiness_blobs(150, 2)?, Vec::new()))
+        }
+        SloScenarioKind::BurstReadiness100InstallsX3 => {
+            Ok((build_burst_readiness_blobs(100, 3)?, Vec::new()))
+        }
         _ => bail!(
             "live schedule requested for non-live scenario {}",
             scenario.key()
@@ -4093,6 +4175,33 @@ fn build_live_append_blobs(
                                     0
                                 },
                                 total_active_installs: if session_index == 0 { 1 } else { 0 },
+                                pro_total_events: if slo_event_matches_plan(install_index, "pro") {
+                                    SLO_REPRESENTATIVE_EVENTS_PER_SESSION as u64
+                                } else {
+                                    0
+                                },
+                                pro_total_sessions: if slo_event_matches_plan(install_index, "pro")
+                                {
+                                    1
+                                } else {
+                                    0
+                                },
+                                pro_total_duration_seconds: if slo_event_matches_plan(
+                                    install_index,
+                                    "pro",
+                                ) {
+                                    SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS
+                                } else {
+                                    0
+                                },
+                                pro_total_new_installs: if day_offset == 0
+                                    && session_index == 0
+                                    && slo_event_matches_plan(install_index, "pro")
+                                {
+                                    1
+                                } else {
+                                    0
+                                },
                             },
                             checkpoint: append_index
                                 .is_multiple_of(policy.append_checkpoint_interval),
@@ -4125,6 +4234,28 @@ fn build_live_append_blobs(
                                 * SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS,
                             total_new_installs: 0,
                             total_active_installs: 0,
+                            pro_total_events: if slo_event_matches_plan(install_index, "pro") {
+                                (SLO_REPRESENTATIVE_OFFLINE_FLUSH_SESSION_COUNT
+                                    * SLO_REPRESENTATIVE_EVENTS_PER_SESSION)
+                                    as u64
+                            } else {
+                                0
+                            },
+                            pro_total_sessions: if slo_event_matches_plan(install_index, "pro") {
+                                SLO_REPRESENTATIVE_OFFLINE_FLUSH_SESSION_COUNT as u64
+                            } else {
+                                0
+                            },
+                            pro_total_duration_seconds: if slo_event_matches_plan(
+                                install_index,
+                                "pro",
+                            ) {
+                                (SLO_REPRESENTATIVE_OFFLINE_FLUSH_SESSION_COUNT as u64)
+                                    * SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS
+                            } else {
+                                0
+                            },
+                            pro_total_new_installs: 0,
                         },
                         checkpoint: offline_flush_index
                             .is_multiple_of(policy.offline_flush_checkpoint_interval),
@@ -4150,6 +4281,32 @@ fn build_live_append_blobs(
                                 0
                             },
                             total_active_installs: if session_index == 0 { 1 } else { 0 },
+                            pro_total_events: if slo_event_matches_plan(install_index, "pro") {
+                                SLO_REPRESENTATIVE_EVENTS_PER_SESSION as u64
+                            } else {
+                                0
+                            },
+                            pro_total_sessions: if slo_event_matches_plan(install_index, "pro") {
+                                1
+                            } else {
+                                0
+                            },
+                            pro_total_duration_seconds: if slo_event_matches_plan(
+                                install_index,
+                                "pro",
+                            ) {
+                                SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS
+                            } else {
+                                0
+                            },
+                            pro_total_new_installs: if day_offset == 0
+                                && session_index == 0
+                                && slo_event_matches_plan(install_index, "pro")
+                            {
+                                1
+                            } else {
+                                0
+                            },
                         },
                         checkpoint: append_index.is_multiple_of(policy.append_checkpoint_interval),
                     },
@@ -4160,6 +4317,104 @@ fn build_live_append_blobs(
 
     scheduled.sort_by_key(|(key, _)| *key);
     Ok(scheduled.into_iter().map(|(_, blob)| blob).collect())
+}
+
+fn build_burst_readiness_blobs(
+    install_count: usize,
+    events_per_install: usize,
+) -> Result<Vec<UploadBlob>> {
+    if events_per_install == 0 {
+        bail!("burst readiness events_per_install must be positive");
+    }
+
+    let day = slo_start_day();
+    let mut blobs = Vec::new();
+    let mut current_events = Vec::new();
+    let mut current_delta = SloExpectationDelta {
+        total_events: 0,
+        total_sessions: 0,
+        total_duration_seconds: 0,
+        total_new_installs: 0,
+        total_active_installs: 0,
+        pro_total_events: 0,
+        pro_total_sessions: 0,
+        pro_total_duration_seconds: 0,
+        pro_total_new_installs: 0,
+    };
+
+    for install_index in 0..install_count {
+        let session_start = live_session_start(day, 0, install_index, 0)?;
+        let is_pro = slo_event_matches_plan(install_index, "pro");
+        let install_delta = SloExpectationDelta {
+            total_events: events_per_install as u64,
+            total_sessions: 1,
+            total_duration_seconds: ((events_per_install - 1) * 60) as u64,
+            total_new_installs: 1,
+            total_active_installs: 1,
+            pro_total_events: if is_pro { events_per_install as u64 } else { 0 },
+            pro_total_sessions: if is_pro { 1 } else { 0 },
+            pro_total_duration_seconds: if is_pro {
+                ((events_per_install - 1) * 60) as u64
+            } else {
+                0
+            },
+            pro_total_new_installs: if is_pro { 1 } else { 0 },
+        };
+
+        for event_offset in 0..events_per_install {
+            if current_events.len() == POST_BATCH_SIZE {
+                blobs.push(UploadBlob {
+                    kind: UploadBlobKind::Append,
+                    events: current_events,
+                    delta: current_delta,
+                    checkpoint: false,
+                });
+                current_events = Vec::new();
+                current_delta = SloExpectationDelta {
+                    total_events: 0,
+                    total_sessions: 0,
+                    total_duration_seconds: 0,
+                    total_new_installs: 0,
+                    total_active_installs: 0,
+                    pro_total_events: 0,
+                    pro_total_sessions: 0,
+                    pro_total_duration_seconds: 0,
+                    pro_total_new_installs: 0,
+                };
+            }
+
+            current_events.push(live_slo_event_for_install(
+                install_index,
+                0,
+                0,
+                session_start + ChronoDuration::minutes(event_offset as i64),
+            ));
+
+            if event_offset + 1 == events_per_install {
+                current_delta.total_events += install_delta.total_events;
+                current_delta.total_sessions += install_delta.total_sessions;
+                current_delta.total_duration_seconds += install_delta.total_duration_seconds;
+                current_delta.total_new_installs += install_delta.total_new_installs;
+                current_delta.total_active_installs += install_delta.total_active_installs;
+                current_delta.pro_total_events += install_delta.pro_total_events;
+                current_delta.pro_total_sessions += install_delta.pro_total_sessions;
+                current_delta.pro_total_duration_seconds +=
+                    install_delta.pro_total_duration_seconds;
+                current_delta.pro_total_new_installs += install_delta.pro_total_new_installs;
+            }
+        }
+    }
+
+    if !current_events.is_empty() {
+        blobs.push(UploadBlob {
+            kind: UploadBlobKind::Append,
+            events: current_events,
+            delta: current_delta,
+            checkpoint: false,
+        });
+    }
+
+    Ok(blobs)
 }
 
 fn build_live_repair_blobs(policy: LiveSloPolicy, hot_project: bool) -> Result<Vec<UploadBlob>> {
@@ -4202,6 +4457,19 @@ fn build_live_repair_blobs(policy: LiveSloPolicy, hot_project: bool) -> Result<V
                         total_duration_seconds: SLO_REPRESENTATIVE_REPAIR_DURATION_DELTA_SECONDS,
                         total_new_installs: 0,
                         total_active_installs: 0,
+                        pro_total_events: if slo_event_matches_plan(install_index, "pro") {
+                            SLO_REPRESENTATIVE_REPAIR_LATE_EVENTS_PER_SESSION as u64
+                        } else {
+                            0
+                        },
+                        pro_total_sessions: 0,
+                        pro_total_duration_seconds: if slo_event_matches_plan(install_index, "pro")
+                        {
+                            SLO_REPRESENTATIVE_REPAIR_DURATION_DELTA_SECONDS
+                        } else {
+                            0
+                        },
+                        pro_total_new_installs: 0,
                     },
                     checkpoint: repair_index.is_multiple_of(policy.repair_checkpoint_interval),
                 },
@@ -6405,7 +6673,7 @@ mod tests {
     fn slo_scenarios_lock_suite_taxonomy_and_default_repetition_policy() {
         let scenarios = slo_scenario_definitions(&dummy_slo_run_config());
 
-        assert_eq!(scenarios.len(), 16);
+        assert_eq!(scenarios.len(), 19);
         assert_eq!(
             scenarios
                 .iter()
@@ -6416,6 +6684,9 @@ mod tests {
                 "live-append-offline-flush",
                 "live-append-plus-light-repair",
                 "live-append-plus-repair-hot-project",
+                "burst-readiness-300-installs-x1",
+                "burst-readiness-150-installs-x2",
+                "burst-readiness-100-installs-x3",
                 "stress-append-30d",
                 "stress-backfill-30d",
                 "stress-repair-30d",
@@ -6451,6 +6722,14 @@ mod tests {
                 .iter()
                 .find(|scenario| scenario.key() == "stress-repair-180d")
                 .expect("stress-repair-180d")
+                .repetitions,
+            1
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.key() == "burst-readiness-300-installs-x1")
+                .expect("burst-readiness-300-installs-x1")
                 .repetitions,
             1
         );
@@ -6640,6 +6919,58 @@ mod tests {
     }
 
     #[test]
+    fn burst_readiness_scenarios_chunk_the_expected_300_event_shapes() {
+        let scenarios = slo_scenario_definitions(&dummy_slo_run_config());
+
+        for (scenario_key, expected_blob_count, expected_events_per_blob) in [
+            ("burst-readiness-300-installs-x1", 3, 100),
+            ("burst-readiness-150-installs-x2", 3, 100),
+            ("burst-readiness-100-installs-x3", 3, 100),
+        ] {
+            let scenario = scenarios
+                .iter()
+                .find(|scenario| scenario.key() == scenario_key)
+                .unwrap_or_else(|| panic!("missing {scenario_key}"));
+            let (append_blobs, repair_blobs) =
+                live_slo_schedule(scenario, &dummy_slo_run_config()).expect("burst schedule");
+
+            assert!(
+                repair_blobs.is_empty(),
+                "{scenario_key} should not schedule repairs"
+            );
+            assert_eq!(
+                append_blobs.len(),
+                expected_blob_count,
+                "{scenario_key} blob count"
+            );
+            assert!(
+                append_blobs
+                    .iter()
+                    .all(|blob| blob.kind == UploadBlobKind::Append),
+                "{scenario_key} should only use append blobs"
+            );
+            assert!(
+                append_blobs.iter().all(|blob| !blob.checkpoint),
+                "{scenario_key} should not emit checkpoint probes"
+            );
+            assert_eq!(
+                append_blobs
+                    .iter()
+                    .map(|blob| blob.events.len())
+                    .sum::<usize>(),
+                300,
+                "{scenario_key} total events"
+            );
+            assert!(
+                append_blobs
+                    .iter()
+                    .all(|blob| blob.events.len() == expected_events_per_blob),
+                "{scenario_key} should stay POST-batch-sized"
+            );
+        }
+    }
+
+    #[test]
     fn prepare_clean_output_dir_removes_stale_artifacts_before_a_rerun() {
         let tempdir = tempdir().expect("create tempdir");
         let output_dir = tempdir.path().join("slo-output");
@@ -6778,6 +7109,59 @@ mod tests {
         assert_eq!(
             expected_total_for_slo_query(&query, &scenario, &expectation),
             333
+        );
+    }
+
+    #[test]
+    fn burst_readiness_filtered_hard_gates_follow_the_actual_burst_distribution() {
+        let scenario = slo_scenario_definitions(&dummy_slo_run_config())
+            .into_iter()
+            .find(|scenario| scenario.key() == "burst-readiness-100-installs-x3")
+            .expect("burst-readiness-100-installs-x3 scenario");
+        let expectation = live_slo_schedule(&scenario, &dummy_slo_run_config())
+            .expect("burst schedule")
+            .0
+            .into_iter()
+            .fold(SloExpectation::default(), |mut expectation, blob| {
+                expectation.apply_delta(&blob.delta);
+                expectation
+            });
+        let queries = slo_query_matrix(scenario.window, slo_start_day());
+
+        let event_query = queries
+            .iter()
+            .find(|query| query.name == "events_count_day_dim2_grouped")
+            .expect("burst dim2 event query");
+        assert_eq!(
+            expected_total_for_slo_query(event_query, &scenario, &expectation),
+            99
+        );
+
+        let session_count_query = queries
+            .iter()
+            .find(|query| query.name == "sessions_count_day_dim2_grouped")
+            .expect("burst dim2 session count query");
+        assert_eq!(
+            expected_total_for_slo_query(session_count_query, &scenario, &expectation),
+            33
+        );
+
+        let duration_query = queries
+            .iter()
+            .find(|query| query.name == "sessions_duration_total_day_dim2_grouped")
+            .expect("burst dim2 session duration query");
+        assert_eq!(
+            expected_total_for_slo_query(duration_query, &scenario, &expectation),
+            3_960
+        );
+
+        let new_install_query = queries
+            .iter()
+            .find(|query| query.name == "sessions_new_installs_day_dim2_grouped")
+            .expect("burst dim2 session new installs query");
+        assert_eq!(
+            expected_total_for_slo_query(new_install_query, &scenario, &expectation),
+            33
         );
     }
 
