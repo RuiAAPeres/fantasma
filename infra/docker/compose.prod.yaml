@@ -1,0 +1,12 @@
+services:
+  fantasma-api:
+    networks:
+      default: {}
+      proxy:
+        aliases:
+          - ${FANTASMA_PROXY_NETWORK_ALIAS:-fantasma-api}
+
+networks:
+  proxy:
+    external: true
+    name: ${FANTASMA_PROXY_NETWORK_NAME:-proxy}

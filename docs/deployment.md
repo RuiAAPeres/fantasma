@@ -16,6 +16,7 @@ The default stack includes:
 Repository files:
 
 - Compose stack: `infra/docker/compose.yaml`
+- production proxy override: `infra/docker/compose.prod.yaml`
 - service images: `infra/docker/Dockerfile.ingest`, `infra/docker/Dockerfile.api`, `infra/docker/Dockerfile.worker`
 - benchmark stack: [`infra/docker/compose.bench.yaml`](../infra/docker/compose.bench.yaml)
 - operator CLI: `cargo run -p fantasma-cli -- ...`
@@ -157,6 +158,42 @@ docker compose -f infra/docker/compose.yaml down --volumes --remove-orphans
 `infra/docker/compose.yaml` declares `name: fantasma-local`, so the default
 local stack now keeps one stable Compose project name unless you override it
 explicitly with `docker compose -p ...`.
+
+## Production Behind A Shared Proxy
+
+When Fantasma runs on a shared host behind an existing reverse proxy such as
+Caddy, keep the local default stack untouched and layer the production override
+on top instead of editing `infra/docker/compose.yaml` directly.
+
+`infra/docker/compose.prod.yaml` attaches `fantasma-api` to an external Docker
+network so the reverse proxy can reach it by a stable alias:
+
+- external network name defaults to `proxy`
+- API alias defaults to `fantasma-api`
+- both can be overridden with `FANTASMA_PROXY_NETWORK_NAME` and
+  `FANTASMA_PROXY_NETWORK_ALIAS`
+
+Example production bring-up:
+
+```bash
+docker compose \
+  --env-file .env.production \
+  -f infra/docker/compose.yaml \
+  -f infra/docker/compose.prod.yaml \
+  -p fantasma-prod \
+  up -d --build
+```
+
+Recommended host-port bindings for single-host production keep Postgres and the
+two HTTP services on loopback only, for example:
+
+- `FANTASMA_POSTGRES_PORTS=127.0.0.1:15432:5432`
+- `FANTASMA_INGEST_PORTS=127.0.0.1:18081:8081`
+- `FANTASMA_API_PORTS=127.0.0.1:18082:8082`
+
+With the override attached, the shared reverse proxy can route
+`api.usefantasma.com` to `fantasma-api:8082` over the shared `proxy` network
+without a manual `docker network connect`.
 
 If you have older Fantasma-owned Docker images, containers, or volumes left
 behind from earlier local runs, reclaim them explicitly with:
