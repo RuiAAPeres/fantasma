@@ -29,7 +29,7 @@ Today Fantasma is centered on:
 - an operator-facing CLI for self-hosted management and metrics access
 - operator-provisioned projects with separate ingest and read keys
 - background aggregation workers
-- durable mobile SDKs
+- durable iOS and Android SDKs
 - simple self-hosted deployment
 
 The API remains the primary interface. The CLI is the primary operator
