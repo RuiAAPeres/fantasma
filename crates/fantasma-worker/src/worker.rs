@@ -4153,6 +4153,11 @@ mod tests {
         unsafe {
             std::env::set_var("FANTASMA_WORKER_STAGE_B_TRACE_PATH", &path);
         }
+        // The trace path is process-global, so unrelated worker activity can append extra
+        // rebuild-finalize records while this test is running.
+        let mut unrelated_trace = StageBTraceRecord::rebuild_finalize();
+        unrelated_trace.add_count("claimed_rebuild_bucket_rows", 7);
+        record_stage_b_trace(&unrelated_trace).expect("write unrelated rebuild trace");
 
         fantasma_store::bootstrap(&pool, &bootstrap_config())
             .await
@@ -4177,27 +4182,31 @@ mod tests {
         );
 
         let contents = fs::read_to_string(&path).expect("read rebuild trace");
-        let rebuild_records = contents
+        let matching_rebuild_records = contents
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse trace"))
-            .filter(|record| record["record_type"] == "rebuild_finalize")
+            .filter(|record| {
+                record["record_type"] == "rebuild_finalize"
+                    && record["counts"]["claimed_rebuild_bucket_rows"] == serde_json::json!(513)
+                    && record["counts"]["touched_hour_buckets"] == serde_json::json!(513)
+            })
             .collect::<Vec<_>>();
         assert_eq!(
-            rebuild_records.len(),
+            matching_rebuild_records.len(),
             1,
             "project sweep should collapse visible queue work into one rebuild-finalize pass"
         );
         assert_eq!(
-            rebuild_records[0]["counts"]["claimed_rebuild_bucket_rows"],
+            matching_rebuild_records[0]["counts"]["claimed_rebuild_bucket_rows"],
             serde_json::json!(513)
         );
         assert!(
-            rebuild_records[0]["finalization_subphases_ms"].is_object(),
+            matching_rebuild_records[0]["finalization_subphases_ms"].is_object(),
             "rebuild-finalize trace records should carry nested finalization timing"
         );
         assert!(
-            rebuild_records[0]["finalization_subphases_ms"]
+            matching_rebuild_records[0]["finalization_subphases_ms"]
                 .get("finalization_drain_setup")
                 .is_some(),
             "drain setup timing should be recorded inside rebuild-finalize traces"
