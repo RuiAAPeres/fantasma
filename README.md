@@ -44,6 +44,7 @@ Technical and operational details belong in the docs below.
 
 - Deployment: [`docs/deployment.md`](docs/deployment.md)
 - Architecture: [`docs/architecture.md`](docs/architecture.md)
+- iOS docs: [`sdks/ios/README.md`](sdks/ios/README.md)
 - Project status: [`docs/STATUS.md`](docs/STATUS.md)
 - Contributor rules: [`AGENTS.md`](AGENTS.md)
 
