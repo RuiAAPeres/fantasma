@@ -78,4 +78,4 @@ Behavior notes:
 - `flush()` throws when the SDK has not been configured.
 - Malformed `202 Accepted` responses are treated as invalid responses and preserve queued rows.
 - Reconfiguring to a different server URL or write key discards any still-queued rows after the current upload boundary, even across app relaunches, then switches future uploads to the new destination.
-- Upload attempts happen every 10 seconds, when the queue reaches 50 events, when `flush()` is called, and when the app enters background.
+- Upload attempts happen every 30 seconds, when the queue reaches 100 events, when `flush()` is called, and when the app enters background.

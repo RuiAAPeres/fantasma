@@ -304,11 +304,13 @@ Current-state metrics:
 
 ## SDK Direction
 
-The first SDK target is iOS.
+Fantasma ships first-party mobile SDKs with parity at the event-contract and
+runtime-behavior level, not necessarily the exact same public API on every
+platform.
 
 Required client behavior:
 
-- `configure(serverURL, writeKey)`
+- configure one destination explicitly
 - `track(eventName, properties?)`
 - `flush()`
 - `clear()`
@@ -320,15 +322,26 @@ Durability requirement:
 - delete only acknowledged rows
 - preserve queued events across `clear()`
 
-Current iOS SDK shape:
+Current first-party SDK shapes:
 
-- expose a single static `Fantasma` facade backed by one shared client
+- iOS exposes a static `Fantasma` facade backed by one shared client
+- Android exposes an instance-based `FantasmaClient(context, FantasmaConfig(...))`
+- this API divergence is intentional and platform-native; parity is at the wire
+  contract and runtime behavior, not method-for-method API duplication
+- Android still preserves one active destination at a time per process: creating
+  a client for a different normalized destination supersedes the previous
+  destination after the current upload boundary rather than supporting multiple
+  live destinations concurrently, and the superseded runtime retires itself even
+  if the old handle is dropped without an explicit `close()`
+
+Shared SDK behavior:
+
 - serialize each tracked event to JSON and store it as an immutable SQLite row
 - auto-populate `platform`, `app_version`, and `os_version`
 - upload queued events asynchronously to `POST /v1/events` using an `ingest` key only
 - reject invalid event property maps before they enter the local queue: at most 2 keys, `^[a-z][a-z0-9_]{0,62}$`, and no reserved query or built-in keys such as `metric`, `granularity`, `start`, `end`, `platform`, `app_version`, or `os_version`
 - treat malformed `202 Accepted` envelopes as invalid responses and keep queued rows for later operator-visible handling
-- when `configure(serverURL, writeKey)` changes destination, finish the current upload boundary, discard still-queued rows from that old destination even across relaunches, and only then let future uploads target the new destination
+- when a client switches to a different normalized destination, finish the current upload boundary for the old destination, discard still-queued rows from that old destination even across relaunches, and only then let future uploads target the new destination
 
 Current upload triggers:
 
@@ -340,4 +353,4 @@ Current upload triggers:
 Current identity rules:
 
 - the SDK generates one local install identity on first use, reuses it until `clear()`, and leaves already queued rows untouched when that identity rotates
-- `clear()` remains identity-only; queue deletion is reserved for destination-drift reconfiguration rather than normal identity rotation
+- `clear()` remains identity-only; queue deletion is reserved for destination replacement rather than normal identity rotation

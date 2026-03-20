@@ -8,3 +8,8 @@
 /.env.production
 /.env.demo
 /.env.local
+/sdks/android/.gradle
+/sdks/android/build
+/sdks/android/local.properties
+/sdks/android/**/build
+/apps/demo-android/build
