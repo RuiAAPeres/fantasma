@@ -565,10 +565,6 @@ async fn project_deletions_range_sends_expected_scope() {
             "platform=ios",
             "--filter",
             "app_version=1.2.3",
-            "--property",
-            "plan=pro",
-            "--property",
-            "provider=stripe",
         ]))
         .await
         .expect("range deletion succeeds");
@@ -597,10 +593,6 @@ async fn project_deletions_range_sends_expected_scope() {
             "filters": {
                 "app_version": "1.2.3",
                 "platform": "ios"
-            },
-            "properties": {
-                "plan": "pro",
-                "provider": "stripe"
             }
         }))
     );
@@ -1284,9 +1276,7 @@ async fn metrics_sessions_active_installs_serializes_exact_range_query() {
         "--interval",
         "week",
         "--filter",
-        "plan=pro",
-        "--group-by",
-        "provider",
+        "locale=en-US",
         "--json",
     ])
     .expect("exact-range active_installs should parse");
@@ -1304,9 +1294,7 @@ async fn metrics_sessions_active_installs_serializes_exact_range_query() {
         .expect("metrics request");
     assert_eq!(
         request.query.as_deref(),
-        Some(
-            "metric=active_installs&start=2026-03-01&end=2026-03-17&interval=week&plan=pro&group_by=provider"
-        )
+        Some("metric=active_installs&start=2026-03-01&end=2026-03-17&interval=week&locale=en-US")
     );
 }
 
@@ -1353,7 +1341,7 @@ async fn metrics_sessions_active_installs_text_renders_exact_range_points() {
 }
 
 #[tokio::test]
-async fn metrics_sessions_active_installs_serializes_d2_filters_and_group_by_exactly() {
+async fn metrics_sessions_active_installs_serializes_builtin_filters_exactly() {
     let server = TestServer::spawn().await;
     let mut config = server.read_config();
     let profile = config.instances.get_mut("prod").unwrap();
@@ -1382,9 +1370,7 @@ async fn metrics_sessions_active_installs_serializes_d2_filters_and_group_by_exa
         "--interval",
         "week",
         "--filter",
-        "plan=pro",
-        "--group-by",
-        "provider",
+        "locale=en-US",
         "--json",
     ])
     .expect("exact-range active_installs should parse");
@@ -1402,14 +1388,12 @@ async fn metrics_sessions_active_installs_serializes_d2_filters_and_group_by_exa
         .expect("metrics request");
     assert_eq!(
         request.query.as_deref(),
-        Some(
-            "metric=active_installs&start=2026-03-01&end=2026-03-17&interval=week&plan=pro&group_by=provider"
-        )
+        Some("metric=active_installs&start=2026-03-01&end=2026-03-17&interval=week&locale=en-US")
     );
 }
 
 #[tokio::test]
-async fn metrics_sessions_serializes_d2_property_filters_and_group_by_exactly() {
+async fn metrics_sessions_serializes_builtin_filters_exactly() {
     let server = TestServer::spawn().await;
     let mut config = server.read_config();
     let profile = config.instances.get_mut("prod").unwrap();
@@ -1439,9 +1423,9 @@ async fn metrics_sessions_serializes_d2_property_filters_and_group_by_exactly() 
             "--end",
             "2026-03-02",
             "--filter",
-            "plan=pro",
-            "--group-by",
-            "provider",
+            "platform=ios",
+            "--filter",
+            "locale=en-US",
             "--json",
         ]))
         .await
@@ -1455,7 +1439,7 @@ async fn metrics_sessions_serializes_d2_property_filters_and_group_by_exactly() 
     assert_eq!(
         request.query.as_deref(),
         Some(
-            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&plan=pro&group_by=provider"
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&locale=en-US&platform=ios"
         )
     );
 }
@@ -1996,8 +1980,6 @@ async fn metrics_events_text_renders_series_rows() {
             "2026-03-02",
             "--filter",
             "platform=ios",
-            "--group-by",
-            "platform",
         ]))
         .await
         .expect("event metrics succeed");
@@ -2008,7 +1990,7 @@ async fn metrics_events_text_renders_series_rows() {
 }
 
 #[tokio::test]
-async fn metrics_events_serializes_d2_filters_and_group_by_exactly() {
+async fn metrics_events_serializes_builtin_filters_exactly() {
     let server = TestServer::spawn().await;
     let mut config = server.read_config();
     let profile = config.instances.get_mut("prod").unwrap();
@@ -2040,9 +2022,9 @@ async fn metrics_events_serializes_d2_filters_and_group_by_exactly() {
             "--end",
             "2026-03-02",
             "--filter",
-            "plan=pro",
-            "--group-by",
-            "provider",
+            "platform=ios",
+            "--filter",
+            "locale=en-US",
             "--json",
         ]))
         .await
@@ -2056,7 +2038,7 @@ async fn metrics_events_serializes_d2_filters_and_group_by_exactly() {
     assert_eq!(
         request.query.as_deref(),
         Some(
-            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&event=app_open&plan=pro&group_by=provider"
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&event=app_open&locale=en-US&platform=ios"
         )
     );
 }
@@ -2627,7 +2609,6 @@ async fn session_metrics(
                 "start": "2026-03-01",
                 "end": "2026-03-17",
                 "interval": "week",
-                "group_by": [],
                 "series": [
                     {
                         "dimensions": {},
@@ -2649,7 +2630,6 @@ async fn session_metrics(
             Json(json!({
                 "metric": metric,
                 "granularity": "day",
-                "group_by": [],
                 "series": [
                     {
                         "dimensions": {},
@@ -2716,7 +2696,6 @@ async fn event_metrics(
         Json(json!({
             "metric": "count",
             "granularity": "day",
-            "group_by": ["platform"],
             "series": [
                 {
                     "dimensions": { "platform": "ios" },

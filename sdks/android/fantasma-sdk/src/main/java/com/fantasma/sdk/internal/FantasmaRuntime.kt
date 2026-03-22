@@ -21,6 +21,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.time.Instant
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 @Suppress("TooManyFunctions")
@@ -63,10 +64,7 @@ internal class FantasmaRuntime private constructor(
         }
     }
 
-    suspend fun track(
-        eventName: String,
-        properties: Map<String, String>?,
-    ) {
+    suspend fun track(eventName: String) {
         ensureRuntimeOpen()
 
         val normalizedName = eventName.trim()
@@ -74,8 +72,7 @@ internal class FantasmaRuntime private constructor(
             throw FantasmaException.InvalidEventName
         }
 
-        val validatedProperties = EventPropertyValidator.validate(properties)
-        val payload = eventPayload(normalizedName, validatedProperties)
+        val payload = eventPayload(normalizedName)
         queue.enqueue(payload = payload, createdAt = Instant.now().epochSecond)
 
         if (queue.count() >= UPLOAD_BATCH_SIZE) {
@@ -140,10 +137,7 @@ internal class FantasmaRuntime private constructor(
         flushResult.getOrThrow()
     }
 
-    private suspend fun eventPayload(
-        eventName: String,
-        properties: Map<String, String>?,
-    ): ByteArray {
+    private suspend fun eventPayload(eventName: String): ByteArray {
         val identity = installId ?: identityStore.load().also { installId = it }
         return try {
             json.encodeToString(
@@ -154,7 +148,7 @@ internal class FantasmaRuntime private constructor(
                     platform = "android",
                     appVersion = appVersion(),
                     osVersion = Build.VERSION.RELEASE,
-                    properties = properties,
+                    locale = currentLocale(),
                 ),
             ).encodeToByteArray()
         } catch (_: Exception) {
@@ -238,6 +232,23 @@ internal class FantasmaRuntime private constructor(
     private fun appVersion(): String? {
         val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
         return packageInfo.versionName?.takeIf { it.isNotBlank() }
+    }
+
+    private fun currentLocale(): String? =
+        appLocale().toLanguageTag().takeIf { it.isNotBlank() }
+
+    private fun appLocale(): java.util.Locale {
+        val configuration = context.resources.configuration
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            if (configuration.locales.isEmpty) {
+                java.util.Locale.getDefault()
+            } else {
+                configuration.locales[0]
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            configuration.locale ?: java.util.Locale.getDefault()
+        }
     }
 
     private fun runOnMainThread(block: () -> Unit) {

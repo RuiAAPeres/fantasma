@@ -109,7 +109,7 @@ poll_metrics() {
       "http://localhost:8082/v1/metrics/sessions?metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z" \
       -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     event_response="$(curl -fsS \
-      "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02&platform=ios&group_by=provider" \
+      "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02&platform=ios&locale=en-US" \
       -H "X-Fantasma-Key: ${READ_KEY}" || true)"
     count_compact="$(printf '%s' "$count_response" | tr -d '[:space:]')"
     duration_compact="$(printf '%s' "$duration_response" | tr -d '[:space:]')"
@@ -216,9 +216,7 @@ PY
           "platform": "ios",
           "app_version": "1.0.0",
           "os_version": "18.3",
-          "properties": {
-            "provider": "strava"
-          }
+          "locale": "en-US"
         },
         {
           "event": "app_open",
@@ -227,9 +225,7 @@ PY
           "platform": "ios",
           "app_version": "1.0.0",
           "os_version": "18.3",
-          "properties": {
-            "provider": "strava"
-          }
+          "locale": "en-US"
         }
       ]
     }' >/dev/null

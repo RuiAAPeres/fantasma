@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS session_active_install_slices (
     app_version_is_null BOOLEAN NOT NULL,
     os_version TEXT NOT NULL DEFAULT '',
     os_version_is_null BOOLEAN NOT NULL,
-    properties JSONB NOT NULL DEFAULT '{}'::jsonb,
+    locale TEXT NOT NULL DEFAULT '',
+    locale_is_null BOOLEAN NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (
         project_id,
@@ -18,7 +19,8 @@ CREATE TABLE IF NOT EXISTS session_active_install_slices (
         app_version,
         os_version_is_null,
         os_version,
-        properties
+        locale_is_null,
+        locale
     )
 );
 

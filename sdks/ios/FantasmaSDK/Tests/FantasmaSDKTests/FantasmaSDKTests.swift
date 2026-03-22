@@ -59,7 +59,7 @@ struct FantasmaSDKBehaviorTests {
     @Test("public API exposes async throwing static entrypoints")
     func publicAPISignatures() {
         let configure: (URL, String) async throws -> Void = Fantasma.configure
-        let track: (String, [String: String]?) async throws -> Void = Fantasma.track
+        let track: (String) async throws -> Void = Fantasma.track
         let flush: () async throws -> Void = Fantasma.flush
         let clear: () async -> Void = Fantasma.clear
 
@@ -78,7 +78,7 @@ struct FantasmaSDKBehaviorTests {
         try await harness.installSharedCore(transport: RecordingTransport())
 
         try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
-        try await Fantasma.track("screen_view", properties: ["screen": "Home"])
+        try await Fantasma.track("screen_view")
 
         let queue = try harness.makeQueue()
         let row = try requireValue(await queue.peek(limit: 1).first)
@@ -89,7 +89,7 @@ struct FantasmaSDKBehaviorTests {
         #expect(event.platform == "ios")
         #expect(event.appVersion == "1.2.3")
         #expect(event.osVersion == "18.3")
-        #expect(event.properties == ["screen": "Home"])
+        #expect(event.locale != nil)
     }
 
     @Test("clear rotates identity for future events without mutating queued rows")
@@ -183,8 +183,8 @@ struct FantasmaSDKBehaviorTests {
         }
     }
 
-    @Test("track rejects property maps larger than two keys before enqueue")
-    func trackRejectsTooManyProperties() async throws {
+    @Test("track accepts property-free events before enqueue")
+    func trackQueuesWithoutProperties() async throws {
         let harness = TestHarness()
         defer { harness.cleanup() }
 
@@ -192,65 +192,10 @@ struct FantasmaSDKBehaviorTests {
         try await harness.installSharedCore(transport: RecordingTransport())
 
         try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
-
-        do {
-            try await Fantasma.track(
-                "screen_view",
-                properties: [
-                    "screen": "Home",
-                    "region": "EU",
-                    "plan": "pro"
-                ]
-            )
-            Issue.record("expected invalidPropertyCount error")
-        } catch let error as FantasmaError {
-            #expect(error == .invalidPropertyCount)
-        }
+        try await Fantasma.track("screen_view")
 
         let queue = try harness.makeQueue()
-        #expect(try await queue.count() == 0)
-    }
-
-    @Test("track rejects property names that do not match the public contract before enqueue")
-    func trackRejectsInvalidPropertyName() async throws {
-        let harness = TestHarness()
-        defer { harness.cleanup() }
-
-        await Fantasma.resetSharedCoreForTesting()
-        try await harness.installSharedCore(transport: RecordingTransport())
-
-        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
-
-        do {
-            try await Fantasma.track("screen_view", properties: ["Screen-Name": "Home"])
-            Issue.record("expected invalidPropertyName error")
-        } catch let error as FantasmaError {
-            #expect(error == .invalidPropertyName)
-        }
-
-        let queue = try harness.makeQueue()
-        #expect(try await queue.count() == 0)
-    }
-
-    @Test("track rejects reserved property names from the public contract before enqueue")
-    func trackRejectsReservedPropertyName() async throws {
-        let harness = TestHarness()
-        defer { harness.cleanup() }
-
-        await Fantasma.resetSharedCoreForTesting()
-        try await harness.installSharedCore(transport: RecordingTransport())
-
-        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
-
-        do {
-            try await Fantasma.track("screen_view", properties: ["metric": "count"])
-            Issue.record("expected reservedPropertyName error")
-        } catch let error as FantasmaError {
-            #expect(error == .reservedPropertyName)
-        }
-
-        let queue = try harness.makeQueue()
-        #expect(try await queue.count() == 0)
+        #expect(try await queue.count() == 1)
     }
 
     @Test("reconfiguring with the same normalized destination preserves queued rows")
@@ -1048,7 +993,7 @@ struct FantasmaSDKBehaviorTests {
         try await harness.installSharedCore(transport: liveTransport)
 
         try await Fantasma.configure(serverURL: serverURL, writeKey: "fg_ing_test")
-        try await Fantasma.track("app_open", properties: ["screen": "Home"])
+        try await Fantasma.track("app_open")
         try await Fantasma.flush()
 
         let request = try await server.waitForRequest()
@@ -1064,7 +1009,7 @@ struct FantasmaSDKBehaviorTests {
         #expect(event.installId == "install-a")
         #expect(event.platform == "ios")
         #expect(event.osVersion == "18.3")
-        #expect(event.properties == ["screen": "Home"])
+        #expect(event.locale != nil)
 
         let queue = try harness.makeQueue()
         try await waitUntil {
@@ -1316,7 +1261,7 @@ private struct TestHarness {
                 platform: "ios",
                 appVersion: "1.2.3",
                 osVersion: "18.3",
-                properties: nil
+                locale: nil
             )
         )
     }

@@ -15,18 +15,6 @@ public sealed class FantasmaException(
 
     public data object InvalidEventName : FantasmaException("Fantasma event name must not be blank.")
 
-    public data object InvalidPropertyCount : FantasmaException(
-        "Fantasma properties accept at most 2 keys.",
-    )
-
-    public data object InvalidPropertyName : FantasmaException(
-        "Fantasma property names must match ^[a-z][a-z0-9_]{0,62}$.",
-    )
-
-    public data object ReservedPropertyName : FantasmaException(
-        "Fantasma property names may not reuse reserved event or query keys.",
-    )
-
     public data object EncodingFailed : FantasmaException("Fantasma could not encode the event payload.")
 
     public data object InvalidResponse : FantasmaException("Fantasma received an invalid ingest response.")

@@ -6,11 +6,8 @@ internal class RuntimeClientDelegate(
     private val runtime: FantasmaRuntime,
     private val onClose: () -> Unit,
 ) : FantasmaClientDelegate {
-    override suspend fun track(
-        eventName: String,
-        properties: Map<String, String>?,
-    ) {
-        runtime.track(eventName, properties)
+    override suspend fun track(eventName: String) {
+        runtime.track(eventName)
     }
 
     override suspend fun flush() {

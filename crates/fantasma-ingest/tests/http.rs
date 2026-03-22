@@ -215,7 +215,8 @@ async fn ingest_accepts_valid_batches(pool: PgPool) {
                                 "event": "app_open",
                                 "timestamp": "2026-01-01T00:00:00Z",
                                 "install_id": "install-1",
-                                "platform": "ios"
+                                "platform": "ios",
+                                "locale": "pt-PT"
                             }
                         ]
                     })
@@ -230,6 +231,86 @@ async fn ingest_accepts_valid_batches(pool: PgPool) {
     assert_eq!(
         response_json(response).await,
         serde_json::json!({ "accepted": 1 })
+    );
+}
+
+#[sqlx::test]
+async fn ingest_rejects_legacy_properties_payloads(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let provisioned = provision_project(&pool).await;
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "properties": {
+                                    "provider": "strava"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response_json(response).await;
+    assert_eq!(body["errors"][0]["index"], serde_json::json!(0));
+    assert_eq!(
+        body["errors"][0]["message"],
+        serde_json::json!("properties are not supported")
+    );
+}
+
+#[sqlx::test]
+async fn ingest_rejects_legacy_properties_null_payloads(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let provisioned = provision_project(&pool).await;
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "properties": null
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response_json(response).await;
+    assert_eq!(body["errors"][0]["index"], serde_json::json!(0));
+    assert_eq!(
+        body["errors"][0]["message"],
+        serde_json::json!("properties are not supported")
     );
 }
 

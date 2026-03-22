@@ -216,7 +216,7 @@ Optional event fields:
 
 - `app_version`
 - `os_version`
-- at most 2 explicit string `properties`
+- `locale`
 
 Identity model:
 
@@ -225,8 +225,7 @@ Identity model:
 - Fantasma does not expose person-scoped identifiers in the public event contract
 - backend-derived session identifiers are internal implementation details, not public API
 - multi-device usage counts as multiple installs by design
-- `properties` are for event context and must not contain direct identifiers or sensitive personal data
-- built-in event dimensions stay minimal: `platform`, `app_version`, and `os_version`
+- built-in event dimensions stay minimal: `platform`, `app_version`, `os_version`, and `locale`
 
 ## Metrics Query Model
 
@@ -261,28 +260,24 @@ Shared query semantics for the bucketed families:
 - `metric`, `granularity`, `start`, and `end` are required
 - `granularity=day` uses inclusive UTC `YYYY-MM-DD` buckets
 - `granularity=hour` uses inclusive UTC RFC3339 hour-start buckets
-- responses are series-only and always include `metric`, `granularity`, `group_by`, and `series`
-- ungrouped responses always use `group_by: []` and one series item with `dimensions: {}`
+- responses are series-only and always include `metric`, `granularity`, and `series`
+- unfiltered responses use one series item with `dimensions: {}`
 
 Event metrics:
 
 - supported public metrics are `count`
 - `event` is required
-- built-in equality filters use `platform`, `app_version`, and `os_version`
-- any other non-reserved query key matching `^[a-z][a-z0-9_]{0,62}$` is an equality filter on an explicit string property
-- `group_by` may be repeated up to twice
-- the total number of distinct referenced dimensions across filters plus `group_by` is capped at 2
-- `group_by=event` is invalid
-- grouped event metrics synthesize explicit `null` buckets from lower-order cuboids so grouped totals add back up to the filtered total
+- built-in equality filters use `platform`, `app_version`, `os_version`, and `locale`
+- only built-in filters are accepted
+- public event metrics are filter-only; `group_by` is rejected
+- all four built-in filters may be combined in one request
 
 Session metrics:
 
 - supported public metrics are `count`, `duration_total`, `new_installs`, and `active_installs`
-- built-in equality filters use `platform`, `app_version`, and `os_version`
-- any other non-reserved query key matching `^[a-z][a-z0-9_]{0,62}$` is an equality filter on an explicit string session property
-- `group_by` may be repeated up to twice
-- the total number of distinct referenced dimensions across filters plus `group_by` is capped at 2
-- session grouped dimensions are fixed from the session's first event
+- built-in equality filters use `platform`, `app_version`, `os_version`, and `locale`
+- only built-in filters are accepted
+- public session metrics are filter-only; `group_by` is rejected
 - `duration_total` is assigned to the bucket where the session starts
 - `new_installs` is assigned once from the install's first accepted event and is never retroactively moved by late arrivals
 - `count`, `duration_total`, and `new_installs` stay on the bucketed `granularity` contract and still require `granularity`
@@ -291,7 +286,7 @@ Session metrics:
 - `active_installs` counts unique installs with at least one session whose `session_start` falls inside the exact requested UTC range or point window
 - `active_installs interval=week|month|year` uses calendar-shaped UTC windows clipped to the request edges; requests do not need to be aligned to calendar boundaries
 - public `active_installs` reads union worker-maintained daily bitmaps across the requested days; there is no separate public week/month/year cuboid family
-- filtered or grouped `active_installs` slices may overlap, so grouped totals are not guaranteed to add back up to the ungrouped distinct-install total
+- filtered `active_installs` reads use the same built-in-only filter vocabulary
 
 Current-state metrics:
 
@@ -311,7 +306,7 @@ platform.
 Required client behavior:
 
 - configure one destination explicitly
-- `track(eventName, properties?)`
+- `track(eventName)`
 - `flush()`
 - `clear()`
 
@@ -337,9 +332,8 @@ Current first-party SDK shapes:
 Shared SDK behavior:
 
 - serialize each tracked event to JSON and store it as an immutable SQLite row
-- auto-populate `platform`, `app_version`, and `os_version`
+- auto-populate `platform`, `app_version`, `os_version`, and `locale`
 - upload queued events asynchronously to `POST /v1/events` using an `ingest` key only
-- reject invalid event property maps before they enter the local queue: at most 2 keys, `^[a-z][a-z0-9_]{0,62}$`, and no reserved query or built-in keys such as `metric`, `granularity`, `start`, `end`, `platform`, `app_version`, or `os_version`
 - treat malformed `202 Accepted` envelopes as invalid responses and keep queued rows for later operator-visible handling
 - when a client switches to a different normalized destination, finish the current upload boundary for the old destination, discard still-queued rows from that old destination even across relaunches, and only then let future uploads target the new destination
 

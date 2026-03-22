@@ -11,6 +11,7 @@ PLANS = ["free", "pro", "team"]
 PROVIDERS = ["strava", "garmin", "polar", "oura"]
 APP_VERSIONS = ["1.0.0", "1.1.0", "1.2.0"]
 OS_VERSIONS = ["18.3", "18.4"]
+LOCALES = ["en-US", "pt-PT", "fr-FR"]
 DEFAULT_DAY = "2026-01-01"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_POLL_INTERVAL_SECONDS = 0.05
@@ -99,10 +100,7 @@ def build_events(day, install_count, events_per_install, prefix):
                     "platform": "ios" if install_index % 2 == 0 else "android",
                     "app_version": APP_VERSIONS[install_index % len(APP_VERSIONS)],
                     "os_version": OS_VERSIONS[install_index % len(OS_VERSIONS)],
-                    "properties": {
-                        "plan": PLANS[install_index % len(PLANS)],
-                        "provider": PROVIDERS[install_index % len(PROVIDERS)],
-                    },
+                    "locale": LOCALES[install_index % len(LOCALES)],
                 }
             )
     return events

@@ -278,7 +278,7 @@ pub struct RawEventRecord {
     pub platform: Platform,
     pub app_version: Option<String>,
     pub os_version: Option<String>,
-    pub properties: BTreeMap<String, String>,
+    pub locale: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,7 +293,7 @@ pub struct SessionRecord {
     pub platform: Platform,
     pub app_version: Option<String>,
     pub os_version: Option<String>,
-    pub properties: BTreeMap<String, String>,
+    pub locale: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -345,7 +345,8 @@ pub struct SessionActiveInstallSliceDelta {
     pub app_version_is_null: bool,
     pub os_version: Option<String>,
     pub os_version_is_null: bool,
-    pub properties: BTreeMap<String, String>,
+    pub locale: Option<String>,
+    pub locale_is_null: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,6 +413,38 @@ pub struct EventMetricBucketDim2Delta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventMetricBucketDim3Delta {
+    pub project_id: Uuid,
+    pub granularity: MetricGranularity,
+    pub bucket_start: DateTime<Utc>,
+    pub event_name: String,
+    pub dim1_key: String,
+    pub dim1_value: String,
+    pub dim2_key: String,
+    pub dim2_value: String,
+    pub dim3_key: String,
+    pub dim3_value: String,
+    pub event_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventMetricBucketDim4Delta {
+    pub project_id: Uuid,
+    pub granularity: MetricGranularity,
+    pub bucket_start: DateTime<Utc>,
+    pub event_name: String,
+    pub dim1_key: String,
+    pub dim1_value: String,
+    pub dim2_key: String,
+    pub dim2_value: String,
+    pub dim3_key: String,
+    pub dim3_value: String,
+    pub dim4_key: String,
+    pub dim4_value: String,
+    pub event_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventMetricsCubeRow {
     pub bucket_start: DateTime<Utc>,
     pub dimensions: BTreeMap<String, String>,
@@ -461,6 +494,40 @@ pub struct SessionMetricDim2Delta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMetricDim3Delta {
+    pub project_id: Uuid,
+    pub granularity: MetricGranularity,
+    pub bucket_start: DateTime<Utc>,
+    pub dim1_key: String,
+    pub dim1_value: String,
+    pub dim2_key: String,
+    pub dim2_value: String,
+    pub dim3_key: String,
+    pub dim3_value: String,
+    pub session_count: i64,
+    pub duration_total_seconds: i64,
+    pub new_installs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMetricDim4Delta {
+    pub project_id: Uuid,
+    pub granularity: MetricGranularity,
+    pub bucket_start: DateTime<Utc>,
+    pub dim1_key: String,
+    pub dim1_value: String,
+    pub dim2_key: String,
+    pub dim2_value: String,
+    pub dim3_key: String,
+    pub dim3_value: String,
+    pub dim4_key: String,
+    pub dim4_value: String,
+    pub session_count: i64,
+    pub duration_total_seconds: i64,
+    pub new_installs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMetricsCubeRow {
     pub bucket_start: DateTime<Utc>,
     pub dimensions: BTreeMap<String, String>,
@@ -482,7 +549,7 @@ pub struct InstallFirstSeenRecord {
     pub platform: Platform,
     pub app_version: Option<String>,
     pub os_version: Option<String>,
-    pub properties: BTreeMap<String, String>,
+    pub locale: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1076,7 +1143,7 @@ pub async fn insert_events(
     let result = async {
         let mut tx = pool.begin().await?;
         let mut builder = QueryBuilder::<sqlx::Postgres>::new(
-            "INSERT INTO events_raw (project_id, event_name, timestamp, install_id, platform, app_version, os_version, properties) ",
+            "INSERT INTO events_raw (project_id, event_name, timestamp, install_id, platform, app_version, os_version, locale) ",
         );
 
         builder.push_values(events, |mut separated, event| {
@@ -1090,9 +1157,7 @@ pub async fn insert_events(
             });
             separated.push_bind(&event.app_version);
             separated.push_bind(&event.os_version);
-            separated.push_bind(sqlx::types::Json(
-                serde_json::to_value(&event.properties).expect("serialize event properties"),
-            ));
+            separated.push_bind(&event.locale);
         });
 
         let inserted = builder.build().execute(&mut *tx).await?;
@@ -1876,6 +1941,88 @@ pub async fn upsert_event_metric_buckets_dim2_in_tx(
     Ok(())
 }
 
+pub async fn upsert_event_metric_buckets_dim3_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deltas: &[EventMetricBucketDim3Delta],
+) -> Result<(), StoreError> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in deltas.chunks(max_rows_per_batched_statement(11)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO event_metric_buckets_dim3 \
+             (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(&delta.event_name);
+            separated.push_bind(&delta.dim1_key);
+            separated.push_bind(&delta.dim1_value);
+            separated.push_bind(&delta.dim2_key);
+            separated.push_bind(&delta.dim2_value);
+            separated.push_bind(&delta.dim3_key);
+            separated.push_bind(&delta.dim3_value);
+            separated.push_bind(delta.event_count);
+        });
+        builder.push(
+            " ON CONFLICT \
+              (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value) \
+              DO UPDATE SET \
+              event_count = event_metric_buckets_dim3.event_count + EXCLUDED.event_count, \
+              updated_at = now()",
+        );
+
+        builder.build().execute(&mut **tx).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn upsert_event_metric_buckets_dim4_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deltas: &[EventMetricBucketDim4Delta],
+) -> Result<(), StoreError> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in deltas.chunks(max_rows_per_batched_statement(13)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO event_metric_buckets_dim4 \
+             (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, event_count) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(&delta.event_name);
+            separated.push_bind(&delta.dim1_key);
+            separated.push_bind(&delta.dim1_value);
+            separated.push_bind(&delta.dim2_key);
+            separated.push_bind(&delta.dim2_value);
+            separated.push_bind(&delta.dim3_key);
+            separated.push_bind(&delta.dim3_value);
+            separated.push_bind(&delta.dim4_key);
+            separated.push_bind(&delta.dim4_value);
+            separated.push_bind(delta.event_count);
+        });
+        builder.push(
+            " ON CONFLICT \
+              (project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value) \
+              DO UPDATE SET \
+              event_count = event_metric_buckets_dim4.event_count + EXCLUDED.event_count, \
+              updated_at = now()",
+        );
+
+        builder.build().execute(&mut **tx).await?;
+    }
+
+    Ok(())
+}
+
 pub async fn upsert_session_metric_totals_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     deltas: &[SessionMetricTotalDelta],
@@ -1989,6 +2136,94 @@ pub async fn upsert_session_metric_dim2_in_tx(
     Ok(())
 }
 
+pub async fn upsert_session_metric_dim3_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deltas: &[SessionMetricDim3Delta],
+) -> Result<(), StoreError> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in deltas.chunks(max_rows_per_batched_statement(12)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_metric_buckets_dim3 \
+             (project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, session_count, duration_total_seconds, new_installs) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(&delta.dim1_key);
+            separated.push_bind(&delta.dim1_value);
+            separated.push_bind(&delta.dim2_key);
+            separated.push_bind(&delta.dim2_value);
+            separated.push_bind(&delta.dim3_key);
+            separated.push_bind(&delta.dim3_value);
+            separated.push_bind(delta.session_count);
+            separated.push_bind(delta.duration_total_seconds);
+            separated.push_bind(delta.new_installs);
+        });
+        builder.push(
+            " ON CONFLICT \
+              (project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value) \
+              DO UPDATE SET \
+              session_count = session_metric_buckets_dim3.session_count + EXCLUDED.session_count, \
+              duration_total_seconds = session_metric_buckets_dim3.duration_total_seconds + EXCLUDED.duration_total_seconds, \
+              new_installs = session_metric_buckets_dim3.new_installs + EXCLUDED.new_installs, \
+              updated_at = now()",
+        );
+
+        builder.build().execute(&mut **tx).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn upsert_session_metric_dim4_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deltas: &[SessionMetricDim4Delta],
+) -> Result<(), StoreError> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in deltas.chunks(max_rows_per_batched_statement(14)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_metric_buckets_dim4 \
+             (project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, session_count, duration_total_seconds, new_installs) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated.push_bind(delta.project_id);
+            separated.push_bind(delta.granularity.as_str());
+            separated.push_bind(delta.bucket_start);
+            separated.push_bind(&delta.dim1_key);
+            separated.push_bind(&delta.dim1_value);
+            separated.push_bind(&delta.dim2_key);
+            separated.push_bind(&delta.dim2_value);
+            separated.push_bind(&delta.dim3_key);
+            separated.push_bind(&delta.dim3_value);
+            separated.push_bind(&delta.dim4_key);
+            separated.push_bind(&delta.dim4_value);
+            separated.push_bind(delta.session_count);
+            separated.push_bind(delta.duration_total_seconds);
+            separated.push_bind(delta.new_installs);
+        });
+        builder.push(
+            " ON CONFLICT \
+              (project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value) \
+              DO UPDATE SET \
+              session_count = session_metric_buckets_dim4.session_count + EXCLUDED.session_count, \
+              duration_total_seconds = session_metric_buckets_dim4.duration_total_seconds + EXCLUDED.duration_total_seconds, \
+              new_installs = session_metric_buckets_dim4.new_installs + EXCLUDED.new_installs, \
+              updated_at = now()",
+        );
+
+        builder.build().execute(&mut **tx).await?;
+    }
+
+    Ok(())
+}
+
 pub async fn insert_install_first_seen_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     record: &InstallFirstSeenRecord,
@@ -2003,7 +2238,7 @@ pub async fn insert_install_first_seen_in_tx(
             platform,
             app_version,
             os_version,
-            properties
+            locale
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (project_id, install_id) DO NOTHING
@@ -2016,7 +2251,7 @@ pub async fn insert_install_first_seen_in_tx(
     .bind(platform_as_str(&record.platform))
     .bind(&record.app_version)
     .bind(&record.os_version)
-    .bind(sqlx::types::Json(record.properties.clone()))
+    .bind(&record.locale)
     .execute(&mut **tx)
     .await?;
 
@@ -2100,8 +2335,34 @@ where
             )
             .await
         }
+        3 => {
+            fetch_event_metrics_dim3_rows(
+                executor,
+                project_id,
+                granularity,
+                event_name,
+                start,
+                end,
+                cube_keys,
+                filters,
+            )
+            .await
+        }
+        4 => {
+            fetch_event_metrics_dim4_rows(
+                executor,
+                project_id,
+                granularity,
+                event_name,
+                start,
+                end,
+                cube_keys,
+                filters,
+            )
+            .await
+        }
         other => Err(StoreError::InvariantViolation(format!(
-            "event metrics cube arity must be between 0 and 2, got {other}"
+            "event metrics cube arity must be between 0 and 4, got {other}"
         ))),
     }
 }
@@ -2406,8 +2667,34 @@ where
             )
             .await
         }
+        3 => {
+            fetch_session_metrics_dim3_rows(
+                executor,
+                project_id,
+                granularity,
+                metric,
+                start,
+                end,
+                cube_keys,
+                filters,
+            )
+            .await
+        }
+        4 => {
+            fetch_session_metrics_dim4_rows(
+                executor,
+                project_id,
+                granularity,
+                metric,
+                start,
+                end,
+                cube_keys,
+                filters,
+            )
+            .await
+        }
         other => Err(StoreError::InvariantViolation(format!(
-            "session metrics cube arity must be between 0 and 2, got {other}"
+            "session metrics cube arity must be between 0 and 4, got {other}"
         ))),
     }
 }
@@ -2513,7 +2800,7 @@ where
 {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, properties
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, locale
         FROM events_raw
         WHERE id > $1
         ORDER BY id ASC
@@ -2556,7 +2843,7 @@ pub async fn fetch_all_events_for_install_in_tx(
 ) -> Result<Vec<RawEventRecord>, StoreError> {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, properties
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, locale
         FROM events_raw
         WHERE project_id = $1
           AND install_id = $2
@@ -2583,7 +2870,7 @@ where
 {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, properties
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, locale
         FROM events_raw
         WHERE project_id = $1
           AND install_id = $2
@@ -2782,7 +3069,7 @@ pub async fn fetch_events_for_install_after_id_through_in_tx(
 ) -> Result<Vec<RawEventRecord>, StoreError> {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, properties
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, locale
         FROM events_raw
         WHERE project_id = $1
           AND install_id = $2
@@ -2828,7 +3115,7 @@ where
     let row = sqlx::query(
         r#"
         SELECT project_id, install_id, session_id, session_start, session_end,
-               event_count, duration_seconds, platform, app_version, os_version, properties
+               event_count, duration_seconds, platform, app_version, os_version, locale
         FROM sessions
         WHERE project_id = $1
           AND install_id = $2
@@ -2854,7 +3141,7 @@ pub async fn fetch_sessions_overlapping_window_in_tx(
     let rows = sqlx::query(
         r#"
         SELECT project_id, install_id, session_id, session_start, session_end,
-               event_count, duration_seconds, platform, app_version, os_version, properties
+               event_count, duration_seconds, platform, app_version, os_version, locale
         FROM sessions
         WHERE project_id = $1
           AND install_id = $2
@@ -2944,7 +3231,7 @@ pub async fn load_tail_sessions_for_installs_in_tx(
             s.platform, \
             s.app_version, \
             s.os_version, \
-            s.properties \
+            s.locale \
           FROM install_session_state state \
           INNER JOIN requested r \
             ON state.project_id = r.project_id \
@@ -3565,7 +3852,7 @@ pub async fn insert_session_in_tx(
             platform,
             app_version,
             os_version,
-            properties
+            locale
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         "#,
@@ -3580,7 +3867,7 @@ pub async fn insert_session_in_tx(
     .bind(platform_as_str(&session.platform))
     .bind(&session.app_version)
     .bind(&session.os_version)
-    .bind(sqlx::types::Json(session.properties.clone()))
+    .bind(&session.locale)
     .execute(&mut **tx)
     .await?;
 
@@ -3597,7 +3884,7 @@ pub async fn insert_sessions_in_tx(
 
     let mut builder = QueryBuilder::<Postgres>::new(
         "INSERT INTO sessions \
-         (project_id, install_id, session_id, session_start, session_end, event_count, duration_seconds, platform, app_version, os_version, properties) ",
+         (project_id, install_id, session_id, session_start, session_end, event_count, duration_seconds, platform, app_version, os_version, locale) ",
     );
     builder.push_values(sessions, |mut separated, session| {
         separated
@@ -3611,7 +3898,7 @@ pub async fn insert_sessions_in_tx(
             .push_bind(platform_as_str(&session.platform))
             .push_bind(&session.app_version)
             .push_bind(&session.os_version)
-            .push_bind(sqlx::types::Json(session.properties.clone()));
+            .push_bind(&session.locale);
     });
     let result = builder.build().execute(&mut **tx).await?;
 
@@ -3792,10 +4079,10 @@ pub async fn upsert_session_active_install_slices_in_tx(
     }
 
     let mut inserted_rows = 0;
-    for chunk in deltas.chunks(max_rows_per_batched_statement(9)) {
+    for chunk in deltas.chunks(max_rows_per_batched_statement(10)) {
         let mut builder = QueryBuilder::<Postgres>::new(
             "INSERT INTO session_active_install_slices \
-             (project_id, day, install_id, platform, app_version, app_version_is_null, os_version, os_version_is_null, properties) ",
+             (project_id, day, install_id, platform, app_version, app_version_is_null, os_version, os_version_is_null, locale, locale_is_null) ",
         );
         builder.push_values(chunk, |mut separated, delta| {
             separated
@@ -3807,7 +4094,8 @@ pub async fn upsert_session_active_install_slices_in_tx(
                 .push_bind(delta.app_version_is_null)
                 .push_bind(delta.os_version.as_deref().unwrap_or(""))
                 .push_bind(delta.os_version_is_null)
-                .push_bind(sqlx::types::Json(delta.properties.clone()));
+                .push_bind(delta.locale.as_deref().unwrap_or(""))
+                .push_bind(delta.locale_is_null);
         });
         builder.push(" ON CONFLICT DO NOTHING");
         inserted_rows += builder.build().execute(&mut **tx).await?.rows_affected();
@@ -3853,7 +4141,7 @@ pub async fn rebuild_session_active_install_slices_days_in_tx(
                 platform,
                 app_version,
                 os_version,
-                properties
+                locale
             FROM sessions
             WHERE project_id = $1
               AND DATE(session_start AT TIME ZONE 'UTC') = ANY($2)
@@ -3867,7 +4155,8 @@ pub async fn rebuild_session_active_install_slices_days_in_tx(
             app_version_is_null,
             os_version,
             os_version_is_null,
-            properties
+            locale,
+            locale_is_null
         )
         SELECT DISTINCT
             project_id,
@@ -3878,7 +4167,8 @@ pub async fn rebuild_session_active_install_slices_days_in_tx(
             app_version IS NULL,
             COALESCE(os_version, ''),
             os_version IS NULL,
-            COALESCE(properties, '{}'::jsonb)
+            COALESCE(locale, ''),
+            locale IS NULL
         FROM scoped_sessions
         "#,
     )
@@ -4921,6 +5211,160 @@ where
         .collect())
 }
 
+async fn fetch_event_metrics_dim3_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    event_name: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count \
+         FROM event_metric_buckets_dim3 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND event_name = ");
+    builder.push_bind(event_name);
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    for (index, key) in cube_keys.iter().enumerate() {
+        builder.push(format!(" AND dim{}_key = ", index + 1));
+        builder.push_bind(key);
+    }
+    for (index, key) in cube_keys.iter().enumerate() {
+        if let Some(value) = filters.get(key) {
+            builder.push(format!(" AND dim{}_value = ", index + 1));
+            builder.push_bind(value);
+        }
+    }
+    builder.push(" ORDER BY bucket_start ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC");
+
+    let rows = builder.build().fetch_all(executor).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsCubeRow {
+            bucket_start: row
+                .try_get("bucket_start")
+                .expect("bucket_start column exists"),
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim3_key")
+                        .expect("dim3_key column exists"),
+                    row.try_get::<String, _>("dim3_value")
+                        .expect("dim3_value column exists"),
+                ),
+            ]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_event_metrics_dim4_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    event_name: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<EventMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, event_count \
+         FROM event_metric_buckets_dim4 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND event_name = ");
+    builder.push_bind(event_name);
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    for (index, key) in cube_keys.iter().enumerate() {
+        builder.push(format!(" AND dim{}_key = ", index + 1));
+        builder.push_bind(key);
+    }
+    for (index, key) in cube_keys.iter().enumerate() {
+        if let Some(value) = filters.get(key) {
+            builder.push(format!(" AND dim{}_value = ", index + 1));
+            builder.push_bind(value);
+        }
+    }
+    builder.push(
+        " ORDER BY bucket_start ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC, dim4_value ASC",
+    );
+
+    let rows = builder.build().fetch_all(executor).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsCubeRow {
+            bucket_start: row
+                .try_get("bucket_start")
+                .expect("bucket_start column exists"),
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim3_key")
+                        .expect("dim3_key column exists"),
+                    row.try_get::<String, _>("dim3_value")
+                        .expect("dim3_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim4_key")
+                        .expect("dim4_key column exists"),
+                    row.try_get::<String, _>("dim4_value")
+                        .expect("dim4_value column exists"),
+                ),
+            ]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
 async fn fetch_total_event_metric_total_rows<'a, E>(
     executor: E,
     project_id: Uuid,
@@ -5608,6 +6052,160 @@ where
         .collect())
 }
 
+async fn fetch_session_metrics_dim3_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    metric: SessionMetric,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<SessionMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, ",
+    );
+    builder.push(session_metric_value_column(metric));
+    builder.push(
+        " AS value \
+         FROM session_metric_buckets_dim3 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    for (index, key) in cube_keys.iter().enumerate() {
+        builder.push(format!(" AND dim{}_key = ", index + 1));
+        builder.push_bind(key);
+    }
+    for (index, key) in cube_keys.iter().enumerate() {
+        if let Some(value) = filters.get(key) {
+            builder.push(format!(" AND dim{}_value = ", index + 1));
+            builder.push_bind(value);
+        }
+    }
+    builder.push(" ORDER BY bucket_start ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC");
+
+    let rows = builder.build().fetch_all(executor).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| SessionMetricsCubeRow {
+            bucket_start: row
+                .try_get("bucket_start")
+                .expect("bucket_start column exists"),
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim3_key")
+                        .expect("dim3_key column exists"),
+                    row.try_get::<String, _>("dim3_value")
+                        .expect("dim3_value column exists"),
+                ),
+            ]),
+            value: row.try_get::<i64, _>("value").expect("value column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_session_metrics_dim4_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    metric: SessionMetric,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+) -> Result<Vec<SessionMetricsCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, ",
+    );
+    builder.push(session_metric_value_column(metric));
+    builder.push(
+        " AS value \
+         FROM session_metric_buckets_dim4 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    for (index, key) in cube_keys.iter().enumerate() {
+        builder.push(format!(" AND dim{}_key = ", index + 1));
+        builder.push_bind(key);
+    }
+    for (index, key) in cube_keys.iter().enumerate() {
+        if let Some(value) = filters.get(key) {
+            builder.push(format!(" AND dim{}_value = ", index + 1));
+            builder.push_bind(value);
+        }
+    }
+    builder.push(
+        " ORDER BY bucket_start ASC, dim1_value ASC, dim2_value ASC, dim3_value ASC, dim4_value ASC",
+    );
+
+    let rows = builder.build().fetch_all(executor).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| SessionMetricsCubeRow {
+            bucket_start: row
+                .try_get("bucket_start")
+                .expect("bucket_start column exists"),
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim3_key")
+                        .expect("dim3_key column exists"),
+                    row.try_get::<String, _>("dim3_value")
+                        .expect("dim3_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim4_key")
+                        .expect("dim4_key column exists"),
+                    row.try_get::<String, _>("dim4_value")
+                        .expect("dim4_value column exists"),
+                ),
+            ]),
+            value: row.try_get::<i64, _>("value").expect("value column exists") as u64,
+        })
+        .collect())
+}
+
 fn ensure_canonical_cube_keys(cube_keys: &[String]) -> Result<(), StoreError> {
     if cube_keys.windows(2).any(|window| window[0] >= window[1]) {
         return Err(StoreError::InvariantViolation(
@@ -5645,10 +6243,7 @@ fn raw_event_from_row(row: sqlx::postgres::PgRow) -> Result<RawEventRecord, Stor
         platform: platform_from_str(&row.try_get::<String, _>("platform")?)?,
         app_version: row.try_get("app_version")?,
         os_version: row.try_get("os_version")?,
-        properties: row
-            .try_get::<Option<sqlx::types::Json<BTreeMap<String, String>>>, _>("properties")?
-            .map(|json| json.0)
-            .unwrap_or_default(),
+        locale: row.try_get("locale")?,
     })
 }
 
@@ -5664,10 +6259,7 @@ fn session_from_row(row: sqlx::postgres::PgRow) -> Result<SessionRecord, StoreEr
         platform: platform_from_str(&row.try_get::<String, _>("platform")?)?,
         app_version: row.try_get("app_version")?,
         os_version: row.try_get("os_version")?,
-        properties: row
-            .try_get::<Option<sqlx::types::Json<BTreeMap<String, String>>>, _>("properties")?
-            .map(|json| json.0)
-            .unwrap_or_default(),
+        locale: row.try_get("locale")?,
     })
 }
 
@@ -5717,18 +6309,13 @@ fn append_raw_event_filters(
 ) {
     for (key, value) in filters {
         match key.as_str() {
-            "platform" | "app_version" | "os_version" => {
+            "platform" | "app_version" | "os_version" | "locale" => {
                 query.push(" AND ");
                 query.push(key.as_str());
                 query.push(" = ");
                 query.push_bind(value.clone());
             }
-            _ => {
-                query.push(" AND properties ->> ");
-                query.push_bind(key.clone());
-                query.push(" = ");
-                query.push_bind(value.clone());
-            }
+            _ => unreachable!("filters are validated before store reads"),
         }
     }
 }
@@ -6325,7 +6912,7 @@ mod tests {
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
-            properties: BTreeMap::new(),
+            locale: Some("en-GB".to_owned()),
         }
     }
 
@@ -6360,7 +6947,7 @@ mod tests {
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
-            properties: BTreeMap::new(),
+            locale: Some("en-GB".to_owned()),
         }
     }
 
@@ -7521,13 +8108,13 @@ mod tests {
         assert!(
             migration.contains("ALTER TABLE sessions")
                 && migration.contains("ADD COLUMN IF NOT EXISTS os_version TEXT")
-                && migration.contains("ADD COLUMN IF NOT EXISTS properties JSONB"),
+                && migration.contains("ADD COLUMN IF NOT EXISTS locale TEXT"),
             "0015 must widen sessions with session snapshot dimensions"
         );
         assert!(
             migration.contains("ALTER TABLE install_first_seen")
                 && migration.contains("ADD COLUMN IF NOT EXISTS os_version TEXT")
-                && migration.contains("ADD COLUMN IF NOT EXISTS properties JSONB"),
+                && migration.contains("ADD COLUMN IF NOT EXISTS locale TEXT"),
             "0015 must widen install_first_seen with first-seen snapshot dimensions"
         );
         assert!(
@@ -7728,7 +8315,7 @@ mod tests {
                 platform,
                 app_version,
                 os_version,
-                properties
+                locale
             )
             VALUES ($1, 'app_open', $2, $3, $4, 'ios', NULL, NULL, $5)
             "#,
@@ -7745,7 +8332,7 @@ mod tests {
                 .with_timezone(&Utc),
         )
         .bind(install_id)
-        .bind(sqlx::types::Json(serde_json::json!({})))
+        .bind("en-GB")
         .execute(pool)
         .await
         .expect("insert usage event");

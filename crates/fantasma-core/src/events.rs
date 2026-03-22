@@ -1,13 +1,9 @@
-use std::collections::BTreeMap;
-
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 const MAX_BATCH_SIZE: usize = 200;
 const MAX_EVENT_BYTES: usize = 8 * 1024;
-const MAX_PROPERTIES_KEYS: usize = 2;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -25,8 +21,7 @@ pub struct EventPayload {
     pub platform: Platform,
     pub app_version: Option<String>,
     pub os_version: Option<String>,
-    #[serde(default)]
-    pub properties: BTreeMap<String, String>,
+    pub locale: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -38,8 +33,13 @@ pub struct RawEventPayload {
     pub platform: Platform,
     pub app_version: Option<String>,
     pub os_version: Option<String>,
-    #[serde(default)]
-    pub properties: Map<String, Value>,
+    pub locale: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_legacy_properties_field",
+        skip_serializing
+    )]
+    pub properties: Option<Option<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -82,14 +82,10 @@ pub enum EventValidationError {
     EmptyAppVersion,
     #[error("os_version must not be empty when provided")]
     EmptyOsVersion,
-    #[error("properties object may contain at most {MAX_PROPERTIES_KEYS} keys")]
-    TooManyProperties,
-    #[error("properties values must be strings")]
-    NonStringPropertyValue,
-    #[error("properties key '{0}' is reserved")]
-    ReservedPropertyKey(String),
-    #[error("properties key '{0}' is invalid")]
-    InvalidPropertyKey(String),
+    #[error("locale must not be empty when provided")]
+    EmptyLocale,
+    #[error("properties are not supported")]
+    LegacyPropertiesUnsupported,
     #[error("event payload may not exceed {MAX_EVENT_BYTES} bytes")]
     EventTooLarge,
 }
@@ -120,18 +116,12 @@ impl EventPayload {
             return Err(EventValidationError::EmptyOsVersion);
         }
 
-        if self.properties.len() > MAX_PROPERTIES_KEYS {
-            return Err(EventValidationError::TooManyProperties);
-        }
-
-        for key in self.properties.keys() {
-            if is_reserved_event_property_key(key) {
-                return Err(EventValidationError::ReservedPropertyKey(key.clone()));
-            }
-
-            if !is_valid_event_property_key(key) {
-                return Err(EventValidationError::InvalidPropertyKey(key.clone()));
-            }
+        if self
+            .locale
+            .as_deref()
+            .is_some_and(|locale| locale.trim().is_empty())
+        {
+            return Err(EventValidationError::EmptyLocale);
         }
 
         let size = serde_json::to_vec(self)
@@ -147,24 +137,8 @@ impl EventPayload {
 
 impl RawEventPayload {
     pub fn normalize(self) -> Result<EventPayload, EventValidationError> {
-        if self.properties.len() > MAX_PROPERTIES_KEYS {
-            return Err(EventValidationError::TooManyProperties);
-        }
-
-        let mut properties = BTreeMap::new();
-        for (key, value) in self.properties {
-            if is_reserved_event_property_key(&key) {
-                return Err(EventValidationError::ReservedPropertyKey(key));
-            }
-
-            if !is_valid_event_property_key(&key) {
-                return Err(EventValidationError::InvalidPropertyKey(key));
-            }
-
-            let Value::String(value) = value else {
-                return Err(EventValidationError::NonStringPropertyValue);
-            };
-            properties.insert(key, value);
+        if self.properties.is_some() {
+            return Err(EventValidationError::LegacyPropertiesUnsupported);
         }
 
         let event = EventPayload {
@@ -174,12 +148,25 @@ impl RawEventPayload {
             platform: self.platform,
             app_version: self.app_version,
             os_version: self.os_version,
-            properties,
+            locale: self.locale,
         };
         event.validate()?;
 
         Ok(event)
     }
+}
+
+fn deserialize_legacy_properties_field<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<serde_json::Value>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(Some(match value {
+        serde_json::Value::Null => None,
+        other => Some(other),
+    }))
 }
 
 impl EventBatchRequest {
@@ -248,40 +235,6 @@ impl RawEventBatchRequest {
     }
 }
 
-pub fn is_reserved_event_property_key(key: &str) -> bool {
-    matches!(
-        key,
-        "project_id"
-            | "event"
-            | "timestamp"
-            | "install_id"
-            | "properties"
-            | "metric"
-            | "granularity"
-            | "start"
-            | "end"
-            | "start_date"
-            | "end_date"
-            | "group_by"
-            | "platform"
-            | "app_version"
-            | "os_version"
-    )
-}
-
-pub fn is_valid_event_property_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-
-    if !first.is_ascii_lowercase() || key.len() > 63 {
-        return false;
-    }
-
-    chars.all(|char| char.is_ascii_lowercase() || char.is_ascii_digit() || char == '_')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,7 +247,7 @@ mod tests {
             platform: Platform::Ios,
             app_version: Some("1.2.3".to_owned()),
             os_version: Some("18.3".to_owned()),
-            properties: BTreeMap::new(),
+            locale: Some("en-GB".to_owned()),
         }
     }
 
@@ -342,12 +295,9 @@ mod tests {
         }
 
         #[test]
-        fn allows_two_explicit_properties() {
+        fn allows_missing_locale() {
             let mut event = valid_event();
-            event.properties = BTreeMap::from([
-                ("plan".to_owned(), "pro".to_owned()),
-                ("provider".to_owned(), "strava".to_owned()),
-            ]);
+            event.locale = None;
 
             let result = event.validate();
 
@@ -362,6 +312,16 @@ mod tests {
             let result = event.validate().unwrap_err();
 
             assert_eq!(result, EventValidationError::EmptyOsVersion);
+        }
+
+        #[test]
+        fn returns_error_when_locale_is_empty() {
+            let mut event = valid_event();
+            event.locale = Some(String::new());
+
+            let result = event.validate().unwrap_err();
+
+            assert_eq!(result, EventValidationError::EmptyLocale);
         }
 
         #[test]
@@ -388,42 +348,6 @@ mod tests {
             let result = event.validate().unwrap_err();
 
             assert_eq!(result, EventValidationError::EventTooLarge);
-        }
-    }
-
-    mod event_property_key_validation {
-        use super::*;
-
-        #[test]
-        fn accepts_keys_up_to_sixty_three_characters() {
-            let key = format!("a{}", "b".repeat(62));
-
-            let result = is_valid_event_property_key(&key);
-
-            assert!(result);
-        }
-
-        #[test]
-        fn rejects_keys_longer_than_sixty_three_characters() {
-            let key = format!("a{}", "b".repeat(63));
-
-            let result = is_valid_event_property_key(&key);
-
-            assert!(!result);
-        }
-
-        #[test]
-        fn rejects_keys_that_do_not_start_with_a_lowercase_letter() {
-            let result = is_valid_event_property_key("1plan");
-
-            assert!(!result);
-        }
-
-        #[test]
-        fn rejects_empty_keys() {
-            let result = is_valid_event_property_key("");
-
-            assert!(!result);
         }
     }
 
@@ -470,7 +394,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn returns_indexed_error_when_property_value_is_not_a_string() {
+        fn accepts_top_level_locale() {
             let request: RawEventBatchRequest = serde_json::from_value(serde_json::json!({
                 "events": [
                     {
@@ -478,27 +402,19 @@ mod tests {
                         "timestamp": "2026-03-01T00:00:00Z",
                         "install_id": "install_123",
                         "platform": "ios",
-                        "properties": {
-                            "provider": 7
-                        }
+                        "locale": "pt-PT"
                     }
                 ]
             }))
             .expect("raw request parses");
 
-            let result = request.normalize().unwrap_err();
+            let normalized = request.normalize().expect("request normalizes");
 
-            assert_eq!(
-                result,
-                vec![EventValidationIssue {
-                    index: 0,
-                    message: "properties values must be strings".to_owned(),
-                }]
-            );
+            assert_eq!(normalized.events[0].locale.as_deref(), Some("pt-PT"));
         }
 
         #[test]
-        fn normalizes_missing_properties_to_an_empty_map() {
+        fn normalizes_missing_locale_to_none() {
             let request: RawEventBatchRequest = serde_json::from_value(serde_json::json!({
                 "events": [
                     {
@@ -513,11 +429,11 @@ mod tests {
 
             let normalized = request.normalize().expect("request normalizes");
 
-            assert!(normalized.events[0].properties.is_empty());
+            assert_eq!(normalized.events[0].locale, None);
         }
 
         #[test]
-        fn returns_indexed_error_when_property_key_is_reserved() {
+        fn rejects_legacy_properties_during_normalization() {
             let request: RawEventBatchRequest = serde_json::from_value(serde_json::json!({
                 "events": [
                     {
@@ -526,26 +442,26 @@ mod tests {
                         "install_id": "install_123",
                         "platform": "ios",
                         "properties": {
-                            "platform": "ios"
+                            "provider": "strava"
                         }
                     }
                 ]
             }))
             .expect("raw request parses");
 
-            let result = request.normalize().unwrap_err();
+            let issues = request.normalize().unwrap_err();
 
             assert_eq!(
-                result,
+                issues,
                 vec![EventValidationIssue {
                     index: 0,
-                    message: "properties key 'platform' is reserved".to_owned(),
+                    message: "properties are not supported".to_owned(),
                 }]
             );
         }
 
         #[test]
-        fn returns_indexed_error_when_more_than_two_properties_are_present() {
+        fn rejects_legacy_properties_null_during_normalization() {
             let request: RawEventBatchRequest = serde_json::from_value(serde_json::json!({
                 "events": [
                     {
@@ -553,23 +469,19 @@ mod tests {
                         "timestamp": "2026-03-01T00:00:00Z",
                         "install_id": "install_123",
                         "platform": "ios",
-                        "properties": {
-                            "plan": "pro",
-                            "provider": "strava",
-                            "region": "eu"
-                        }
+                        "properties": null
                     }
                 ]
             }))
             .expect("raw request parses");
 
-            let result = request.normalize().unwrap_err();
+            let issues = request.normalize().unwrap_err();
 
             assert_eq!(
-                result,
+                issues,
                 vec![EventValidationIssue {
                     index: 0,
-                    message: "properties object may contain at most 2 keys".to_owned(),
+                    message: "properties are not supported".to_owned(),
                 }]
             );
         }

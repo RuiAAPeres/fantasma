@@ -64,9 +64,9 @@ public enum Fantasma {
         try await core.configure(serverURL: serverURL, writeKey: writeKey)
     }
 
-    public static func track(_ eventName: String, properties: [String: String]? = nil) async throws {
+    public static func track(_ eventName: String) async throws {
         let core = try await runtime.sharedCore()
-        try await core.track(eventName, properties: properties)
+        try await core.track(eventName)
     }
 
     public static func flush() async throws {

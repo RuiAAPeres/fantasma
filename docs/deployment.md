@@ -527,7 +527,7 @@ cargo run -p fantasma-cli -- metrics events \
   --start 2026-01-01 \
   --end 2026-01-02 \
   --filter platform=ios \
-  --group-by provider
+  --filter locale=en-US
 ```
 
 ```bash
@@ -577,9 +577,7 @@ curl -fsS -X POST http://localhost:8081/v1/events \
         "platform": "ios",
         "app_version": "1.0.0",
         "os_version": "18.3",
-        "properties": {
-          "provider": "strava"
-        }
+        "locale": "en-US"
       },
       {
         "event": "app_open",
@@ -588,9 +586,7 @@ curl -fsS -X POST http://localhost:8081/v1/events \
         "platform": "ios",
         "app_version": "1.0.0",
         "os_version": "18.3",
-        "properties": {
-          "provider": "strava"
-        }
+        "locale": "en-US"
       }
     ]
   }'
@@ -621,7 +617,7 @@ curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&star
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-02&plan=pro&group_by=provider" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-02&platform=ios&locale=en-US" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
@@ -631,7 +627,7 @@ curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&star
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-10&end=2026-03-20&interval=month&plan=pro" \
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-10&end=2026-03-20&interval=month&platform=ios" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
@@ -641,12 +637,12 @@ curl -fsS "http://localhost:8082/v1/metrics/live_installs" \
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02&platform=ios&group_by=provider" \
+curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02&platform=ios&locale=en-US" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z&group_by=provider" \
+curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z&platform=ios" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
 

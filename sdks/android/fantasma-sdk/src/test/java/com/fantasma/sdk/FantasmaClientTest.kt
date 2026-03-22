@@ -25,10 +25,7 @@ internal class FantasmaClientTest {
         }
 
     private class RecordingDelegate : FantasmaClientDelegate {
-        override suspend fun track(
-            eventName: String,
-            properties: Map<String, String>?,
-        ): Unit = Unit
+        override suspend fun track(eventName: String): Unit = Unit
 
         override suspend fun flush(): Unit = Unit
 

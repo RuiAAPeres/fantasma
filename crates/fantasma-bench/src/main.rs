@@ -25,8 +25,7 @@ const API_BASE_URL: &str = "http://127.0.0.1:18082";
 const POST_BATCH_SIZE: usize = 100;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const PROVIDERS: [&str; 4] = ["strava", "garmin", "polar", "oura"];
-const PLANS: [&str; 3] = ["free", "pro", "team"];
+const PLANS: [&str; 3] = ["en-US", "pt-PT", "fr-FR"];
 const APP_VERSIONS: [&str; 3] = ["1.0.0", "1.1.0", "1.2.0"];
 const OS_VERSIONS: [&str; 2] = ["18.3", "18.4"];
 const SLO_INSTALL_COUNT_PER_DAY: usize = 1_000;
@@ -938,7 +937,7 @@ struct BenchEvent {
     platform: String,
     app_version: String,
     os_version: String,
-    properties: BTreeMap<String, String>,
+    locale: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1989,16 +1988,16 @@ fn slo_base_expectation(window: SloWindow) -> SloExpectation {
         total_new_installs: SLO_INSTALL_COUNT_PER_DAY as u64,
         total_active_installs: (window.days() * SLO_INSTALL_COUNT_PER_DAY) as u64,
         pro_total_events: (window.days()
-            * install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "pro")
+            * install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "en-US")
             * SLO_EVENTS_PER_INSTALL_PER_DAY) as u64,
         pro_total_sessions: (window.days()
-            * install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "pro"))
+            * install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "en-US"))
             as u64,
         pro_total_duration_seconds: (window.days()
-            * install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "pro"))
+            * install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "en-US"))
             as u64
             * SLO_SESSION_DURATION_SECONDS,
-        pro_total_new_installs: install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "pro") as u64,
+        pro_total_new_installs: install_count_for_plan(SLO_INSTALL_COUNT_PER_DAY, "en-US") as u64,
         include_repair_late_events: false,
     }
 }
@@ -2009,7 +2008,7 @@ fn slo_expectation(scenario: &SloScenarioDefinition) -> SloExpectation {
     if matches!(scenario.kind, SloScenarioKind::StressRepair) {
         let repaired_install_days = repaired_install_days_for_plan(scenario.window, None) as u64;
         let repaired_pro_install_days =
-            repaired_install_days_for_plan(scenario.window, Some("pro")) as u64;
+            repaired_install_days_for_plan(scenario.window, Some("en-US")) as u64;
         expectation.total_events +=
             repaired_install_days * SLO_REPAIR_LATE_EVENTS_PER_INSTALL_DAY as u64;
         expectation.total_duration_seconds +=
@@ -2037,7 +2036,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "events_count_day_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start={day_start}&end={day_end}&group_by=plan&group_by=provider",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start={day_start}&end={day_end}",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
@@ -2047,7 +2046,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "events_count_hour_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start={hour_start}&end={hour_end}&group_by=plan&group_by=provider",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start={hour_start}&end={hour_end}",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
@@ -2057,31 +2056,31 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "events_count_day_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start={day_start}&end={day_end}&plan=pro&group_by=provider",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start={day_start}&end={day_end}&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
             family: "event",
             expected_total: SloQueryExpectedTotal::Events(
-                SloEventCountExpectation::FilteredByPlan { plan: "pro" },
+                SloEventCountExpectation::FilteredByPlan { plan: "en-US" },
             ),
         },
         SloQuerySpec {
             name: "events_count_hour_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start={hour_start}&end={hour_end}&plan=pro&group_by=provider",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start={hour_start}&end={hour_end}&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
             family: "event",
             expected_total: SloQueryExpectedTotal::Events(
-                SloEventCountExpectation::FilteredByPlan { plan: "pro" },
+                SloEventCountExpectation::FilteredByPlan { plan: "en-US" },
             ),
         },
         SloQuerySpec {
             name: "sessions_count_day_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=count&granularity=day&start={day_start}&end={day_end}&group_by=platform&group_by=app_version",
+                "{}/v1/metrics/sessions?metric=count&granularity=day&start={day_start}&end={day_end}",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
@@ -2091,7 +2090,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_count_hour_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=count&granularity=hour&start={hour_start}&end={hour_end}&group_by=platform&group_by=app_version",
+                "{}/v1/metrics/sessions?metric=count&granularity=hour&start={hour_start}&end={hour_end}",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
@@ -2101,27 +2100,27 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_count_day_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=count&granularity=day&start={day_start}&end={day_end}&plan=pro&group_by=provider",
+                "{}/v1/metrics/sessions?metric=count&granularity=day&start={day_start}&end={day_end}&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
             family: "session",
-            expected_total: SloQueryExpectedTotal::SessionsCountFilteredByPlan { plan: "pro" },
+            expected_total: SloQueryExpectedTotal::SessionsCountFilteredByPlan { plan: "en-US" },
         },
         SloQuerySpec {
             name: "sessions_count_hour_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=count&granularity=hour&start={hour_start}&end={hour_end}&plan=pro&group_by=provider",
+                "{}/v1/metrics/sessions?metric=count&granularity=hour&start={hour_start}&end={hour_end}&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
             family: "session",
-            expected_total: SloQueryExpectedTotal::SessionsCountFilteredByPlan { plan: "pro" },
+            expected_total: SloQueryExpectedTotal::SessionsCountFilteredByPlan { plan: "en-US" },
         },
         SloQuerySpec {
             name: "sessions_duration_total_day_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=duration_total&granularity=day&start={day_start}&end={day_end}&group_by=platform&group_by=app_version",
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=day&start={day_start}&end={day_end}",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
@@ -2131,7 +2130,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_duration_total_hour_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=duration_total&granularity=hour&start={hour_start}&end={hour_end}&group_by=platform&group_by=app_version",
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=hour&start={hour_start}&end={hour_end}",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
@@ -2141,31 +2140,31 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_duration_total_day_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=duration_total&granularity=day&start={day_start}&end={day_end}&plan=pro&group_by=provider",
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=day&start={day_start}&end={day_end}&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
             family: "session",
             expected_total: SloQueryExpectedTotal::SessionsDurationTotalFilteredByPlan {
-                plan: "pro",
+                plan: "en-US",
             },
         },
         SloQuerySpec {
             name: "sessions_duration_total_hour_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=duration_total&granularity=hour&start={hour_start}&end={hour_end}&plan=pro&group_by=provider",
+                "{}/v1/metrics/sessions?metric=duration_total&granularity=hour&start={hour_start}&end={hour_end}&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
             family: "session",
             expected_total: SloQueryExpectedTotal::SessionsDurationTotalFilteredByPlan {
-                plan: "pro",
+                plan: "en-US",
             },
         },
         SloQuerySpec {
             name: "sessions_new_installs_day_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=new_installs&granularity=day&start={day_start}&end={day_end}&group_by=platform&group_by=app_version",
+                "{}/v1/metrics/sessions?metric=new_installs&granularity=day&start={day_start}&end={day_end}",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
@@ -2175,7 +2174,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_new_installs_hour_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=new_installs&granularity=hour&start={hour_start}&end={hour_end}&group_by=platform&group_by=app_version",
+                "{}/v1/metrics/sessions?metric=new_installs&granularity=hour&start={hour_start}&end={hour_end}",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
@@ -2185,25 +2184,25 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_new_installs_day_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=new_installs&granularity=day&start={day_start}&end={day_end}&plan=pro&group_by=provider",
+                "{}/v1/metrics/sessions?metric=new_installs&granularity=day&start={day_start}&end={day_end}&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
             family: "session",
             expected_total: SloQueryExpectedTotal::SessionsNewInstallsFilteredByPlan {
-                plan: "pro",
+                plan: "en-US",
             },
         },
         SloQuerySpec {
             name: "sessions_new_installs_hour_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=new_installs&granularity=hour&start={hour_start}&end={hour_end}&plan=pro&group_by=provider",
+                "{}/v1/metrics/sessions?metric=new_installs&granularity=hour&start={hour_start}&end={hour_end}&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: true,
             family: "session",
             expected_total: SloQueryExpectedTotal::SessionsNewInstallsFilteredByPlan {
-                plan: "pro",
+                plan: "en-US",
             },
         },
     ]);
@@ -2292,7 +2291,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_active_installs_day_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=day&plan=pro&group_by=provider",
+                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=day&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: false,
@@ -2302,7 +2301,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_active_installs_day_dim2_filtered".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=day&plan=pro&provider=strava",
+                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=day&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: false,
@@ -2322,7 +2321,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_active_installs_week_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=week&plan=pro&group_by=provider",
+                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=week&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: false,
@@ -2332,7 +2331,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_active_installs_week_dim2_filtered".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=week&plan=pro&provider=strava",
+                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=week&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: false,
@@ -2352,7 +2351,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_active_installs_month_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=month&plan=pro&group_by=provider",
+                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=month&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: false,
@@ -2362,7 +2361,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_active_installs_month_dim2_filtered".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=month&plan=pro&provider=strava",
+                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=month&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: false,
@@ -2382,7 +2381,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_active_installs_year_dim2_grouped".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=year&plan=pro&group_by=provider",
+                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=year&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: false,
@@ -2392,7 +2391,7 @@ fn slo_query_matrix(window: SloWindow, start_day: NaiveDate) -> Vec<SloQuerySpec
         SloQuerySpec {
             name: "sessions_active_installs_year_dim2_filtered".to_owned(),
             url: format!(
-                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=year&plan=pro&provider=strava",
+                "{}/v1/metrics/sessions?metric=active_installs&start={day_start}&end={day_end}&interval=year&locale=en-US",
                 benchmark_api_base_url()
             ),
             hard_gate: false,
@@ -2555,7 +2554,6 @@ fn slo_event(
     };
     let app_version = APP_VERSIONS[(day_offset + install_index) % APP_VERSIONS.len()];
     let os_version = OS_VERSIONS[(day_offset + install_index) % OS_VERSIONS.len()];
-    let provider = PROVIDERS[install_index % PROVIDERS.len()];
     let plan = PLANS[install_index % PLANS.len()];
 
     BenchEvent {
@@ -2565,10 +2563,7 @@ fn slo_event(
         platform: platform.to_owned(),
         app_version: app_version.to_owned(),
         os_version: os_version.to_owned(),
-        properties: BTreeMap::from([
-            ("plan".to_owned(), plan.to_owned()),
-            ("provider".to_owned(), provider.to_owned()),
-        ]),
+        locale: plan.to_owned(),
     }
 }
 
@@ -3079,14 +3074,14 @@ fn expected_total_for_slo_query(
 
 fn filtered_event_total_for_slo_expectation(expectation: &SloExpectation, plan: &str) -> u64 {
     match plan {
-        "pro" => expectation.pro_total_events,
+        "en-US" => expectation.pro_total_events,
         _ => 0,
     }
 }
 
 fn filtered_session_count_for_slo_expectation(expectation: &SloExpectation, plan: &str) -> u64 {
     match plan {
-        "pro" => expectation.pro_total_sessions,
+        "en-US" => expectation.pro_total_sessions,
         _ => 0,
     }
 }
@@ -3096,7 +3091,7 @@ fn filtered_session_duration_total_for_slo_expectation(
     plan: &str,
 ) -> u64 {
     match plan {
-        "pro" => expectation.pro_total_duration_seconds,
+        "en-US" => expectation.pro_total_duration_seconds,
         _ => 0,
     }
 }
@@ -3106,7 +3101,7 @@ fn filtered_session_new_installs_for_slo_expectation(
     plan: &str,
 ) -> u64 {
     match plan {
-        "pro" => expectation.pro_total_new_installs,
+        "en-US" => expectation.pro_total_new_installs,
         _ => 0,
     }
 }
@@ -4175,20 +4170,23 @@ fn build_live_append_blobs(
                                     0
                                 },
                                 total_active_installs: if session_index == 0 { 1 } else { 0 },
-                                pro_total_events: if slo_event_matches_plan(install_index, "pro") {
+                                pro_total_events: if slo_event_matches_plan(install_index, "en-US")
+                                {
                                     SLO_REPRESENTATIVE_EVENTS_PER_SESSION as u64
                                 } else {
                                     0
                                 },
-                                pro_total_sessions: if slo_event_matches_plan(install_index, "pro")
-                                {
+                                pro_total_sessions: if slo_event_matches_plan(
+                                    install_index,
+                                    "en-US",
+                                ) {
                                     1
                                 } else {
                                     0
                                 },
                                 pro_total_duration_seconds: if slo_event_matches_plan(
                                     install_index,
-                                    "pro",
+                                    "en-US",
                                 ) {
                                     SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS
                                 } else {
@@ -4196,7 +4194,7 @@ fn build_live_append_blobs(
                                 },
                                 pro_total_new_installs: if day_offset == 0
                                     && session_index == 0
-                                    && slo_event_matches_plan(install_index, "pro")
+                                    && slo_event_matches_plan(install_index, "en-US")
                                 {
                                     1
                                 } else {
@@ -4234,21 +4232,21 @@ fn build_live_append_blobs(
                                 * SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS,
                             total_new_installs: 0,
                             total_active_installs: 0,
-                            pro_total_events: if slo_event_matches_plan(install_index, "pro") {
+                            pro_total_events: if slo_event_matches_plan(install_index, "en-US") {
                                 (SLO_REPRESENTATIVE_OFFLINE_FLUSH_SESSION_COUNT
                                     * SLO_REPRESENTATIVE_EVENTS_PER_SESSION)
                                     as u64
                             } else {
                                 0
                             },
-                            pro_total_sessions: if slo_event_matches_plan(install_index, "pro") {
+                            pro_total_sessions: if slo_event_matches_plan(install_index, "en-US") {
                                 SLO_REPRESENTATIVE_OFFLINE_FLUSH_SESSION_COUNT as u64
                             } else {
                                 0
                             },
                             pro_total_duration_seconds: if slo_event_matches_plan(
                                 install_index,
-                                "pro",
+                                "en-US",
                             ) {
                                 (SLO_REPRESENTATIVE_OFFLINE_FLUSH_SESSION_COUNT as u64)
                                     * SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS
@@ -4281,19 +4279,19 @@ fn build_live_append_blobs(
                                 0
                             },
                             total_active_installs: if session_index == 0 { 1 } else { 0 },
-                            pro_total_events: if slo_event_matches_plan(install_index, "pro") {
+                            pro_total_events: if slo_event_matches_plan(install_index, "en-US") {
                                 SLO_REPRESENTATIVE_EVENTS_PER_SESSION as u64
                             } else {
                                 0
                             },
-                            pro_total_sessions: if slo_event_matches_plan(install_index, "pro") {
+                            pro_total_sessions: if slo_event_matches_plan(install_index, "en-US") {
                                 1
                             } else {
                                 0
                             },
                             pro_total_duration_seconds: if slo_event_matches_plan(
                                 install_index,
-                                "pro",
+                                "en-US",
                             ) {
                                 SLO_REPRESENTATIVE_SESSION_DURATION_SECONDS
                             } else {
@@ -4301,7 +4299,7 @@ fn build_live_append_blobs(
                             },
                             pro_total_new_installs: if day_offset == 0
                                 && session_index == 0
-                                && slo_event_matches_plan(install_index, "pro")
+                                && slo_event_matches_plan(install_index, "en-US")
                             {
                                 1
                             } else {
@@ -4344,7 +4342,7 @@ fn build_burst_readiness_blobs(
 
     for install_index in 0..install_count {
         let session_start = live_session_start(day, 0, install_index, 0)?;
-        let is_pro = slo_event_matches_plan(install_index, "pro");
+        let is_pro = slo_event_matches_plan(install_index, "en-US");
         let install_delta = SloExpectationDelta {
             total_events: events_per_install as u64,
             total_sessions: 1,
@@ -4457,14 +4455,16 @@ fn build_live_repair_blobs(policy: LiveSloPolicy, hot_project: bool) -> Result<V
                         total_duration_seconds: SLO_REPRESENTATIVE_REPAIR_DURATION_DELTA_SECONDS,
                         total_new_installs: 0,
                         total_active_installs: 0,
-                        pro_total_events: if slo_event_matches_plan(install_index, "pro") {
+                        pro_total_events: if slo_event_matches_plan(install_index, "en-US") {
                             SLO_REPRESENTATIVE_REPAIR_LATE_EVENTS_PER_SESSION as u64
                         } else {
                             0
                         },
                         pro_total_sessions: 0,
-                        pro_total_duration_seconds: if slo_event_matches_plan(install_index, "pro")
-                        {
+                        pro_total_duration_seconds: if slo_event_matches_plan(
+                            install_index,
+                            "en-US",
+                        ) {
                             SLO_REPRESENTATIVE_REPAIR_DURATION_DELTA_SECONDS
                         } else {
                             0
@@ -4528,7 +4528,6 @@ fn live_slo_event_for_install(
     let app_version =
         APP_VERSIONS[(day_offset + install_index + session_index) % APP_VERSIONS.len()];
     let os_version = OS_VERSIONS[(day_offset + install_index) % OS_VERSIONS.len()];
-    let provider = PROVIDERS[install_index % PROVIDERS.len()];
     let plan = PLANS[install_index % PLANS.len()];
 
     BenchEvent {
@@ -4538,10 +4537,7 @@ fn live_slo_event_for_install(
         platform: platform.to_owned(),
         app_version: app_version.to_owned(),
         os_version: os_version.to_owned(),
-        properties: BTreeMap::from([
-            ("plan".to_owned(), plan.to_owned()),
-            ("provider".to_owned(), provider.to_owned()),
-        ]),
+        locale: plan.to_owned(),
     }
 }
 
@@ -4988,7 +4984,6 @@ fn hot_path_events(install_count: usize) -> Result<Vec<BenchEvent>> {
 
     for install_index in 0..install_count {
         let install_id = format!("hot-install-{}", install_index);
-        let provider = PROVIDERS[install_index % PROVIDERS.len()];
         let plan = PLANS[install_index % PLANS.len()];
         let app_version = APP_VERSIONS[install_index % APP_VERSIONS.len()];
         let os_version = OS_VERSIONS[install_index % OS_VERSIONS.len()];
@@ -5001,10 +4996,7 @@ fn hot_path_events(install_count: usize) -> Result<Vec<BenchEvent>> {
                 platform: "ios".to_owned(),
                 app_version: app_version.to_owned(),
                 os_version: os_version.to_owned(),
-                properties: BTreeMap::from([
-                    ("plan".to_owned(), plan.to_owned()),
-                    ("provider".to_owned(), provider.to_owned()),
-                ]),
+                locale: plan.to_owned(),
             });
         }
     }
@@ -5017,14 +5009,9 @@ fn repair_scenario(group_count: usize) -> Result<RepairScenario> {
     let mut late_events = Vec::with_capacity(group_count * 2);
 
     for group_index in 0..group_count {
-        let provider = PROVIDERS[group_index % PROVIDERS.len()];
         let plan = PLANS[group_index % PLANS.len()];
         let app_version = APP_VERSIONS[group_index % APP_VERSIONS.len()];
         let os_version = OS_VERSIONS[group_index % OS_VERSIONS.len()];
-        let properties = BTreeMap::from([
-            ("plan".to_owned(), plan.to_owned()),
-            ("provider".to_owned(), provider.to_owned()),
-        ]);
 
         baseline_events.extend([
             repair_event(
@@ -5032,35 +5019,35 @@ fn repair_scenario(group_count: usize) -> Result<RepairScenario> {
                 "2026-01-01T00:00:00Z",
                 app_version,
                 os_version,
-                &properties,
+                plan,
             ),
             repair_event(
                 format!("repair-a-{}", group_index),
                 "2026-01-01T00:45:00Z",
                 app_version,
                 os_version,
-                &properties,
+                plan,
             ),
             repair_event(
                 format!("repair-b-{}", group_index),
                 "2026-01-02T12:00:00Z",
                 app_version,
                 os_version,
-                &properties,
+                plan,
             ),
             repair_event(
                 format!("repair-c-{}", group_index),
                 "2026-01-03T00:00:00Z",
                 app_version,
                 os_version,
-                &properties,
+                plan,
             ),
             repair_event(
                 format!("repair-c-{}", group_index),
                 "2026-01-03T00:45:00Z",
                 app_version,
                 os_version,
-                &properties,
+                plan,
             ),
         ]);
         late_events.extend([
@@ -5069,14 +5056,14 @@ fn repair_scenario(group_count: usize) -> Result<RepairScenario> {
                 "2026-01-01T00:20:00Z",
                 app_version,
                 os_version,
-                &properties,
+                plan,
             ),
             repair_event(
                 format!("repair-c-{}", group_index),
                 "2026-01-03T00:20:00Z",
                 app_version,
                 os_version,
-                &properties,
+                plan,
             ),
         ]);
     }
@@ -5103,7 +5090,6 @@ fn scale_scenario(day_count: usize, install_count_per_day: usize) -> Result<Scal
 
         for install_index in 0..install_count_per_day {
             let install_id = format!("scale-{}-{}", day.format("%Y%m%d"), install_index);
-            let provider = PROVIDERS[install_index % PROVIDERS.len()];
             let plan = PLANS[install_index % PLANS.len()];
             let app_version = APP_VERSIONS[(day_offset + install_index) % APP_VERSIONS.len()];
             let os_version = OS_VERSIONS[(day_offset + install_index) % OS_VERSIONS.len()];
@@ -5116,10 +5102,7 @@ fn scale_scenario(day_count: usize, install_count_per_day: usize) -> Result<Scal
                     platform: "ios".to_owned(),
                     app_version: app_version.to_owned(),
                     os_version: os_version.to_owned(),
-                    properties: BTreeMap::from([
-                        ("plan".to_owned(), plan.to_owned()),
-                        ("provider".to_owned(), provider.to_owned()),
-                    ]),
+                    locale: plan.to_owned(),
                 });
             }
         }
@@ -5140,7 +5123,7 @@ fn repair_event(
     timestamp: &str,
     app_version: &str,
     os_version: &str,
-    properties: &BTreeMap<String, String>,
+    locale: &str,
 ) -> BenchEvent {
     BenchEvent {
         event: "app_open".to_owned(),
@@ -5149,7 +5132,7 @@ fn repair_event(
         platform: "ios".to_owned(),
         app_version: app_version.to_owned(),
         os_version: os_version.to_owned(),
-        properties: properties.clone(),
+        locale: locale.to_owned(),
     }
 }
 
@@ -5165,14 +5148,14 @@ fn hot_path_query_urls() -> HashMap<&'static str, String> {
         (
             "events_day_dim2",
             format!(
-                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-01&group_by=plan&group_by=provider",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-01",
                 benchmark_api_base_url()
             ),
         ),
         (
             "events_hour_dim2",
             format!(
-                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-03-01T00:00:00Z&end=2026-03-01T23:00:00Z&group_by=plan&group_by=provider",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-03-01T00:00:00Z&end=2026-03-01T23:00:00Z",
                 benchmark_api_base_url()
             ),
         ),
@@ -5198,14 +5181,14 @@ fn repair_path_query_urls() -> HashMap<&'static str, String> {
         (
             "events_day_dim2",
             format!(
-                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-03&group_by=plan&group_by=provider",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-03",
                 benchmark_api_base_url()
             ),
         ),
         (
             "events_hour_dim2",
             format!(
-                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-03T23:00:00Z&group_by=plan&group_by=provider",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-03T23:00:00Z",
                 benchmark_api_base_url()
             ),
         ),
@@ -5234,14 +5217,14 @@ fn scale_path_query_urls(
         (
             "events_day_dim2",
             format!(
-                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start={start_day}&end={end_day}&group_by=plan&group_by=provider",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=day&start={start_day}&end={end_day}",
                 benchmark_api_base_url()
             ),
         ),
         (
             "events_hour_dim2",
             format!(
-                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start={start_day}T00:00:00Z&end={end_day}T23:00:00Z&group_by=plan&group_by=provider",
+                "{}/v1/metrics/events?event=app_open&metric=count&granularity=hour&start={start_day}T00:00:00Z&end={end_day}T23:00:00Z",
                 benchmark_api_base_url()
             ),
         ),
@@ -7044,7 +7027,7 @@ mod tests {
 
         assert_eq!(
             expected_total_for_slo_query(&query, &scenario, &expectation),
-            299_700
+            300_600
         );
     }
 
@@ -7062,7 +7045,7 @@ mod tests {
 
         assert_eq!(
             expected_total_for_slo_query(&query, &scenario, &expectation),
-            299_700
+            300_600
         );
     }
 
@@ -7081,7 +7064,7 @@ mod tests {
             .expect("dim2 session count query");
         assert_eq!(
             expected_total_for_slo_query(count_query, &scenario, &expectation),
-            9_990
+            10_020
         );
 
         let duration_query = queries
@@ -7090,7 +7073,7 @@ mod tests {
             .expect("dim2 session duration query");
         assert_eq!(
             expected_total_for_slo_query(duration_query, &scenario, &expectation),
-            17_382_600
+            17_434_800
         );
     }
 
@@ -7108,7 +7091,7 @@ mod tests {
 
         assert_eq!(
             expected_total_for_slo_query(&query, &scenario, &expectation),
-            333
+            334
         );
     }
 
@@ -7134,7 +7117,7 @@ mod tests {
             .expect("burst dim2 event query");
         assert_eq!(
             expected_total_for_slo_query(event_query, &scenario, &expectation),
-            99
+            102
         );
 
         let session_count_query = queries
@@ -7143,7 +7126,7 @@ mod tests {
             .expect("burst dim2 session count query");
         assert_eq!(
             expected_total_for_slo_query(session_count_query, &scenario, &expectation),
-            33
+            34
         );
 
         let duration_query = queries
@@ -7152,7 +7135,7 @@ mod tests {
             .expect("burst dim2 session duration query");
         assert_eq!(
             expected_total_for_slo_query(duration_query, &scenario, &expectation),
-            3_960
+            4_080
         );
 
         let new_install_query = queries
@@ -7161,7 +7144,7 @@ mod tests {
             .expect("burst dim2 session new installs query");
         assert_eq!(
             expected_total_for_slo_query(new_install_query, &scenario, &expectation),
-            33
+            34
         );
     }
 

@@ -25,7 +25,7 @@ Task {
             writeKey: "<ingest-key-from-provision-project>"
         )
         try await Fantasma.track("app_open")
-        try await Fantasma.track("screen_view", properties: ["screen": "Home"])
+        try await Fantasma.track("screen_view")
         try await Fantasma.flush()
         await Fantasma.clear()
     } catch {
@@ -34,13 +34,8 @@ Task {
 }
 ```
 
-`track(_:properties:)` only takes the explicit string properties you want on
-the event, with at most 2 keys per event. Property names must match
-`^[a-z][a-z0-9_]{0,62}$` and may not use reserved keys such as `event`,
-`install_id`, `metric`, `granularity`, `start`, `end`, `platform`,
-`app_version`, or `os_version`. The SDK rejects invalid properties before they
-enter the local queue. The SDK adds `platform`, `app_version`, and
-`os_version` automatically.
+The SDK adds `platform`, `app_version`, `os_version`, and `locale`
+automatically.
 
 ## Behavior
 
@@ -54,10 +49,9 @@ enter the local queue. The SDK adds `platform`, `app_version`, and
 - Malformed `202 Accepted` responses are treated as invalid responses and also leave rows queued.
 - `409 project_busy` is treated as a transient upload failure; queued rows stay durable and the SDK will retry on later automatic flushes.
 - `409 project_pending_deletion` is treated as a blocked destination; queued rows stay durable, automatic flushes stop retrying that destination, and only reconfiguring to a different server/write-key pair clears the block.
-- `track(_:properties:)` throws when the SDK has not been configured.
+- `track(_:)` throws when the SDK has not been configured.
 - `flush()` throws when the SDK has not been configured.
 - The SDK also attempts a periodic flush every 30 seconds when configured.
-- The SDK auto-populates `platform`, `app_version`, and `os_version` on each event.
-- Event properties remain explicit string-to-string context you pass in `track(_:properties:)`, and invalid property maps are rejected locally before persistence.
+- The SDK auto-populates `platform`, `app_version`, `os_version`, and `locale` on each event.
 - The SDK persists one local install identifier, reuses it on every event, and rotates it on `clear()` without mutating already queued rows.
 - Reconfiguring to a different server URL or write key discards any still-queued rows after the current upload boundary, even across app relaunches, then switches future uploads to the new destination.

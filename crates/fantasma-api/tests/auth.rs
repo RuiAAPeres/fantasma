@@ -131,9 +131,9 @@ async fn insert_usage_event(
             platform,
             app_version,
             os_version,
-            properties
+            locale
         )
-        VALUES ($1, $2, $3, $4, $5, 'ios', NULL, NULL, $6)
+        VALUES ($1, $2, $3, $4, $5, 'ios', NULL, NULL, NULL)
         "#,
     )
     .bind(project_id)
@@ -149,7 +149,6 @@ async fn insert_usage_event(
             .with_timezone(&Utc),
     )
     .bind(install_id)
-    .bind(sqlx::types::Json(serde_json::json!({})))
     .execute(pool)
     .await
     .expect("insert usage event");
@@ -841,9 +840,6 @@ async fn range_delete_conflicts_when_project_is_pending_deletion(pool: PgPool) {
                         "event": "app_open",
                         "filters": {
                             "platform": "ios"
-                        },
-                        "properties": {
-                            "plan": "pro"
                         }
                     })
                     .to_string(),
@@ -1112,7 +1108,7 @@ async fn live_installs_rejects_public_query_params(pool: PgPool) {
         "/v1/metrics/live_installs?start=2026-01-01".to_owned(),
         "/v1/metrics/live_installs?end=2026-01-01".to_owned(),
         "/v1/metrics/live_installs?platform=ios".to_owned(),
-        "/v1/metrics/live_installs?plan=pro".to_owned(),
+        "/v1/metrics/live_installs?locale=en-US".to_owned(),
         "/v1/metrics/live_installs?group_by=platform".to_owned(),
     ];
 

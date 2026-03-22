@@ -1,5 +1,6 @@
 ALTER TABLE events_raw
-    ADD COLUMN IF NOT EXISTS os_version TEXT;
+    ADD COLUMN IF NOT EXISTS os_version TEXT,
+    ADD COLUMN IF NOT EXISTS locale TEXT;
 
 CREATE TABLE IF NOT EXISTS event_count_daily_total (
     project_id UUID NOT NULL REFERENCES projects(id),

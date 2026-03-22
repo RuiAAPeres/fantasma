@@ -10,38 +10,41 @@ use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Timelike
 use fantasma_core::MetricGranularity;
 use fantasma_store::{
     ActiveInstallBitmapDim1Input, ActiveInstallBitmapDim2Input, EventMetricBucketDim1Delta,
-    EventMetricBucketDim2Delta, EventMetricBucketTotalDelta, InstallFirstSeenRecord,
-    InstallSessionStateRecord, LiveInstallStateUpsert, PendingSessionDailyInstallRebuildRecord,
-    PgPool, ProjectDeletionKind, ProjectDeletionRecord, ProjectDeletionStats,
-    ProjectProcessingActorKind, ProjectProcessingLease, ProjectState, RawEventRecord,
-    SessionActiveInstallSliceDelta, SessionDailyActiveInstallDelta, SessionDailyDelta,
-    SessionDailyDurationDelta, SessionDailyInstallDelta, SessionMetricDim1Delta,
-    SessionMetricDim2Delta, SessionMetricTotalDelta, SessionRecord, SessionRepairJobRecord,
-    SessionRepairJobUpsert, SessionTailUpdate, StoreError, add_session_daily_duration_deltas_in_tx,
-    allocate_project_install_ordinals_in_tx, claim_and_sweep_pending_session_rebuild_buckets_in_tx,
-    claim_next_project_deletion_job_in_tx, claim_pending_session_repair_jobs_in_tx,
-    claim_project_processing_lease, complete_session_repair_job_in_tx,
-    count_project_processing_leases_before_epoch, delete_sessions_overlapping_window_in_tx,
-    enqueue_active_install_bitmap_rebuild_in_tx, enqueue_session_daily_installs_rebuilds_in_tx,
-    enqueue_session_rebuild_buckets_in_tx, fetch_all_events_for_install_in_tx,
-    fetch_events_after_in_tx, fetch_events_for_install_after_id_through_in_tx,
-    fetch_events_for_install_between_in_tx, fetch_latest_session_for_install_in_tx,
-    fetch_sessions_overlapping_window_in_tx, insert_install_first_seen_in_tx, insert_session_in_tx,
-    insert_sessions_in_tx, load_install_session_states_in_tx,
-    load_pending_session_daily_install_rebuilds_in_tx, load_project,
-    load_session_repair_jobs_for_installs_in_tx, load_tail_sessions_for_installs_in_tx,
-    lock_worker_offset, mark_project_deletion_job_succeeded_in_tx,
-    rebuild_session_active_install_slices_days_in_tx,
+    EventMetricBucketDim2Delta, EventMetricBucketDim3Delta, EventMetricBucketDim4Delta,
+    EventMetricBucketTotalDelta, InstallFirstSeenRecord, InstallSessionStateRecord,
+    LiveInstallStateUpsert, PendingSessionDailyInstallRebuildRecord, PgPool, ProjectDeletionKind,
+    ProjectDeletionRecord, ProjectDeletionStats, ProjectProcessingActorKind,
+    ProjectProcessingLease, ProjectState, RawEventRecord, SessionActiveInstallSliceDelta,
+    SessionDailyActiveInstallDelta, SessionDailyDelta, SessionDailyDurationDelta,
+    SessionDailyInstallDelta, SessionMetricDim1Delta, SessionMetricDim2Delta,
+    SessionMetricDim3Delta, SessionMetricDim4Delta, SessionMetricTotalDelta, SessionRecord,
+    SessionRepairJobRecord, SessionRepairJobUpsert, SessionTailUpdate, StoreError,
+    add_session_daily_duration_deltas_in_tx, allocate_project_install_ordinals_in_tx,
+    claim_and_sweep_pending_session_rebuild_buckets_in_tx, claim_next_project_deletion_job_in_tx,
+    claim_pending_session_repair_jobs_in_tx, claim_project_processing_lease,
+    complete_session_repair_job_in_tx, count_project_processing_leases_before_epoch,
+    delete_sessions_overlapping_window_in_tx, enqueue_active_install_bitmap_rebuild_in_tx,
+    enqueue_session_daily_installs_rebuilds_in_tx, enqueue_session_rebuild_buckets_in_tx,
+    fetch_all_events_for_install_in_tx, fetch_events_after_in_tx,
+    fetch_events_for_install_after_id_through_in_tx, fetch_events_for_install_between_in_tx,
+    fetch_latest_session_for_install_in_tx, fetch_sessions_overlapping_window_in_tx,
+    insert_install_first_seen_in_tx, insert_session_in_tx, insert_sessions_in_tx,
+    load_install_session_states_in_tx, load_pending_session_daily_install_rebuilds_in_tx,
+    load_project, load_session_repair_jobs_for_installs_in_tx,
+    load_tail_sessions_for_installs_in_tx, lock_worker_offset,
+    mark_project_deletion_job_succeeded_in_tx, rebuild_session_active_install_slices_days_in_tx,
     rebuild_session_daily_days_from_pending_install_rebuilds_with_telemetry_in_tx,
     rebuild_session_daily_days_in_tx, refresh_project_processing_lease,
     release_project_processing_lease, release_session_repair_job_claim_in_tx,
     replace_active_install_day_bitmaps_in_tx, save_worker_offset_in_tx, set_project_state_in_tx,
     update_session_tail_in_tx, upsert_event_metric_buckets_dim1_in_tx,
-    upsert_event_metric_buckets_dim2_in_tx, upsert_event_metric_buckets_total_in_tx,
+    upsert_event_metric_buckets_dim2_in_tx, upsert_event_metric_buckets_dim3_in_tx,
+    upsert_event_metric_buckets_dim4_in_tx, upsert_event_metric_buckets_total_in_tx,
     upsert_install_session_state_in_tx, upsert_live_install_state_in_tx,
     upsert_session_active_install_slices_in_tx, upsert_session_daily_deltas_in_tx,
     upsert_session_daily_install_deltas_in_tx, upsert_session_metric_dim1_in_tx,
-    upsert_session_metric_dim2_in_tx, upsert_session_metric_totals_in_tx,
+    upsert_session_metric_dim2_in_tx, upsert_session_metric_dim3_in_tx,
+    upsert_session_metric_dim4_in_tx, upsert_session_metric_totals_in_tx,
     upsert_session_repair_jobs_in_tx, verify_project_processing_lease_in_tx,
 };
 use roaring::RoaringTreemap;
@@ -76,8 +79,6 @@ struct RangeDeletionScope {
     event: Option<String>,
     #[serde(default)]
     filters: BTreeMap<String, String>,
-    #[serde(default)]
-    properties: BTreeMap<String, String>,
 }
 
 async fn claim_worker_project_lease(
@@ -387,6 +388,8 @@ struct SessionMetricAccumulator {
     totals: BTreeMap<(MetricGranularity, DateTime<Utc>), SessionMetricDeltaValue>,
     dim1: BTreeMap<(MetricGranularity, DateTime<Utc>, String, String), SessionMetricDeltaValue>,
     dim2: BTreeMap<SessionMetricDim2Key, SessionMetricDeltaValue>,
+    dim3: BTreeMap<SessionMetricDim3Key, SessionMetricDeltaValue>,
+    dim4: BTreeMap<SessionMetricDim4Key, SessionMetricDeltaValue>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -405,6 +408,38 @@ type SessionMetricDim2Key = (
     String,
 );
 
+type SessionMetricDim3Key = (
+    MetricGranularity,
+    DateTime<Utc>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+type SessionMetricDim4Key = (
+    MetricGranularity,
+    DateTime<Utc>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+type SessionMetricStoreDeltas = (
+    Vec<SessionMetricTotalDelta>,
+    Vec<SessionMetricDim1Delta>,
+    Vec<SessionMetricDim2Delta>,
+    Vec<SessionMetricDim3Delta>,
+    Vec<SessionMetricDim4Delta>,
+);
+
 impl SessionMetricAccumulator {
     fn add_session_delta(
         &mut self,
@@ -416,7 +451,7 @@ impl SessionMetricAccumulator {
             &session.platform,
             session.app_version.as_ref(),
             session.os_version.as_ref(),
-            &session.properties,
+            session.locale.as_ref(),
         );
         self.add_deltas_for_dimensions(
             session.session_start,
@@ -432,7 +467,7 @@ impl SessionMetricAccumulator {
             &first_seen.platform,
             first_seen.app_version.as_ref(),
             first_seen.os_version.as_ref(),
-            &first_seen.properties,
+            first_seen.locale.as_ref(),
         );
         self.add_deltas_for_dimensions(first_seen.first_seen_at, &dimensions, 0, 0, 1);
     }
@@ -481,17 +516,51 @@ impl SessionMetricAccumulator {
                         .add(session_count_delta, duration_delta, new_installs_delta);
                 }
             }
+
+            for first in 0..dimensions.len() {
+                for second in (first + 1)..dimensions.len() {
+                    for third in (second + 1)..dimensions.len() {
+                        let (dim1_key, dim1_value) = &dimensions[first];
+                        let (dim2_key, dim2_value) = &dimensions[second];
+                        let (dim3_key, dim3_value) = &dimensions[third];
+                        self.dim3
+                            .entry((
+                                granularity,
+                                bucket_start,
+                                dim1_key.clone(),
+                                dim1_value.clone(),
+                                dim2_key.clone(),
+                                dim2_value.clone(),
+                                dim3_key.clone(),
+                                dim3_value.clone(),
+                            ))
+                            .or_default()
+                            .add(session_count_delta, duration_delta, new_installs_delta);
+                    }
+                }
+            }
+
+            if dimensions.len() == 4 {
+                self.dim4
+                    .entry((
+                        granularity,
+                        bucket_start,
+                        dimensions[0].0.clone(),
+                        dimensions[0].1.clone(),
+                        dimensions[1].0.clone(),
+                        dimensions[1].1.clone(),
+                        dimensions[2].0.clone(),
+                        dimensions[2].1.clone(),
+                        dimensions[3].0.clone(),
+                        dimensions[3].1.clone(),
+                    ))
+                    .or_default()
+                    .add(session_count_delta, duration_delta, new_installs_delta);
+            }
         }
     }
 
-    fn into_store_deltas(
-        self,
-        project_id: Uuid,
-    ) -> (
-        Vec<SessionMetricTotalDelta>,
-        Vec<SessionMetricDim1Delta>,
-        Vec<SessionMetricDim2Delta>,
-    ) {
+    fn into_store_deltas(self, project_id: Uuid) -> SessionMetricStoreDeltas {
         let totals = self
             .totals
             .into_iter()
@@ -545,8 +614,76 @@ impl SessionMetricAccumulator {
                 },
             )
             .collect::<Vec<_>>();
+        let dim3 = self
+            .dim3
+            .into_iter()
+            .map(
+                |(
+                    (
+                        granularity,
+                        bucket_start,
+                        dim1_key,
+                        dim1_value,
+                        dim2_key,
+                        dim2_value,
+                        dim3_key,
+                        dim3_value,
+                    ),
+                    value,
+                )| SessionMetricDim3Delta {
+                    project_id,
+                    granularity,
+                    bucket_start,
+                    dim1_key,
+                    dim1_value,
+                    dim2_key,
+                    dim2_value,
+                    dim3_key,
+                    dim3_value,
+                    session_count: value.session_count,
+                    duration_total_seconds: value.duration_total_seconds,
+                    new_installs: value.new_installs,
+                },
+            )
+            .collect::<Vec<_>>();
+        let dim4 = self
+            .dim4
+            .into_iter()
+            .map(
+                |(
+                    (
+                        granularity,
+                        bucket_start,
+                        dim1_key,
+                        dim1_value,
+                        dim2_key,
+                        dim2_value,
+                        dim3_key,
+                        dim3_value,
+                        dim4_key,
+                        dim4_value,
+                    ),
+                    value,
+                )| SessionMetricDim4Delta {
+                    project_id,
+                    granularity,
+                    bucket_start,
+                    dim1_key,
+                    dim1_value,
+                    dim2_key,
+                    dim2_value,
+                    dim3_key,
+                    dim3_value,
+                    dim4_key,
+                    dim4_value,
+                    session_count: value.session_count,
+                    duration_total_seconds: value.duration_total_seconds,
+                    new_installs: value.new_installs,
+                },
+            )
+            .collect::<Vec<_>>();
 
-        (totals, dim1, dim2)
+        (totals, dim1, dim2, dim3, dim4)
     }
 }
 
@@ -1541,6 +1678,8 @@ pub(crate) async fn process_event_metrics_batch_with_config(
         trace.add_count("total_delta_rows", rollups.total_deltas.len());
         trace.add_count("dim1_delta_rows", rollups.dim1_deltas.len());
         trace.add_count("dim2_delta_rows", rollups.dim2_deltas.len());
+        trace.add_count("dim3_delta_rows", rollups.dim3_deltas.len());
+        trace.add_count("dim4_delta_rows", rollups.dim4_deltas.len());
         trace.add_count("live_install_rows", live_install_upserts.len());
         refresh_worker_project_leases(pool, &project_leases).await?;
 
@@ -1553,6 +1692,12 @@ pub(crate) async fn process_event_metrics_batch_with_config(
         let dim2_upsert_started_at = Instant::now();
         upsert_event_metric_buckets_dim2_in_tx(&mut tx, &rollups.dim2_deltas).await?;
         trace.add_phase_duration("upsert_dim2", dim2_upsert_started_at.elapsed());
+        let dim3_upsert_started_at = Instant::now();
+        upsert_event_metric_buckets_dim3_in_tx(&mut tx, &rollups.dim3_deltas).await?;
+        trace.add_phase_duration("upsert_dim3", dim3_upsert_started_at.elapsed());
+        let dim4_upsert_started_at = Instant::now();
+        upsert_event_metric_buckets_dim4_in_tx(&mut tx, &rollups.dim4_deltas).await?;
+        trace.add_phase_duration("upsert_dim4", dim4_upsert_started_at.elapsed());
         let live_install_upsert_started_at = Instant::now();
         upsert_live_install_state_in_tx(&mut tx, &live_install_upserts).await?;
         trace.add_phase_duration(
@@ -1895,13 +2040,6 @@ async fn delete_scoped_raw_events_in_tx(
         query.push_bind(value);
     }
 
-    for (key, value) in &scope.properties {
-        query.push(" AND properties ->> ");
-        query.push_bind(key);
-        query.push(" = ");
-        query.push_bind(value);
-    }
-
     query.push(" RETURNING install_id, event_name, timestamp");
 
     let rows = query.build().fetch_all(&mut **tx).await?;
@@ -1995,7 +2133,7 @@ async fn rebuild_range_deleted_install_in_tx(
             platform: first_raw_event.platform.clone(),
             app_version: first_raw_event.app_version.clone(),
             os_version: first_raw_event.os_version.clone(),
-            properties: first_raw_event.properties.clone(),
+            locale: first_raw_event.locale.clone(),
         },
     )
     .await?;
@@ -2063,6 +2201,8 @@ async fn rebuild_event_metric_buckets_in_tx(
         "event_metric_buckets_total",
         "event_metric_buckets_dim1",
         "event_metric_buckets_dim2",
+        "event_metric_buckets_dim3",
+        "event_metric_buckets_dim4",
     ] {
         sqlx::query(&format!(
             "DELETE FROM {table} WHERE project_id = $1 AND granularity = $2 AND event_name = ANY($3) AND bucket_start = ANY($4)"
@@ -2105,7 +2245,7 @@ async fn rebuild_event_metric_buckets_in_tx(
     sqlx::query(&format!(
         r#"
         WITH scoped_events AS MATERIALIZED (
-            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, properties
+            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, locale
             FROM events_raw AS scope
             WHERE scope.project_id = $1
               AND scope.event_name = ANY($3)
@@ -2142,7 +2282,7 @@ async fn rebuild_event_metric_buckets_in_tx(
     sqlx::query(&format!(
         r#"
         WITH scoped_events AS MATERIALIZED (
-            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, properties
+            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, locale
             FROM events_raw AS scope
             WHERE scope.project_id = $1
               AND scope.event_name = ANY($3)
@@ -2187,6 +2327,123 @@ async fn rebuild_event_metric_buckets_in_tx(
     .execute(&mut **tx)
     .await?;
 
+    sqlx::query(&format!(
+        r#"
+        WITH scoped_events AS MATERIALIZED (
+            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, locale
+            FROM events_raw AS scope
+            WHERE scope.project_id = $1
+              AND scope.event_name = ANY($3)
+              AND {bucket_expr} = ANY($4)
+        ),
+        event_dim_source AS MATERIALIZED (
+            SELECT scoped_events.id, scoped_events.project_id, scoped_events.bucket_start, scoped_events.event_name, dims.dim_key, dims.dim_value
+            FROM scoped_events
+            CROSS JOIN LATERAL ({event_dims}) AS dims(dim_key, dim_value)
+        )
+        INSERT INTO event_metric_buckets_dim3 (
+            project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count
+        )
+        SELECT
+            first_dims.project_id,
+            $2,
+            first_dims.bucket_start,
+            first_dims.event_name,
+            first_dims.dim_key,
+            first_dims.dim_value,
+            second_dims.dim_key,
+            second_dims.dim_value,
+            third_dims.dim_key,
+            third_dims.dim_value,
+            COUNT(*)::BIGINT
+        FROM event_dim_source AS first_dims
+        JOIN event_dim_source AS second_dims
+          ON second_dims.id = first_dims.id
+         AND second_dims.dim_key > first_dims.dim_key
+        JOIN event_dim_source AS third_dims
+          ON third_dims.id = first_dims.id
+         AND third_dims.dim_key > second_dims.dim_key
+        GROUP BY
+            first_dims.project_id,
+            first_dims.bucket_start,
+            first_dims.event_name,
+            first_dims.dim_key,
+            first_dims.dim_value,
+            second_dims.dim_key,
+            second_dims.dim_value,
+            third_dims.dim_key,
+            third_dims.dim_value
+        "#
+    ))
+    .bind(project_id)
+    .bind(granularity.as_str())
+    .bind(&event_names)
+    .bind(&bucket_starts)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(&format!(
+        r#"
+        WITH scoped_events AS MATERIALIZED (
+            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, locale
+            FROM events_raw AS scope
+            WHERE scope.project_id = $1
+              AND scope.event_name = ANY($3)
+              AND {bucket_expr} = ANY($4)
+        ),
+        event_dim_source AS MATERIALIZED (
+            SELECT scoped_events.id, scoped_events.project_id, scoped_events.bucket_start, scoped_events.event_name, dims.dim_key, dims.dim_value
+            FROM scoped_events
+            CROSS JOIN LATERAL ({event_dims}) AS dims(dim_key, dim_value)
+        )
+        INSERT INTO event_metric_buckets_dim4 (
+            project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, event_count
+        )
+        SELECT
+            first_dims.project_id,
+            $2,
+            first_dims.bucket_start,
+            first_dims.event_name,
+            first_dims.dim_key,
+            first_dims.dim_value,
+            second_dims.dim_key,
+            second_dims.dim_value,
+            third_dims.dim_key,
+            third_dims.dim_value,
+            fourth_dims.dim_key,
+            fourth_dims.dim_value,
+            COUNT(*)::BIGINT
+        FROM event_dim_source AS first_dims
+        JOIN event_dim_source AS second_dims
+          ON second_dims.id = first_dims.id
+         AND second_dims.dim_key > first_dims.dim_key
+        JOIN event_dim_source AS third_dims
+          ON third_dims.id = first_dims.id
+         AND third_dims.dim_key > second_dims.dim_key
+        JOIN event_dim_source AS fourth_dims
+          ON fourth_dims.id = first_dims.id
+         AND fourth_dims.dim_key > third_dims.dim_key
+        GROUP BY
+            first_dims.project_id,
+            first_dims.bucket_start,
+            first_dims.event_name,
+            first_dims.dim_key,
+            first_dims.dim_value,
+            second_dims.dim_key,
+            second_dims.dim_value,
+            third_dims.dim_key,
+            third_dims.dim_value,
+            fourth_dims.dim_key,
+            fourth_dims.dim_value
+        "#
+    ))
+    .bind(project_id)
+    .bind(granularity.as_str())
+    .bind(&event_names)
+    .bind(&bucket_starts)
+    .execute(&mut **tx)
+    .await?;
+
     Ok(())
 }
 
@@ -2195,6 +2452,8 @@ struct EventMetricRollups {
     total_deltas: Vec<EventMetricBucketTotalDelta>,
     dim1_deltas: Vec<EventMetricBucketDim1Delta>,
     dim2_deltas: Vec<EventMetricBucketDim2Delta>,
+    dim3_deltas: Vec<EventMetricBucketDim3Delta>,
+    dim4_deltas: Vec<EventMetricBucketDim4Delta>,
 }
 
 fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
@@ -2215,6 +2474,38 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
             Uuid,
             MetricGranularity,
             DateTime<Utc>,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ),
+        i64,
+    >::new();
+    let mut dim3 = BTreeMap::<
+        (
+            Uuid,
+            MetricGranularity,
+            DateTime<Utc>,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ),
+        i64,
+    >::new();
+    let mut dim4 = BTreeMap::<
+        (
+            Uuid,
+            MetricGranularity,
+            DateTime<Utc>,
+            String,
+            String,
+            String,
+            String,
             String,
             String,
             String,
@@ -2268,6 +2559,49 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                         ))
                         .or_default() += 1;
                 }
+            }
+
+            for first_index in 0..dimensions.len() {
+                for second_index in first_index + 1..dimensions.len() {
+                    for third_index in second_index + 1..dimensions.len() {
+                        let first = &dimensions[first_index];
+                        let second = &dimensions[second_index];
+                        let third = &dimensions[third_index];
+                        *dim3
+                            .entry((
+                                event.project_id,
+                                granularity,
+                                bucket_start,
+                                event_name.clone(),
+                                first.0.clone(),
+                                first.1.clone(),
+                                second.0.clone(),
+                                second.1.clone(),
+                                third.0.clone(),
+                                third.1.clone(),
+                            ))
+                            .or_default() += 1;
+                    }
+                }
+            }
+
+            if dimensions.len() == 4 {
+                *dim4
+                    .entry((
+                        event.project_id,
+                        granularity,
+                        bucket_start,
+                        event_name.clone(),
+                        dimensions[0].0.clone(),
+                        dimensions[0].1.clone(),
+                        dimensions[1].0.clone(),
+                        dimensions[1].1.clone(),
+                        dimensions[2].0.clone(),
+                        dimensions[2].1.clone(),
+                        dimensions[3].0.clone(),
+                        dimensions[3].1.clone(),
+                    ))
+                    .or_default() += 1;
             }
         }
     }
@@ -2334,6 +2668,74 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                 },
             )
             .collect(),
+        dim3_deltas: dim3
+            .into_iter()
+            .map(
+                |(
+                    (
+                        project_id,
+                        granularity,
+                        bucket_start,
+                        event_name,
+                        dim1_key,
+                        dim1_value,
+                        dim2_key,
+                        dim2_value,
+                        dim3_key,
+                        dim3_value,
+                    ),
+                    event_count,
+                )| EventMetricBucketDim3Delta {
+                    project_id,
+                    granularity,
+                    bucket_start,
+                    event_name,
+                    dim1_key,
+                    dim1_value,
+                    dim2_key,
+                    dim2_value,
+                    dim3_key,
+                    dim3_value,
+                    event_count,
+                },
+            )
+            .collect(),
+        dim4_deltas: dim4
+            .into_iter()
+            .map(
+                |(
+                    (
+                        project_id,
+                        granularity,
+                        bucket_start,
+                        event_name,
+                        dim1_key,
+                        dim1_value,
+                        dim2_key,
+                        dim2_value,
+                        dim3_key,
+                        dim3_value,
+                        dim4_key,
+                        dim4_value,
+                    ),
+                    event_count,
+                )| EventMetricBucketDim4Delta {
+                    project_id,
+                    granularity,
+                    bucket_start,
+                    event_name,
+                    dim1_key,
+                    dim1_value,
+                    dim2_key,
+                    dim2_value,
+                    dim3_key,
+                    dim3_value,
+                    dim4_key,
+                    dim4_value,
+                    event_count,
+                },
+            )
+            .collect(),
     }
 }
 
@@ -2365,7 +2767,7 @@ fn build_live_install_state_upserts(batch: &[RawEventRecord]) -> Vec<LiveInstall
 }
 
 fn event_metric_dimensions(event: &RawEventRecord) -> Vec<(String, String)> {
-    let mut dimensions = Vec::with_capacity(3 + event.properties.len());
+    let mut dimensions = Vec::with_capacity(4);
 
     dimensions.push((
         "platform".to_owned(),
@@ -2380,12 +2782,9 @@ fn event_metric_dimensions(event: &RawEventRecord) -> Vec<(String, String)> {
         dimensions.push(("os_version".to_owned(), os_version.clone()));
     }
 
-    dimensions.extend(
-        event
-            .properties
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
+    if let Some(locale) = event.locale.as_ref() {
+        dimensions.push(("locale".to_owned(), locale.clone()));
+    }
     dimensions.sort_by(|left, right| left.0.cmp(&right.0));
 
     dimensions
@@ -2395,9 +2794,9 @@ fn session_metric_dimensions(
     platform: &fantasma_core::Platform,
     app_version: Option<&String>,
     os_version: Option<&String>,
-    properties: &BTreeMap<String, String>,
+    locale: Option<&String>,
 ) -> Vec<(String, String)> {
-    let mut dimensions = Vec::with_capacity(3 + properties.len());
+    let mut dimensions = Vec::with_capacity(4);
     dimensions.push(("platform".to_owned(), platform_dimension_value(platform)));
 
     if let Some(app_version) = app_version {
@@ -2408,11 +2807,9 @@ fn session_metric_dimensions(
         dimensions.push(("os_version".to_owned(), os_version.clone()));
     }
 
-    dimensions.extend(
-        properties
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
+    if let Some(locale) = locale {
+        dimensions.push(("locale".to_owned(), locale.clone()));
+    }
     dimensions.sort_by(|left, right| left.0.cmp(&right.0));
 
     dimensions
@@ -2428,7 +2825,8 @@ fn active_install_slice_delta(session: &SessionRecord) -> SessionActiveInstallSl
         app_version_is_null: session.app_version.is_none(),
         os_version: session.os_version.clone(),
         os_version_is_null: session.os_version.is_none(),
-        properties: session.properties.clone(),
+        locale: session.locale.clone(),
+        locale_is_null: session.locale.is_none(),
     }
 }
 
@@ -2536,7 +2934,7 @@ fn plan_incremental_session_batch(
                 platform: event.platform.clone(),
                 app_version: event.app_version.clone(),
                 os_version: event.os_version.clone(),
-                properties: event.properties.clone(),
+                locale: event.locale.clone(),
             });
     let highest_processed_event_id = events
         .iter()
@@ -2555,7 +2953,7 @@ fn plan_incremental_session_batch(
                 platform: event.platform.clone(),
                 app_version: event.app_version.clone(),
                 os_version: event.os_version.clone(),
-                properties: event.properties.clone(),
+                locale: event.locale.clone(),
             })
             .collect::<Vec<_>>(),
     );
@@ -2719,12 +3117,20 @@ async fn apply_incremental_session_plan(
         ),
     )?;
 
-    let (session_total_deltas, session_dim1_deltas, session_dim2_deltas) = plan
+    let (
+        session_total_deltas,
+        session_dim1_deltas,
+        session_dim2_deltas,
+        session_dim3_deltas,
+        session_dim4_deltas,
+    ) = plan
         .session_metric_accumulator
         .into_store_deltas(plan.next_state.project_id);
     upsert_session_metric_totals_in_tx(tx, &session_total_deltas).await?;
     upsert_session_metric_dim1_in_tx(tx, &session_dim1_deltas).await?;
     upsert_session_metric_dim2_in_tx(tx, &session_dim2_deltas).await?;
+    upsert_session_metric_dim3_in_tx(tx, &session_dim3_deltas).await?;
+    upsert_session_metric_dim4_in_tx(tx, &session_dim4_deltas).await?;
 
     enqueue_touched_active_install_bitmap_rebuilds_in_tx(
         tx,
@@ -3132,7 +3538,8 @@ async fn rebuild_active_install_day_bitmaps_in_tx(
             app_version_is_null,
             os_version,
             os_version_is_null,
-            properties
+            locale,
+            locale_is_null
         FROM session_active_install_slices
         WHERE project_id = $1
           AND day = $2
@@ -3237,12 +3644,9 @@ fn active_install_dimensions_for_slice_row(
         (!os_version_is_null).then_some(os_version),
     );
 
-    let properties = row
-        .try_get::<sqlx::types::Json<BTreeMap<String, String>>, _>("properties")?
-        .0;
-    for (key, value) in properties {
-        dims.insert(key, Some(value));
-    }
+    let locale: String = row.try_get("locale")?;
+    let locale_is_null: bool = row.try_get("locale_is_null")?;
+    dims.insert("locale".to_owned(), (!locale_is_null).then_some(locale));
 
     Ok(dims.into_iter().collect())
 }
@@ -3317,7 +3721,7 @@ fn derive_sessions_for_window(raw_events: &[RawEventRecord]) -> Vec<SessionRecor
             platform: event.platform.clone(),
             app_version: event.app_version.clone(),
             os_version: event.os_version.clone(),
-            properties: event.properties.clone(),
+            locale: event.locale.clone(),
         })
         .collect::<Vec<_>>();
 
@@ -3484,8 +3888,8 @@ fn session_dimension_sql(source_alias: &str) -> String {
         SELECT 'os_version'::text, {source_alias}.os_version
         WHERE {source_alias}.os_version IS NOT NULL
         UNION ALL
-        SELECT props.key, props.value
-        FROM jsonb_each_text(COALESCE({source_alias}.properties, '{{}}'::jsonb)) AS props(key, value)
+        SELECT 'locale'::text, {source_alias}.locale
+        WHERE {source_alias}.locale IS NOT NULL
         "#
     )
 }
@@ -3501,8 +3905,8 @@ fn event_dimension_sql(source_alias: &str) -> String {
         SELECT 'os_version'::text, {source_alias}.os_version
         WHERE {source_alias}.os_version IS NOT NULL
         UNION ALL
-        SELECT props.key, props.value
-        FROM jsonb_each_text(COALESCE({source_alias}.properties, '{{}}'::jsonb)) AS props(key, value)
+        SELECT 'locale'::text, {source_alias}.locale
+        WHERE {source_alias}.locale IS NOT NULL
         "#
     )
 }
@@ -3532,6 +3936,8 @@ async fn rebuild_session_metric_buckets_in_tx(
         "session_metric_buckets_total",
         "session_metric_buckets_dim1",
         "session_metric_buckets_dim2",
+        "session_metric_buckets_dim3",
+        "session_metric_buckets_dim4",
     ] {
         sqlx::query(&format!(
             "DELETE FROM {table} WHERE project_id = $1 AND granularity = $2 AND bucket_start = ANY($3)"
@@ -3591,13 +3997,13 @@ async fn rebuild_session_metric_buckets_in_tx(
     sqlx::query(&format!(
         r#"
         WITH scoped_sessions AS MATERIALIZED (
-            SELECT project_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, properties
+            SELECT project_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, locale
             FROM sessions AS scope
             WHERE scope.project_id = $1
               AND {bucket_expr} = ANY($3)
         ),
         scoped_installs AS MATERIALIZED (
-            SELECT project_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, properties
+            SELECT project_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, locale
             FROM install_first_seen AS scope
             WHERE scope.project_id = $1
               AND {first_seen_bucket_expr} = ANY($3)
@@ -3652,13 +4058,13 @@ async fn rebuild_session_metric_buckets_in_tx(
     sqlx::query(&format!(
         r#"
         WITH scoped_sessions AS MATERIALIZED (
-            SELECT project_id, session_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, properties
+            SELECT project_id, session_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, locale
             FROM sessions AS scope
             WHERE scope.project_id = $1
               AND {bucket_expr} = ANY($3)
         ),
         scoped_installs AS MATERIALIZED (
-            SELECT project_id, install_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, properties
+            SELECT project_id, install_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, locale
             FROM install_first_seen AS scope
             WHERE scope.project_id = $1
               AND {first_seen_bucket_expr} = ANY($3)
@@ -3734,6 +4140,224 @@ async fn rebuild_session_metric_buckets_in_tx(
     .execute(&mut **tx)
     .await?;
 
+    sqlx::query(&format!(
+        r#"
+        WITH scoped_sessions AS MATERIALIZED (
+            SELECT project_id, session_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, locale
+            FROM sessions AS scope
+            WHERE scope.project_id = $1
+              AND {bucket_expr} = ANY($3)
+        ),
+        scoped_installs AS MATERIALIZED (
+            SELECT project_id, install_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, locale
+            FROM install_first_seen AS scope
+            WHERE scope.project_id = $1
+              AND {first_seen_bucket_expr} = ANY($3)
+        ),
+        session_dim_source AS MATERIALIZED (
+            SELECT scoped_sessions.project_id, scoped_sessions.session_id, scoped_sessions.bucket_start, scoped_sessions.duration_seconds, dims.dim_key, dims.dim_value
+            FROM scoped_sessions
+            CROSS JOIN LATERAL ({session_dims}) AS dims(dim_key, dim_value)
+        ),
+        install_dim_source AS MATERIALIZED (
+            SELECT scoped_installs.project_id, scoped_installs.install_id, scoped_installs.bucket_start, dims.dim_key, dims.dim_value
+            FROM scoped_installs
+            CROSS JOIN LATERAL ({install_dims}) AS dims(dim_key, dim_value)
+        ),
+        combined AS (
+            SELECT
+                first_dims.project_id,
+                first_dims.bucket_start,
+                first_dims.dim_key AS dim1_key,
+                first_dims.dim_value AS dim1_value,
+                second_dims.dim_key AS dim2_key,
+                second_dims.dim_value AS dim2_value,
+                third_dims.dim_key AS dim3_key,
+                third_dims.dim_value AS dim3_value,
+                COUNT(*)::BIGINT AS session_count,
+                COALESCE(SUM(first_dims.duration_seconds), 0)::BIGINT AS duration_total_seconds,
+                0::BIGINT AS new_installs
+            FROM session_dim_source AS first_dims
+            JOIN session_dim_source AS second_dims
+              ON first_dims.project_id = second_dims.project_id
+             AND first_dims.session_id = second_dims.session_id
+             AND first_dims.bucket_start = second_dims.bucket_start
+             AND first_dims.dim_key < second_dims.dim_key
+            JOIN session_dim_source AS third_dims
+              ON first_dims.project_id = third_dims.project_id
+             AND first_dims.session_id = third_dims.session_id
+             AND first_dims.bucket_start = third_dims.bucket_start
+             AND second_dims.dim_key < third_dims.dim_key
+            GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value
+            UNION ALL
+            SELECT
+                first_dims.project_id,
+                first_dims.bucket_start,
+                first_dims.dim_key,
+                first_dims.dim_value,
+                second_dims.dim_key,
+                second_dims.dim_value,
+                third_dims.dim_key,
+                third_dims.dim_value,
+                0::BIGINT,
+                0::BIGINT,
+                COUNT(*)::BIGINT
+            FROM install_dim_source AS first_dims
+            JOIN install_dim_source AS second_dims
+              ON first_dims.project_id = second_dims.project_id
+             AND first_dims.install_id = second_dims.install_id
+             AND first_dims.bucket_start = second_dims.bucket_start
+             AND first_dims.dim_key < second_dims.dim_key
+            JOIN install_dim_source AS third_dims
+              ON first_dims.project_id = third_dims.project_id
+             AND first_dims.install_id = third_dims.install_id
+             AND first_dims.bucket_start = third_dims.bucket_start
+             AND second_dims.dim_key < third_dims.dim_key
+            GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value
+        )
+        INSERT INTO session_metric_buckets_dim3 (
+            project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, session_count, duration_total_seconds, new_installs
+        )
+        SELECT
+            project_id,
+            $2,
+            bucket_start,
+            dim1_key,
+            dim1_value,
+            dim2_key,
+            dim2_value,
+            dim3_key,
+            dim3_value,
+            SUM(session_count)::BIGINT,
+            SUM(duration_total_seconds)::BIGINT,
+            SUM(new_installs)::BIGINT
+        FROM combined
+        GROUP BY project_id, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value
+        "#
+    ))
+    .bind(project_id)
+    .bind(granularity.as_str())
+    .bind(&bucket_starts)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(&format!(
+        r#"
+        WITH scoped_sessions AS MATERIALIZED (
+            SELECT project_id, session_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, locale
+            FROM sessions AS scope
+            WHERE scope.project_id = $1
+              AND {bucket_expr} = ANY($3)
+        ),
+        scoped_installs AS MATERIALIZED (
+            SELECT project_id, install_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, locale
+            FROM install_first_seen AS scope
+            WHERE scope.project_id = $1
+              AND {first_seen_bucket_expr} = ANY($3)
+        ),
+        session_dim_source AS MATERIALIZED (
+            SELECT scoped_sessions.project_id, scoped_sessions.session_id, scoped_sessions.bucket_start, scoped_sessions.duration_seconds, dims.dim_key, dims.dim_value
+            FROM scoped_sessions
+            CROSS JOIN LATERAL ({session_dims}) AS dims(dim_key, dim_value)
+        ),
+        install_dim_source AS MATERIALIZED (
+            SELECT scoped_installs.project_id, scoped_installs.install_id, scoped_installs.bucket_start, dims.dim_key, dims.dim_value
+            FROM scoped_installs
+            CROSS JOIN LATERAL ({install_dims}) AS dims(dim_key, dim_value)
+        ),
+        combined AS (
+            SELECT
+                first_dims.project_id,
+                first_dims.bucket_start,
+                first_dims.dim_key AS dim1_key,
+                first_dims.dim_value AS dim1_value,
+                second_dims.dim_key AS dim2_key,
+                second_dims.dim_value AS dim2_value,
+                third_dims.dim_key AS dim3_key,
+                third_dims.dim_value AS dim3_value,
+                fourth_dims.dim_key AS dim4_key,
+                fourth_dims.dim_value AS dim4_value,
+                COUNT(*)::BIGINT AS session_count,
+                COALESCE(SUM(first_dims.duration_seconds), 0)::BIGINT AS duration_total_seconds,
+                0::BIGINT AS new_installs
+            FROM session_dim_source AS first_dims
+            JOIN session_dim_source AS second_dims
+              ON first_dims.project_id = second_dims.project_id
+             AND first_dims.session_id = second_dims.session_id
+             AND first_dims.bucket_start = second_dims.bucket_start
+             AND first_dims.dim_key < second_dims.dim_key
+            JOIN session_dim_source AS third_dims
+              ON first_dims.project_id = third_dims.project_id
+             AND first_dims.session_id = third_dims.session_id
+             AND first_dims.bucket_start = third_dims.bucket_start
+             AND second_dims.dim_key < third_dims.dim_key
+            JOIN session_dim_source AS fourth_dims
+              ON first_dims.project_id = fourth_dims.project_id
+             AND first_dims.session_id = fourth_dims.session_id
+             AND first_dims.bucket_start = fourth_dims.bucket_start
+             AND third_dims.dim_key < fourth_dims.dim_key
+            GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value, fourth_dims.dim_key, fourth_dims.dim_value
+            UNION ALL
+            SELECT
+                first_dims.project_id,
+                first_dims.bucket_start,
+                first_dims.dim_key,
+                first_dims.dim_value,
+                second_dims.dim_key,
+                second_dims.dim_value,
+                third_dims.dim_key,
+                third_dims.dim_value,
+                fourth_dims.dim_key,
+                fourth_dims.dim_value,
+                0::BIGINT,
+                0::BIGINT,
+                COUNT(*)::BIGINT
+            FROM install_dim_source AS first_dims
+            JOIN install_dim_source AS second_dims
+              ON first_dims.project_id = second_dims.project_id
+             AND first_dims.install_id = second_dims.install_id
+             AND first_dims.bucket_start = second_dims.bucket_start
+             AND first_dims.dim_key < second_dims.dim_key
+            JOIN install_dim_source AS third_dims
+              ON first_dims.project_id = third_dims.project_id
+             AND first_dims.install_id = third_dims.install_id
+             AND first_dims.bucket_start = third_dims.bucket_start
+             AND second_dims.dim_key < third_dims.dim_key
+            JOIN install_dim_source AS fourth_dims
+              ON first_dims.project_id = fourth_dims.project_id
+             AND first_dims.install_id = fourth_dims.install_id
+             AND first_dims.bucket_start = fourth_dims.bucket_start
+             AND third_dims.dim_key < fourth_dims.dim_key
+            GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value, fourth_dims.dim_key, fourth_dims.dim_value
+        )
+        INSERT INTO session_metric_buckets_dim4 (
+            project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, session_count, duration_total_seconds, new_installs
+        )
+        SELECT
+            project_id,
+            $2,
+            bucket_start,
+            dim1_key,
+            dim1_value,
+            dim2_key,
+            dim2_value,
+            dim3_key,
+            dim3_value,
+            dim4_key,
+            dim4_value,
+            SUM(session_count)::BIGINT,
+            SUM(duration_total_seconds)::BIGINT,
+            SUM(new_installs)::BIGINT
+        FROM combined
+        GROUP BY project_id, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value
+        "#
+    ))
+    .bind(project_id)
+    .bind(granularity.as_str())
+    .bind(&bucket_starts)
+    .execute(&mut **tx)
+    .await?;
+
     Ok(())
 }
 
@@ -3796,7 +4420,7 @@ mod tests {
             platform: Platform::Ios,
             app_version: app_version.map(str::to_owned),
             os_version: Some("18.3".to_owned()),
-            properties: BTreeMap::new(),
+            locale: Some("en-GB".to_owned()),
         }
     }
 
@@ -3811,10 +4435,7 @@ mod tests {
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
-            properties: BTreeMap::from([
-                ("plan".to_owned(), "pro".to_owned()),
-                ("provider".to_owned(), "strava".to_owned()),
-            ]),
+            locale: Some("en-GB".to_owned()),
         }
     }
 
@@ -4249,7 +4870,7 @@ mod tests {
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
-            properties: BTreeMap::new(),
+            locale: Some("en-GB".to_owned()),
         };
         let second = RawEventRecord {
             id: 2,
@@ -4261,7 +4882,7 @@ mod tests {
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
-            properties: BTreeMap::new(),
+            locale: Some("en-GB".to_owned()),
         };
         let third = RawEventRecord {
             id: 3,
@@ -4273,7 +4894,7 @@ mod tests {
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
-            properties: BTreeMap::new(),
+            locale: Some("en-GB".to_owned()),
         };
 
         let updates = build_live_install_state_upserts(&[first, second, third]);

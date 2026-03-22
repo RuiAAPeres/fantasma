@@ -9,9 +9,6 @@ public enum FantasmaError: Error, Equatable, Sendable {
     case invalidWriteKey
     case unsupportedServerURL
     case invalidEventName
-    case invalidPropertyCount
-    case invalidPropertyName
-    case reservedPropertyName
     case encodingFailed
     case invalidResponse
     case uploadFailed
@@ -59,69 +56,6 @@ struct FantasmaConfiguration: Equatable, Sendable {
     }
 }
 
-private enum EventPropertyValidation {
-    static let reservedKeys: Set<String> = [
-        "project_id",
-        "event",
-        "timestamp",
-        "install_id",
-        "properties",
-        "metric",
-        "granularity",
-        "start",
-        "end",
-        "start_date",
-        "end_date",
-        "group_by",
-        "platform",
-        "app_version",
-        "os_version",
-    ]
-
-    static func validated(_ properties: [String: String]?) throws -> [String: String]? {
-        guard let properties, !properties.isEmpty else {
-            return nil
-        }
-
-        guard properties.count <= 2 else {
-            throw FantasmaError.invalidPropertyCount
-        }
-
-        for key in properties.keys {
-            guard isValidKey(key) else {
-                throw FantasmaError.invalidPropertyName
-            }
-            guard !reservedKeys.contains(key) else {
-                throw FantasmaError.reservedPropertyName
-            }
-        }
-
-        return properties
-    }
-
-    static func isValidKey(_ key: String) -> Bool {
-        guard let first = key.unicodeScalars.first, key.count <= 63 else {
-            return false
-        }
-
-        guard first.value >= 97 && first.value <= 122 else {
-            return false
-        }
-
-        for scalar in key.unicodeScalars.dropFirst() {
-            let value = scalar.value
-            let isLowercaseLetter = value >= 97 && value <= 122
-            let isDigit = value >= 48 && value <= 57
-            let isUnderscore = value == 95
-            if !(isLowercaseLetter || isDigit || isUnderscore) {
-                return false
-            }
-        }
-
-        return true
-    }
-}
-
 struct EventEnvelope: Codable, Equatable, Sendable {
     let event: String
     let timestamp: String
@@ -129,7 +63,7 @@ struct EventEnvelope: Codable, Equatable, Sendable {
     let platform: String
     let appVersion: String?
     let osVersion: String?
-    let properties: [String: String]?
+    let locale: String?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -138,7 +72,7 @@ struct EventEnvelope: Codable, Equatable, Sendable {
         case platform
         case appVersion = "app_version"
         case osVersion = "os_version"
-        case properties
+        case locale
     }
 }
 
@@ -294,7 +228,7 @@ actor FantasmaCore {
         }
     }
 
-    func track(_ eventName: String, properties: [String: String]?) async throws {
+    func track(_ eventName: String) async throws {
         guard configuration != nil else {
             throw FantasmaError.notConfigured
         }
@@ -306,8 +240,6 @@ actor FantasmaCore {
 
         trackOperationsInProgress += 1
         do {
-            let validatedProperties = try EventPropertyValidation.validated(properties)
-
             let now = dependencies.now()
             let identity = await currentIdentity()
             let event = EventEnvelope(
@@ -317,7 +249,7 @@ actor FantasmaCore {
                 platform: "ios",
                 appVersion: dependencies.appVersion(),
                 osVersion: dependencies.osVersion(),
-                properties: validatedProperties
+                locale: currentLocaleIdentifier()
             )
 
             let payload: Data
@@ -348,6 +280,11 @@ actor FantasmaCore {
 
         trackOperationsInProgress -= 1
         _ = try await applyPendingReconfigurationIfNeeded()
+    }
+
+    private func currentLocaleIdentifier() -> String? {
+        let identifier = Locale.current.identifier.replacingOccurrences(of: "_", with: "-")
+        return identifier.isEmpty ? nil : identifier
     }
 
     func clear() async {

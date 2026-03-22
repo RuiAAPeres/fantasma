@@ -59,7 +59,7 @@ struct ContentView: View {
         }
 
         do {
-            try await Fantasma.track("screen_view", properties: ["screen": "Home"])
+            try await Fantasma.track("screen_view")
             didTrackScreen = true
             statusText = "Queued screen_view for Home"
         } catch {

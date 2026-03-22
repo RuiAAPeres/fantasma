@@ -55,7 +55,7 @@ class DemoApplication : Application() {
 ## Public API
 
 - `FantasmaClient(context, FantasmaConfig(serverUrl, writeKey))`
-- `track(eventName, properties?)`
+- `track(eventName)`
 - `flush()`
 - `clear()`
 - `close()`
@@ -80,12 +80,8 @@ failures. `close()` is idempotent, and any later `track()`, `flush()`, or
 - `500`, transport failures, and unrelated `409` responses remain retryable.
 - The SDK attempts a periodic flush every 30 seconds, when the queue reaches 100
   events, on explicit `flush()`, and when the app enters background.
-- The SDK auto-populates `platform = "android"`, `app_version`, and
-  `os_version`.
-- Event properties remain explicit string-to-string context, capped at 2 keys.
-  Property names must match `^[a-z][a-z0-9_]{0,62}$` and may not reuse reserved
-  built-in/query keys such as `event`, `install_id`, `metric`, `granularity`,
-  `start`, `end`, `platform`, `app_version`, or `os_version`.
+- The SDK auto-populates `platform = "android"`, `app_version`,
+  `os_version`, and `locale`.
 - The SDK persists one app-local install identifier, reuses it across
   destinations, and rotates it on `clear()` without mutating already queued
   rows.

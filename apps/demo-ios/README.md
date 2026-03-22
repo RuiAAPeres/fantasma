@@ -51,10 +51,10 @@ SDK's upload timer fires or the app backgrounds, plus the worker's next poll.
 If the first request comes back empty, wait at least 10 to 15 seconds and poll
 again, or background the app to trigger an upload sooner.
 
-Confirm that `screen_view` grouped by `screen` includes `Home`:
+Confirm that `screen_view` events are visible for iOS traffic:
 
 ```bash
-curl -fsS "http://localhost:8082/v1/metrics/events?event=screen_view&metric=count&granularity=day&start=<UTC-start-date>&end=<UTC-end-date>&group_by=screen" \
+curl -fsS "http://localhost:8082/v1/metrics/events?event=screen_view&metric=count&granularity=day&start=<UTC-start-date>&end=<UTC-end-date>&platform=ios" \
   -H "X-Fantasma-Key: <read-key-from-provision-project-output>"
 ```
 

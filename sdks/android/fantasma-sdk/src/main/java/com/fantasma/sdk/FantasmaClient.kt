@@ -20,12 +20,9 @@ public class FantasmaClient internal constructor(
     /**
      * Persist one event and schedule upload if needed.
      */
-    public suspend fun track(
-        eventName: String,
-        properties: Map<String, String>? = null,
-    ) {
+    public suspend fun track(eventName: String) {
         ensureOpen()
-        delegate.track(eventName, properties)
+        delegate.track(eventName)
     }
 
     /**

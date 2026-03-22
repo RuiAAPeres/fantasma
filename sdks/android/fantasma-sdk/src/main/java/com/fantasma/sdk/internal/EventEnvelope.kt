@@ -14,5 +14,5 @@ internal data class EventEnvelope(
     val appVersion: String?,
     @SerialName("os_version")
     val osVersion: String?,
-    val properties: Map<String, String>?,
+    val locale: String?,
 )

@@ -152,8 +152,6 @@ pub struct ProjectRangeDeleteArgs {
     pub event: Option<String>,
     #[arg(long = "filter")]
     pub filters: Vec<String>,
-    #[arg(long = "property")]
-    pub properties: Vec<String>,
     #[arg(long)]
     pub project: Option<Uuid>,
     #[command(flatten)]
@@ -231,7 +229,7 @@ pub enum MetricsSubcommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  fantasma metrics events --event app_open --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider"
+    after_help = "Examples:\n  fantasma metrics events --event app_open --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter platform=ios --filter app_version=1.0.0 --filter locale=en-GB"
 )]
 pub struct EventMetricsArgs {
     #[arg(long)]
@@ -246,14 +244,9 @@ pub struct EventMetricsArgs {
     pub end: String,
     #[arg(
         long = "filter",
-        help = "Repeat key=value filters. Filters plus group-by may reference at most 2 distinct dimensions total."
+        help = "Repeat built-in key=value filters. Supported keys: platform, app_version, os_version, locale."
     )]
     pub filters: Vec<String>,
-    #[arg(
-        long = "group-by",
-        help = "Repeat up to twice. Combined with filters, the API accepts at most 2 distinct dimensions total."
-    )]
-    pub group_by: Vec<String>,
     #[command(flatten)]
     pub output: ReadOutputArgs,
 }
@@ -292,7 +285,7 @@ pub struct LiveInstallsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  fantasma metrics sessions --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter plan=pro --group-by provider\n  fantasma metrics sessions --metric active_installs --start 2026-03-01 --end 2026-03-17 --interval week --filter plan=pro --group-by provider"
+    after_help = "Examples:\n  fantasma metrics sessions --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter platform=ios --filter os_version=18.3 --filter locale=en-GB\n  fantasma metrics sessions --metric active_installs --start 2026-03-01 --end 2026-03-17 --interval week --filter platform=ios"
 )]
 pub struct SessionMetricsArgs {
     #[arg(long)]
@@ -307,14 +300,9 @@ pub struct SessionMetricsArgs {
     pub end: String,
     #[arg(
         long = "filter",
-        help = "Repeat key=value filters. Filters plus group-by may reference at most 2 distinct dimensions total."
+        help = "Repeat built-in key=value filters. Supported keys: platform, app_version, os_version, locale."
     )]
     pub filters: Vec<String>,
-    #[arg(
-        long = "group-by",
-        help = "Repeat up to twice. Combined with filters, the API accepts at most 2 distinct dimensions total."
-    )]
-    pub group_by: Vec<String>,
     #[command(flatten)]
     pub output: ReadOutputArgs,
 }

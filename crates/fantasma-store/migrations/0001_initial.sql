@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS events_raw (
     session_id TEXT,
     platform TEXT NOT NULL,
     app_version TEXT,
-    properties JSONB,
+    os_version TEXT,
+    locale TEXT,
     received_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

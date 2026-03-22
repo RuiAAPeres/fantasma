@@ -1,6 +1,9 @@
 package com.fantasma.sdk.internal
 
 import android.content.Context
+import android.content.res.Configuration
+import android.os.Build
+import android.os.LocaleList
 import androidx.test.core.app.ApplicationProvider
 import com.fantasma.sdk.FantasmaClient
 import com.fantasma.sdk.FantasmaConfig
@@ -10,6 +13,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.yield
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import kotlin.test.Test
@@ -17,6 +22,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import java.util.Locale
 
 @RunWith(RobolectricTestRunner::class)
 internal class FantasmaRuntimeBehaviorTest {
@@ -98,7 +104,7 @@ internal class FantasmaRuntimeBehaviorTest {
             val harness = RuntimeHarness.create(transport)
 
             try {
-                harness.runtime.track("app_open", null)
+                harness.runtime.track("app_open")
 
                 val firstFlush = async(Dispatchers.Default) { harness.runtime.flush() }
                 transport.waitUntilSendStarts()
@@ -127,7 +133,7 @@ internal class FantasmaRuntimeBehaviorTest {
             registry.acquire(harness.destination.signature) { harness.runtime }
 
             try {
-                harness.runtime.track("app_open", null)
+                harness.runtime.track("app_open")
 
                 val inFlightFlush = async(Dispatchers.Default) { harness.runtime.flush() }
                 transport.waitUntilSendStarts()
@@ -143,9 +149,44 @@ internal class FantasmaRuntimeBehaviorTest {
                 inFlightFlush.await()
 
                 assertFailsWith<FantasmaException.ClosedClient> {
-                    harness.runtime.track("stale_after_retirement", null)
+                    harness.runtime.track("stale_after_retirement")
                 }
             } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    internal fun `event locale uses the app context locale instead of the process default`() =
+        runTest {
+            val baseContext = ApplicationProvider.getApplicationContext<Context>()
+            val configuration = Configuration(baseContext.resources.configuration)
+            val appLocale = Locale.forLanguageTag("pt-PT")
+            val originalDefault = Locale.getDefault()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                configuration.setLocales(LocaleList(appLocale))
+            } else {
+                @Suppress("DEPRECATION")
+                run {
+                    configuration.locale = appLocale
+                }
+            }
+            val localizedContext = baseContext.createConfigurationContext(configuration)
+            val harness = RuntimeHarness.create(NoopTransport(), context = localizedContext)
+
+            try {
+                Locale.setDefault(Locale.US)
+                harness.runtime.track("app_open")
+
+                val row = harness.queue.peek(limit = 1).single()
+                val payload =
+                    kotlinx.serialization.json.Json
+                        .parseToJsonElement(row.payload.decodeToString())
+                        .jsonObject
+
+                assertEquals("pt-PT", payload["locale"]?.jsonPrimitive?.content)
+            } finally {
+                Locale.setDefault(originalDefault)
                 harness.close()
             }
         }
@@ -172,6 +213,15 @@ internal class FantasmaRuntimeBehaviorTest {
         }
     }
 
+    private class NoopTransport : FantasmaTransport {
+        override suspend fun send(request: FantasmaRequest): FantasmaResponse {
+            return FantasmaResponse(
+                statusCode = 202,
+                body = """{"accepted":1}""".encodeToByteArray(),
+            )
+        }
+    }
+
     private class RuntimeHarness(
         val context: Context,
         val destination: NormalizedDestination,
@@ -185,8 +235,10 @@ internal class FantasmaRuntimeBehaviorTest {
         }
 
         companion object {
-            fun create(transport: FantasmaTransport): RuntimeHarness {
-                val context = ApplicationProvider.getApplicationContext<Context>()
+            fun create(
+                transport: FantasmaTransport,
+                context: Context = ApplicationProvider.getApplicationContext(),
+            ): RuntimeHarness {
                 val destination =
                     NormalizedDestination.from(
                         serverUrl = "https://api.usefantasma.com",

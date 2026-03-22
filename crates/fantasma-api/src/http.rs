@@ -21,7 +21,7 @@ use fantasma_core::{
     ActiveInstallsPoint, ActiveInstallsResponse, ActiveInstallsSeries, CurrentMetricResponse,
     EventMetric, EventMetricsQuery, MetricGranularity, MetricInterval, MetricsBucketWindow,
     MetricsPoint, MetricsResponse, MetricsSeries, SessionMetric, SessionMetricsQuery,
-    UsageEventsResponse, is_reserved_event_property_key, is_valid_event_property_key,
+    UsageEventsResponse,
 };
 use fantasma_store::{
     ApiKeyKind, EventCatalogRecord, EventMetricsAggregateCubeRow, EventMetricsCubeRow, PgPool,
@@ -56,7 +56,6 @@ struct PublicEventMetricsQuery {
     event: String,
     window: MetricsBucketWindow,
     filters: BTreeMap<String, String>,
-    group_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +64,6 @@ struct PublicSessionMetricsQuery {
     window: MetricsBucketWindow,
     interval: Option<MetricInterval>,
     filters: BTreeMap<String, String>,
-    group_by: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,8 +94,6 @@ struct CreateRangeDeletionRequest {
     event: Option<String>,
     #[serde(default)]
     filters: BTreeMap<String, String>,
-    #[serde(default)]
-    properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,10 +170,10 @@ impl EventMetricsQueryError {
     }
 }
 
-const MAX_GROUP_BY_DIMENSIONS: usize = 2;
-const MAX_EVENT_REFERENCED_DIMENSIONS: usize = 2;
+const MAX_FILTER_DIMENSIONS: usize = 4;
 const MAX_METRIC_GROUPS: usize = 100;
 const MAX_ACTIVE_INSTALL_POINTS: usize = 120;
+const EMPTY_GROUP_BY: &[String] = &[];
 type GroupKey = Vec<Option<String>>;
 type CountsByBucket = BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>;
 type SingletonCountsByBucket = (CountsByBucket, CountsByBucket);
@@ -191,8 +187,6 @@ fn parse_event_metrics_query(
     let mut start = None;
     let mut end = None;
     let mut filters = BTreeMap::new();
-    let mut group_by = Vec::new();
-    let mut group_by_seen = BTreeSet::new();
 
     for (raw_key, raw_value) in form_urlencoded::parse(raw_query.as_bytes()) {
         let key = raw_key.into_owned();
@@ -243,25 +237,8 @@ fn parse_event_metrics_query(
 
                 end = Some(value);
             }
-            "group_by" => {
-                if value.is_empty() {
-                    return Err(EventMetricsQueryError("invalid_group_by"));
-                }
-
-                if !matches!(value.as_str(), "platform" | "app_version" | "os_version")
-                    && (is_reserved_event_property_key(&value)
-                        || !is_valid_event_property_key(&value))
-                {
-                    return Err(EventMetricsQueryError("invalid_group_by"));
-                }
-
-                if !group_by_seen.insert(value.clone()) {
-                    return Err(EventMetricsQueryError("duplicate_group_by"));
-                }
-
-                group_by.push(value);
-            }
-            "platform" | "app_version" | "os_version" => {
+            "group_by" => return Err(EventMetricsQueryError("invalid_query_key")),
+            "platform" | "app_version" | "os_version" | "locale" => {
                 if filters.insert(key, value).is_some() {
                     return Err(EventMetricsQueryError("duplicate_query_key"));
                 }
@@ -269,15 +246,7 @@ fn parse_event_metrics_query(
             "project_id" | "start_date" | "end_date" => {
                 return Err(EventMetricsQueryError("invalid_query_key"));
             }
-            _ => {
-                if is_reserved_event_property_key(&key) || !is_valid_event_property_key(&key) {
-                    return Err(EventMetricsQueryError("invalid_query_key"));
-                }
-
-                if filters.insert(key, value).is_some() {
-                    return Err(EventMetricsQueryError("duplicate_query_key"));
-                }
-            }
+            _ => return Err(EventMetricsQueryError("invalid_query_key")),
         }
     }
 
@@ -294,18 +263,7 @@ fn parse_event_metrics_query(
     )
     .map_err(EventMetricsQueryError)?;
 
-    if group_by.len() > MAX_GROUP_BY_DIMENSIONS {
-        return Err(EventMetricsQueryError("too_many_group_by_dimensions"));
-    }
-
-    let filter_keys = filters.keys().cloned().collect::<BTreeSet<_>>();
-    if group_by.iter().any(|key| filter_keys.contains(key)) {
-        return Err(EventMetricsQueryError("conflicting_dimension_usage"));
-    }
-
-    let mut referenced_dimensions = filter_keys;
-    referenced_dimensions.extend(group_by.iter().cloned());
-    if referenced_dimensions.len() > MAX_EVENT_REFERENCED_DIMENSIONS {
+    if filters.len() > MAX_FILTER_DIMENSIONS {
         return Err(EventMetricsQueryError("too_many_dimensions"));
     }
 
@@ -314,7 +272,6 @@ fn parse_event_metrics_query(
         event,
         window,
         filters,
-        group_by,
     })
 }
 
@@ -385,8 +342,6 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
     let mut start = None;
     let mut end = None;
     let mut filters = BTreeMap::new();
-    let mut group_by = Vec::new();
-    let mut group_by_seen = BTreeSet::new();
 
     for (raw_key, raw_value) in form_urlencoded::parse(raw_query.as_bytes()) {
         let key = raw_key.into_owned();
@@ -428,54 +383,18 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
 
                 end = Some(value);
             }
-            "group_by" => {
-                if value.is_empty() {
-                    return Err("invalid_group_by");
-                }
-
-                if !is_supported_session_dimension(&value)
-                    && (is_reserved_event_property_key(&value)
-                        || !is_valid_event_property_key(&value))
-                {
-                    return Err("invalid_group_by");
-                }
-
-                if !group_by_seen.insert(value.clone()) {
-                    return Err("duplicate_group_by");
-                }
-
-                group_by.push(value);
-            }
-            "platform" | "app_version" | "os_version" => {
+            "group_by" => return Err("invalid_query_key"),
+            "platform" | "app_version" | "os_version" | "locale" => {
                 if filters.insert(key, value).is_some() {
                     return Err("duplicate_query_key");
                 }
             }
             "project_id" | "start_date" | "end_date" => return Err("invalid_query_key"),
-            _ => {
-                if is_reserved_event_property_key(&key) || !is_valid_event_property_key(&key) {
-                    return Err("invalid_query_key");
-                }
-
-                if filters.insert(key, value).is_some() {
-                    return Err("duplicate_query_key");
-                }
-            }
+            _ => return Err("invalid_query_key"),
         }
     }
 
-    if group_by.len() > MAX_GROUP_BY_DIMENSIONS {
-        return Err("too_many_group_by_dimensions");
-    }
-
-    let filter_keys = filters.keys().cloned().collect::<BTreeSet<_>>();
-    if group_by.iter().any(|key| filter_keys.contains(key)) {
-        return Err("conflicting_dimension_usage");
-    }
-
-    let mut referenced_dimensions = filter_keys;
-    referenced_dimensions.extend(group_by.iter().cloned());
-    if referenced_dimensions.len() > MAX_EVENT_REFERENCED_DIMENSIONS {
+    if filters.len() > MAX_FILTER_DIMENSIONS {
         return Err("too_many_dimensions");
     }
 
@@ -511,7 +430,6 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
         window,
         interval,
         filters,
-        group_by,
     })
 }
 
@@ -573,10 +491,7 @@ fn parse_event_discovery_query(
             }
             "limit" => {
                 if !allow_limit {
-                    if filters.insert(key, value).is_some() {
-                        return Err("invalid_query_key");
-                    }
-                    continue;
+                    return Err("invalid_query_key");
                 }
 
                 if limit.is_some() {
@@ -585,7 +500,7 @@ fn parse_event_discovery_query(
 
                 limit = Some(parse_top_events_limit(&value)?);
             }
-            "platform" | "app_version" | "os_version" => {
+            "platform" | "app_version" | "os_version" | "locale" => {
                 if filters.insert(key, value).is_some() {
                     return Err("invalid_query_key");
                 }
@@ -593,15 +508,7 @@ fn parse_event_discovery_query(
             "project_id" | "event" | "metric" | "granularity" | "group_by" => {
                 return Err("invalid_query_key");
             }
-            _ => {
-                if is_reserved_event_property_key(&key) || !is_valid_event_property_key(&key) {
-                    return Err("invalid_query_key");
-                }
-
-                if filters.insert(key, value).is_some() {
-                    return Err("invalid_query_key");
-                }
-            }
+            _ => return Err("invalid_query_key"),
         }
     }
 
@@ -797,10 +704,6 @@ fn parse_hour_bucket(raw: &str) -> Result<DateTime<Utc>, &'static str> {
     }
 
     Ok(parsed)
-}
-
-fn is_supported_session_dimension(key: &str) -> bool {
-    matches!(key, "platform" | "app_version" | "os_version")
 }
 
 #[allow(clippy::result_large_err)]
@@ -1405,7 +1308,6 @@ async fn events_metrics(
         event: public_query.event,
         window: public_query.window,
         filters: public_query.filters,
-        group_by: public_query.group_by,
     };
     if let Err(error) = validate_event_metrics_query(&query) {
         return query_error_response(error);
@@ -1453,7 +1355,6 @@ async fn sessions_metrics(
         window: public_query.window,
         interval: public_query.interval,
         filters: public_query.filters,
-        group_by: public_query.group_by,
     };
 
     if let Err(error) = validate_active_installs_query(&query) {
@@ -1661,19 +1562,12 @@ fn validate_range_deletion_request(
         return Err("invalid_request");
     }
 
-    if payload
-        .filters
-        .keys()
-        .any(|key| !matches!(key.as_str(), "platform" | "app_version" | "os_version"))
-    {
-        return Err("invalid_request");
-    }
-
-    if payload
-        .properties
-        .keys()
-        .any(|key| is_reserved_event_property_key(key) || !is_valid_event_property_key(key))
-    {
+    if payload.filters.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "platform" | "app_version" | "os_version" | "locale"
+        )
+    }) {
         return Err("invalid_request");
     }
 
@@ -1692,7 +1586,7 @@ async fn execute_event_metrics_query(
     Ok(build_metrics_response(
         query.metric.as_str(),
         &query.window,
-        &query.group_by,
+        EMPTY_GROUP_BY,
         counts_by_bucket,
     ))
 }
@@ -1741,21 +1635,9 @@ async fn execute_active_installs_query(
         ))
     })?;
     let mut counts_by_window = BTreeMap::new();
-    let mut groups_seen = BTreeSet::new();
-
     for window in &windows {
         let counts = load_active_install_group_counts_for_window(&mut tx, query, window).await?;
-        groups_seen.extend(counts.keys().cloned());
         counts_by_window.insert(window.start, counts);
-    }
-
-    let group_count = if query.group_by.is_empty() {
-        1
-    } else {
-        groups_seen.len()
-    };
-    if group_count > MAX_METRIC_GROUPS {
-        return Err(MetricsResponseError::GroupLimitExceeded);
     }
     tx.commit().await.map_err(StoreError::Database)?;
 
@@ -1826,16 +1708,32 @@ fn end_of_year(day: NaiveDate) -> NaiveDate {
     NaiveDate::from_ymd_opt(day.year(), 12, 31).expect("valid last day of year")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveInstallReadStrategy {
+    BitmapTotals,
+    BitmapDim1,
+    BitmapDim2,
+    DistinctCount,
+}
+
+fn active_install_read_strategy(filters: &BTreeMap<String, String>) -> ActiveInstallReadStrategy {
+    match cube_keys_with(filters, EMPTY_GROUP_BY).len() {
+        0 => ActiveInstallReadStrategy::BitmapTotals,
+        1 => ActiveInstallReadStrategy::BitmapDim1,
+        2 => ActiveInstallReadStrategy::BitmapDim2,
+        _ => ActiveInstallReadStrategy::DistinctCount,
+    }
+}
+
 async fn load_active_install_group_counts_for_window(
     tx: &mut Transaction<'_, Postgres>,
     query: &SessionMetricsQuery,
     window: &ActiveInstallPointWindow,
 ) -> Result<BTreeMap<GroupKey, u64>, MetricsResponseError> {
     let days = active_install_days(window);
-    let referenced_keys = cube_keys_with(&query.filters, &query.group_by);
 
-    match referenced_keys.len() {
-        0 => {
+    match active_install_read_strategy(&query.filters) {
+        ActiveInstallReadStrategy::BitmapTotals => {
             let mut bitmap = RoaringTreemap::new();
             for row in
                 load_active_install_bitmap_totals_in_executor(&mut **tx, query.project_id, &days)
@@ -1846,11 +1744,13 @@ async fn load_active_install_group_counts_for_window(
 
             Ok(BTreeMap::from([(Vec::new(), bitmap.len())]))
         }
-        1 => {
+        ActiveInstallReadStrategy::BitmapDim1 => {
+            let referenced_keys = cube_keys_with(&query.filters, EMPTY_GROUP_BY);
             load_active_install_dim1_group_counts_for_window(tx, query, &days, &referenced_keys[0])
                 .await
         }
-        2 => {
+        ActiveInstallReadStrategy::BitmapDim2 => {
+            let referenced_keys = cube_keys_with(&query.filters, EMPTY_GROUP_BY);
             load_active_install_dim2_group_counts_for_window(
                 tx,
                 query,
@@ -1860,10 +1760,54 @@ async fn load_active_install_group_counts_for_window(
             )
             .await
         }
-        other => Err(StoreError::InvariantViolation(format!(
-            "active_installs referenced dimension arity must be between 0 and 2, got {other}"
-        ))
-        .into()),
+        ActiveInstallReadStrategy::DistinctCount => {
+            let value = load_active_install_total_count_for_window(tx, query, &days).await?;
+            Ok(BTreeMap::from([(Vec::new(), value)]))
+        }
+    }
+}
+
+async fn load_active_install_total_count_for_window(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &SessionMetricsQuery,
+    days: &[NaiveDate],
+) -> Result<u64, MetricsResponseError> {
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT COUNT(DISTINCT install_id)::BIGINT AS value \
+         FROM session_active_install_slices \
+         WHERE project_id = ",
+    );
+    builder.push_bind(query.project_id);
+    builder.push(" AND day = ANY(");
+    builder.push_bind(days);
+    builder.push(")");
+
+    if let Some(value) = query.filters.get("platform") {
+        builder.push(" AND platform = ");
+        builder.push_bind(value);
+    }
+
+    append_optional_slice_filter(&mut builder, &query.filters, "app_version");
+    append_optional_slice_filter(&mut builder, &query.filters, "os_version");
+    append_optional_slice_filter(&mut builder, &query.filters, "locale");
+
+    let row = builder
+        .build()
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(StoreError::from)?;
+
+    Ok(row.try_get::<i64, _>("value").map_err(StoreError::from)? as u64)
+}
+
+fn append_optional_slice_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    filters: &BTreeMap<String, String>,
+    key: &str,
+) {
+    if let Some(value) = filters.get(key) {
+        builder.push(format!(" AND {key}_is_null = FALSE AND {key} = "));
+        builder.push_bind(value.clone());
     }
 }
 
@@ -1922,7 +1866,7 @@ async fn load_active_install_dim1_group_counts_for_window(
             &row.try_get::<Vec<u8>, _>("bitmap")
                 .map_err(StoreError::from)?,
         )?;
-        let group_key = if query.group_by.is_empty() {
+        let group_key = if EMPTY_GROUP_BY.is_empty() {
             Vec::new()
         } else {
             vec![dim_value]
@@ -1982,8 +1926,7 @@ async fn load_active_install_dim2_group_counts_for_window(
             &row.try_get::<Vec<u8>, _>("bitmap")
                 .map_err(StoreError::from)?,
         )?;
-        let group_key = query
-            .group_by
+        let group_key = EMPTY_GROUP_BY
             .iter()
             .map(|group_key| {
                 if group_key == key1 {
@@ -2025,7 +1968,7 @@ fn build_active_installs_response(
         }
     }
 
-    let series = if query.group_by.is_empty() {
+    let series = if EMPTY_GROUP_BY.is_empty() {
         let points_by_window = series_by_group.remove(&Vec::new()).unwrap_or_default();
         vec![ActiveInstallsSeries {
             dimensions: BTreeMap::new(),
@@ -2047,7 +1990,7 @@ fn build_active_installs_response(
         grouped
             .into_iter()
             .map(|(group_key, points_by_window)| ActiveInstallsSeries {
-                dimensions: dimensions_for_group(&query.group_by, &group_key),
+                dimensions: dimensions_for_group(EMPTY_GROUP_BY, &group_key),
                 points: windows
                     .iter()
                     .map(|window| ActiveInstallsPoint {
@@ -2068,7 +2011,6 @@ fn build_active_installs_response(
         start: format_active_install_day(query.window.start),
         end: format_active_install_day(query.window.end),
         interval: query.interval,
-        group_by: query.group_by.clone(),
         series,
     }
 }
@@ -2089,7 +2031,7 @@ async fn execute_session_metrics_query(
     Ok(build_metrics_response(
         query.metric.as_str(),
         &query.window,
-        &query.group_by,
+        EMPTY_GROUP_BY,
         counts_by_bucket,
     ))
 }
@@ -2130,7 +2072,7 @@ async fn precheck_event_metrics_group_limit(
     tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<(), MetricsResponseError> {
-    match query.group_by.len() {
+    match EMPTY_GROUP_BY.len() {
         0 => Ok(()),
         1 => {
             let primary_rows = load_event_aggregate_rows(
@@ -2138,7 +2080,7 @@ async fn precheck_event_metrics_group_limit(
                 query,
                 &cube_keys_with(
                     &query.filters,
-                    std::slice::from_ref(query.group_by.first().expect("group exists")),
+                    std::slice::from_ref(EMPTY_GROUP_BY.first().expect("group exists")),
                 ),
                 Some(MAX_METRIC_GROUPS + 1),
             )
@@ -2152,7 +2094,7 @@ async fn precheck_event_metrics_group_limit(
                 load_event_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
                     .await?;
             let final_groups = synthesize_single_group_counts(
-                aggregate_rows_to_groups(&primary_rows, &query.group_by),
+                aggregate_rows_to_groups(&primary_rows, EMPTY_GROUP_BY),
                 sum_aggregate_rows(&total_rows),
             )?;
 
@@ -2166,7 +2108,7 @@ async fn precheck_event_metrics_group_limit(
             let pair_rows = load_event_aggregate_rows(
                 tx,
                 query,
-                &cube_keys_with(&query.filters, &query.group_by),
+                &cube_keys_with(&query.filters, EMPTY_GROUP_BY),
                 Some(MAX_METRIC_GROUPS + 1),
             )
             .await?;
@@ -2174,7 +2116,7 @@ async fn precheck_event_metrics_group_limit(
                 return Err(MetricsResponseError::GroupLimitExceeded);
             }
 
-            let first_group = vec![query.group_by[0].clone()];
+            let first_group = vec![EMPTY_GROUP_BY[0].clone()];
             let first_rows = load_event_aggregate_rows(
                 tx,
                 query,
@@ -2186,7 +2128,7 @@ async fn precheck_event_metrics_group_limit(
                 return Err(MetricsResponseError::GroupLimitExceeded);
             }
 
-            let second_group = vec![query.group_by[1].clone()];
+            let second_group = vec![EMPTY_GROUP_BY[1].clone()];
             let second_rows = load_event_aggregate_rows(
                 tx,
                 query,
@@ -2202,7 +2144,7 @@ async fn precheck_event_metrics_group_limit(
                 load_event_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
                     .await?;
             let final_groups = synthesize_two_group_counts(
-                aggregate_rows_to_groups(&pair_rows, &query.group_by),
+                aggregate_rows_to_groups(&pair_rows, EMPTY_GROUP_BY),
                 aggregate_rows_to_groups(&first_rows, &first_group),
                 aggregate_rows_to_groups(&second_rows, &second_group),
                 sum_aggregate_rows(&total_rows),
@@ -2225,7 +2167,7 @@ async fn precheck_session_metrics_group_limit(
     tx: &mut Transaction<'_, Postgres>,
     query: &SessionMetricsQuery,
 ) -> Result<(), MetricsResponseError> {
-    match query.group_by.len() {
+    match EMPTY_GROUP_BY.len() {
         0 => Ok(()),
         1 => {
             let primary_rows = load_session_aggregate_rows(
@@ -2233,7 +2175,7 @@ async fn precheck_session_metrics_group_limit(
                 query,
                 &cube_keys_with(
                     &query.filters,
-                    std::slice::from_ref(query.group_by.first().expect("group exists")),
+                    std::slice::from_ref(EMPTY_GROUP_BY.first().expect("group exists")),
                 ),
                 Some(MAX_METRIC_GROUPS + 1),
             )
@@ -2247,7 +2189,7 @@ async fn precheck_session_metrics_group_limit(
                 load_session_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
                     .await?;
             let final_groups = synthesize_single_group_counts(
-                aggregate_rows_to_groups(&primary_rows, &query.group_by),
+                aggregate_rows_to_groups(&primary_rows, EMPTY_GROUP_BY),
                 sum_aggregate_rows(&total_rows),
             )?;
 
@@ -2261,7 +2203,7 @@ async fn precheck_session_metrics_group_limit(
             let pair_rows = load_session_aggregate_rows(
                 tx,
                 query,
-                &cube_keys_with(&query.filters, &query.group_by),
+                &cube_keys_with(&query.filters, EMPTY_GROUP_BY),
                 Some(MAX_METRIC_GROUPS + 1),
             )
             .await?;
@@ -2269,7 +2211,7 @@ async fn precheck_session_metrics_group_limit(
                 return Err(MetricsResponseError::GroupLimitExceeded);
             }
 
-            let first_group = vec![query.group_by[0].clone()];
+            let first_group = vec![EMPTY_GROUP_BY[0].clone()];
             let first_rows = load_session_aggregate_rows(
                 tx,
                 query,
@@ -2281,7 +2223,7 @@ async fn precheck_session_metrics_group_limit(
                 return Err(MetricsResponseError::GroupLimitExceeded);
             }
 
-            let second_group = vec![query.group_by[1].clone()];
+            let second_group = vec![EMPTY_GROUP_BY[1].clone()];
             let second_rows = load_session_aggregate_rows(
                 tx,
                 query,
@@ -2297,7 +2239,7 @@ async fn precheck_session_metrics_group_limit(
                 load_session_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
                     .await?;
             let final_groups = synthesize_two_group_counts(
-                aggregate_rows_to_groups(&pair_rows, &query.group_by),
+                aggregate_rows_to_groups(&pair_rows, EMPTY_GROUP_BY),
                 aggregate_rows_to_groups(&first_rows, &first_group),
                 aggregate_rows_to_groups(&second_rows, &second_group),
                 sum_aggregate_rows(&total_rows),
@@ -2320,7 +2262,7 @@ async fn load_event_group_counts_by_bucket(
     tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
-    match query.group_by.len() {
+    match EMPTY_GROUP_BY.len() {
         0 => {
             let total_rows =
                 load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
@@ -2331,13 +2273,13 @@ async fn load_event_group_counts_by_bucket(
         }
         1 => {
             let primary_rows =
-                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &query.group_by))
+                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, EMPTY_GROUP_BY))
                     .await?;
             let total_rows =
                 load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
 
             synthesize_group_counts_by_bucket(
-                group_rows_by_bucket(&primary_rows, &query.group_by),
+                group_rows_by_bucket(&primary_rows, EMPTY_GROUP_BY),
                 sum_rows_by_bucket(&total_rows),
                 None,
             )
@@ -2345,13 +2287,13 @@ async fn load_event_group_counts_by_bucket(
         }
         2 => {
             let pair_rows =
-                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &query.group_by))
+                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, EMPTY_GROUP_BY))
                     .await?;
-            let first_group = vec![query.group_by[0].clone()];
+            let first_group = vec![EMPTY_GROUP_BY[0].clone()];
             let first_rows =
                 load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &first_group))
                     .await?;
-            let second_group = vec![query.group_by[1].clone()];
+            let second_group = vec![EMPTY_GROUP_BY[1].clone()];
             let second_rows =
                 load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &second_group))
                     .await?;
@@ -2359,7 +2301,7 @@ async fn load_event_group_counts_by_bucket(
                 load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
 
             synthesize_group_counts_by_bucket(
-                group_rows_by_bucket(&pair_rows, &query.group_by),
+                group_rows_by_bucket(&pair_rows, EMPTY_GROUP_BY),
                 sum_rows_by_bucket(&total_rows),
                 Some((
                     group_rows_by_bucket(&first_rows, &first_group),
@@ -2379,7 +2321,7 @@ async fn load_session_group_counts_by_bucket(
     tx: &mut Transaction<'_, Postgres>,
     query: &SessionMetricsQuery,
 ) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
-    match query.group_by.len() {
+    match EMPTY_GROUP_BY.len() {
         0 => {
             let total_rows =
                 load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
@@ -2390,13 +2332,13 @@ async fn load_session_group_counts_by_bucket(
         }
         1 => {
             let primary_rows =
-                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &query.group_by))
+                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, EMPTY_GROUP_BY))
                     .await?;
             let total_rows =
                 load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
 
             synthesize_group_counts_by_bucket(
-                group_rows_by_bucket(&primary_rows, &query.group_by),
+                group_rows_by_bucket(&primary_rows, EMPTY_GROUP_BY),
                 sum_rows_by_bucket(&total_rows),
                 None,
             )
@@ -2404,13 +2346,13 @@ async fn load_session_group_counts_by_bucket(
         }
         2 => {
             let pair_rows =
-                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &query.group_by))
+                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, EMPTY_GROUP_BY))
                     .await?;
-            let first_group = vec![query.group_by[0].clone()];
+            let first_group = vec![EMPTY_GROUP_BY[0].clone()];
             let first_rows =
                 load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &first_group))
                     .await?;
-            let second_group = vec![query.group_by[1].clone()];
+            let second_group = vec![EMPTY_GROUP_BY[1].clone()];
             let second_rows =
                 load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &second_group))
                     .await?;
@@ -2418,7 +2360,7 @@ async fn load_session_group_counts_by_bucket(
                 load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
 
             synthesize_group_counts_by_bucket(
-                group_rows_by_bucket(&pair_rows, &query.group_by),
+                group_rows_by_bucket(&pair_rows, EMPTY_GROUP_BY),
                 sum_rows_by_bucket(&total_rows),
                 Some((
                     group_rows_by_bucket(&first_rows, &first_group),
@@ -2588,7 +2530,6 @@ fn build_metrics_response(
     MetricsResponse {
         metric: metric.to_owned(),
         granularity: window.granularity,
-        group_by: group_by.to_vec(),
         series,
     }
 }
@@ -2937,7 +2878,6 @@ mod tests {
             serde_json::json!({
                 "metric": "count",
                 "granularity": "day",
-                "group_by": [],
                 "series": [
                     {
                         "dimensions": {},
@@ -2969,7 +2909,6 @@ mod tests {
             serde_json::json!({
                 "metric": "count",
                 "granularity": "hour",
-                "group_by": ["platform"],
                 "series": [
                     {
                         "dimensions": { "platform": "ios" },
@@ -3065,18 +3004,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_event_metrics_query_preserves_group_by_request_order() {
+    fn parse_event_metrics_query_accepts_all_four_built_in_filters() {
         let query = parse_event_metrics_query(
-            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=provider&group_by=is_paying",
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.0.0&os_version=18.3&locale=pt-PT",
         )
         .expect("query parses");
 
         assert_eq!(query.metric, EventMetric::Count);
-        assert_eq!(
-            query.group_by,
-            vec!["provider".to_owned(), "is_paying".to_owned()]
-        );
-        assert!(!query.filters.contains_key("provider"));
+        assert_eq!(query.filters.len(), 4);
+        assert_eq!(query.filters.get("locale"), Some(&"pt-PT".to_owned()));
     }
 
     #[test]
@@ -3165,13 +3101,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_event_metrics_query_rejects_duplicate_group_by() {
+    fn parse_event_metrics_query_rejects_group_by() {
         let error = parse_event_metrics_query(
-            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=provider&group_by=provider",
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=provider",
         )
         .unwrap_err();
 
-        assert_eq!(error.error_code(), "duplicate_group_by");
+        assert_eq!(error.error_code(), "invalid_query_key");
     }
 
     #[test]
@@ -3208,17 +3144,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_event_metrics_query_accepts_two_referenced_dimensions() {
-        let query = parse_event_metrics_query(
-            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&plan=pro&group_by=provider",
-        )
-        .expect("query parses");
-
-        assert_eq!(query.group_by, vec!["provider".to_owned()]);
-        assert_eq!(query.filters.get("plan"), Some(&"pro".to_owned()));
-    }
-
-    #[test]
     fn parse_event_metrics_query_rejects_total_count() {
         let error = parse_event_metrics_query(
             "metric=total_count&granularity=day&start=2026-03-01&end=2026-03-02",
@@ -3226,16 +3151,6 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.error_code(), "invalid_metric");
-    }
-
-    #[test]
-    fn parse_event_metrics_query_rejects_three_referenced_dimensions() {
-        let error = parse_event_metrics_query(
-            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&app_version=1.4.0&plan=pro&group_by=provider",
-        )
-        .unwrap_err();
-
-        assert_eq!(error.error_code(), "too_many_dimensions");
     }
 
     #[test]
@@ -3261,14 +3176,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_metric_query_accepts_two_referenced_dimensions() {
+    fn parse_session_metric_query_accepts_all_four_built_in_filters() {
         let query = parse_session_metric_query(
-            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&plan=pro&group_by=provider",
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.0.0&os_version=18.3&locale=en-GB",
         )
         .expect("query parses");
 
-        assert_eq!(query.group_by, vec!["provider".to_owned()]);
-        assert_eq!(query.filters.get("plan"), Some(&"pro".to_owned()));
+        assert_eq!(query.filters.len(), 4);
+        assert_eq!(query.filters.get("locale"), Some(&"en-GB".to_owned()));
     }
 
     #[test]
@@ -3315,13 +3230,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_metric_query_rejects_three_referenced_dimensions() {
+    fn parse_session_metric_query_rejects_group_by() {
         let error = parse_session_metric_query(
-            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&app_version=1.4.0&plan=pro&group_by=provider",
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=provider",
         )
         .unwrap_err();
 
-        assert_eq!(error, "too_many_dimensions");
+        assert_eq!(error, "invalid_query_key");
+    }
+
+    #[test]
+    fn parse_live_installs_query_rejects_locale_filter() {
+        let error = parse_live_installs_query("locale=en-GB").unwrap_err();
+
+        assert_eq!(error, "invalid_query_key");
+    }
+
+    #[test]
+    fn parse_event_catalog_query_rejects_limit() {
+        let error =
+            parse_event_catalog_query("start=2026-03-01&end=2026-03-02&limit=1").unwrap_err();
+
+        assert_eq!(error, "invalid_query_key");
     }
 
     #[test]
@@ -3376,12 +3306,54 @@ mod tests {
             window: public_query.window,
             interval: public_query.interval,
             filters: public_query.filters,
-            group_by: public_query.group_by,
         };
 
         assert_eq!(
             validate_active_installs_query(&query),
             Err("invalid_request")
+        );
+    }
+
+    #[test]
+    fn active_install_read_strategy_uses_bitmaps_for_up_to_two_filters() {
+        assert_eq!(
+            active_install_read_strategy(&BTreeMap::new()),
+            ActiveInstallReadStrategy::BitmapTotals
+        );
+        assert_eq!(
+            active_install_read_strategy(&BTreeMap::from([(
+                "platform".to_owned(),
+                "ios".to_owned()
+            )])),
+            ActiveInstallReadStrategy::BitmapDim1
+        );
+        assert_eq!(
+            active_install_read_strategy(&BTreeMap::from([
+                ("platform".to_owned(), "ios".to_owned()),
+                ("locale".to_owned(), "en-US".to_owned()),
+            ])),
+            ActiveInstallReadStrategy::BitmapDim2
+        );
+    }
+
+    #[test]
+    fn active_install_read_strategy_falls_back_after_two_filters() {
+        assert_eq!(
+            active_install_read_strategy(&BTreeMap::from([
+                ("platform".to_owned(), "ios".to_owned()),
+                ("app_version".to_owned(), "1.0.0".to_owned()),
+                ("locale".to_owned(), "en-US".to_owned()),
+            ])),
+            ActiveInstallReadStrategy::DistinctCount
+        );
+        assert_eq!(
+            active_install_read_strategy(&BTreeMap::from([
+                ("platform".to_owned(), "ios".to_owned()),
+                ("app_version".to_owned(), "1.0.0".to_owned()),
+                ("os_version".to_owned(), "18.3".to_owned()),
+                ("locale".to_owned(), "en-US".to_owned()),
+            ])),
+            ActiveInstallReadStrategy::DistinctCount
         );
     }
 
@@ -3534,9 +3506,8 @@ mod tests {
         let session_metrics_parameters = session_metrics_route["parameters"]
             .as_sequence()
             .expect("session metrics parameters");
-        let explicit_filters =
-            &spec["paths"]["/v1/metrics/events"]["get"]["x-fantasma-explicit-property-filters"];
         let platform_filter_schema = &spec["components"]["parameters"]["PlatformFilter"]["schema"];
+        let locale_filter_schema = &spec["components"]["parameters"]["LocaleFilter"]["schema"];
         let operator_auth = &spec["components"]["securitySchemes"]["OperatorBearerAuth"];
         let project_key_auth = &spec["components"]["securitySchemes"]["ProjectKeyHeader"];
         let usage_response_schema = &spec["components"]["schemas"]["UsageEventsResponse"];
@@ -3656,15 +3627,12 @@ mod tests {
             Some(false),
             "session metric granularity must remain conditional in OpenAPI"
         );
-        assert!(
-            explicit_filters.is_mapping(),
-            "event metrics routes must document the additional explicit-property filter namespace"
-        );
+        assert_eq!(locale_filter_schema["type"], "string");
         assert!(
             event_metrics_description
                 .as_str()
                 .expect("event metrics description")
-                .contains("`metric=count` is the only public event metric"),
+                .contains("built-in equality filters"),
             "openapi must document the narrowed event metric contract"
         );
         assert!(

@@ -8,8 +8,8 @@ info:
 
     The current public surface covers raw event ingestion, operator-managed
     project provisioning, operator usage reads, worker-derived session
-    metrics, and worker-derived event metrics. Event properties are explicit
-    string-to-string context with at most 2 keys.
+    metrics, and worker-derived event metrics. Fantasma accepts only known
+    built-in event fields rather than arbitrary event properties.
 servers:
   - url: http://localhost:8081
     description: Local ingest service
@@ -559,35 +559,19 @@ paths:
 
         `metric=count` is the only public event metric, and it requires `event`.
 
-        Use normal query params for equality filters:
-
-        - built-ins: `platform`, `app_version`, `os_version`
-        - explicit properties: any additional non-reserved query key matching
-          `^[a-z][a-z0-9_]{0,62}$`
-        - legacy public params such as `project_id`, `start_date`, and
-          `end_date` fail fast and are never reinterpreted as property filters
-
-        `group_by` may be repeated up to twice. The total number of distinct
-        referenced dimensions across filters plus `group_by` is capped at 2.
-        Queries exceeding 100 final groups fail with `group_limit_exceeded`.
-      x-fantasma-explicit-property-filters:
-        type: object
-        description: |
-          Any additional non-reserved top-level query parameter whose key
-          matches `^[a-z][a-z0-9_]{0,62}$` is treated as an equality filter on
-          an explicit event property.
-        additionalProperties:
-          type: string
+        Use only the built-in equality filters `platform`, `app_version`,
+        `os_version`, and `locale`. Legacy public params such as `project_id`,
+        `start_date`, `end_date`, and `group_by` fail fast with `422`.
       parameters:
         - $ref: '#/components/parameters/EventName'
         - $ref: '#/components/parameters/EventMetric'
         - $ref: '#/components/parameters/EventMetricGranularity'
         - $ref: '#/components/parameters/MetricStart'
         - $ref: '#/components/parameters/MetricEnd'
-        - $ref: '#/components/parameters/EventGroupBy'
         - $ref: '#/components/parameters/PlatformFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
+        - $ref: '#/components/parameters/LocaleFilter'
       responses:
         '200':
           description: Bucketed event metric series using the uniform metrics family response shape.
@@ -611,12 +595,7 @@ paths:
             - `invalid_time_range`
             - `invalid_query_key`
             - `duplicate_query_key`
-            - `invalid_group_by`
-            - `duplicate_group_by`
-            - `too_many_group_by_dimensions`
             - `too_many_dimensions`
-            - `conflicting_dimension_usage`
-            - `group_limit_exceeded`
           content:
             application/json:
               schema:
@@ -643,27 +622,16 @@ paths:
         read directly from accepted raw events. They are intended for event
         discovery, not bucketed chart series.
 
-        Use normal query params for equality filters:
-
-        - built-ins: `platform`, `app_version`, `os_version`
-        - explicit properties: any additional non-reserved query key matching
-          `^[a-z][a-z0-9_]{0,62}$`
-        - legacy public params such as `project_id`, `start_date`, and
-          `end_date` fail fast and are never reinterpreted as property filters
-      x-fantasma-explicit-property-filters:
-        type: object
-        description: |
-          Any additional non-reserved top-level query parameter whose key
-          matches `^[a-z][a-z0-9_]{0,62}$` is treated as an equality filter on
-          an explicit event property.
-        additionalProperties:
-          type: string
+        Use only the built-in equality filters `platform`, `app_version`,
+        `os_version`, and `locale`. Legacy public params such as `project_id`,
+        `start_date`, `end_date`, and `group_by` fail fast with `422`.
       parameters:
         - $ref: '#/components/parameters/EventDiscoveryStart'
         - $ref: '#/components/parameters/EventDiscoveryEnd'
         - $ref: '#/components/parameters/PlatformFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
+        - $ref: '#/components/parameters/LocaleFilter'
       responses:
         '200':
           description: Distinct event names ordered by most recent occurrence.
@@ -710,21 +678,9 @@ paths:
         read directly from accepted raw events. They are discovery helpers, not
         worker-derived bucketed metrics.
 
-        Use normal query params for equality filters:
-
-        - built-ins: `platform`, `app_version`, `os_version`
-        - explicit properties: any additional non-reserved query key matching
-          `^[a-z][a-z0-9_]{0,62}$`
-        - legacy public params such as `project_id`, `start_date`, and
-          `end_date` fail fast and are never reinterpreted as property filters
-      x-fantasma-explicit-property-filters:
-        type: object
-        description: |
-          Any additional non-reserved top-level query parameter whose key
-          matches `^[a-z][a-z0-9_]{0,62}$` is treated as an equality filter on
-          an explicit event property.
-        additionalProperties:
-          type: string
+        Use only the built-in equality filters `platform`, `app_version`,
+        `os_version`, and `locale`. Legacy public params such as `project_id`,
+        `start_date`, `end_date`, and `group_by` fail fast with `422`.
       parameters:
         - $ref: '#/components/parameters/EventDiscoveryStart'
         - $ref: '#/components/parameters/EventDiscoveryEnd'
@@ -732,6 +688,7 @@ paths:
         - $ref: '#/components/parameters/PlatformFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
+        - $ref: '#/components/parameters/LocaleFilter'
       responses:
         '200':
           description: Ranked event counts in the requested window.
@@ -831,31 +788,24 @@ paths:
         calendar-shaped and clipped to the request edges; requests do not need
         aligned boundaries.
 
-        Built-in session dimensions are `platform`, `app_version`, and
-        `os_version`. Any other non-reserved query key matching
-        `^[a-z][a-z0-9_]{0,62}$` is an equality filter or `group_by`
-        dimension on an explicit string property captured from the session's
-        first event. `group_by` may be repeated up to twice, and the total
-        number of distinct referenced dimensions across filters plus
-        `group_by` is capped at 2. Legacy public params such as `project_id`,
-        `start_date`, and `end_date` fail fast with `422`.
+        Built-in filter dimensions are `platform`, `app_version`,
+        `os_version`, and `locale`. Legacy public params such as `project_id`,
+        `start_date`, `end_date`, and `group_by` fail fast with `422`.
 
         `new_installs` keeps first-seen assignment fixed once an install is
         recorded, even if earlier late events arrive later. `active_installs`
         counts distinct installs with at least one session whose
-        `session_start` falls inside the exact requested UTC range. Grouped or
-        filtered `active_installs` slices may overlap, so grouped totals are
-        not guaranteed to sum back to the ungrouped distinct-install total.
+        `session_start` falls inside the exact requested UTC range.
       parameters:
         - $ref: '#/components/parameters/SessionMetric'
         - $ref: '#/components/parameters/SessionMetricGranularity'
         - $ref: '#/components/parameters/MetricInterval'
         - $ref: '#/components/parameters/MetricStart'
         - $ref: '#/components/parameters/MetricEnd'
-        - $ref: '#/components/parameters/SessionGroupBy'
         - $ref: '#/components/parameters/PlatformFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
+        - $ref: '#/components/parameters/LocaleFilter'
       responses:
         '200':
           description: Bucketed session metrics for `count`, `duration_total`, and `new_installs`, or exact-range point windows for `active_installs`.
@@ -875,15 +825,9 @@ paths:
           description: |
             Invalid query. Error envelope is `{ "error": "..." }` with one of:
 
-            - `invalid_group_by`
-            - `duplicate_group_by`
             - `duplicate_query_key`
             - `invalid_query_key`
-            - `too_many_group_by_dimensions`
-            - `conflicting_dimension_usage`
             - `too_many_dimensions`
-            - `group_limit_exceeded` for grouped `count`, `duration_total`,
-              `new_installs`, and `active_installs` queries
           content:
             application/json:
               schema:
@@ -939,34 +883,6 @@ components:
         minLength: 1
       description: |
         Required when `metric=count`.
-    EventGroupBy:
-      in: query
-      name: group_by
-      required: false
-      explode: true
-      schema:
-        type: array
-        maxItems: 2
-        items:
-          type: string
-      description: |
-        Repeat up to twice. Built-ins use `platform`, `app_version`, or
-        `os_version`. Explicit properties use canonical keys that match
-        `^[a-z][a-z0-9_]{0,62}$`.
-    SessionGroupBy:
-      in: query
-      name: group_by
-      required: false
-      explode: true
-      schema:
-        type: array
-        maxItems: 2
-        items:
-          type: string
-      description: |
-        Repeat up to twice. Built-ins use `platform`, `app_version`, or
-        `os_version`. Explicit properties use canonical keys that match
-        `^[a-z][a-z0-9_]{0,62}$`.
     EventMetric:
       in: query
       name: metric
@@ -1042,6 +958,12 @@ components:
     OsVersionFilter:
       in: query
       name: os_version
+      required: false
+      schema:
+        type: string
+    LocaleFilter:
+      in: query
+      name: locale
       required: false
       schema:
         type: string
@@ -1457,44 +1379,12 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Allowed keys are `platform`, `app_version`, and `os_version`.
-        properties:
-          type: object
-          additionalProperties:
-            type: string
-          description: Explicit event-property predicates ANDed with the other filters.
+          description: Allowed keys are `platform`, `app_version`, `os_version`, and `locale`.
     Platform:
       type: string
       enum:
         - ios
         - android
-    EventProperties:
-      type: object
-      maxProperties: 2
-      propertyNames:
-        allOf:
-          - type: string
-            pattern: '^[a-z][a-z0-9_]{0,62}$'
-          - not:
-              enum:
-                - project_id
-                - event
-                - timestamp
-                - install_id
-                - properties
-                - metric
-                - granularity
-                - start
-                - end
-                - start_date
-                - end_date
-                - group_by
-                - platform
-                - app_version
-                - os_version
-      additionalProperties:
-        type: string
-      description: Explicit string event context, capped at 2 keys. Reserved keys are rejected, and properties must not be used to reconstruct person-level identity.
     EventPayload:
       type: object
       description: Install-scoped mobile event payload for Fantasma.
@@ -1529,8 +1419,12 @@ components:
             - 'null'
           minLength: 1
           description: Optional built-in OS version. First-party SDKs populate it when supported.
-        properties:
-          $ref: '#/components/schemas/EventProperties'
+        locale:
+          type:
+            - string
+            - 'null'
+          minLength: 1
+          description: Optional built-in locale. First-party SDKs populate it when supported.
     EventBatchRequest:
       type: object
       additionalProperties: false
@@ -1679,17 +1573,12 @@ components:
       required:
         - metric
         - granularity
-        - group_by
         - series
       properties:
         metric:
           type: string
         granularity:
           $ref: '#/components/schemas/MetricGranularityValue'
-        group_by:
-          type: array
-          items:
-            type: string
         series:
           type: array
           items:
@@ -1726,7 +1615,6 @@ components:
         - metric
         - start
         - end
-        - group_by
         - series
       properties:
         metric:
@@ -1738,10 +1626,6 @@ components:
           type: string
         interval:
           $ref: '#/components/schemas/MetricIntervalValue'
-        group_by:
-          type: array
-          items:
-            type: string
         series:
           type: array
           items:

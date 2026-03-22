@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use fantasma_core::Platform;
-use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const SESSION_TIMEOUT_SECS: i64 = 30 * 60;
@@ -13,7 +12,7 @@ pub(crate) struct SessionEvent {
     pub(crate) platform: Platform,
     pub(crate) app_version: Option<String>,
     pub(crate) os_version: Option<String>,
-    pub(crate) properties: BTreeMap<String, String>,
+    pub(crate) locale: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -105,7 +104,7 @@ fn session_from_event(event: &SessionEvent) -> fantasma_store::SessionRecord {
         platform: event.platform.clone(),
         app_version: event.app_version.clone(),
         os_version: event.os_version.clone(),
-        properties: event.properties.clone(),
+        locale: event.locale.clone(),
     }
 }
 
@@ -127,7 +126,6 @@ fn session_id(install_id: &str, session_start: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use std::collections::BTreeMap;
 
     fn project_id() -> Uuid {
         Uuid::from_u128(0x9bad8b88_5e7a_44ed_98ce_4cf9ddde713a)
@@ -146,7 +144,7 @@ mod tests {
         minute: u32,
         app_version: Option<&str>,
         os_version: Option<&str>,
-        properties: &[(&str, &str)],
+        locale: Option<&str>,
     ) -> SessionEvent {
         SessionEvent {
             project_id: project_id(),
@@ -155,10 +153,7 @@ mod tests {
             platform: Platform::Ios,
             app_version: app_version.map(str::to_owned),
             os_version: os_version.map(str::to_owned),
-            properties: properties
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                .collect(),
+            locale: locale.map(str::to_owned),
         }
     }
 
@@ -172,9 +167,9 @@ mod tests {
                 0,
                 Some("1.0.0"),
                 Some("18.3"),
-                &[("plan", "pro"), ("provider", "strava")],
+                Some("en-GB"),
             ),
-            event("install-1", 1, 0, 10, None, None, &[]),
+            event("install-1", 1, 0, 10, None, None, None),
             event(
                 "install-1",
                 1,
@@ -182,7 +177,7 @@ mod tests {
                 29,
                 Some("1.0.1"),
                 Some("18.4"),
-                &[("plan", "team"), ("provider", "garmin")],
+                Some("pt-PT"),
             ),
         ]);
 
@@ -193,20 +188,14 @@ mod tests {
         assert_eq!(sessions[0].duration_seconds, 29 * 60);
         assert_eq!(sessions[0].app_version.as_deref(), Some("1.0.0"));
         assert_eq!(sessions[0].os_version.as_deref(), Some("18.3"));
-        assert_eq!(
-            sessions[0].properties,
-            BTreeMap::from([
-                ("plan".to_owned(), "pro".to_owned()),
-                ("provider".to_owned(), "strava".to_owned())
-            ])
-        );
+        assert_eq!(sessions[0].locale.as_deref(), Some("en-GB"));
     }
 
     #[test]
     fn splits_sessions_when_gap_exceeds_thirty_minutes() {
         let sessions = derive_sessions(&[
-            event("install-1", 1, 0, 0, Some("1.0.0"), Some("18.3"), &[]),
-            event("install-1", 1, 0, 31, Some("1.0.0"), Some("18.3"), &[]),
+            event("install-1", 1, 0, 0, Some("1.0.0"), Some("18.3"), None),
+            event("install-1", 1, 0, 31, Some("1.0.0"), Some("18.3"), None),
         ]);
 
         assert_eq!(sessions.len(), 2);
@@ -217,8 +206,8 @@ mod tests {
     #[test]
     fn crosses_midnight_without_changing_start_day() {
         let sessions = derive_sessions(&[
-            event("install-1", 1, 23, 55, Some("1.0.0"), Some("18.3"), &[]),
-            event("install-1", 2, 0, 20, Some("1.0.1"), Some("18.4"), &[]),
+            event("install-1", 1, 23, 55, Some("1.0.0"), Some("18.3"), None),
+            event("install-1", 2, 0, 20, Some("1.0.1"), Some("18.4"), None),
         ]);
 
         assert_eq!(sessions.len(), 1);
@@ -241,7 +230,7 @@ mod tests {
             platform: Platform::Ios,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
-            properties: BTreeMap::from([("plan".to_owned(), "pro".to_owned())]),
+            locale: Some("en-GB".to_owned()),
         };
 
         let appended = derive_append_sessions(
@@ -254,7 +243,7 @@ mod tests {
                     20,
                     Some("1.0.1"),
                     Some("18.4"),
-                    &[("plan", "team")],
+                    Some("pt-PT"),
                 ),
                 event(
                     "install-1",
@@ -263,7 +252,7 @@ mod tests {
                     0,
                     Some("1.1.0"),
                     Some("19.0"),
-                    &[("plan", "free")],
+                    Some("fr-FR"),
                 ),
                 event(
                     "install-1",
@@ -272,7 +261,7 @@ mod tests {
                     10,
                     Some("1.1.1"),
                     Some("19.1"),
-                    &[("plan", "pro")],
+                    Some("de-DE"),
                 ),
             ],
         );
@@ -283,10 +272,7 @@ mod tests {
         assert_eq!(updated_tail.duration_seconds, 20 * 60);
         assert_eq!(updated_tail.app_version.as_deref(), Some("1.0.0"));
         assert_eq!(updated_tail.os_version.as_deref(), Some("18.3"));
-        assert_eq!(
-            updated_tail.properties,
-            BTreeMap::from([("plan".to_owned(), "pro".to_owned())])
-        );
+        assert_eq!(updated_tail.locale.as_deref(), Some("en-GB"));
         assert_eq!(appended.new_sessions.len(), 1);
         assert_eq!(appended.new_sessions[0].session_start, timestamp(1, 1, 0));
         assert_eq!(appended.new_sessions[0].session_end, timestamp(1, 1, 10));
@@ -296,9 +282,6 @@ mod tests {
             Some("1.1.0")
         );
         assert_eq!(appended.new_sessions[0].os_version.as_deref(), Some("19.0"));
-        assert_eq!(
-            appended.new_sessions[0].properties,
-            BTreeMap::from([("plan".to_owned(), "free".to_owned())])
-        );
+        assert_eq!(appended.new_sessions[0].locale.as_deref(), Some("fr-FR"));
     }
 }

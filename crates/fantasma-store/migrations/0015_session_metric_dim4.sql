@@ -1,7 +1,7 @@
 ALTER TABLE sessions
     ADD COLUMN IF NOT EXISTS os_version TEXT,
-    ADD COLUMN IF NOT EXISTS properties JSONB;
+    ADD COLUMN IF NOT EXISTS locale TEXT;
 
 ALTER TABLE install_first_seen
     ADD COLUMN IF NOT EXISTS os_version TEXT,
-    ADD COLUMN IF NOT EXISTS properties JSONB;
+    ADD COLUMN IF NOT EXISTS locale TEXT;

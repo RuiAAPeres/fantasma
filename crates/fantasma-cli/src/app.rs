@@ -523,8 +523,7 @@ impl App {
                 start_at: args.start_at,
                 end_before: args.end_before,
                 event: args.event,
-                filters: parse_key_value_pairs(&args.filters, "filter")?,
-                properties: parse_key_value_pairs(&args.properties, "property")?,
+                filters: parse_filters(&args.filters)?.into_iter().collect(),
             })
             .send()
             .await
@@ -830,7 +829,6 @@ impl App {
                 end: &sessions.end,
                 event: None,
                 filters: &sessions.filters,
-                group_by: &sessions.group_by,
             })
             .await?;
         render_metrics_output(body, sessions.output.json)
@@ -848,7 +846,6 @@ impl App {
                 end: &events.end,
                 event: events.event,
                 filters: &events.filters,
-                group_by: &events.group_by,
             })
             .await?;
         render_metrics_output(body, events.output.json)
@@ -923,9 +920,6 @@ impl App {
             }
             for (key, value) in &parsed_filters {
                 query.append_pair(key, value);
-            }
-            for dimension in request.group_by {
-                query.append_pair("group_by", dimension);
             }
         }
         let response = self
@@ -1020,7 +1014,6 @@ struct MetricsRequest<'a> {
     end: &'a str,
     event: Option<String>,
     filters: &'a [String],
-    group_by: &'a [String],
 }
 
 fn active_instance_name(config: &CliConfig) -> anyhow::Result<&str> {
@@ -1154,7 +1147,6 @@ struct CreateRangeDeletionRequest {
     end_before: String,
     event: Option<String>,
     filters: std::collections::BTreeMap<String, String>,
-    properties: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1416,6 +1408,20 @@ fn render_usage_events_output(response: UsageEventsResponse) -> CommandOutput {
 
 fn parse_filters(filters: &[String]) -> anyhow::Result<Vec<(String, String)>> {
     Ok(parse_key_value_pairs(filters, "filter")?
+        .into_iter()
+        .map(|(key, value)| {
+            if !matches!(
+                key.as_str(),
+                "platform" | "app_version" | "os_version" | "locale"
+            ) {
+                bail!(
+                    "invalid filter key '{key}', supported keys are platform, app_version, os_version, locale"
+                );
+            }
+
+            Ok((key, value))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
         .into_iter()
         .collect())
 }
