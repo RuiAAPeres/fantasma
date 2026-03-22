@@ -8,7 +8,8 @@ This repository is for building Fantasma, a privacy-first, self-hosted mobile an
 - Simplicity is a product feature. Prefer fewer metrics, fewer dimensions, and fewer knobs.
 - The goal is actionable understanding for mobile apps, not exhaustive analytics coverage.
 - Privacy claims must be reflected in the data model. Do not add hidden identity or stitching primitives.
-- Properties are for event context, not for profile building. Do not use them to reconstruct person-level identity.
+- Do not add user-defined event properties to the current event contract or SDK APIs unless the repository explicitly changes direction.
+- If event metadata is ever introduced, treat it as event context only and never use it to reconstruct person-level identity.
 
 ## Product Rules
 
@@ -51,7 +52,7 @@ Do not add scope beyond the product vision without an explicit decision:
 - Do not add hidden enrichment or automatic identity stitching.
 - Do not add person-level identity primitives to the MVP model.
 - Do not accept public session identifiers from clients; backend sessionization is internal.
-- Do not infer identity from `properties` or other client metadata.
+- Do not infer identity from event payload fields or other client metadata.
 - Scope all persisted data by `project_id`.
 - DB-backed Rust tests should run fully in Docker through the repository workflow rather than host Postgres or ad hoc host `DATABASE_URL` setup.
 - Keep `cargo test --workspace` on the Docker Postgres path limited to tests satisfied by containerized Postgres alone; stack-level checks belong in dedicated smoke workflows.
