@@ -1620,6 +1620,7 @@ async fn pipeline_keeps_active_installs_visible_while_session_backlog_remains(po
             "metric": "active_installs",
             "start": "2026-03-01",
             "end": "2026-03-01",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1758,6 +1759,7 @@ async fn pipeline_exposes_weekly_active_installs_with_zero_fill(pool: PgPool) {
             "start": "2026-03-01",
             "end": "2026-03-17",
             "interval": "week",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -2260,6 +2262,7 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_d2_dimension_budget(
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -2757,6 +2760,7 @@ async fn pipeline_exposes_grouped_session_metrics_and_rejects_unsupported_dimens
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -2787,6 +2791,7 @@ async fn pipeline_exposes_grouped_session_metrics_and_rejects_unsupported_dimens
         serde_json::json!({
             "metric": "new_installs",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -2907,6 +2912,7 @@ async fn pipeline_keeps_new_installs_fixed_on_first_seen_bucket_after_late_event
         serde_json::json!({
             "metric": "new_installs",
             "granularity": "hour",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -2937,6 +2943,7 @@ async fn pipeline_keeps_new_installs_fixed_on_first_seen_bucket_after_late_event
         serde_json::json!({
             "metric": "new_installs",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -3046,6 +3053,7 @@ async fn pipeline_moves_grouped_session_app_version_after_late_event_repair(pool
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -3075,6 +3083,7 @@ async fn pipeline_moves_grouped_session_app_version_after_late_event_repair(pool
         serde_json::json!({
             "metric": "duration_total",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
