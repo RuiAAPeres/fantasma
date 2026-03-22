@@ -324,6 +324,7 @@ Current first-party SDK shapes:
 
 - iOS exposes a static `Fantasma` facade backed by one shared client
 - Android exposes an instance-based `FantasmaClient(context, FantasmaConfig(...))`
+- Flutter exposes an instance-based `FantasmaClient(FantasmaConfig(..., storageNamespace: ...))`
 - this API divergence is intentional and platform-native; parity is at the wire
   contract and runtime behavior, not method-for-method API duplication
 - Android still preserves one active destination at a time per process: creating
@@ -331,6 +332,10 @@ Current first-party SDK shapes:
   destination after the current upload boundary rather than supporting multiple
   live destinations concurrently, and the superseded runtime retires itself even
   if the old handle is dropped without an explicit `close()`
+- Flutter keeps each client isolated by its explicit `storageNamespace`, and
+  the current runtime supports only one live client per namespace inside a
+  process so queue state, blocked-destination state, and install identity stay
+  client-local instead of being implicitly shared
 
 Shared SDK behavior:
 
@@ -338,7 +343,9 @@ Shared SDK behavior:
 - auto-populate `platform`, `app_version`, `os_version`, and `locale`
 - upload queued events asynchronously to `POST /v1/events` using an `ingest` key only
 - treat malformed `202 Accepted` envelopes as invalid responses and keep queued rows for later operator-visible handling
-- when a client switches to a different normalized destination, finish the current upload boundary for the old destination, discard still-queued rows from that old destination even across relaunches, and only then let future uploads target the new destination
+- snapshot `locale` at enqueue time rather than re-resolving it during upload
+- block uploads for destinations that return `401`, `422`, or `409 project_pending_deletion` until the client switches to a different normalized destination or storage namespace
+- SDKs that support destination replacement should finish the current upload boundary for the old destination, discard still-queued rows from that old destination even across relaunches, and only then let future uploads target the new destination
 
 Current upload triggers:
 
@@ -346,6 +353,12 @@ Current upload triggers:
 - when the local queue reaches 100 events
 - when `flush()` is called
 - when the app enters background
+
+Trigger semantics:
+
+- `flush()` is the explicit path that can surface upload failures to the caller
+- threshold and lifecycle triggers are best-effort background flush attempts and
+  must not make `track()` fail after the event has been durably queued
 
 Current identity rules:
 

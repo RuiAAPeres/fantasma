@@ -13,3 +13,8 @@
 /sdks/android/local.properties
 /sdks/android/**/build
 /apps/demo-android/build
+/sdks/flutter/**/build
+/sdks/flutter/**/.dart_tool
+/sdks/flutter/**/.flutter-plugins
+/sdks/flutter/**/.flutter-plugins-dependencies
+/sdks/flutter/**/pubspec.lock
