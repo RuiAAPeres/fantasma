@@ -111,6 +111,10 @@ Fantasma now expects Codex agents to use the installed `superpowers` skills when
 - Use `systematic-debugging` for defects, flaky tests, or unexpected runtime behavior instead of guessing at fixes.
 - Use `verification-before-completion` before claiming work is done, fixed, or passing. Do not report success without fresh command output.
 - Before pushing, run the same CI-scope checks your change can affect. At minimum, workspace-affecting Rust changes must run `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`, not just package-scoped checks; new scripts must at least pass `bash -n`.
+- Treat backend/API/worker contract changes as requiring the full affected Docker-backed suite, not just selected regressions. In particular, metric/query/response-contract work must run `./scripts/docker-test.sh -p fantasma-worker --test pipeline --quiet` before push.
+- After any red CI run, do not push another fix until you have pulled the failing job logs, identified the exact failing test or step, and reproduced that failing CI slice locally.
+- Do not treat a targeted subset as sufficient signoff when the CI job covers a broader layer. If CI runs a broader suite for that layer, rerun that broader suite locally before push.
+- Prefer the checked-in verification matrix script for repeatable local proof: `./scripts/verify-changed-surface.sh list`, `./scripts/verify-changed-surface.sh print <profile>`, or `./scripts/verify-changed-surface.sh run <profile>`.
 - Dogfood operator-facing development through `fantasma-cli`. For new or touched operator workflows, prefer the CLI for manual verification, keep `scripts/cli-smoke.sh` passing, and add or extend CLI coverage instead of relying only on raw HTTP checks.
 - Keep low-level service correctness checks direct when that is the right layer. The CLI is the required operator workflow proof, not a substitute for route-level ingest/API/worker tests.
 - Use `requesting-code-review` or `receiving-code-review` when preparing or responding to substantive review cycles.
