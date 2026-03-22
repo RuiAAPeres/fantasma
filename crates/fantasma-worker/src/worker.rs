@@ -4842,12 +4842,17 @@ mod tests {
     #[test]
     fn max_dimension_event_metrics_fanout_stays_bounded() {
         let rollups = build_event_metric_rollups(&[raw_event_with_max_dimensions()]);
-        let total_fanout =
-            rollups.total_deltas.len() + rollups.dim1_deltas.len() + rollups.dim2_deltas.len();
+        let total_fanout = rollups.total_deltas.len()
+            + rollups.dim1_deltas.len()
+            + rollups.dim2_deltas.len()
+            + rollups.dim3_deltas.len()
+            + rollups.dim4_deltas.len();
 
         assert_eq!(rollups.total_deltas.len(), 2);
-        assert_eq!(rollups.dim1_deltas.len(), 10);
-        assert_eq!(rollups.dim2_deltas.len(), 20);
+        assert_eq!(rollups.dim1_deltas.len(), 8);
+        assert_eq!(rollups.dim2_deltas.len(), 12);
+        assert_eq!(rollups.dim3_deltas.len(), 8);
+        assert_eq!(rollups.dim4_deltas.len(), 2);
         assert_eq!(total_fanout, 32);
         assert!(
             rollups
