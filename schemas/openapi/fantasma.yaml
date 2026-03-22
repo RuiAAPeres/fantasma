@@ -559,9 +559,15 @@ paths:
 
         `metric=count` is the only public event metric, and it requires `event`.
 
-        Use only the built-in equality filters `platform`, `app_version`,
-        `os_version`, and `locale`. Legacy public params such as `project_id`,
-        `start_date`, `end_date`, and `group_by` fail fast with `422`.
+        Use only the built-in dimensions `platform`, `app_version`,
+        `os_version`, and `locale`.
+
+        Repeated `group_by` is supported on those same built-ins. Total
+        referenced dimensions across filters plus `group_by` are capped at 4.
+        Duplicate group keys and filter/group overlap fail fast with `422`.
+
+        Legacy public params such as `project_id`, `start_date`, and
+        `end_date` fail fast with `422`.
       parameters:
         - $ref: '#/components/parameters/EventName'
         - $ref: '#/components/parameters/EventMetric'
@@ -572,6 +578,7 @@ paths:
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
         - $ref: '#/components/parameters/LocaleFilter'
+        - $ref: '#/components/parameters/MetricGroupBy'
       responses:
         '200':
           description: Bucketed event metric series using the uniform metrics family response shape.
@@ -788,9 +795,19 @@ paths:
         calendar-shaped and clipped to the request edges; requests do not need
         aligned boundaries.
 
-        Built-in filter dimensions are `platform`, `app_version`,
-        `os_version`, and `locale`. Legacy public params such as `project_id`,
-        `start_date`, `end_date`, and `group_by` fail fast with `422`.
+        Built-in filter and grouping dimensions are `platform`, `app_version`,
+        `os_version`, and `locale`.
+
+        `count`, `duration_total`, and `new_installs` allow up to 4 total
+        referenced dimensions across filters plus repeated `group_by`.
+
+        `active_installs` allows up to 2 total referenced dimensions across
+        filters plus repeated `group_by`; requests above D2 fail fast with
+        `422` instead of falling back to ad hoc distinct-count scans.
+
+        Duplicate group keys and filter/group overlap fail fast with `422`.
+        Legacy public params such as `project_id`, `start_date`, and
+        `end_date` fail fast with `422`.
 
         `new_installs` keeps first-seen assignment fixed once an install is
         recorded, even if earlier late events arrive later. `active_installs`
@@ -806,6 +823,7 @@ paths:
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
         - $ref: '#/components/parameters/LocaleFilter'
+        - $ref: '#/components/parameters/MetricGroupBy'
       responses:
         '200':
           description: Bucketed session metrics for `count`, `duration_total`, and `new_installs`, or exact-range point windows for `active_installs`.
@@ -967,6 +985,23 @@ components:
       required: false
       schema:
         type: string
+    MetricGroupBy:
+      in: query
+      name: group_by
+      required: false
+      explode: true
+      schema:
+        type: array
+        items:
+          type: string
+          enum:
+            - platform
+            - app_version
+            - os_version
+            - locale
+      description: |
+        Repeat to group by built-in dimensions in request order. Supported
+        keys are `platform`, `app_version`, `os_version`, and `locale`.
     MetricStart:
       in: query
       name: start
@@ -1573,12 +1608,22 @@ components:
       required:
         - metric
         - granularity
+        - group_by
         - series
       properties:
         metric:
           type: string
         granularity:
           $ref: '#/components/schemas/MetricGranularityValue'
+        group_by:
+          type: array
+          items:
+            type: string
+            enum:
+              - platform
+              - app_version
+              - os_version
+              - locale
         series:
           type: array
           items:
@@ -1615,6 +1660,7 @@ components:
         - metric
         - start
         - end
+        - group_by
         - series
       properties:
         metric:
@@ -1626,6 +1672,15 @@ components:
           type: string
         interval:
           $ref: '#/components/schemas/MetricIntervalValue'
+        group_by:
+          type: array
+          items:
+            type: string
+            enum:
+              - platform
+              - app_version
+              - os_version
+              - locale
         series:
           type: array
           items:

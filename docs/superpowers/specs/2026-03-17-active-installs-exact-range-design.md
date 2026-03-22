@@ -88,8 +88,7 @@ Optional parameters:
 
 - `interval=day|week|month|year`
 - repeated `group_by`
-- built-in filters: `platform`, `app_version`, `os_version`
-- explicit first-event session-property filters
+- built-in filters: `platform`, `app_version`, `os_version`, `locale`
 
 Dimension rules:
 

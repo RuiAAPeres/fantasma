@@ -2444,8 +2444,34 @@ where
             )
             .await
         }
+        3 => {
+            fetch_event_metrics_dim3_aggregate_rows(
+                executor,
+                project_id,
+                granularity,
+                event_name,
+                (start, end),
+                cube_keys,
+                filters,
+                limit,
+            )
+            .await
+        }
+        4 => {
+            fetch_event_metrics_dim4_aggregate_rows(
+                executor,
+                project_id,
+                granularity,
+                event_name,
+                (start, end),
+                cube_keys,
+                filters,
+                limit,
+            )
+            .await
+        }
         other => Err(StoreError::InvariantViolation(format!(
-            "event metrics cube arity must be between 0 and 2, got {other}"
+            "event metrics cube arity must be between 0 and 4, got {other}"
         ))),
     }
 }
@@ -2776,8 +2802,34 @@ where
             )
             .await
         }
+        3 => {
+            fetch_session_metrics_dim3_aggregate_rows(
+                executor,
+                project_id,
+                granularity,
+                metric,
+                (start, end),
+                cube_keys,
+                filters,
+                limit,
+            )
+            .await
+        }
+        4 => {
+            fetch_session_metrics_dim4_aggregate_rows(
+                executor,
+                project_id,
+                granularity,
+                metric,
+                (start, end),
+                cube_keys,
+                filters,
+                limit,
+            )
+            .await
+        }
         other => Err(StoreError::InvariantViolation(format!(
-            "session metrics cube arity must be between 0 and 2, got {other}"
+            "session metrics cube arity must be between 0 and 4, got {other}"
         ))),
     }
 }
@@ -5365,6 +5417,170 @@ where
         .collect())
 }
 
+async fn fetch_event_metrics_dim3_aggregate_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    event_name: &str,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let (start, end) = window;
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, SUM(event_count)::BIGINT AS event_count \
+         FROM event_metric_buckets_dim3 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND event_name = ");
+    builder.push_bind(event_name);
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    for (index, key) in cube_keys.iter().enumerate() {
+        builder.push(format!(" AND dim{}_key = ", index + 1));
+        builder.push_bind(key);
+    }
+    for (index, key) in cube_keys.iter().enumerate() {
+        if let Some(value) = filters.get(key) {
+            builder.push(format!(" AND dim{}_value = ", index + 1));
+            builder.push_bind(value);
+        }
+    }
+    builder.push(
+        " GROUP BY dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value \
+          ORDER BY dim1_value ASC, dim2_value ASC, dim3_value ASC",
+    );
+
+    if let Some(limit) = limit {
+        builder.push(" LIMIT ");
+        builder.push_bind(limit as i64);
+    }
+
+    let rows = builder.build().fetch_all(executor).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsAggregateCubeRow {
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim3_key")
+                        .expect("dim3_key column exists"),
+                    row.try_get::<String, _>("dim3_value")
+                        .expect("dim3_value column exists"),
+                ),
+            ]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_event_metrics_dim4_aggregate_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    event_name: &str,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<EventMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let (start, end) = window;
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, SUM(event_count)::BIGINT AS event_count \
+         FROM event_metric_buckets_dim4 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND event_name = ");
+    builder.push_bind(event_name);
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    for (index, key) in cube_keys.iter().enumerate() {
+        builder.push(format!(" AND dim{}_key = ", index + 1));
+        builder.push_bind(key);
+    }
+    for (index, key) in cube_keys.iter().enumerate() {
+        if let Some(value) = filters.get(key) {
+            builder.push(format!(" AND dim{}_value = ", index + 1));
+            builder.push_bind(value);
+        }
+    }
+    builder.push(
+        " GROUP BY dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value \
+          ORDER BY dim1_value ASC, dim2_value ASC, dim3_value ASC, dim4_value ASC",
+    );
+
+    if let Some(limit) = limit {
+        builder.push(" LIMIT ");
+        builder.push_bind(limit as i64);
+    }
+
+    let rows = builder.build().fetch_all(executor).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| EventMetricsAggregateCubeRow {
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim3_key")
+                        .expect("dim3_key column exists"),
+                    row.try_get::<String, _>("dim3_value")
+                        .expect("dim3_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim4_key")
+                        .expect("dim4_key column exists"),
+                    row.try_get::<String, _>("dim4_value")
+                        .expect("dim4_value column exists"),
+                ),
+            ]),
+            event_count: row
+                .try_get::<i64, _>("event_count")
+                .expect("event_count column exists") as u64,
+        })
+        .collect())
+}
+
 async fn fetch_total_event_metric_total_rows<'a, E>(
     executor: E,
     project_id: Uuid,
@@ -6175,6 +6391,170 @@ where
             bucket_start: row
                 .try_get("bucket_start")
                 .expect("bucket_start column exists"),
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim3_key")
+                        .expect("dim3_key column exists"),
+                    row.try_get::<String, _>("dim3_value")
+                        .expect("dim3_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim4_key")
+                        .expect("dim4_key column exists"),
+                    row.try_get::<String, _>("dim4_value")
+                        .expect("dim4_value column exists"),
+                ),
+            ]),
+            value: row.try_get::<i64, _>("value").expect("value column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_session_metrics_dim3_aggregate_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    metric: SessionMetric,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<SessionMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let (start, end) = window;
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, SUM(",
+    );
+    builder.push(session_metric_value_column(metric));
+    builder.push(
+        ")::BIGINT AS value \
+         FROM session_metric_buckets_dim3 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    for (index, key) in cube_keys.iter().enumerate() {
+        builder.push(format!(" AND dim{}_key = ", index + 1));
+        builder.push_bind(key);
+    }
+    for (index, key) in cube_keys.iter().enumerate() {
+        if let Some(value) = filters.get(key) {
+            builder.push(format!(" AND dim{}_value = ", index + 1));
+            builder.push_bind(value);
+        }
+    }
+    builder.push(
+        " GROUP BY dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value \
+          ORDER BY dim1_value ASC, dim2_value ASC, dim3_value ASC",
+    );
+
+    if let Some(limit) = limit {
+        builder.push(" LIMIT ");
+        builder.push_bind(limit as i64);
+    }
+
+    let rows = builder.build().fetch_all(executor).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| SessionMetricsAggregateCubeRow {
+            dimensions: BTreeMap::from([
+                (
+                    row.try_get::<String, _>("dim1_key")
+                        .expect("dim1_key column exists"),
+                    row.try_get::<String, _>("dim1_value")
+                        .expect("dim1_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim2_key")
+                        .expect("dim2_key column exists"),
+                    row.try_get::<String, _>("dim2_value")
+                        .expect("dim2_value column exists"),
+                ),
+                (
+                    row.try_get::<String, _>("dim3_key")
+                        .expect("dim3_key column exists"),
+                    row.try_get::<String, _>("dim3_value")
+                        .expect("dim3_value column exists"),
+                ),
+            ]),
+            value: row.try_get::<i64, _>("value").expect("value column exists") as u64,
+        })
+        .collect())
+}
+
+async fn fetch_session_metrics_dim4_aggregate_rows<'a, E>(
+    executor: E,
+    project_id: Uuid,
+    granularity: MetricGranularity,
+    metric: SessionMetric,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    cube_keys: &[String],
+    filters: &BTreeMap<String, String>,
+    limit: Option<usize>,
+) -> Result<Vec<SessionMetricsAggregateCubeRow>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let (start, end) = window;
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "SELECT dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, SUM(",
+    );
+    builder.push(session_metric_value_column(metric));
+    builder.push(
+        ")::BIGINT AS value \
+         FROM session_metric_buckets_dim4 \
+         WHERE project_id = ",
+    );
+    builder.push_bind(project_id);
+    builder.push(" AND granularity = ");
+    builder.push_bind(granularity.as_str());
+    builder.push(" AND bucket_start BETWEEN ");
+    builder.push_bind(start);
+    builder.push(" AND ");
+    builder.push_bind(end);
+    for (index, key) in cube_keys.iter().enumerate() {
+        builder.push(format!(" AND dim{}_key = ", index + 1));
+        builder.push_bind(key);
+    }
+    for (index, key) in cube_keys.iter().enumerate() {
+        if let Some(value) = filters.get(key) {
+            builder.push(format!(" AND dim{}_value = ", index + 1));
+            builder.push_bind(value);
+        }
+    }
+    builder.push(
+        " GROUP BY dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value \
+          ORDER BY dim1_value ASC, dim2_value ASC, dim3_value ASC, dim4_value ASC",
+    );
+
+    if let Some(limit) = limit {
+        builder.push(" LIMIT ");
+        builder.push_bind(limit as i64);
+    }
+
+    let rows = builder.build().fetch_all(executor).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| SessionMetricsAggregateCubeRow {
             dimensions: BTreeMap::from([
                 (
                     row.try_get::<String, _>("dim1_key")

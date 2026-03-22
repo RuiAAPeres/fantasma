@@ -1445,6 +1445,56 @@ async fn metrics_sessions_serializes_builtin_filters_exactly() {
 }
 
 #[tokio::test]
+async fn metrics_sessions_serializes_group_by_in_request_order() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: server.read_key_secret.clone(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "sessions",
+            "--metric",
+            "active_installs",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-17",
+            "--group-by",
+            "platform",
+            "--group-by",
+            "locale",
+            "--json",
+        ]))
+        .await
+        .expect("session metrics succeed");
+
+    let records = server.records();
+    let request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/sessions")
+        .expect("metrics request");
+    assert_eq!(
+        request.query.as_deref(),
+        Some(
+            "metric=active_installs&start=2026-03-01&end=2026-03-17&group_by=platform&group_by=locale"
+        )
+    );
+}
+
+#[tokio::test]
 async fn instances_add_use_remove_updates_local_profiles() {
     let server = TestServer::spawn().await;
 
@@ -2044,6 +2094,62 @@ async fn metrics_events_serializes_builtin_filters_exactly() {
 }
 
 #[tokio::test]
+async fn metrics_events_serializes_group_by_in_request_order() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: server.read_key_secret.clone(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "events",
+            "--event",
+            "app_open",
+            "--metric",
+            "count",
+            "--granularity",
+            "day",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-02",
+            "--filter",
+            "platform=ios",
+            "--group-by",
+            "app_version",
+            "--group-by",
+            "locale",
+            "--json",
+        ]))
+        .await
+        .expect("event metrics succeed");
+
+    let records = server.records();
+    let request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/events")
+        .expect("metrics request");
+    assert_eq!(
+        request.query.as_deref(),
+        Some(
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&event=app_open&platform=ios&group_by=app_version&group_by=locale"
+        )
+    );
+}
+
+#[tokio::test]
 async fn metrics_events_top_text_renders_ranked_rows_and_serializes_limit() {
     let server = TestServer::spawn().await;
     let mut config = server.read_config();
@@ -2609,6 +2715,7 @@ async fn session_metrics(
                 "start": "2026-03-01",
                 "end": "2026-03-17",
                 "interval": "week",
+                "group_by": [],
                 "series": [
                     {
                         "dimensions": {},
@@ -2630,6 +2737,7 @@ async fn session_metrics(
             Json(json!({
                 "metric": metric,
                 "granularity": "day",
+                "group_by": [],
                 "series": [
                     {
                         "dimensions": {},
@@ -2696,6 +2804,7 @@ async fn event_metrics(
         Json(json!({
             "metric": "count",
             "granularity": "day",
+            "group_by": ["platform"],
             "series": [
                 {
                     "dimensions": { "platform": "ios" },

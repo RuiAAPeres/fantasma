@@ -268,16 +268,19 @@ Event metrics:
 - supported public metrics are `count`
 - `event` is required
 - built-in equality filters use `platform`, `app_version`, `os_version`, and `locale`
-- only built-in filters are accepted
-- public event metrics are filter-only; `group_by` is rejected
-- all four built-in filters may be combined in one request
+- only built-in filters and built-in `group_by` keys are accepted
+- `group_by` is supported on `platform`, `app_version`, `os_version`, and `locale`
+- total referenced dimensions across filters plus `group_by` are capped at 4
+- duplicate `group_by` keys and filter/group overlap are rejected
 
 Session metrics:
 
 - supported public metrics are `count`, `duration_total`, `new_installs`, and `active_installs`
 - built-in equality filters use `platform`, `app_version`, `os_version`, and `locale`
-- only built-in filters are accepted
-- public session metrics are filter-only; `group_by` is rejected
+- only built-in filters and built-in `group_by` keys are accepted
+- `count`, `duration_total`, and `new_installs` allow built-in `group_by` through D4
+- `active_installs` allows built-in `group_by` through D2 only
+- duplicate `group_by` keys and filter/group overlap are rejected
 - `duration_total` is assigned to the bucket where the session starts
 - `new_installs` is assigned once from the install's first accepted event and is never retroactively moved by late arrivals
 - `count`, `duration_total`, and `new_installs` stay on the bucketed `granularity` contract and still require `granularity`
@@ -286,7 +289,7 @@ Session metrics:
 - `active_installs` counts unique installs with at least one session whose `session_start` falls inside the exact requested UTC range or point window
 - `active_installs interval=week|month|year` uses calendar-shaped UTC windows clipped to the request edges; requests do not need to be aligned to calendar boundaries
 - public `active_installs` reads union worker-maintained daily bitmaps across the requested days; there is no separate public week/month/year cuboid family
-- filtered `active_installs` reads use the same built-in-only filter vocabulary
+- filtered and grouped `active_installs` reads use the same built-in-only vocabulary, but the public contract stops at D2 so the bitmap path stays bounded
 
 Current-state metrics:
 

@@ -229,7 +229,7 @@ pub enum MetricsSubcommand {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  fantasma metrics events --event app_open --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter platform=ios --filter app_version=1.0.0 --filter locale=en-GB"
+    after_help = "Examples:\n  fantasma metrics events --event app_open --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter platform=ios --filter app_version=1.0.0 --group-by locale\n  fantasma metrics events --event app_open --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --group-by platform --group-by app_version"
 )]
 pub struct EventMetricsArgs {
     #[arg(long)]
@@ -247,6 +247,11 @@ pub struct EventMetricsArgs {
         help = "Repeat built-in key=value filters. Supported keys: platform, app_version, os_version, locale."
     )]
     pub filters: Vec<String>,
+    #[arg(
+        long = "group-by",
+        help = "Repeat built-in group keys. Supported keys: platform, app_version, os_version, locale."
+    )]
+    pub group_by: Vec<String>,
     #[command(flatten)]
     pub output: ReadOutputArgs,
 }
@@ -285,7 +290,7 @@ pub struct LiveInstallsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  fantasma metrics sessions --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter platform=ios --filter os_version=18.3 --filter locale=en-GB\n  fantasma metrics sessions --metric active_installs --start 2026-03-01 --end 2026-03-17 --interval week --filter platform=ios"
+    after_help = "Examples:\n  fantasma metrics sessions --metric count --granularity day --start 2026-03-01 --end 2026-03-02 --filter platform=ios --filter os_version=18.3 --group-by locale\n  fantasma metrics sessions --metric active_installs --start 2026-03-01 --end 2026-03-17 --interval week --group-by platform --group-by locale"
 )]
 pub struct SessionMetricsArgs {
     #[arg(long)]
@@ -303,6 +308,11 @@ pub struct SessionMetricsArgs {
         help = "Repeat built-in key=value filters. Supported keys: platform, app_version, os_version, locale."
     )]
     pub filters: Vec<String>,
+    #[arg(
+        long = "group-by",
+        help = "Repeat built-in group keys. Supported keys: platform, app_version, os_version, locale."
+    )]
+    pub group_by: Vec<String>,
     #[command(flatten)]
     pub output: ReadOutputArgs,
 }

@@ -526,8 +526,8 @@ cargo run -p fantasma-cli -- metrics events \
   --granularity day \
   --start 2026-01-01 \
   --end 2026-01-02 \
-  --filter platform=ios \
-  --filter locale=en-US
+  --group-by platform \
+  --group-by locale
 ```
 
 ```bash
@@ -622,6 +622,11 @@ curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&star
 ```
 
 ```bash
+curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-02&group_by=platform&group_by=locale" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
+```
+
+```bash
 curl -fsS "http://localhost:8082/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-31&interval=week" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
@@ -642,9 +647,21 @@ curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&g
 ```
 
 ```bash
+curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02&group_by=platform&group_by=locale" \
+  -H "X-Fantasma-Key: ${READ_KEY}"
+```
+
+```bash
 curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z&platform=ios" \
   -H "X-Fantasma-Key: ${READ_KEY}"
 ```
+
+Grouping rules:
+
+- `events`, `count`, `duration_total`, and `new_installs` allow built-in filters plus built-in `group_by` through D4
+- `active_installs` allows built-in filters plus built-in `group_by` through D2
+- built-in dimensions are `platform`, `app_version`, `os_version`, and `locale`
+- `live_installs` remains unfiltered and ungrouped
 
 ## Related Docs
 

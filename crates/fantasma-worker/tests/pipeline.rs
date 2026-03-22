@@ -816,6 +816,7 @@ async fn pipeline_provisions_project_and_scopes_ingest_and_read_keys(pool: PgPoo
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1122,6 +1123,7 @@ async fn pipeline_exposes_bucketed_session_metrics_after_worker_batch(pool: PgPo
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1158,6 +1160,7 @@ async fn pipeline_exposes_bucketed_session_metrics_after_worker_batch(pool: PgPo
         serde_json::json!({
             "metric": "duration_total",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1193,6 +1196,7 @@ async fn pipeline_exposes_bucketed_session_metrics_after_worker_batch(pool: PgPo
         serde_json::json!({
             "metric": "new_installs",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1229,6 +1233,7 @@ async fn pipeline_exposes_bucketed_session_metrics_after_worker_batch(pool: PgPo
             "metric": "active_installs",
             "start": "2026-01-01",
             "end": "2026-01-02",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1317,6 +1322,7 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
         serde_json::json!({
             "metric": "count",
             "granularity": "hour",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1352,6 +1358,7 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1498,6 +1505,7 @@ async fn pipeline_exposes_dim2_event_metrics_with_null_buckets(pool: PgPool) {
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1581,6 +1589,7 @@ async fn pipeline_keeps_active_installs_visible_while_session_backlog_remains(po
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1871,6 +1880,7 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1902,6 +1912,7 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
             "metric": "active_installs",
             "start": "2026-01-01",
             "end": "2026-01-01",
+            "group_by": [],
             "series": [
                 {
                     "dimensions": {},
@@ -1914,9 +1925,10 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
     );
 
     let grouped_active_installs_response = api
+        .clone()
         .oneshot(
             Request::get(
-                "/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-01&group_by=provider",
+                "/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-01&group_by=platform&group_by=locale",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -1925,14 +1937,48 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
         .await
         .expect("grouped active installs request succeeds");
 
-    assert_eq!(
-        grouped_active_installs_response.status(),
-        StatusCode::UNPROCESSABLE_ENTITY
-    );
+    assert_eq!(grouped_active_installs_response.status(), StatusCode::OK);
     assert_eq!(
         response_json(grouped_active_installs_response).await,
         serde_json::json!({
-            "error": "invalid_query_key"
+            "metric": "active_installs",
+            "start": "2026-01-01",
+            "end": "2026-01-01",
+            "group_by": ["platform", "locale"],
+            "series": [
+                {
+                    "dimensions": {
+                        "platform": "ios",
+                        "locale": "en-US"
+                    },
+                    "points": [
+                        { "start": "2026-01-01", "end": "2026-01-01", "value": 2 }
+                    ]
+                }
+            ]
+        })
+    );
+
+    let invalid_grouped_active_installs_response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/sessions?metric=active_installs&start=2026-01-01&end=2026-01-01&platform=ios&group_by=app_version&group_by=locale",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("invalid grouped active installs request succeeds");
+
+    assert_eq!(
+        invalid_grouped_active_installs_response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        response_json(invalid_grouped_active_installs_response).await,
+        serde_json::json!({
+            "error": "too_many_dimensions"
         })
     );
 }
@@ -1954,7 +2000,7 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
                 "timestamp": "2026-03-01T00:00:00Z",
                 "install_id": format!("install-{index}"),
                 "platform": "ios",
-                "app_version": "1.4.0",
+                "app_version": format!("1.4.{index}"),
                 "os_version": "18.3",
                 "locale": "en-US"
             })
@@ -1997,7 +2043,7 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
     let response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-01&group_by=platform",
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-01&group_by=app_version",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -2015,7 +2061,126 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
         )
         .expect("decode response"),
         serde_json::json!({
-            "error": "invalid_query_key"
+            "error": "group_limit_exceeded"
+        })
+    );
+}
+
+#[sqlx::test]
+async fn pipeline_exposes_grouped_event_metrics_up_to_four_built_in_dimensions(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios",
+                                "app_version": "1.0.0",
+                                "os_version": "18.3",
+                                "locale": "en-US"
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T01:00:00Z",
+                                "install_id": "install-2",
+                                "platform": "ios",
+                                "app_version": "1.0.0",
+                                "os_version": "18.4",
+                                "locale": "pt-PT"
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T02:00:00Z",
+                                "install_id": "install-3",
+                                "platform": "android",
+                                "app_version": "2.0.0",
+                                "os_version": "15",
+                                "locale": "en-US"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    fantasma_worker::process_event_metrics_batch(&pool, 100)
+        .await
+        .expect("event worker batch succeeds");
+
+    let response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-01&group_by=platform&group_by=app_version&group_by=os_version&group_by=locale",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid api request"),
+        )
+        .await
+        .expect("grouped event request succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "metric": "count",
+            "granularity": "day",
+            "group_by": ["platform", "app_version", "os_version", "locale"],
+            "series": [
+                {
+                    "dimensions": {
+                        "platform": "android",
+                        "app_version": "2.0.0",
+                        "os_version": "15",
+                        "locale": "en-US"
+                    },
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 1 }
+                    ]
+                },
+                {
+                    "dimensions": {
+                        "platform": "ios",
+                        "app_version": "1.0.0",
+                        "os_version": "18.3",
+                        "locale": "en-US"
+                    },
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 1 }
+                    ]
+                },
+                {
+                    "dimensions": {
+                        "platform": "ios",
+                        "app_version": "1.0.0",
+                        "os_version": "18.4",
+                        "locale": "pt-PT"
+                    },
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 1 }
+                    ]
+                }
+            ]
         })
     );
 }

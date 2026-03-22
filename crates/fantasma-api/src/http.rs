@@ -56,6 +56,7 @@ struct PublicEventMetricsQuery {
     event: String,
     window: MetricsBucketWindow,
     filters: BTreeMap<String, String>,
+    group_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,7 @@ struct PublicSessionMetricsQuery {
     window: MetricsBucketWindow,
     interval: Option<MetricInterval>,
     filters: BTreeMap<String, String>,
+    group_by: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,10 +175,8 @@ impl EventMetricsQueryError {
 const MAX_FILTER_DIMENSIONS: usize = 4;
 const MAX_METRIC_GROUPS: usize = 100;
 const MAX_ACTIVE_INSTALL_POINTS: usize = 120;
-const EMPTY_GROUP_BY: &[String] = &[];
 type GroupKey = Vec<Option<String>>;
 type CountsByBucket = BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>;
-type SingletonCountsByBucket = (CountsByBucket, CountsByBucket);
 
 fn parse_event_metrics_query(
     raw_query: &str,
@@ -187,6 +187,7 @@ fn parse_event_metrics_query(
     let mut start = None;
     let mut end = None;
     let mut filters = BTreeMap::new();
+    let mut group_by = Vec::new();
 
     for (raw_key, raw_value) in form_urlencoded::parse(raw_query.as_bytes()) {
         let key = raw_key.into_owned();
@@ -237,8 +238,17 @@ fn parse_event_metrics_query(
 
                 end = Some(value);
             }
-            "group_by" => return Err(EventMetricsQueryError("invalid_query_key")),
+            "group_by" => {
+                validate_group_by_key(&value).map_err(EventMetricsQueryError)?;
+                if filters.contains_key(&value) || group_by.contains(&value) {
+                    return Err(EventMetricsQueryError("duplicate_query_key"));
+                }
+                group_by.push(value);
+            }
             "platform" | "app_version" | "os_version" | "locale" => {
+                if group_by.contains(&key) {
+                    return Err(EventMetricsQueryError("duplicate_query_key"));
+                }
                 if filters.insert(key, value).is_some() {
                     return Err(EventMetricsQueryError("duplicate_query_key"));
                 }
@@ -263,7 +273,7 @@ fn parse_event_metrics_query(
     )
     .map_err(EventMetricsQueryError)?;
 
-    if filters.len() > MAX_FILTER_DIMENSIONS {
+    if filters.len() + group_by.len() > MAX_FILTER_DIMENSIONS {
         return Err(EventMetricsQueryError("too_many_dimensions"));
     }
 
@@ -272,6 +282,7 @@ fn parse_event_metrics_query(
         event,
         window,
         filters,
+        group_by,
     })
 }
 
@@ -342,6 +353,7 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
     let mut start = None;
     let mut end = None;
     let mut filters = BTreeMap::new();
+    let mut group_by = Vec::new();
 
     for (raw_key, raw_value) in form_urlencoded::parse(raw_query.as_bytes()) {
         let key = raw_key.into_owned();
@@ -383,8 +395,17 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
 
                 end = Some(value);
             }
-            "group_by" => return Err("invalid_query_key"),
+            "group_by" => {
+                validate_group_by_key(&value)?;
+                if filters.contains_key(&value) || group_by.contains(&value) {
+                    return Err("duplicate_query_key");
+                }
+                group_by.push(value);
+            }
             "platform" | "app_version" | "os_version" | "locale" => {
+                if group_by.contains(&key) {
+                    return Err("duplicate_query_key");
+                }
                 if filters.insert(key, value).is_some() {
                     return Err("duplicate_query_key");
                 }
@@ -394,11 +415,15 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
         }
     }
 
-    if filters.len() > MAX_FILTER_DIMENSIONS {
+    let metric = metric.ok_or("invalid_request")?;
+    let max_dimensions = if metric == SessionMetric::ActiveInstalls {
+        2
+    } else {
+        MAX_FILTER_DIMENSIONS
+    };
+    if filters.len() + group_by.len() > max_dimensions {
         return Err("too_many_dimensions");
     }
-
-    let metric = metric.ok_or("invalid_request")?;
     let window = match metric {
         SessionMetric::ActiveInstalls => {
             if granularity.is_some() {
@@ -430,7 +455,15 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
         window,
         interval,
         filters,
+        group_by,
     })
+}
+
+fn validate_group_by_key(key: &str) -> Result<(), &'static str> {
+    match key {
+        "platform" | "app_version" | "os_version" | "locale" => Ok(()),
+        _ => Err("invalid_query_key"),
+    }
 }
 
 fn parse_event_catalog_query(raw_query: &str) -> Result<EventDiscoveryQuery, &'static str> {
@@ -1308,6 +1341,7 @@ async fn events_metrics(
         event: public_query.event,
         window: public_query.window,
         filters: public_query.filters,
+        group_by: public_query.group_by,
     };
     if let Err(error) = validate_event_metrics_query(&query) {
         return query_error_response(error);
@@ -1355,6 +1389,7 @@ async fn sessions_metrics(
         window: public_query.window,
         interval: public_query.interval,
         filters: public_query.filters,
+        group_by: public_query.group_by,
     };
 
     if let Err(error) = validate_active_installs_query(&query) {
@@ -1586,7 +1621,7 @@ async fn execute_event_metrics_query(
     Ok(build_metrics_response(
         query.metric.as_str(),
         &query.window,
-        EMPTY_GROUP_BY,
+        &query.group_by,
         counts_by_bucket,
     ))
 }
@@ -1601,6 +1636,10 @@ fn validate_event_metrics_query(query: &EventMetricsQuery) -> Result<(), &'stati
 }
 
 fn validate_active_installs_query(query: &SessionMetricsQuery) -> Result<(), &'static str> {
+    if query.filters.len() + query.group_by.len() > 2 {
+        return Err("too_many_dimensions");
+    }
+
     match query.metric {
         SessionMetric::ActiveInstalls => {
             if active_install_point_windows(query)?.len() > MAX_ACTIVE_INSTALL_POINTS {
@@ -1713,15 +1752,19 @@ enum ActiveInstallReadStrategy {
     BitmapTotals,
     BitmapDim1,
     BitmapDim2,
-    DistinctCount,
 }
 
-fn active_install_read_strategy(filters: &BTreeMap<String, String>) -> ActiveInstallReadStrategy {
-    match cube_keys_with(filters, EMPTY_GROUP_BY).len() {
-        0 => ActiveInstallReadStrategy::BitmapTotals,
-        1 => ActiveInstallReadStrategy::BitmapDim1,
-        2 => ActiveInstallReadStrategy::BitmapDim2,
-        _ => ActiveInstallReadStrategy::DistinctCount,
+fn active_install_read_strategy(
+    filters: &BTreeMap<String, String>,
+    group_by: &[String],
+) -> Result<ActiveInstallReadStrategy, StoreError> {
+    match cube_keys_with(filters, group_by).len() {
+        0 => Ok(ActiveInstallReadStrategy::BitmapTotals),
+        1 => Ok(ActiveInstallReadStrategy::BitmapDim1),
+        2 => Ok(ActiveInstallReadStrategy::BitmapDim2),
+        other => Err(StoreError::InvariantViolation(format!(
+            "active installs referenced dimensions must be between 0 and 2, got {other}"
+        ))),
     }
 }
 
@@ -1731,8 +1774,9 @@ async fn load_active_install_group_counts_for_window(
     window: &ActiveInstallPointWindow,
 ) -> Result<BTreeMap<GroupKey, u64>, MetricsResponseError> {
     let days = active_install_days(window);
+    let referenced_keys = cube_keys_with(&query.filters, &query.group_by);
 
-    match active_install_read_strategy(&query.filters) {
+    match active_install_read_strategy(&query.filters, &query.group_by)? {
         ActiveInstallReadStrategy::BitmapTotals => {
             let mut bitmap = RoaringTreemap::new();
             for row in
@@ -1745,12 +1789,10 @@ async fn load_active_install_group_counts_for_window(
             Ok(BTreeMap::from([(Vec::new(), bitmap.len())]))
         }
         ActiveInstallReadStrategy::BitmapDim1 => {
-            let referenced_keys = cube_keys_with(&query.filters, EMPTY_GROUP_BY);
             load_active_install_dim1_group_counts_for_window(tx, query, &days, &referenced_keys[0])
                 .await
         }
         ActiveInstallReadStrategy::BitmapDim2 => {
-            let referenced_keys = cube_keys_with(&query.filters, EMPTY_GROUP_BY);
             load_active_install_dim2_group_counts_for_window(
                 tx,
                 query,
@@ -1760,54 +1802,6 @@ async fn load_active_install_group_counts_for_window(
             )
             .await
         }
-        ActiveInstallReadStrategy::DistinctCount => {
-            let value = load_active_install_total_count_for_window(tx, query, &days).await?;
-            Ok(BTreeMap::from([(Vec::new(), value)]))
-        }
-    }
-}
-
-async fn load_active_install_total_count_for_window(
-    tx: &mut Transaction<'_, Postgres>,
-    query: &SessionMetricsQuery,
-    days: &[NaiveDate],
-) -> Result<u64, MetricsResponseError> {
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "SELECT COUNT(DISTINCT install_id)::BIGINT AS value \
-         FROM session_active_install_slices \
-         WHERE project_id = ",
-    );
-    builder.push_bind(query.project_id);
-    builder.push(" AND day = ANY(");
-    builder.push_bind(days);
-    builder.push(")");
-
-    if let Some(value) = query.filters.get("platform") {
-        builder.push(" AND platform = ");
-        builder.push_bind(value);
-    }
-
-    append_optional_slice_filter(&mut builder, &query.filters, "app_version");
-    append_optional_slice_filter(&mut builder, &query.filters, "os_version");
-    append_optional_slice_filter(&mut builder, &query.filters, "locale");
-
-    let row = builder
-        .build()
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(StoreError::from)?;
-
-    Ok(row.try_get::<i64, _>("value").map_err(StoreError::from)? as u64)
-}
-
-fn append_optional_slice_filter(
-    builder: &mut QueryBuilder<'_, Postgres>,
-    filters: &BTreeMap<String, String>,
-    key: &str,
-) {
-    if let Some(value) = filters.get(key) {
-        builder.push(format!(" AND {key}_is_null = FALSE AND {key} = "));
-        builder.push_bind(value.clone());
     }
 }
 
@@ -1866,11 +1860,11 @@ async fn load_active_install_dim1_group_counts_for_window(
             &row.try_get::<Vec<u8>, _>("bitmap")
                 .map_err(StoreError::from)?,
         )?;
-        let group_key = if EMPTY_GROUP_BY.is_empty() {
-            Vec::new()
-        } else {
-            vec![dim_value]
-        };
+        let group_key = query
+            .group_by
+            .iter()
+            .map(|group_key| (group_key == key).then(|| dim_value.clone()).flatten())
+            .collect::<Vec<_>>();
         let entry = bitmaps_by_group.entry(group_key).or_default();
         *entry |= bitmap;
     }
@@ -1926,7 +1920,8 @@ async fn load_active_install_dim2_group_counts_for_window(
             &row.try_get::<Vec<u8>, _>("bitmap")
                 .map_err(StoreError::from)?,
         )?;
-        let group_key = EMPTY_GROUP_BY
+        let group_key = query
+            .group_by
             .iter()
             .map(|group_key| {
                 if group_key == key1 {
@@ -1968,7 +1963,7 @@ fn build_active_installs_response(
         }
     }
 
-    let series = if EMPTY_GROUP_BY.is_empty() {
+    let series = if query.group_by.is_empty() {
         let points_by_window = series_by_group.remove(&Vec::new()).unwrap_or_default();
         vec![ActiveInstallsSeries {
             dimensions: BTreeMap::new(),
@@ -1990,7 +1985,7 @@ fn build_active_installs_response(
         grouped
             .into_iter()
             .map(|(group_key, points_by_window)| ActiveInstallsSeries {
-                dimensions: dimensions_for_group(EMPTY_GROUP_BY, &group_key),
+                dimensions: dimensions_for_group(&query.group_by, &group_key),
                 points: windows
                     .iter()
                     .map(|window| ActiveInstallsPoint {
@@ -2011,6 +2006,7 @@ fn build_active_installs_response(
         start: format_active_install_day(query.window.start),
         end: format_active_install_day(query.window.end),
         interval: query.interval,
+        group_by: query.group_by.clone(),
         series,
     }
 }
@@ -2031,7 +2027,7 @@ async fn execute_session_metrics_query(
     Ok(build_metrics_response(
         query.metric.as_str(),
         &query.window,
-        EMPTY_GROUP_BY,
+        &query.group_by,
         counts_by_bucket,
     ))
 }
@@ -2072,308 +2068,133 @@ async fn precheck_event_metrics_group_limit(
     tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<(), MetricsResponseError> {
-    match EMPTY_GROUP_BY.len() {
-        0 => Ok(()),
-        1 => {
-            let primary_rows = load_event_aggregate_rows(
-                tx,
-                query,
-                &cube_keys_with(
-                    &query.filters,
-                    std::slice::from_ref(EMPTY_GROUP_BY.first().expect("group exists")),
-                ),
-                Some(MAX_METRIC_GROUPS + 1),
-            )
-            .await?;
-
-            if primary_rows.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            let total_rows =
-                load_event_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
-                    .await?;
-            let final_groups = synthesize_single_group_counts(
-                aggregate_rows_to_groups(&primary_rows, EMPTY_GROUP_BY),
-                sum_aggregate_rows(&total_rows),
-            )?;
-
-            if final_groups.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            Ok(())
-        }
-        2 => {
-            let pair_rows = load_event_aggregate_rows(
-                tx,
-                query,
-                &cube_keys_with(&query.filters, EMPTY_GROUP_BY),
-                Some(MAX_METRIC_GROUPS + 1),
-            )
-            .await?;
-            if pair_rows.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            let first_group = vec![EMPTY_GROUP_BY[0].clone()];
-            let first_rows = load_event_aggregate_rows(
-                tx,
-                query,
-                &cube_keys_with(&query.filters, &first_group),
-                Some(MAX_METRIC_GROUPS + 1),
-            )
-            .await?;
-            if first_rows.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            let second_group = vec![EMPTY_GROUP_BY[1].clone()];
-            let second_rows = load_event_aggregate_rows(
-                tx,
-                query,
-                &cube_keys_with(&query.filters, &second_group),
-                Some(MAX_METRIC_GROUPS + 1),
-            )
-            .await?;
-            if second_rows.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            let total_rows =
-                load_event_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
-                    .await?;
-            let final_groups = synthesize_two_group_counts(
-                aggregate_rows_to_groups(&pair_rows, EMPTY_GROUP_BY),
-                aggregate_rows_to_groups(&first_rows, &first_group),
-                aggregate_rows_to_groups(&second_rows, &second_group),
-                sum_aggregate_rows(&total_rows),
-            )?;
-
-            if final_groups.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            Ok(())
-        }
-        other => Err(StoreError::InvariantViolation(format!(
-            "event metrics group_by arity must be between 0 and 2, got {other}"
-        ))
-        .into()),
+    if query.group_by.is_empty() {
+        return Ok(());
     }
+
+    let mut subset_counts = BTreeMap::new();
+    for subset in non_empty_group_subsets(&query.group_by) {
+        let rows = load_event_aggregate_rows(
+            tx,
+            query,
+            &cube_keys_with(&query.filters, &subset),
+            Some(MAX_METRIC_GROUPS + 1),
+        )
+        .await?;
+        if rows.len() > MAX_METRIC_GROUPS {
+            return Err(MetricsResponseError::GroupLimitExceeded);
+        }
+        subset_counts.insert(subset.clone(), aggregate_rows_to_groups(&rows, &subset));
+    }
+
+    let total_rows =
+        load_event_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None).await?;
+    let final_groups = synthesize_group_counts(
+        &query.group_by,
+        subset_counts,
+        sum_aggregate_rows(&total_rows),
+    )?;
+
+    if final_groups.len() > MAX_METRIC_GROUPS {
+        return Err(MetricsResponseError::GroupLimitExceeded);
+    }
+
+    Ok(())
 }
 
 async fn precheck_session_metrics_group_limit(
     tx: &mut Transaction<'_, Postgres>,
     query: &SessionMetricsQuery,
 ) -> Result<(), MetricsResponseError> {
-    match EMPTY_GROUP_BY.len() {
-        0 => Ok(()),
-        1 => {
-            let primary_rows = load_session_aggregate_rows(
-                tx,
-                query,
-                &cube_keys_with(
-                    &query.filters,
-                    std::slice::from_ref(EMPTY_GROUP_BY.first().expect("group exists")),
-                ),
-                Some(MAX_METRIC_GROUPS + 1),
-            )
-            .await?;
-
-            if primary_rows.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            let total_rows =
-                load_session_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
-                    .await?;
-            let final_groups = synthesize_single_group_counts(
-                aggregate_rows_to_groups(&primary_rows, EMPTY_GROUP_BY),
-                sum_aggregate_rows(&total_rows),
-            )?;
-
-            if final_groups.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            Ok(())
-        }
-        2 => {
-            let pair_rows = load_session_aggregate_rows(
-                tx,
-                query,
-                &cube_keys_with(&query.filters, EMPTY_GROUP_BY),
-                Some(MAX_METRIC_GROUPS + 1),
-            )
-            .await?;
-            if pair_rows.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            let first_group = vec![EMPTY_GROUP_BY[0].clone()];
-            let first_rows = load_session_aggregate_rows(
-                tx,
-                query,
-                &cube_keys_with(&query.filters, &first_group),
-                Some(MAX_METRIC_GROUPS + 1),
-            )
-            .await?;
-            if first_rows.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            let second_group = vec![EMPTY_GROUP_BY[1].clone()];
-            let second_rows = load_session_aggregate_rows(
-                tx,
-                query,
-                &cube_keys_with(&query.filters, &second_group),
-                Some(MAX_METRIC_GROUPS + 1),
-            )
-            .await?;
-            if second_rows.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            let total_rows =
-                load_session_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None)
-                    .await?;
-            let final_groups = synthesize_two_group_counts(
-                aggregate_rows_to_groups(&pair_rows, EMPTY_GROUP_BY),
-                aggregate_rows_to_groups(&first_rows, &first_group),
-                aggregate_rows_to_groups(&second_rows, &second_group),
-                sum_aggregate_rows(&total_rows),
-            )?;
-
-            if final_groups.len() > MAX_METRIC_GROUPS {
-                return Err(MetricsResponseError::GroupLimitExceeded);
-            }
-
-            Ok(())
-        }
-        other => Err(StoreError::InvariantViolation(format!(
-            "session metrics group_by arity must be between 0 and 2, got {other}"
-        ))
-        .into()),
+    if query.group_by.is_empty() {
+        return Ok(());
     }
+
+    let mut subset_counts = BTreeMap::new();
+    for subset in non_empty_group_subsets(&query.group_by) {
+        let rows = load_session_aggregate_rows(
+            tx,
+            query,
+            &cube_keys_with(&query.filters, &subset),
+            Some(MAX_METRIC_GROUPS + 1),
+        )
+        .await?;
+        if rows.len() > MAX_METRIC_GROUPS {
+            return Err(MetricsResponseError::GroupLimitExceeded);
+        }
+        subset_counts.insert(subset.clone(), aggregate_rows_to_groups(&rows, &subset));
+    }
+
+    let total_rows =
+        load_session_aggregate_rows(tx, query, &filter_cube_keys(&query.filters), None).await?;
+    let final_groups = synthesize_group_counts(
+        &query.group_by,
+        subset_counts,
+        sum_aggregate_rows(&total_rows),
+    )?;
+
+    if final_groups.len() > MAX_METRIC_GROUPS {
+        return Err(MetricsResponseError::GroupLimitExceeded);
+    }
+
+    Ok(())
 }
 
 async fn load_event_group_counts_by_bucket(
     tx: &mut Transaction<'_, Postgres>,
     query: &EventMetricsQuery,
 ) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
-    match EMPTY_GROUP_BY.len() {
-        0 => {
-            let total_rows =
-                load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
-            Ok(sum_rows_by_bucket(&total_rows)
-                .into_iter()
-                .map(|(bucket_start, value)| (bucket_start, BTreeMap::from([(Vec::new(), value)])))
-                .collect())
-        }
-        1 => {
-            let primary_rows =
-                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, EMPTY_GROUP_BY))
-                    .await?;
-            let total_rows =
-                load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
-
-            synthesize_group_counts_by_bucket(
-                group_rows_by_bucket(&primary_rows, EMPTY_GROUP_BY),
-                sum_rows_by_bucket(&total_rows),
-                None,
-            )
-            .map_err(Into::into)
-        }
-        2 => {
-            let pair_rows =
-                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, EMPTY_GROUP_BY))
-                    .await?;
-            let first_group = vec![EMPTY_GROUP_BY[0].clone()];
-            let first_rows =
-                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &first_group))
-                    .await?;
-            let second_group = vec![EMPTY_GROUP_BY[1].clone()];
-            let second_rows =
-                load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &second_group))
-                    .await?;
-            let total_rows =
-                load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
-
-            synthesize_group_counts_by_bucket(
-                group_rows_by_bucket(&pair_rows, EMPTY_GROUP_BY),
-                sum_rows_by_bucket(&total_rows),
-                Some((
-                    group_rows_by_bucket(&first_rows, &first_group),
-                    group_rows_by_bucket(&second_rows, &second_group),
-                )),
-            )
-            .map_err(Into::into)
-        }
-        other => Err(StoreError::InvariantViolation(format!(
-            "event metrics group_by arity must be between 0 and 2, got {other}"
-        ))
-        .into()),
+    if query.group_by.is_empty() {
+        let total_rows = load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
+        return Ok(sum_rows_by_bucket(&total_rows)
+            .into_iter()
+            .map(|(bucket_start, value)| (bucket_start, BTreeMap::from([(Vec::new(), value)])))
+            .collect());
     }
+
+    let mut subset_counts_by_bucket = BTreeMap::new();
+    for subset in non_empty_group_subsets(&query.group_by) {
+        let rows =
+            load_event_cube_rows(tx, query, &cube_keys_with(&query.filters, &subset)).await?;
+        subset_counts_by_bucket.insert(subset.clone(), group_rows_by_bucket(&rows, &subset));
+    }
+
+    let total_rows = load_event_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
+    synthesize_group_counts_by_bucket(
+        &query.group_by,
+        subset_counts_by_bucket,
+        sum_rows_by_bucket(&total_rows),
+    )
+    .map_err(Into::into)
 }
 
 async fn load_session_group_counts_by_bucket(
     tx: &mut Transaction<'_, Postgres>,
     query: &SessionMetricsQuery,
 ) -> Result<BTreeMap<DateTime<Utc>, BTreeMap<GroupKey, u64>>, MetricsResponseError> {
-    match EMPTY_GROUP_BY.len() {
-        0 => {
-            let total_rows =
-                load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
-            Ok(sum_rows_by_bucket(&total_rows)
-                .into_iter()
-                .map(|(bucket_start, value)| (bucket_start, BTreeMap::from([(Vec::new(), value)])))
-                .collect())
-        }
-        1 => {
-            let primary_rows =
-                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, EMPTY_GROUP_BY))
-                    .await?;
-            let total_rows =
-                load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
-
-            synthesize_group_counts_by_bucket(
-                group_rows_by_bucket(&primary_rows, EMPTY_GROUP_BY),
-                sum_rows_by_bucket(&total_rows),
-                None,
-            )
-            .map_err(Into::into)
-        }
-        2 => {
-            let pair_rows =
-                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, EMPTY_GROUP_BY))
-                    .await?;
-            let first_group = vec![EMPTY_GROUP_BY[0].clone()];
-            let first_rows =
-                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &first_group))
-                    .await?;
-            let second_group = vec![EMPTY_GROUP_BY[1].clone()];
-            let second_rows =
-                load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &second_group))
-                    .await?;
-            let total_rows =
-                load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
-
-            synthesize_group_counts_by_bucket(
-                group_rows_by_bucket(&pair_rows, EMPTY_GROUP_BY),
-                sum_rows_by_bucket(&total_rows),
-                Some((
-                    group_rows_by_bucket(&first_rows, &first_group),
-                    group_rows_by_bucket(&second_rows, &second_group),
-                )),
-            )
-            .map_err(Into::into)
-        }
-        other => Err(StoreError::InvariantViolation(format!(
-            "session metrics group_by arity must be between 0 and 2, got {other}"
-        ))
-        .into()),
+    if query.group_by.is_empty() {
+        let total_rows =
+            load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
+        return Ok(sum_rows_by_bucket(&total_rows)
+            .into_iter()
+            .map(|(bucket_start, value)| (bucket_start, BTreeMap::from([(Vec::new(), value)])))
+            .collect());
     }
+
+    let mut subset_counts_by_bucket = BTreeMap::new();
+    for subset in non_empty_group_subsets(&query.group_by) {
+        let rows =
+            load_session_cube_rows(tx, query, &cube_keys_with(&query.filters, &subset)).await?;
+        subset_counts_by_bucket.insert(subset.clone(), group_rows_by_bucket(&rows, &subset));
+    }
+
+    let total_rows = load_session_cube_rows(tx, query, &filter_cube_keys(&query.filters)).await?;
+    synthesize_group_counts_by_bucket(
+        &query.group_by,
+        subset_counts_by_bucket,
+        sum_rows_by_bucket(&total_rows),
+    )
+    .map_err(Into::into)
 }
 
 async fn load_event_cube_rows(
@@ -2530,54 +2351,55 @@ fn build_metrics_response(
     MetricsResponse {
         metric: metric.to_owned(),
         granularity: window.granularity,
+        group_by: group_by.to_vec(),
         series,
     }
 }
 
+fn non_empty_group_subsets(group_by: &[String]) -> Vec<Vec<String>> {
+    let mut subsets = Vec::new();
+
+    for mask in 1..(1_usize << group_by.len()) {
+        let subset = group_by
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| ((mask & (1 << index)) != 0).then_some(key.clone()))
+            .collect::<Vec<_>>();
+        subsets.push(subset);
+    }
+
+    subsets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    subsets
+}
+
 fn synthesize_group_counts_by_bucket(
-    primary_by_bucket: CountsByBucket,
+    group_by: &[String],
+    subset_counts_by_bucket: BTreeMap<Vec<String>, CountsByBucket>,
     totals_by_bucket: BTreeMap<DateTime<Utc>, u64>,
-    singleton_by_bucket: Option<SingletonCountsByBucket>,
 ) -> Result<CountsByBucket, StoreError> {
     let mut buckets = totals_by_bucket.keys().copied().collect::<BTreeSet<_>>();
-    buckets.extend(primary_by_bucket.keys().copied());
-
-    if let Some((first_by_bucket, second_by_bucket)) = singleton_by_bucket.as_ref() {
-        buckets.extend(first_by_bucket.keys().copied());
-        buckets.extend(second_by_bucket.keys().copied());
+    for counts_by_bucket in subset_counts_by_bucket.values() {
+        buckets.extend(counts_by_bucket.keys().copied());
     }
 
     let mut grouped = BTreeMap::new();
 
     for bucket_start in buckets {
-        let total = totals_by_bucket
-            .get(&bucket_start)
-            .copied()
-            .unwrap_or_default();
-        let final_groups = match singleton_by_bucket.as_ref() {
-            None => synthesize_single_group_counts(
-                primary_by_bucket
-                    .get(&bucket_start)
-                    .cloned()
-                    .unwrap_or_default(),
-                total,
-            )?,
-            Some((first_by_bucket, second_by_bucket)) => synthesize_two_group_counts(
-                primary_by_bucket
-                    .get(&bucket_start)
-                    .cloned()
-                    .unwrap_or_default(),
-                first_by_bucket
-                    .get(&bucket_start)
-                    .cloned()
-                    .unwrap_or_default(),
-                second_by_bucket
-                    .get(&bucket_start)
-                    .cloned()
-                    .unwrap_or_default(),
-                total,
-            )?,
-        };
+        let mut subset_counts = BTreeMap::new();
+        for (subset, counts_by_bucket) in &subset_counts_by_bucket {
+            if let Some(counts) = counts_by_bucket.get(&bucket_start) {
+                subset_counts.insert(subset.clone(), counts.clone());
+            }
+        }
+
+        let final_groups = synthesize_group_counts(
+            group_by,
+            subset_counts,
+            totals_by_bucket
+                .get(&bucket_start)
+                .copied()
+                .unwrap_or_default(),
+        )?;
 
         if !final_groups.is_empty() {
             grouped.insert(bucket_start, final_groups);
@@ -2650,97 +2472,82 @@ fn sum_aggregate_rows(rows: &[MetricsAggregateValueRow]) -> u64 {
     rows.iter().map(|row| row.value).sum()
 }
 
-fn synthesize_single_group_counts(
-    mut non_null_groups: BTreeMap<GroupKey, u64>,
+fn synthesize_group_counts(
+    group_by: &[String],
+    subset_counts: BTreeMap<Vec<String>, BTreeMap<GroupKey, u64>>,
     total: u64,
 ) -> Result<BTreeMap<GroupKey, u64>, StoreError> {
-    let non_null_total = non_null_groups.values().sum::<u64>();
-
-    if non_null_total > total {
-        // Session cuboids can be temporarily out of sync while bounded rebuild batches catch up.
-        // Returning the visible non-null groups is better than failing the whole request.
-        return Ok(non_null_groups);
+    if group_by.is_empty() {
+        return Ok(BTreeMap::from([(Vec::new(), total)]));
     }
 
-    let null_count = total - non_null_total;
-    if null_count > 0 {
-        non_null_groups.insert(vec![None], null_count);
-    }
+    let mut final_groups = BTreeMap::<GroupKey, u64>::new();
+    let mut subsets = subset_counts.into_iter().collect::<Vec<_>>();
+    subsets.sort_by(|(left_keys, _), (right_keys, _)| {
+        right_keys
+            .len()
+            .cmp(&left_keys.len())
+            .then_with(|| left_keys.cmp(right_keys))
+    });
 
-    Ok(non_null_groups)
-}
+    for (subset_keys, groups) in subsets {
+        let positions = subset_keys
+            .iter()
+            .map(|subset_key| {
+                group_by
+                    .iter()
+                    .position(|group_key| group_key == subset_key)
+                    .ok_or_else(|| {
+                        StoreError::InvariantViolation(format!(
+                            "subset key '{subset_key}' is not present in group_by"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-fn synthesize_two_group_counts(
-    pair_groups: BTreeMap<GroupKey, u64>,
-    first_groups: BTreeMap<GroupKey, u64>,
-    second_groups: BTreeMap<GroupKey, u64>,
-    total: u64,
-) -> Result<BTreeMap<GroupKey, u64>, StoreError> {
-    let mut final_groups = BTreeMap::new();
-    let mut pair_totals_by_first = BTreeMap::<String, u64>::new();
-    let mut pair_totals_by_second = BTreeMap::<String, u64>::new();
-    let mut returned_total = 0_u64;
+        for (subset_group_key, subtotal) in groups {
+            if subset_group_key.len() != positions.len() {
+                return Err(StoreError::InvariantViolation(
+                    "subset group key length must match subset key count".to_owned(),
+                ));
+            }
 
-    for (group_key, value) in pair_groups {
-        let first_value = group_key.first().and_then(Clone::clone).ok_or_else(|| {
-            StoreError::InvariantViolation(
-                "missing first dimension value in non-null pair".to_owned(),
-            )
-        })?;
-        let second_value = group_key.get(1).and_then(Clone::clone).ok_or_else(|| {
-            StoreError::InvariantViolation(
-                "missing second dimension value in non-null pair".to_owned(),
-            )
-        })?;
-        *pair_totals_by_first.entry(first_value.clone()).or_default() += value;
-        *pair_totals_by_second
-            .entry(second_value.clone())
-            .or_default() += value;
-        returned_total += value;
-        final_groups.insert(vec![Some(first_value), Some(second_value)], value);
-    }
+            let used = final_groups
+                .iter()
+                .filter_map(|(group_key, value)| {
+                    positions
+                        .iter()
+                        .zip(subset_group_key.iter())
+                        .all(|(position, subset_value)| {
+                            group_key.get(*position) == Some(subset_value)
+                        })
+                        .then_some(*value)
+                })
+                .sum::<u64>();
 
-    for (group_key, total_for_first) in first_groups {
-        let first_value = group_key.first().and_then(Clone::clone).ok_or_else(|| {
-            StoreError::InvariantViolation(
-                "missing first dimension value in single-dimension cube".to_owned(),
-            )
-        })?;
-        let used = pair_totals_by_first
-            .get(&first_value)
-            .copied()
-            .unwrap_or_default();
-        let null_count = total_for_first.saturating_sub(used);
-        if null_count > 0 {
-            returned_total += null_count;
-            final_groups.insert(vec![Some(first_value), None], null_count);
+            let remainder = subtotal.saturating_sub(used);
+            if remainder == 0 {
+                continue;
+            }
+
+            let mut final_group_key = vec![None; group_by.len()];
+            for (position, subset_value) in positions.iter().zip(subset_group_key.into_iter()) {
+                final_group_key[*position] = subset_value;
+            }
+            *final_groups.entry(final_group_key).or_default() += remainder;
         }
     }
 
-    for (group_key, total_for_second) in second_groups {
-        let second_value = group_key.first().and_then(Clone::clone).ok_or_else(|| {
-            StoreError::InvariantViolation(
-                "missing second dimension value in single-dimension cube".to_owned(),
-            )
-        })?;
-        let used = pair_totals_by_second
-            .get(&second_value)
-            .copied()
-            .unwrap_or_default();
-        let null_count = total_for_second.saturating_sub(used);
-        if null_count > 0 {
-            returned_total += null_count;
-            final_groups.insert(vec![None, Some(second_value)], null_count);
-        }
-    }
-
+    let returned_total = final_groups.values().sum::<u64>();
     if returned_total > total {
+        // Session/event cuboids can be temporarily skewed while bounded rebuild batches catch up.
+        // Returning the visible groups is better than failing the whole request.
         return Ok(final_groups);
     }
 
-    let double_null = total - returned_total;
-    if double_null > 0 {
-        final_groups.insert(vec![None, None], double_null);
+    let all_null_count = total - returned_total;
+    if all_null_count > 0 {
+        final_groups.insert(vec![None; group_by.len()], all_null_count);
     }
 
     Ok(final_groups)
@@ -2878,6 +2685,7 @@ mod tests {
             serde_json::json!({
                 "metric": "count",
                 "granularity": "day",
+                "group_by": [],
                 "series": [
                     {
                         "dimensions": {},
@@ -2909,6 +2717,7 @@ mod tests {
             serde_json::json!({
                 "metric": "count",
                 "granularity": "hour",
+                "group_by": ["platform"],
                 "series": [
                     {
                         "dimensions": { "platform": "ios" },
@@ -3013,6 +2822,44 @@ mod tests {
         assert_eq!(query.metric, EventMetric::Count);
         assert_eq!(query.filters.len(), 4);
         assert_eq!(query.filters.get("locale"), Some(&"pt-PT".to_owned()));
+    }
+
+    #[test]
+    fn parse_event_metrics_query_accepts_four_group_by_dimensions() {
+        let query = parse_event_metrics_query(
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=platform&group_by=app_version&group_by=os_version&group_by=locale",
+        )
+        .expect("query parses");
+
+        assert_eq!(
+            query.group_by,
+            vec![
+                "platform".to_owned(),
+                "app_version".to_owned(),
+                "os_version".to_owned(),
+                "locale".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_event_metrics_query_rejects_filter_group_overlap() {
+        let error = parse_event_metrics_query(
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&group_by=platform",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), "duplicate_query_key");
+    }
+
+    #[test]
+    fn parse_event_metrics_query_rejects_duplicate_dimension_when_filter_and_group_overlap() {
+        let error = parse_event_metrics_query(
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&group_by=app_version&group_by=os_version&group_by=locale&group_by=platform",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), "duplicate_query_key");
     }
 
     #[test]
@@ -3187,6 +3034,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_metric_query_accepts_four_group_by_dimensions_for_bucket_metrics() {
+        let query = parse_session_metric_query(
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=platform&group_by=app_version&group_by=os_version&group_by=locale",
+        )
+        .expect("query parses");
+
+        assert_eq!(
+            query.group_by,
+            vec![
+                "platform".to_owned(),
+                "app_version".to_owned(),
+                "os_version".to_owned(),
+                "locale".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_session_metric_query_accepts_two_group_by_dimensions_for_active_installs() {
+        let query = parse_session_metric_query(
+            "metric=active_installs&start=2026-03-01&end=2026-03-17&group_by=platform&group_by=locale",
+        )
+        .expect("query parses");
+
+        assert_eq!(
+            query.group_by,
+            vec!["platform".to_owned(), "locale".to_owned()]
+        );
+    }
+
+    #[test]
     fn parse_session_metric_query_accepts_exact_range_active_installs() {
         let query =
             parse_session_metric_query("metric=active_installs&start=2026-03-01&end=2026-03-17")
@@ -3230,13 +3108,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_metric_query_rejects_group_by() {
+    fn parse_session_metric_query_rejects_duplicate_group_by() {
         let error = parse_session_metric_query(
-            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=provider",
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=platform&group_by=platform",
         )
         .unwrap_err();
 
-        assert_eq!(error, "invalid_query_key");
+        assert_eq!(error, "duplicate_query_key");
+    }
+
+    #[test]
+    fn parse_session_metric_query_rejects_filter_group_overlap() {
+        let error = parse_session_metric_query(
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&group_by=platform",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "duplicate_query_key");
+    }
+
+    #[test]
+    fn parse_session_metric_query_rejects_active_installs_above_two_referenced_dimensions() {
+        let error = parse_session_metric_query(
+            "metric=active_installs&start=2026-03-01&end=2026-03-17&platform=ios&group_by=app_version&group_by=locale",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "too_many_dimensions");
     }
 
     #[test]
@@ -3306,6 +3204,7 @@ mod tests {
             window: public_query.window,
             interval: public_query.interval,
             filters: public_query.filters,
+            group_by: public_query.group_by,
         };
 
         assert_eq!(
@@ -3315,45 +3214,84 @@ mod tests {
     }
 
     #[test]
-    fn active_install_read_strategy_uses_bitmaps_for_up_to_two_filters() {
+    fn validate_active_installs_query_rejects_more_than_two_referenced_dimensions() {
+        let query = SessionMetricsQuery {
+            project_id: Uuid::nil(),
+            metric: SessionMetric::ActiveInstalls,
+            window: MetricsBucketWindow {
+                granularity: MetricGranularity::Day,
+                start: Utc
+                    .with_ymd_and_hms(2026, 3, 1, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+                end: Utc
+                    .with_ymd_and_hms(2026, 3, 17, 0, 0, 0)
+                    .single()
+                    .expect("end"),
+            },
+            interval: None,
+            filters: BTreeMap::from([
+                ("platform".to_owned(), "ios".to_owned()),
+                ("app_version".to_owned(), "1.0.0".to_owned()),
+                ("locale".to_owned(), "en-US".to_owned()),
+            ]),
+            group_by: Vec::new(),
+        };
+
         assert_eq!(
-            active_install_read_strategy(&BTreeMap::new()),
+            validate_active_installs_query(&query),
+            Err("too_many_dimensions")
+        );
+    }
+
+    #[test]
+    fn active_install_read_strategy_uses_bitmaps_for_up_to_two_referenced_dimensions() {
+        assert_eq!(
+            active_install_read_strategy(&BTreeMap::new(), &[]).expect("strategy"),
             ActiveInstallReadStrategy::BitmapTotals
         );
         assert_eq!(
-            active_install_read_strategy(&BTreeMap::from([(
-                "platform".to_owned(),
-                "ios".to_owned()
-            )])),
+            active_install_read_strategy(
+                &BTreeMap::from([("platform".to_owned(), "ios".to_owned())]),
+                &[]
+            )
+            .expect("strategy"),
             ActiveInstallReadStrategy::BitmapDim1
         );
         assert_eq!(
-            active_install_read_strategy(&BTreeMap::from([
-                ("platform".to_owned(), "ios".to_owned()),
-                ("locale".to_owned(), "en-US".to_owned()),
-            ])),
+            active_install_read_strategy(
+                &BTreeMap::from([("platform".to_owned(), "ios".to_owned())]),
+                &["locale".to_owned()]
+            )
+            .expect("strategy"),
             ActiveInstallReadStrategy::BitmapDim2
         );
     }
 
     #[test]
-    fn active_install_read_strategy_falls_back_after_two_filters() {
+    fn active_install_read_strategy_rejects_more_than_two_referenced_dimensions() {
         assert_eq!(
-            active_install_read_strategy(&BTreeMap::from([
-                ("platform".to_owned(), "ios".to_owned()),
-                ("app_version".to_owned(), "1.0.0".to_owned()),
-                ("locale".to_owned(), "en-US".to_owned()),
-            ])),
-            ActiveInstallReadStrategy::DistinctCount
+            active_install_read_strategy(
+                &BTreeMap::from([
+                    ("platform".to_owned(), "ios".to_owned()),
+                    ("app_version".to_owned(), "1.0.0".to_owned()),
+                ]),
+                &["locale".to_owned()]
+            )
+            .map_err(|error| matches!(error, StoreError::InvariantViolation(_))),
+            Err(true)
         );
         assert_eq!(
-            active_install_read_strategy(&BTreeMap::from([
-                ("platform".to_owned(), "ios".to_owned()),
-                ("app_version".to_owned(), "1.0.0".to_owned()),
-                ("os_version".to_owned(), "18.3".to_owned()),
-                ("locale".to_owned(), "en-US".to_owned()),
-            ])),
-            ActiveInstallReadStrategy::DistinctCount
+            active_install_read_strategy(
+                &BTreeMap::from([
+                    ("platform".to_owned(), "ios".to_owned()),
+                    ("app_version".to_owned(), "1.0.0".to_owned()),
+                    ("os_version".to_owned(), "18.3".to_owned()),
+                ]),
+                &["locale".to_owned()]
+            )
+            .map_err(|error| matches!(error, StoreError::InvariantViolation(_))),
+            Err(true)
         );
     }
 
@@ -3617,6 +3555,18 @@ mod tests {
                     == "#/components/parameters/SessionMetricGranularity"),
             "session metrics route must use the conditional granularity parameter"
         );
+        assert!(
+            event_metrics_parameters
+                .iter()
+                .any(|parameter| parameter["$ref"] == "#/components/parameters/MetricGroupBy"),
+            "event metrics route must document repeated group_by"
+        );
+        assert!(
+            session_metrics_parameters
+                .iter()
+                .any(|parameter| parameter["$ref"] == "#/components/parameters/MetricGroupBy"),
+            "session metrics route must document repeated group_by"
+        );
         assert_eq!(
             event_metric_granularity["required"].as_bool(),
             Some(true),
@@ -3632,8 +3582,8 @@ mod tests {
             event_metrics_description
                 .as_str()
                 .expect("event metrics description")
-                .contains("built-in equality filters"),
-            "openapi must document the narrowed event metric contract"
+                .contains("Repeated `group_by` is supported"),
+            "openapi must document the restored event grouping contract"
         );
         assert!(
             event_name_description
@@ -3726,32 +3676,50 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_single_group_counts_adds_null_bucket_to_final_group_count() {
-        let non_null = (0..100)
-            .map(|index| (vec![Some(format!("provider_{index:03}"))], 1_u64))
-            .collect::<BTreeMap<_, _>>();
-
-        let final_groups =
-            synthesize_single_group_counts(non_null, 101).expect("groups synthesize");
+    fn synthesize_group_counts_adds_null_bucket_to_final_group_count() {
+        let final_groups = synthesize_group_counts(
+            &["platform".to_owned()],
+            BTreeMap::from([(
+                vec!["platform".to_owned()],
+                (0..100)
+                    .map(|index| (vec![Some(format!("provider_{index:03}"))], 1_u64))
+                    .collect::<BTreeMap<_, _>>(),
+            )]),
+            101,
+        )
+        .expect("groups synthesize");
 
         assert_eq!(final_groups.len(), 101);
         assert_eq!(final_groups.get(&vec![None]), Some(&1));
     }
 
     #[test]
-    fn synthesize_two_group_counts_handles_single_null_buckets_after_filtering() {
-        let pair_groups = BTreeMap::from([(
-            vec![Some("strava".to_owned()), Some("true".to_owned())],
-            1_u64,
-        )]);
-        let first_groups = BTreeMap::from([(vec![Some("strava".to_owned())], 2_u64)]);
-        let second_groups = BTreeMap::from([
-            (vec![Some("true".to_owned())], 1_u64),
-            (vec![Some("false".to_owned())], 1_u64),
-        ]);
-
-        let final_groups = synthesize_two_group_counts(pair_groups, first_groups, second_groups, 3)
-            .expect("groups synthesize");
+    fn synthesize_group_counts_handles_single_null_buckets_after_filtering() {
+        let final_groups = synthesize_group_counts(
+            &["provider".to_owned(), "flag".to_owned()],
+            BTreeMap::from([
+                (
+                    vec!["provider".to_owned(), "flag".to_owned()],
+                    BTreeMap::from([(
+                        vec![Some("strava".to_owned()), Some("true".to_owned())],
+                        1_u64,
+                    )]),
+                ),
+                (
+                    vec!["provider".to_owned()],
+                    BTreeMap::from([(vec![Some("strava".to_owned())], 2_u64)]),
+                ),
+                (
+                    vec!["flag".to_owned()],
+                    BTreeMap::from([
+                        (vec![Some("true".to_owned())], 1_u64),
+                        (vec![Some("false".to_owned())], 1_u64),
+                    ]),
+                ),
+            ]),
+            3,
+        )
+        .expect("groups synthesize");
 
         assert_eq!(final_groups.len(), 3);
         assert_eq!(
@@ -3769,28 +3737,115 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_single_group_counts_tolerates_temporarily_inconsistent_totals() {
-        let non_null = BTreeMap::from([(vec![Some("ios".to_owned())], 3_u64)]);
+    fn synthesize_group_counts_tolerates_temporarily_inconsistent_totals() {
+        let final_groups = synthesize_group_counts(
+            &["platform".to_owned()],
+            BTreeMap::from([(
+                vec!["platform".to_owned()],
+                BTreeMap::from([(vec![Some("ios".to_owned())], 3_u64)]),
+            )]),
+            2,
+        )
+        .expect("groups synthesize");
 
-        let final_groups =
-            synthesize_single_group_counts(non_null.clone(), 2).expect("groups synthesize");
-
-        assert_eq!(final_groups, non_null);
+        assert_eq!(
+            final_groups,
+            BTreeMap::from([(vec![Some("ios".to_owned())], 3_u64)])
+        );
     }
 
     #[test]
-    fn synthesize_two_group_counts_tolerates_temporarily_inconsistent_totals() {
-        let pair_groups = BTreeMap::from([(
-            vec![Some("ios".to_owned()), Some("1.0.0".to_owned())],
-            3_u64,
-        )]);
-        let first_groups = BTreeMap::from([(vec![Some("ios".to_owned())], 2_u64)]);
-        let second_groups = BTreeMap::from([(vec![Some("1.0.0".to_owned())], 2_u64)]);
+    fn synthesize_group_counts_fills_missing_null_dimensions_for_three_group_keys() {
+        let subset_counts = BTreeMap::from([
+            (
+                vec![
+                    "platform".to_owned(),
+                    "app_version".to_owned(),
+                    "locale".to_owned(),
+                ],
+                BTreeMap::from([(
+                    vec![
+                        Some("ios".to_owned()),
+                        Some("1.0.0".to_owned()),
+                        Some("en-US".to_owned()),
+                    ],
+                    1_u64,
+                )]),
+            ),
+            (
+                vec!["platform".to_owned(), "app_version".to_owned()],
+                BTreeMap::from([(
+                    vec![Some("ios".to_owned()), Some("1.0.0".to_owned())],
+                    2_u64,
+                )]),
+            ),
+            (
+                vec!["platform".to_owned(), "locale".to_owned()],
+                BTreeMap::from([(
+                    vec![Some("ios".to_owned()), Some("en-US".to_owned())],
+                    1_u64,
+                )]),
+            ),
+            (
+                vec!["app_version".to_owned(), "locale".to_owned()],
+                BTreeMap::from([(
+                    vec![Some("1.0.0".to_owned()), Some("en-US".to_owned())],
+                    2_u64,
+                )]),
+            ),
+            (
+                vec!["platform".to_owned()],
+                BTreeMap::from([(vec![Some("ios".to_owned())], 3_u64)]),
+            ),
+            (
+                vec!["app_version".to_owned()],
+                BTreeMap::from([(vec![Some("1.0.0".to_owned())], 3_u64)]),
+            ),
+            (
+                vec!["locale".to_owned()],
+                BTreeMap::from([(vec![Some("en-US".to_owned())], 2_u64)]),
+            ),
+        ]);
 
-        let final_groups =
-            synthesize_two_group_counts(pair_groups.clone(), first_groups, second_groups, 2)
-                .expect("groups synthesize");
+        let final_groups = synthesize_group_counts(
+            &[
+                "platform".to_owned(),
+                "app_version".to_owned(),
+                "locale".to_owned(),
+            ],
+            subset_counts,
+            3,
+        )
+        .expect("groups synthesize");
 
-        assert_eq!(final_groups, pair_groups);
+        assert_eq!(final_groups.len(), 4);
+        assert_eq!(
+            final_groups.get(&vec![
+                Some("ios".to_owned()),
+                Some("1.0.0".to_owned()),
+                Some("en-US".to_owned())
+            ]),
+            Some(&1)
+        );
+        assert_eq!(
+            final_groups.get(&vec![
+                Some("ios".to_owned()),
+                Some("1.0.0".to_owned()),
+                None
+            ]),
+            Some(&1)
+        );
+        assert_eq!(
+            final_groups.get(&vec![Some("ios".to_owned()), None, None]),
+            Some(&1)
+        );
+        assert_eq!(
+            final_groups.get(&vec![
+                None,
+                Some("1.0.0".to_owned()),
+                Some("en-US".to_owned())
+            ]),
+            Some(&1)
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::{Context, bail};
 use chrono::{SecondsFormat, Utc};
@@ -829,6 +829,12 @@ impl App {
                 end: &sessions.end,
                 event: None,
                 filters: &sessions.filters,
+                group_by: &sessions.group_by,
+                max_referenced_dimensions: if sessions.metric == SessionMetricArg::ActiveInstalls {
+                    2
+                } else {
+                    4
+                },
             })
             .await?;
         render_metrics_output(body, sessions.output.json)
@@ -846,6 +852,8 @@ impl App {
                 end: &events.end,
                 event: events.event,
                 filters: &events.filters,
+                group_by: &events.group_by,
+                max_referenced_dimensions: 4,
             })
             .await?;
         render_metrics_output(body, events.output.json)
@@ -903,6 +911,23 @@ impl App {
                 "read key is not configured for the active project; run `fantasma keys create --kind read --name <key-name>`",
             )?;
         let parsed_filters = parse_filters(request.filters)?;
+        let parsed_group_by = parse_group_by(request.group_by)?;
+        for group_key in &parsed_group_by {
+            if parsed_filters
+                .iter()
+                .any(|(filter_key, _)| filter_key == group_key)
+            {
+                bail!(
+                    "duplicate dimension '{group_key}' cannot be used in both --filter and --group-by"
+                );
+            }
+        }
+        if parsed_filters.len() + parsed_group_by.len() > request.max_referenced_dimensions {
+            bail!(
+                "too many referenced dimensions; this metric supports at most {} across --filter and --group-by",
+                request.max_referenced_dimensions
+            );
+        }
         let mut url = api_url(&profile.api_base_url, request.path).context("build metrics url")?;
         {
             let mut query = url.query_pairs_mut();
@@ -920,6 +945,9 @@ impl App {
             }
             for (key, value) in &parsed_filters {
                 query.append_pair(key, value);
+            }
+            for key in &parsed_group_by {
+                query.append_pair("group_by", key);
             }
         }
         let response = self
@@ -1014,6 +1042,8 @@ struct MetricsRequest<'a> {
     end: &'a str,
     event: Option<String>,
     filters: &'a [String],
+    group_by: &'a [String],
+    max_referenced_dimensions: usize,
 }
 
 fn active_instance_name(config: &CliConfig) -> anyhow::Result<&str> {
@@ -1424,6 +1454,28 @@ fn parse_filters(filters: &[String]) -> anyhow::Result<Vec<(String, String)>> {
         .collect::<anyhow::Result<Vec<_>>>()?
         .into_iter()
         .collect())
+}
+
+fn parse_group_by(group_by: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+
+    group_by
+        .iter()
+        .map(|key| {
+            if !matches!(
+                key.as_str(),
+                "platform" | "app_version" | "os_version" | "locale"
+            ) {
+                bail!(
+                    "invalid group-by key '{key}', supported keys are platform, app_version, os_version, locale"
+                );
+            }
+            if !seen.insert(key.clone()) {
+                bail!("duplicate group-by key '{key}'");
+            }
+            Ok(key.clone())
+        })
+        .collect()
 }
 
 fn parse_key_value_pairs(

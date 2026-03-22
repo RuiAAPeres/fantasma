@@ -94,6 +94,7 @@ pub struct EventMetricsQuery {
     pub event: String,
     pub window: MetricsBucketWindow,
     pub filters: BTreeMap<String, String>,
+    pub group_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -103,6 +104,7 @@ pub struct SessionMetricsQuery {
     pub window: MetricsBucketWindow,
     pub interval: Option<MetricInterval>,
     pub filters: BTreeMap<String, String>,
+    pub group_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -121,6 +123,7 @@ pub struct MetricsSeries {
 pub struct MetricsResponse {
     pub metric: String,
     pub granularity: MetricGranularity,
+    pub group_by: Vec<String>,
     pub series: Vec<MetricsSeries>,
 }
 
@@ -165,6 +168,7 @@ pub struct ActiveInstallsResponse {
     pub end: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interval: Option<MetricInterval>,
+    pub group_by: Vec<String>,
     pub series: Vec<ActiveInstallsSeries>,
 }
 
@@ -216,6 +220,7 @@ mod tests {
         let response = MetricsResponse {
             metric: "count".to_owned(),
             granularity: MetricGranularity::Day,
+            group_by: Vec::new(),
             series: vec![MetricsSeries {
                 dimensions: BTreeMap::new(),
                 points: vec![MetricsPoint {
@@ -232,6 +237,7 @@ mod tests {
             serde_json::json!({
                 "metric": "count",
                 "granularity": "day",
+                "group_by": [],
                 "series": [
                     {
                         "dimensions": {},
@@ -249,6 +255,7 @@ mod tests {
         let response = MetricsResponse {
             metric: "count".to_owned(),
             granularity: MetricGranularity::Hour,
+            group_by: vec!["platform".to_owned()],
             series: vec![MetricsSeries {
                 dimensions: BTreeMap::from([("platform".to_owned(), Some("ios".to_owned()))]),
                 points: vec![MetricsPoint {
@@ -265,6 +272,7 @@ mod tests {
             serde_json::json!({
                 "metric": "count",
                 "granularity": "hour",
+                "group_by": ["platform"],
                 "series": [
                     {
                         "dimensions": {
@@ -284,6 +292,7 @@ mod tests {
         let response = MetricsResponse {
             metric: "active_installs".to_owned(),
             granularity: MetricGranularity::Week,
+            group_by: Vec::new(),
             series: vec![MetricsSeries {
                 dimensions: BTreeMap::new(),
                 points: vec![MetricsPoint {
@@ -300,6 +309,7 @@ mod tests {
             serde_json::json!({
                 "metric": "active_installs",
                 "granularity": "week",
+                "group_by": [],
                 "series": [
                     {
                         "dimensions": {},
@@ -319,6 +329,7 @@ mod tests {
             start: "2026-03-01".to_owned(),
             end: "2026-03-17".to_owned(),
             interval: Some(MetricInterval::Week),
+            group_by: vec!["platform".to_owned()],
             series: vec![ActiveInstallsSeries {
                 dimensions: BTreeMap::from([("platform".to_owned(), Some("ios".to_owned()))]),
                 points: vec![ActiveInstallsPoint {
@@ -338,6 +349,7 @@ mod tests {
                 "start": "2026-03-01",
                 "end": "2026-03-17",
                 "interval": "week",
+                "group_by": ["platform"],
                 "series": [
                     {
                         "dimensions": {
