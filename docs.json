@@ -2,8 +2,20 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
   "name": "Fantasma",
+  "description": "Privacy-first mobile analytics SDK docs for Fantasma.",
+  "logo": {
+    "light": "/images/fantasma-icon.svg",
+    "dark": "/images/fantasma-icon.svg",
+    "href": "https://usefantasma.com"
+  },
+  "favicon": {
+    "light": "/images/fantasma-icon.svg",
+    "dark": "/images/fantasma-icon.svg"
+  },
   "colors": {
-    "primary": "#111827"
+    "primary": "#fa8072",
+    "light": "#ff9b90",
+    "dark": "#e77466"
   },
   "navigation": {
     "tabs": [
