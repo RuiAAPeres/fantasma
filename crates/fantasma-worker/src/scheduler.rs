@@ -4,7 +4,7 @@ use std::{
 };
 
 use fantasma_store::{PgPool, StoreError, load_raw_event_tail_id, load_worker_offset};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::worker::{
     EVENT_METRICS_WORKER_NAME, SESSION_WORKER_NAME, SessionBatchConfig,
@@ -142,7 +142,7 @@ where
         match tick().await {
             Ok(result) if !result.made_progress => {
                 stats.idle_ticks += 1;
-                info!(
+                debug!(
                     lane,
                     tick_state = "idle",
                     batch_elapsed_ms = tick_started.elapsed().as_millis() as u64,
@@ -273,8 +273,40 @@ mod tests {
     };
 
     use fantasma_store::StoreError;
+    use tracing::dispatcher::Dispatch;
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
 
     use super::{LaneRunStats, LaneTickResult, WorkerConfig, drive_lane_until};
+
+    #[derive(Clone, Default)]
+    struct InfoEventCounter {
+        count: Arc<AtomicUsize>,
+    }
+
+    impl InfoEventCounter {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn load(&self) -> usize {
+            self.count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl<S> Layer<S> for InfoEventCounter
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::INFO {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
 
     #[test]
     fn worker_config_defaults_match_repo_defaults() {
@@ -417,6 +449,44 @@ mod tests {
         assert_eq!(
             sleeps.lock().expect("lock sleeps").as_slice(),
             &[Duration::from_millis(250)]
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_ticks_do_not_emit_info_logs() {
+        let counter = InfoEventCounter::new();
+        let subscriber = tracing_subscriber::registry().with(counter.clone());
+        let dispatch = Dispatch::new(subscriber);
+
+        let stats = {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            drive_lane_until(
+                "sessions",
+                Duration::from_millis(250),
+                || async {
+                    Ok::<_, StoreError>(LaneTickResult {
+                        processed_events: 0,
+                        backlog_events: 0,
+                        made_progress: false,
+                    })
+                },
+                |_duration| async {},
+                || true,
+            )
+            .await
+        }
+        .expect("drive lane");
+
+        assert_eq!(
+            stats,
+            LaneRunStats {
+                busy_ticks: 0,
+                idle_ticks: 1,
+            }
+        );
+        assert!(
+            counter.load() == 0,
+            "idle ticks should not emit info-level logs"
         );
     }
 
