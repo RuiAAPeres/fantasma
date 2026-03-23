@@ -1,9 +1,9 @@
 ---
-title: "useFantasma"
+title: "Intro"
 description: "Hosted Fantasma setup and managed endpoint guidance."
 ---
 
-# useFantasma
+# Intro
 
 [useFantasma](https://usefantasma.com) is the hosted Fantasma product. It gives
 you the Fantasma API and dashboard without running the stack yourself. You can
@@ -11,6 +11,46 @@ see it in the [live demo](https://usefantasma.com/demo).
 
 ## How To Use It
 
-- create and manage projects at `https://usefantasma.com`
-- point SDK traffic at `https://api.usefantasma.com`
-- use the project-scoped ingest key from the hosted dashboard
+When setting up your SDK, use the hosted API base URL and the project-scoped
+ingest key:
+
+<CodeGroup>
+
+```swift Swift
+import Foundation
+import FantasmaSDK
+
+let serverURL = URL(string: "https://api.usefantasma.com")!
+
+try await Fantasma.configure(
+    serverURL: serverURL,
+    writeKey: "<your-usefantasma-ingest-key>"
+)
+```
+
+```kotlin Android
+import com.fantasma.sdk.FantasmaClient
+import com.fantasma.sdk.FantasmaConfig
+
+val client = FantasmaClient(
+    context = applicationContext,
+    config = FantasmaConfig(
+        serverUrl = "https://api.usefantasma.com",
+        writeKey = "<your-usefantasma-ingest-key>",
+    ),
+)
+```
+
+```dart Flutter
+import 'package:fantasma_flutter/fantasma_flutter.dart';
+
+final client = FantasmaClient(
+  FantasmaConfig(
+    serverUrl: 'https://api.usefantasma.com',
+    writeKey: '<your-usefantasma-ingest-key>',
+    storageNamespace: 'primary',
+  ),
+);
+```
+
+</CodeGroup>
