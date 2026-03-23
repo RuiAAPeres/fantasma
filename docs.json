@@ -24,7 +24,7 @@
         "groups": [
           {
             "group": "Overview",
-            "pages": ["mintlify/index"]
+            "pages": ["mintlify/index", "mintlify/usefantasma"]
           },
           {
             "group": "SDKs",
