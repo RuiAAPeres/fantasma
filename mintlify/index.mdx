@@ -1,0 +1,28 @@
+---
+title: "Fantasma SDK Docs"
+description: "Privacy-first mobile analytics SDKs for iOS, Android, and Flutter."
+---
+
+# Fantasma SDK Docs
+
+Fantasma is a self-hosted, privacy-first mobile analytics platform with a small,
+legible product surface. These docs cover the shipped client SDKs for iOS,
+Android, and Flutter.
+
+The SDKs share the same core ingest model:
+
+- events are queued durably before upload
+- uploads target `POST /v1/events`
+- write keys must be project-scoped `ingest` keys
+- runtime metadata such as platform and locale is added automatically
+
+Choose your platform:
+
+- [Shared SDK behavior](./sdk-behavior)
+- [iOS SDK](./ios-sdk)
+- [Android SDK](./android-sdk)
+- [Flutter SDK](./flutter-sdk)
+
+Fantasma keeps the public product surface narrow on purpose. This docs site is
+SDK-first for now; operator, deployment, and API reference docs remain in the
+repository until a later phase.

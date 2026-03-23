@@ -1,0 +1,8 @@
+# Keep Mintlify focused on the public docs pages for this launch.
+AGENTS.md
+README.md
+apps/
+artifacts/
+docs/
+schemas/
+sdks/

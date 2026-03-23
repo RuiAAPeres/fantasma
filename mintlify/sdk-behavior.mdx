@@ -1,0 +1,55 @@
+---
+title: "SDK Behavior"
+description: "Shared ingest and runtime behavior across Fantasma mobile SDKs."
+---
+
+# Shared SDK Behavior
+
+Fantasma's iOS, Android, and Flutter SDKs share one ingest contract and one
+core runtime model. The platform pages cover install and API shape; this page
+covers the behavior they have in common.
+
+## Common Ingest Model
+
+- Events are queued durably before upload rather than sent inline.
+- Uploads target `POST /v1/events`.
+- Client apps must use project-scoped `ingest` write keys.
+- SDKs upload in JSON batches and treat `202 Accepted` as the success case.
+- Malformed successful responses are treated as invalid and leave queued rows in place.
+
+## Upload Triggers
+
+All shipped SDKs attempt uploads:
+
+- every 30 seconds
+- when the queue reaches 100 events
+- when `flush()` is called
+
+Lifecycle-driven flush attempts are platform-specific in implementation, but the
+intent is the same: opportunistic background delivery rather than a delivery
+guarantee.
+
+## Queue And Identity Semantics
+
+- Accepted events are deleted from the durable queue.
+- Failed or retryable uploads keep rows in the queue for later replay.
+- `clear()` rotates the future install identity without rewriting already queued rows.
+- Each SDK auto-populates built-in metadata such as timestamp, install id, platform, app version, OS version, and locale.
+
+## Blocked And Retryable Destinations
+
+The shared destination model is:
+
+- `401`, `422`, and `409 project_pending_deletion` block the current destination
+- transport failures, `500`, and unrelated `409` responses remain retryable
+
+Once a destination is blocked, the SDK requires a different destination
+configuration before it resumes sending events there.
+
+## Platform-Specific Notes
+
+See each platform page for the details that differ by client:
+
+- [iOS SDK](./ios-sdk)
+- [Android SDK](./android-sdk)
+- [Flutter SDK](./flutter-sdk)

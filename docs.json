@@ -1,0 +1,30 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Fantasma",
+  "colors": {
+    "primary": "#111827"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Docs",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": ["mintlify/index"]
+          },
+          {
+            "group": "SDKs",
+            "pages": [
+              "mintlify/sdk-behavior",
+              "mintlify/ios-sdk",
+              "mintlify/android-sdk",
+              "mintlify/flutter-sdk"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

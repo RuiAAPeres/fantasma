@@ -1,0 +1,67 @@
+---
+title: "Flutter SDK"
+description: "Install and use the Fantasma Flutter SDK."
+---
+
+# Fantasma Flutter SDK
+
+The Flutter SDK lives under `sdks/flutter/fantasma_flutter`.
+
+Shared ingest and queue behavior lives on the [SDK behavior](./sdk-behavior)
+page.
+
+## Public API
+
+- `FantasmaConfig(serverUrl, writeKey, storageNamespace, {localeProvider})`
+- `FantasmaClient(config)`
+- `track(eventName)`
+- `flush()`
+- `clear()`
+- `close()`
+
+## Usage
+
+```dart
+import 'dart:ui';
+
+import 'package:fantasma_flutter/fantasma_flutter.dart';
+import 'package:flutter/widgets.dart';
+
+final client = FantasmaClient(
+  FantasmaConfig(
+    serverUrl: 'http://10.0.2.2:8081',
+    writeKey: '<ingest-key-from-provision-project>',
+    storageNamespace: 'primary',
+    localeProvider: () => WidgetsBinding.instance.platformDispatcher.locale,
+  ),
+);
+
+await client.track('app_open');
+await client.flush();
+await client.clear();
+await client.close();
+```
+
+## Install
+
+The package name is:
+
+```text
+fantasma_flutter
+```
+
+The current package constraints are:
+
+- Dart `>=3.4.0 <4.0.0`
+- Flutter `>=3.22.0`
+
+The package is currently source-first in this repository rather than published
+to `pub.dev`.
+
+## Flutter-Specific Notes
+
+- `storageNamespace` is required and defines the client-local persistence boundary for the queue, install identity, and blocked-destination state.
+- Only one live `FantasmaClient` may use a given `storageNamespace` inside a process at a time. Reusing a namespace concurrently is rejected.
+- `localeProvider` is resolved when `track()` enqueues the event; queued rows keep that snapshot even if the app locale changes later.
+- In addition to the shared upload triggers, the SDK also attempts best-effort flushes when the app pauses or backgrounds.
+- Lifecycle-triggered and threshold-triggered flushes are best-effort background work and do not make `track()` surface upload failures.
