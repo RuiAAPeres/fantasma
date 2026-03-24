@@ -1,0 +1,57 @@
+---
+title: "React Native SDK"
+description: "Install and use the Fantasma React Native SDK."
+---
+
+# Fantasma React Native SDK
+
+The React Native SDK lives under `sdks/react-native/fantasma-react-native`.
+
+Shared ingest and queue behavior lives on the [SDK behavior](/mintlify/sdk-behavior)
+page.
+
+## Public API
+
+- `new FantasmaClient({ serverUrl, writeKey })`
+- `track(eventName)`
+- `flush()`
+- `clear()`
+- `close()`
+
+## Usage
+
+```ts
+import { FantasmaClient } from "fantasma-react-native";
+
+const client = new FantasmaClient({
+  serverUrl: "https://api.usefantasma.com",
+  writeKey: "<ingest-key-from-provision-project>",
+});
+
+await client.track("app_open");
+await client.flush();
+await client.clear();
+await client.close();
+```
+
+## Install
+
+The package name is:
+
+```text
+fantasma-react-native
+```
+
+Current packaging shape:
+
+- bare React Native support through native module files under `ios/` and `android/`
+- Expo-managed support through prebuild/dev-client only
+- no Expo Go support in v1
+
+## React Native-Specific Notes
+
+- The JS layer allows one live `FantasmaClient` per process at a time.
+- Config validation happens synchronously at construction time, while native configure/acquire happens on first use.
+- If first native acquire fails, that JS instance auto-closes and frees the slot immediately.
+- Destination switching remains supported by closing the current client and creating a new one with a different destination.
+- The native iOS and Android SDKs still own queue durability, built-in metadata, blocked-destination handling, and identity rotation.

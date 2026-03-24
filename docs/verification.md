@@ -55,6 +55,32 @@ Commands:
 - `cargo test -p fantasma-cli --test http_flows --quiet`
 - `./scripts/cli-smoke.sh`
 
+### `react-native-sdk`
+
+Use for:
+- `sdks/react-native/**`
+- React Native bridge changes in the iOS or Android SDK layers
+- React Native docs, package scripts, or verification wiring
+
+Notes:
+- `bridge:ios:check` requires macOS with Xcode command-line tools available.
+- Android commands assume `ANDROID_HOME` or `ANDROID_SDK_ROOT` is set.
+
+Commands:
+- `pnpm install`
+- `pnpm --dir sdks/react-native/fantasma-react-native typecheck`
+- `pnpm --dir sdks/react-native/fantasma-react-native test`
+- `pnpm --dir sdks/react-native/fantasma-react-native lint`
+- `pnpm --dir sdks/react-native/fantasma-react-native build`
+- `pnpm --dir sdks/react-native/fantasma-react-native bridge:ios:check`
+- `ANDROID_HOME="${ANDROID_HOME:?set ANDROID_HOME}" ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}" pnpm --dir sdks/react-native/fantasma-react-native bridge:android:check`
+- `swift test --package-path . --filter FantasmaReactNativeBridgeTests`
+- `swift test --package-path . --filter FantasmaSDKTests`
+- `swift test --package-path . -Xswiftc -strict-concurrency=complete`
+- `cd sdks/android && ANDROID_HOME="${ANDROID_HOME:?set ANDROID_HOME}" ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}" ./gradlew :fantasma-sdk:testDebugUnitTest --tests 'com.fantasma.sdk.reactnative.FantasmaReactNativeBridgeTest'`
+- `cd sdks/android && ANDROID_HOME="${ANDROID_HOME:?set ANDROID_HOME}" ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}" ./gradlew :fantasma-sdk:testDebugUnitTest`
+- `cd sdks/android && ANDROID_HOME="${ANDROID_HOME:?set ANDROID_HOME}" ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}" ./gradlew :fantasma-sdk:lintDebug :fantasma-sdk:assembleDebugAndroidTest :demo:assembleDebug ktlintCheck detekt`
+
 ### `rust-ci`
 
 Use for:

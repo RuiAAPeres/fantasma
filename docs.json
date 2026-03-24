@@ -32,7 +32,8 @@
               "mintlify/sdk-behavior",
               "mintlify/ios-sdk",
               "mintlify/android-sdk",
-              "mintlify/flutter-sdk"
+              "mintlify/flutter-sdk",
+              "mintlify/react-native-sdk"
             ]
           }
         ]

@@ -1018,6 +1018,47 @@ struct FantasmaSDKBehaviorTests {
     }
 }
 
+@Suite("Fantasma React Native Bridge Tests", .serialized)
+struct FantasmaReactNativeBridgeTests {
+    @Test("close during in-flight work keeps the core alive for a replacement destination")
+    func closeDuringInFlightWorkHandsOffToReplacement() async throws {
+        let firstCore = TestBridgeCore()
+        let secondCore = TestBridgeCore()
+        let factory = TestBridgeCoreFactory(first: firstCore, second: secondCore)
+        let bridge = FantasmaReactNativeBridge(
+            makeCore: { await factory.nextCore() }
+        )
+
+        try await bridge.open(serverURL: localhostURL(), writeKey: "fg_ing_primary")
+        let inFlightTrack = Task<Void, Error> {
+            try await bridge.track("app_open")
+        }
+
+        await firstCore.waitUntilTrackStarts()
+        await bridge.close()
+        try await bridge.open(serverURL: localhostURL(), writeKey: "fg_ing_replacement")
+        await firstCore.releaseTrack()
+        try await inFlightTrack.value
+
+        #expect(await firstCore.configurations == ["fg_ing_primary", "fg_ing_replacement"])
+        #expect(await firstCore.shutdownCallCount == 0)
+        #expect(await secondCore.configurations.isEmpty)
+    }
+
+    @Test("close without a replacement shuts the active core down")
+    func closeWithoutReplacementShutsDown() async throws {
+        let core = TestBridgeCore()
+        let bridge = FantasmaReactNativeBridge(
+            makeCore: { core }
+        )
+
+        try await bridge.open(serverURL: localhostURL(), writeKey: "fg_ing_primary")
+        await bridge.close()
+
+        #expect(await core.shutdownCallCount == 1)
+    }
+}
+
 private struct EventBatch: Decodable {
     let events: [EventEnvelope]
 }
@@ -1301,6 +1342,71 @@ private struct TestHarness {
             eventQueue: queue,
             uploader: uploader
         )
+    }
+}
+
+private actor TestBridgeCore: FantasmaReactNativeBridgeCore {
+    private var trackStartedContinuations: [CheckedContinuation<Void, Never>] = []
+    private var releaseTrackContinuations: [CheckedContinuation<Void, Never>] = []
+    private(set) var configurations: [String] = []
+    private(set) var shutdownCallCount = 0
+
+    func configure(configuration: FantasmaConfiguration) async throws {
+        configurations.append(configuration.writeKey)
+    }
+
+    func track(_ eventName: String) async throws {
+        let continuations = trackStartedContinuations
+        trackStartedContinuations.removeAll(keepingCapacity: false)
+        for continuation in continuations {
+            continuation.resume()
+        }
+
+        await withCheckedContinuation { continuation in
+            releaseTrackContinuations.append(continuation)
+        }
+    }
+
+    func flush() async throws {}
+
+    func clear() async {}
+
+    func shutdown() async {
+        shutdownCallCount += 1
+    }
+
+    func waitUntilTrackStarts() async {
+        await withCheckedContinuation { continuation in
+            trackStartedContinuations.append(continuation)
+        }
+    }
+
+    func releaseTrack() {
+        let continuations = releaseTrackContinuations
+        releaseTrackContinuations.removeAll(keepingCapacity: false)
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+}
+
+private actor TestBridgeCoreFactory {
+    private let first: TestBridgeCore
+    private let second: TestBridgeCore
+    private var hasServedFirst = false
+
+    init(first: TestBridgeCore, second: TestBridgeCore) {
+        self.first = first
+        self.second = second
+    }
+
+    func nextCore() -> FantasmaReactNativeBridgeCore {
+        if hasServedFirst {
+            return second
+        }
+
+        hasServedFirst = true
+        return first
     }
 }
 

@@ -325,6 +325,11 @@ Current first-party SDK shapes:
 - iOS exposes a static `Fantasma` facade backed by one shared client
 - Android exposes an instance-based `FantasmaClient(context, FantasmaConfig(...))`
 - Flutter exposes an instance-based `FantasmaClient(FantasmaConfig(..., storageNamespace: ...))`
+- React Native exposes an explicit `FantasmaClient({ serverUrl, writeKey })`
+  JS API with one live client per process; the JS layer validates config and
+  reserves that slot eagerly, performs native configure/acquire on first use,
+  auto-closes the JS client if first native acquire fails, and then delegates
+  durability and upload behavior to the native iOS/Android bridge layer
 - this API divergence is intentional and platform-native; parity is at the wire
   contract and runtime behavior, not method-for-method API duplication
 - Android still preserves one active destination at a time per process: creating
@@ -336,6 +341,11 @@ Current first-party SDK shapes:
   the current runtime supports only one live client per namespace inside a
   process so queue state, blocked-destination state, and install identity stay
   client-local instead of being implicitly shared
+- React Native intentionally follows the existing native iOS/Android storage and
+  identity models rather than introducing Flutter-style namespaces; it preserves
+  destination switching through a thin native bridge handoff that closes the old
+  JS client, keeps the old native destination alive only as long as needed for
+  a safe handoff, and then lets future uploads move to the new destination
 
 Shared SDK behavior:
 
@@ -346,6 +356,8 @@ Shared SDK behavior:
 - snapshot `locale` at enqueue time rather than re-resolving it during upload
 - block uploads for destinations that return `401`, `422`, or `409 project_pending_deletion` until the client switches to a different normalized destination or storage namespace
 - SDKs that support destination replacement should finish the current upload boundary for the old destination, discard still-queued rows from that old destination even across relaunches, and only then let future uploads target the new destination
+- React Native preserves that replacement contract even though its JS surface
+  allows only one live client per process at a time
 
 Current upload triggers:
 

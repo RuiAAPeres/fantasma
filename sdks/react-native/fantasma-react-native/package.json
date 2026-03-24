@@ -1,0 +1,41 @@
+{
+  "name": "fantasma-react-native",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "react-native": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "react-native.config.js",
+    "fantasma-react-native.podspec",
+    "ios",
+    "android",
+    "expo-plugin",
+    "README.md"
+  ],
+  "scripts": {
+    "sync:native": "node ./scripts/sync-native-sources.mjs",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "bridge:ios:check": "node ./scripts/check-ios-bridge.mjs",
+    "bridge:android:check": "node ./scripts/check-android-bridge.mjs",
+    "prepack": "pnpm sync:native && pnpm build"
+  },
+  "peerDependencies": {
+    "react-native": ">=0.74.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

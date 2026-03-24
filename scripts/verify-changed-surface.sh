@@ -12,6 +12,7 @@ profiles:
   api-contract
   worker-contract
   cli-operator
+  react-native-sdk
   rust-ci
   script-only
 EOF
@@ -46,6 +47,23 @@ cargo test -p fantasma-cli --test http_flows --quiet
 ./scripts/cli-smoke.sh
 EOF
       ;;
+    react-native-sdk)
+      cat <<'EOF'
+pnpm install
+pnpm --dir sdks/react-native/fantasma-react-native typecheck
+pnpm --dir sdks/react-native/fantasma-react-native test
+pnpm --dir sdks/react-native/fantasma-react-native lint
+pnpm --dir sdks/react-native/fantasma-react-native build
+pnpm --dir sdks/react-native/fantasma-react-native bridge:ios:check
+ANDROID_HOME="${ANDROID_HOME:?set ANDROID_HOME}" ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}" pnpm --dir sdks/react-native/fantasma-react-native bridge:android:check
+swift test --package-path . --filter FantasmaReactNativeBridgeTests
+swift test --package-path . --filter FantasmaSDKTests
+swift test --package-path . -Xswiftc -strict-concurrency=complete
+cd sdks/android && ANDROID_HOME="${ANDROID_HOME:?set ANDROID_HOME}" ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}" ./gradlew :fantasma-sdk:testDebugUnitTest --tests 'com.fantasma.sdk.reactnative.FantasmaReactNativeBridgeTest'
+cd sdks/android && ANDROID_HOME="${ANDROID_HOME:?set ANDROID_HOME}" ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}" ./gradlew :fantasma-sdk:testDebugUnitTest
+cd sdks/android && ANDROID_HOME="${ANDROID_HOME:?set ANDROID_HOME}" ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}" ./gradlew :fantasma-sdk:lintDebug :fantasma-sdk:assembleDebugAndroidTest :demo:assembleDebug ktlintCheck detekt
+EOF
+      ;;
     rust-ci)
       cat <<'EOF'
 cargo fmt --all --check
@@ -71,6 +89,7 @@ list_profiles() {
 api-contract
 worker-contract
 cli-operator
+react-native-sdk
 rust-ci
 script-only
 EOF

@@ -1,0 +1,8 @@
+{
+  "name": "fantasma-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.6.5",
+  "workspaces": [
+    "sdks/react-native/fantasma-react-native"
+  ]
+}

@@ -127,8 +127,81 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.5
+
+      - name: Install workspace packages
+        run: pnpm install
+
+      - name: Build React Native package
+        run: pnpm --dir sdks/react-native/fantasma-react-native build
+
+      - name: Compile iOS React Native bridge host
+        run: pnpm --dir sdks/react-native/fantasma-react-native bridge:ios:check
+
       - name: Run Swift SDK tests with complete concurrency checking
         run: swift test -Xswiftc -strict-concurrency=complete
+
+  react-native-sdk:
+    name: React Native SDK Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.5
+
+      - name: Install workspace packages
+        run: pnpm install
+
+      - name: Typecheck React Native package
+        run: pnpm --dir sdks/react-native/fantasma-react-native typecheck
+
+      - name: Test React Native package
+        run: pnpm --dir sdks/react-native/fantasma-react-native test
+
+      - name: Lint React Native package
+        run: pnpm --dir sdks/react-native/fantasma-react-native lint
+
+      - name: Build React Native package
+        run: pnpm --dir sdks/react-native/fantasma-react-native build
+
+      - name: Compile Android React Native bridge host
+        run: pnpm --dir sdks/react-native/fantasma-react-native bridge:android:check
+
+      - name: Run Android React Native bridge regression tests
+        run: cd sdks/android && ./gradlew :fantasma-sdk:testDebugUnitTest --tests 'com.fantasma.sdk.reactnative.FantasmaReactNativeBridgeTest'
+
+      - name: Run Android SDK unit tests
+        run: cd sdks/android && ./gradlew :fantasma-sdk:testDebugUnitTest
+
+      - name: Run Android SDK lint and build checks
+        run: cd sdks/android && ./gradlew :fantasma-sdk:lintDebug :fantasma-sdk:assembleDebugAndroidTest :demo:assembleDebug ktlintCheck detekt
 
   deployment:
     name: Deployment Checks
