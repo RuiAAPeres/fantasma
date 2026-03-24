@@ -1,3 +1,4 @@
+import CSQLite
 import Foundation
 #if canImport(Testing)
 import Testing
@@ -51,6 +52,27 @@ struct FantasmaSDKInternalTests {
 
         #expect(dependencies.timerInterval == .seconds(30))
         #expect(dependencies.uploadBatchSize == 100)
+    }
+
+    @Test("queue init waits for a transient database lock instead of failing")
+    func queueInitWaitsForTransientDatabaseLock() async throws {
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        let lock = try SQLiteTestLock(databaseURL: harness.databaseURL)
+        try lock.beginExclusiveTransaction()
+        defer { lock.close() }
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+            try? lock.commit()
+        }
+
+        let startedAt = Date()
+        let queue = try harness.makeQueue()
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        _ = queue
+        #expect(elapsed >= 0.04)
     }
 }
 
@@ -1342,6 +1364,48 @@ private struct TestHarness {
             eventQueue: queue,
             uploader: uploader
         )
+    }
+}
+
+private final class SQLiteTestLock: @unchecked Sendable {
+    private let pointer: OpaquePointer?
+
+    init(databaseURL: URL) throws {
+        try FileManager.default.createDirectory(
+            at: databaseURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        var database: OpaquePointer?
+        let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+        if sqlite3_open_v2(databaseURL.path, &database, flags, nil) != SQLITE_OK {
+            let message = database.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown sqlite error"
+            sqlite3_close(database)
+            throw FantasmaError.storageFailure(message)
+        }
+
+        pointer = database
+    }
+
+    func beginExclusiveTransaction() throws {
+        try execute("BEGIN EXCLUSIVE TRANSACTION;")
+    }
+
+    func commit() throws {
+        try execute("COMMIT;")
+    }
+
+    func close() {
+        sqlite3_close(pointer)
+    }
+
+    private func execute(_ sql: String) throws {
+        var errorMessage: UnsafeMutablePointer<Int8>?
+        if sqlite3_exec(pointer, sql, nil, nil, &errorMessage) != SQLITE_OK {
+            let message = errorMessage.map { String(cString: $0) } ?? "unknown sqlite error"
+            sqlite3_free(errorMessage)
+            throw FantasmaError.storageFailure(message)
+        }
     }
 }
 

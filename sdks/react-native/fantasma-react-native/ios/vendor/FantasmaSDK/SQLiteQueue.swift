@@ -2,6 +2,8 @@ import SQLite3
 import Foundation
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+// A brief busy timeout lets transient second-connection checks wait out in-flight writes.
+private let sqliteBusyTimeoutMilliseconds: Int32 = 1_000
 
 private final class SQLiteDatabaseHandle {
     let pointer: OpaquePointer?
@@ -48,6 +50,7 @@ internal actor SQLiteEventQueue {
         }
 
         self.database = SQLiteDatabaseHandle(pointer: database)
+        sqlite3_busy_timeout(self.database.pointer, sqliteBusyTimeoutMilliseconds)
 
         var errorMessage: UnsafeMutablePointer<Int8>?
         if sqlite3_exec(
