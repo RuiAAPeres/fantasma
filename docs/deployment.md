@@ -384,7 +384,9 @@ Use the ingest key only with `POST /v1/events`. Use the read key only with
 `GET /v1/metrics/events/catalog`, and `GET /v1/metrics/events/top`. Keep the
 script for automation; prefer the CLI for manual operator work. `POST /v1/events`
 accepts at most 200 events per request and still enforces the ingest payload
-size limit separately.
+size limit separately. Read-key metrics routes return `409` with
+`project_busy` or `project_pending_deletion` while a project is being range
+deleted or fully deleted.
 
 ## Smoke Verification
 
@@ -540,7 +542,8 @@ cargo run -p fantasma-cli -- metrics events-top \
 ```bash
 cargo run -p fantasma-cli -- metrics events-catalog \
   --start 2026-01-01 \
-  --end 2026-01-02
+  --end 2026-01-02 \
+  --limit 10
 ```
 
 ```bash

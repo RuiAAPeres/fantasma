@@ -882,7 +882,7 @@ impl App {
                 &catalog.start,
                 &catalog.end,
                 &catalog.filters,
-                &[],
+                &[("limit", catalog.limit.to_string())],
             )
             .await?;
         render_event_catalog_output(body, catalog.output.json)

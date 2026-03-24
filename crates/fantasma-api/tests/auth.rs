@@ -154,6 +154,15 @@ async fn insert_usage_event(
     .expect("insert usage event");
 }
 
+async fn set_project_state(pool: &PgPool, project_id: &str, state: &str) {
+    sqlx::query("UPDATE projects SET state = $2 WHERE id = $1::uuid")
+        .bind(project_id)
+        .bind(state)
+        .execute(pool)
+        .await
+        .expect("update project state");
+}
+
 #[sqlx::test]
 async fn management_routes_require_operator_bearer_auth(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
@@ -1539,4 +1548,56 @@ async fn event_discovery_routes_require_read_keys(pool: PgPool) {
         .await
         .expect("response succeeds");
     assert_eq!(invalid_limit.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test]
+async fn read_key_metrics_routes_return_409_for_non_active_projects(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let (project_id, _, read_key) = provision_project(api.clone()).await;
+
+    let routes = [
+        "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-02",
+        "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-02",
+        "/v1/metrics/live_installs",
+        "/v1/metrics/events/catalog?start=2026-01-01&end=2026-01-02",
+        "/v1/metrics/events/top?start=2026-01-01&end=2026-01-02",
+    ];
+
+    for (state, expected_error) in [
+        ("range_deleting", "project_busy"),
+        ("pending_deletion", "project_pending_deletion"),
+    ] {
+        set_project_state(&pool, &project_id, state).await;
+
+        for path in routes {
+            let response = api
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("x-fantasma-key", &read_key)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response succeeds");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "{path} for {state}"
+            );
+            assert_eq!(
+                response_json(response).await,
+                serde_json::json!({ "error": expected_error }),
+                "{path} for {state}"
+            );
+        }
+
+        set_project_state(&pool, &project_id, "active").await;
+    }
 }

@@ -592,6 +592,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Project is range-deleting or pending deletion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '422':
           description: |
             Invalid query. Error envelope is `{ "error": "..." }` with one of:
@@ -603,6 +609,7 @@ paths:
             - `invalid_query_key`
             - `duplicate_query_key`
             - `too_many_dimensions`
+            - `group_limit_exceeded`
           content:
             application/json:
               schema:
@@ -635,6 +642,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/EventDiscoveryStart'
         - $ref: '#/components/parameters/EventDiscoveryEnd'
+        - $ref: '#/components/parameters/TopEventsLimit'
         - $ref: '#/components/parameters/PlatformFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
@@ -648,6 +656,12 @@ paths:
                 $ref: '#/components/schemas/EventCatalogResponse'
         '401':
           description: Missing, invalid, revoked, or wrong-kind project read key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Project is range-deleting or pending deletion.
           content:
             application/json:
               schema:
@@ -709,6 +723,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Project is range-deleting or pending deletion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '422':
           description: |
             Invalid query. Error envelope is `{ "error": "..." }` with one of:
@@ -751,6 +771,12 @@ paths:
                 $ref: '#/components/schemas/LiveInstallsResponse'
         '401':
           description: Missing, invalid, revoked, or wrong-kind project read key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Project is range-deleting or pending deletion.
           content:
             application/json:
               schema:
@@ -839,13 +865,21 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Project is range-deleting or pending deletion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '422':
           description: |
             Invalid query. Error envelope is `{ "error": "..." }` with one of:
 
+            - `invalid_request`
             - `duplicate_query_key`
             - `invalid_query_key`
             - `too_many_dimensions`
+            - `group_limit_exceeded`
           content:
             application/json:
               schema:
@@ -899,6 +933,8 @@ components:
       schema:
         type: string
         minLength: 1
+        maxLength: 64
+        pattern: ^\S(?:[\s\S]*\S)?$
       description: |
         Required when `metric=count`.
     EventMetric:
@@ -973,18 +1009,27 @@ components:
       required: false
       schema:
         type: string
+        minLength: 1
+        maxLength: 64
+        pattern: ^\S(?:[\s\S]*\S)?$
     OsVersionFilter:
       in: query
       name: os_version
       required: false
       schema:
         type: string
+        minLength: 1
+        maxLength: 64
+        pattern: ^\S(?:[\s\S]*\S)?$
     LocaleFilter:
       in: query
       name: locale
       required: false
       schema:
         type: string
+        minLength: 1
+        maxLength: 64
+        pattern: ^\S(?:[\s\S]*\S)?$
     MetricGroupBy:
       in: query
       name: group_by
@@ -1049,7 +1094,7 @@ components:
         minimum: 1
         maximum: 50
         default: 10
-      description: Maximum number of ranked events to return.
+      description: Maximum number of event-discovery rows to return.
   schemas:
     Project:
       type: object
@@ -1433,12 +1478,16 @@ components:
         event:
           type: string
           minLength: 1
+          maxLength: 64
+          pattern: ^\S(?:[\s\S]*\S)?$
         timestamp:
           type: string
           format: date-time
         install_id:
           type: string
           minLength: 1
+          maxLength: 128
+          pattern: ^\S(?:[\s\S]*\S)?$
           description: Stable install-scoped client identity used by ingest and backend sessionization. It is not a person identifier and it is not a public metrics query dimension.
         platform:
           $ref: '#/components/schemas/Platform'
@@ -1447,18 +1496,24 @@ components:
             - string
             - 'null'
           minLength: 1
+          maxLength: 64
+          pattern: ^\S(?:[\s\S]*\S)?$
           description: Optional built-in app version.
         os_version:
           type:
             - string
             - 'null'
           minLength: 1
+          maxLength: 64
+          pattern: ^\S(?:[\s\S]*\S)?$
           description: Optional built-in OS version. First-party SDKs populate it when supported.
         locale:
           type:
             - string
             - 'null'
           minLength: 1
+          maxLength: 64
+          pattern: ^\S(?:[\s\S]*\S)?$
           description: Optional built-in locale. First-party SDKs populate it when supported.
     EventBatchRequest:
       type: object
@@ -1519,6 +1574,7 @@ components:
       properties:
         events:
           type: array
+          maxItems: 50
           items:
             $ref: '#/components/schemas/EventCatalogItem'
     TopEventItem:

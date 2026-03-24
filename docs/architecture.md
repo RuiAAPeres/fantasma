@@ -253,6 +253,8 @@ Public event discovery extends that read surface with:
 
 - `GET /v1/metrics/events/catalog`
 - `GET /v1/metrics/events/top`
+- both discovery routes accept inclusive UTC `start` / `end`; `catalog` and `top` also use the shared discovery `limit` contract with default `10` and max `50`
+- read-key metrics routes, including discovery, return `409` while a project is `range_deleting` or `pending_deletion`
 
 Shared query semantics for the bucketed families:
 

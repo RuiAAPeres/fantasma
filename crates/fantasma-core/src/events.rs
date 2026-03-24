@@ -4,6 +4,11 @@ use thiserror::Error;
 
 const MAX_BATCH_SIZE: usize = 200;
 const MAX_EVENT_BYTES: usize = 8 * 1024;
+pub const MAX_EVENT_NAME_CHARS: usize = 64;
+pub const MAX_INSTALL_ID_CHARS: usize = 128;
+pub const MAX_APP_VERSION_CHARS: usize = 64;
+pub const MAX_OS_VERSION_CHARS: usize = 64;
+pub const MAX_LOCALE_CHARS: usize = 64;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -76,18 +81,42 @@ pub enum EventValidationError {
     EmptyBatch,
     #[error("event name must not be empty")]
     EmptyEventName,
+    #[error("event must not have leading or trailing whitespace")]
+    EventNameHasOuterWhitespace,
+    #[error("event must not exceed {MAX_EVENT_NAME_CHARS} characters")]
+    EventNameTooLong,
     #[error("install_id must not be empty")]
     EmptyInstallId,
+    #[error("install_id must not have leading or trailing whitespace")]
+    InstallIdHasOuterWhitespace,
+    #[error("install_id must not exceed {MAX_INSTALL_ID_CHARS} characters")]
+    InstallIdTooLong,
     #[error("app version must not be empty when provided")]
     EmptyAppVersion,
+    #[error("app_version must not have leading or trailing whitespace when provided")]
+    AppVersionHasOuterWhitespace,
+    #[error("app_version must not exceed {MAX_APP_VERSION_CHARS} characters")]
+    AppVersionTooLong,
     #[error("os_version must not be empty when provided")]
     EmptyOsVersion,
+    #[error("os_version must not have leading or trailing whitespace when provided")]
+    OsVersionHasOuterWhitespace,
+    #[error("os_version must not exceed {MAX_OS_VERSION_CHARS} characters")]
+    OsVersionTooLong,
     #[error("locale must not be empty when provided")]
     EmptyLocale,
+    #[error("locale must not have leading or trailing whitespace when provided")]
+    LocaleHasOuterWhitespace,
+    #[error("locale must not exceed {MAX_LOCALE_CHARS} characters")]
+    LocaleTooLong,
     #[error("properties are not supported")]
     LegacyPropertiesUnsupported,
     #[error("event payload may not exceed {MAX_EVENT_BYTES} bytes")]
     EventTooLarge,
+}
+
+fn has_outer_whitespace(value: &str) -> bool {
+    value.trim() != value
 }
 
 impl EventPayload {
@@ -95,9 +124,21 @@ impl EventPayload {
         if self.event.trim().is_empty() {
             return Err(EventValidationError::EmptyEventName);
         }
+        if has_outer_whitespace(&self.event) {
+            return Err(EventValidationError::EventNameHasOuterWhitespace);
+        }
+        if self.event.chars().count() > MAX_EVENT_NAME_CHARS {
+            return Err(EventValidationError::EventNameTooLong);
+        }
 
         if self.install_id.trim().is_empty() {
             return Err(EventValidationError::EmptyInstallId);
+        }
+        if has_outer_whitespace(&self.install_id) {
+            return Err(EventValidationError::InstallIdHasOuterWhitespace);
+        }
+        if self.install_id.chars().count() > MAX_INSTALL_ID_CHARS {
+            return Err(EventValidationError::InstallIdTooLong);
         }
 
         if self
@@ -107,6 +148,20 @@ impl EventPayload {
         {
             return Err(EventValidationError::EmptyAppVersion);
         }
+        if self
+            .app_version
+            .as_deref()
+            .is_some_and(has_outer_whitespace)
+        {
+            return Err(EventValidationError::AppVersionHasOuterWhitespace);
+        }
+        if self
+            .app_version
+            .as_deref()
+            .is_some_and(|app_version| app_version.chars().count() > MAX_APP_VERSION_CHARS)
+        {
+            return Err(EventValidationError::AppVersionTooLong);
+        }
 
         if self
             .os_version
@@ -115,6 +170,16 @@ impl EventPayload {
         {
             return Err(EventValidationError::EmptyOsVersion);
         }
+        if self.os_version.as_deref().is_some_and(has_outer_whitespace) {
+            return Err(EventValidationError::OsVersionHasOuterWhitespace);
+        }
+        if self
+            .os_version
+            .as_deref()
+            .is_some_and(|os_version| os_version.chars().count() > MAX_OS_VERSION_CHARS)
+        {
+            return Err(EventValidationError::OsVersionTooLong);
+        }
 
         if self
             .locale
@@ -122,6 +187,16 @@ impl EventPayload {
             .is_some_and(|locale| locale.trim().is_empty())
         {
             return Err(EventValidationError::EmptyLocale);
+        }
+        if self.locale.as_deref().is_some_and(has_outer_whitespace) {
+            return Err(EventValidationError::LocaleHasOuterWhitespace);
+        }
+        if self
+            .locale
+            .as_deref()
+            .is_some_and(|locale| locale.chars().count() > MAX_LOCALE_CHARS)
+        {
+            return Err(EventValidationError::LocaleTooLong);
         }
 
         let size = serde_json::to_vec(self)
@@ -341,13 +416,52 @@ mod tests {
         }
 
         #[test]
-        fn returns_error_when_payload_exceeds_byte_limit() {
+        fn returns_error_when_event_name_has_leading_or_trailing_whitespace() {
             let mut event = valid_event();
-            event.event = "a".repeat(8 * 1024);
+            event.event = " screen_view ".to_owned();
 
             let result = event.validate().unwrap_err();
 
-            assert_eq!(result, EventValidationError::EventTooLarge);
+            assert_eq!(
+                result.to_string(),
+                "event must not have leading or trailing whitespace"
+            );
+        }
+
+        #[test]
+        fn returns_error_when_install_id_has_leading_or_trailing_whitespace() {
+            let mut event = valid_event();
+            event.install_id = " install_123 ".to_owned();
+
+            let result = event.validate().unwrap_err();
+
+            assert_eq!(
+                result.to_string(),
+                "install_id must not have leading or trailing whitespace"
+            );
+        }
+
+        #[test]
+        fn returns_error_when_event_name_exceeds_max_length() {
+            let mut event = valid_event();
+            event.event = "a".repeat(65);
+
+            let result = event.validate().unwrap_err();
+
+            assert_eq!(result.to_string(), "event must not exceed 64 characters");
+        }
+
+        #[test]
+        fn returns_error_when_install_id_exceeds_max_length() {
+            let mut event = valid_event();
+            event.install_id = "a".repeat(129);
+
+            let result = event.validate().unwrap_err();
+
+            assert_eq!(
+                result.to_string(),
+                "install_id must not exceed 128 characters"
+            );
         }
     }
 
@@ -484,6 +598,43 @@ mod tests {
                     message: "properties are not supported".to_owned(),
                 }]
             );
+        }
+
+        #[test]
+        fn shared_event_batch_schema_matches_runtime_batch_limit() {
+            let schema: serde_json::Value = serde_json::from_str(include_str!(
+                "../../../schemas/events/event-batch.schema.json"
+            ))
+            .expect("schema parses");
+
+            assert_eq!(
+                schema["properties"]["events"]["maxItems"],
+                serde_json::json!(200)
+            );
+        }
+
+        #[test]
+        fn shared_mobile_event_schema_documents_no_outer_whitespace_constraints() {
+            let schema: serde_json::Value = serde_json::from_str(include_str!(
+                "../../../schemas/events/mobile-event.schema.json"
+            ))
+            .expect("schema parses");
+            let properties = &schema["properties"];
+
+            assert_eq!(properties["event"]["pattern"], "^\\S(?:[\\s\\S]*\\S)?$");
+            assert_eq!(
+                properties["install_id"]["pattern"],
+                "^\\S(?:[\\s\\S]*\\S)?$"
+            );
+            assert_eq!(
+                properties["app_version"]["pattern"],
+                "^\\S(?:[\\s\\S]*\\S)?$"
+            );
+            assert_eq!(
+                properties["os_version"]["pattern"],
+                "^\\S(?:[\\s\\S]*\\S)?$"
+            );
+            assert_eq!(properties["locale"]["pattern"], "^\\S(?:[\\s\\S]*\\S)?$");
         }
     }
 }

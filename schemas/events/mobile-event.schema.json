@@ -14,7 +14,9 @@
   "properties": {
     "event": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
     },
     "timestamp": {
       "type": "string",
@@ -23,6 +25,8 @@
     "install_id": {
       "type": "string",
       "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
       "description": "Stable install-scoped client identity used by ingest and backend sessionization. It is not a person identifier and it is not a public metrics query dimension."
     },
     "platform": {
@@ -38,6 +42,8 @@
         "null"
       ],
       "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
       "description": "Optional built-in app version."
     },
     "os_version": {
@@ -46,6 +52,8 @@
         "null"
       ],
       "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
       "description": "Optional built-in OS version. First-party SDKs populate it when supported."
     },
     "locale": {
@@ -54,6 +62,8 @@
         "null"
       ],
       "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
       "description": "Optional built-in locale. First-party SDKs populate it when supported."
     }
   }

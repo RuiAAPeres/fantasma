@@ -276,6 +276,8 @@ pub struct EventCatalogArgs {
     pub start: String,
     #[arg(long)]
     pub end: String,
+    #[arg(long, default_value_t = 10)]
+    pub limit: u32,
     #[arg(long = "filter")]
     pub filters: Vec<String>,
     #[command(flatten)]

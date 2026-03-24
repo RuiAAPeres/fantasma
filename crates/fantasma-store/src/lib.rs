@@ -2946,6 +2946,7 @@ pub async fn list_event_catalog(
     start: DateTime<Utc>,
     end_exclusive: DateTime<Utc>,
     filters: &BTreeMap<String, String>,
+    limit: i64,
 ) -> Result<Vec<EventCatalogRecord>, StoreError> {
     let mut query = QueryBuilder::<Postgres>::new(
         "SELECT event_name, MAX(timestamp) AS last_seen_at \
@@ -2958,7 +2959,8 @@ pub async fn list_event_catalog(
     query.push(" AND timestamp < ");
     query.push_bind(end_exclusive);
     append_raw_event_filters(&mut query, filters);
-    query.push(" GROUP BY event_name ORDER BY MAX(timestamp) DESC, event_name ASC");
+    query.push(" GROUP BY event_name ORDER BY MAX(timestamp) DESC, event_name ASC LIMIT ");
+    query.push_bind(limit);
 
     let rows = query.build().fetch_all(pool).await?;
 

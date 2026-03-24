@@ -19,9 +19,9 @@ use chrono::{
 use fantasma_auth::StaticAdminAuthorizer;
 use fantasma_core::{
     ActiveInstallsPoint, ActiveInstallsResponse, ActiveInstallsSeries, CurrentMetricResponse,
-    EventMetric, EventMetricsQuery, MetricGranularity, MetricInterval, MetricsBucketWindow,
-    MetricsPoint, MetricsResponse, MetricsSeries, SessionMetric, SessionMetricsQuery,
-    UsageEventsResponse,
+    EventMetric, EventMetricsQuery, MAX_APP_VERSION_CHARS, MAX_EVENT_NAME_CHARS, MAX_LOCALE_CHARS,
+    MAX_OS_VERSION_CHARS, MetricGranularity, MetricInterval, MetricsBucketWindow, MetricsPoint,
+    MetricsResponse, MetricsSeries, SessionMetric, SessionMetricsQuery, UsageEventsResponse,
 };
 use fantasma_store::{
     ApiKeyKind, EventCatalogRecord, EventMetricsAggregateCubeRow, EventMetricsCubeRow, PgPool,
@@ -103,6 +103,12 @@ struct EventDiscoveryQuery {
     start: DateTime<Utc>,
     end_exclusive: DateTime<Utc>,
     filters: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventCatalogQuery {
+    window: EventDiscoveryQuery,
+    limit: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +209,9 @@ fn parse_event_metrics_query(
                     return Err(EventMetricsQueryError("invalid_event"));
                 }
 
+                validate_query_text_value(&value, MAX_EVENT_NAME_CHARS)
+                    .map_err(EventMetricsQueryError)?;
+
                 event = Some(value);
             }
             "metric" => {
@@ -246,6 +255,7 @@ fn parse_event_metrics_query(
                 group_by.push(value);
             }
             "platform" | "app_version" | "os_version" | "locale" => {
+                validate_filter_query_value(&key, &value).map_err(EventMetricsQueryError)?;
                 if group_by.contains(&key) {
                     return Err(EventMetricsQueryError("duplicate_query_key"));
                 }
@@ -403,6 +413,7 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
                 group_by.push(value);
             }
             "platform" | "app_version" | "os_version" | "locale" => {
+                validate_filter_query_value(&key, &value)?;
                 if group_by.contains(&key) {
                     return Err("duplicate_query_key");
                 }
@@ -466,8 +477,33 @@ fn validate_group_by_key(key: &str) -> Result<(), &'static str> {
     }
 }
 
-fn parse_event_catalog_query(raw_query: &str) -> Result<EventDiscoveryQuery, &'static str> {
-    parse_event_discovery_query(raw_query, false).map(|(window, _)| window)
+fn validate_query_text_value(value: &str, max_chars: usize) -> Result<(), &'static str> {
+    if value.trim().is_empty() || value.trim() != value || value.chars().count() > max_chars {
+        return Err("invalid_query_key");
+    }
+
+    Ok(())
+}
+
+fn validate_filter_query_value(key: &str, value: &str) -> Result<(), &'static str> {
+    let max_chars = match key {
+        "platform" => return Ok(()),
+        "app_version" => MAX_APP_VERSION_CHARS,
+        "os_version" => MAX_OS_VERSION_CHARS,
+        "locale" => MAX_LOCALE_CHARS,
+        _ => return Err("invalid_query_key"),
+    };
+
+    validate_query_text_value(value, max_chars)
+}
+
+fn parse_event_catalog_query(raw_query: &str) -> Result<EventCatalogQuery, &'static str> {
+    let (window, limit) = parse_event_discovery_query(raw_query, true)?;
+
+    Ok(EventCatalogQuery {
+        window,
+        limit: limit.expect("catalog parser always returns a limit"),
+    })
 }
 
 fn parse_live_installs_query(raw_query: &str) -> Result<(), &'static str> {
@@ -534,6 +570,7 @@ fn parse_event_discovery_query(
                 limit = Some(parse_top_events_limit(&value)?);
             }
             "platform" | "app_version" | "os_version" | "locale" => {
+                validate_filter_query_value(&key, &value)?;
                 if filters.insert(key, value).is_some() {
                     return Err("invalid_query_key");
                 }
@@ -1472,6 +1509,12 @@ async fn event_catalog_route(
         Err(response) => return response,
     };
 
+    if let Err(response) =
+        require_project_active_for_read_key_route(&state.pool, auth.project_id).await
+    {
+        return response;
+    }
+
     let query = match parse_event_catalog_query(raw_query.as_deref().unwrap_or_default()) {
         Ok(query) => query,
         Err(error) => return query_error_response(error),
@@ -1480,9 +1523,10 @@ async fn event_catalog_route(
     match list_event_catalog(
         &state.pool,
         auth.project_id,
-        query.start,
-        query.end_exclusive,
-        &query.filters,
+        query.window.start,
+        query.window.end_exclusive,
+        &query.window.filters,
+        query.limit,
     )
     .await
     {
@@ -1509,6 +1553,12 @@ async fn top_events_route(
         Ok(auth) => auth,
         Err(response) => return response,
     };
+
+    if let Err(response) =
+        require_project_active_for_read_key_route(&state.pool, auth.project_id).await
+    {
+        return response;
+    }
 
     let query = match parse_top_events_query(raw_query.as_deref().unwrap_or_default()) {
         Ok(query) => query,
@@ -2991,6 +3041,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_event_metrics_query_rejects_empty_event_name_as_invalid_event() {
+        let error = parse_event_metrics_query(
+            "event=&metric=count&granularity=day&start=2026-03-01&end=2026-03-02",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), "invalid_event");
+    }
+
+    #[test]
     fn parse_event_metrics_query_rejects_total_count() {
         let error = parse_event_metrics_query(
             "metric=total_count&granularity=day&start=2026-03-01&end=2026-03-02",
@@ -3145,9 +3205,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_event_catalog_query_rejects_limit() {
+    fn parse_event_catalog_query_accepts_limit() {
+        let query = parse_event_catalog_query("start=2026-03-01&end=2026-03-02&limit=1")
+            .expect("query parses");
+
+        assert_eq!(query.limit, 1);
+    }
+
+    #[test]
+    fn parse_event_metrics_query_rejects_whitespace_padded_event_name() {
+        let error = parse_event_metrics_query(
+            "event=%20app_open%20&metric=count&granularity=day&start=2026-03-01&end=2026-03-02",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), "invalid_query_key");
+    }
+
+    #[test]
+    fn parse_event_metrics_query_rejects_too_long_event_name() {
+        let event = "a".repeat(65);
+        let error = parse_event_metrics_query(&format!(
+            "event={event}&metric=count&granularity=day&start=2026-03-01&end=2026-03-02"
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), "invalid_query_key");
+    }
+
+    #[test]
+    fn parse_session_metric_query_rejects_whitespace_padded_filter_values() {
+        let error = parse_session_metric_query(
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&locale=%20en-GB%20",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "invalid_query_key");
+    }
+
+    #[test]
+    fn parse_event_catalog_query_rejects_too_long_filter_values() {
+        let locale = "a".repeat(65);
         let error =
-            parse_event_catalog_query("start=2026-03-01&end=2026-03-02&limit=1").unwrap_err();
+            parse_event_catalog_query(&format!("start=2026-03-01&end=2026-03-02&locale={locale}"))
+                .unwrap_err();
 
         assert_eq!(error, "invalid_query_key");
     }
@@ -3420,13 +3521,24 @@ mod tests {
 
         let ingest_422 = &spec["paths"]["/v1/events"]["post"]["responses"]["422"]["content"]["application/json"]
             ["schema"]["oneOf"];
+        let ingest_description = &spec["paths"]["/v1/events"]["post"]["description"];
+        let ingest_batch_max_items =
+            &spec["components"]["schemas"]["EventBatchRequest"]["properties"]["events"]["maxItems"];
         let event_metrics_500 = &spec["paths"]["/v1/metrics/events"]["get"]["responses"]["500"];
+        let event_metrics_409 = &spec["paths"]["/v1/metrics/events"]["get"]["responses"]["409"];
+        let event_metrics_422 = &spec["paths"]["/v1/metrics/events"]["get"]["responses"]["422"];
         let catalog_security = spec["paths"]["/v1/metrics/events/catalog"]["get"]["security"]
             .as_sequence()
             .expect("catalog security");
+        let catalog_route = &spec["paths"]["/v1/metrics/events/catalog"]["get"];
+        let catalog_409 = &catalog_route["responses"]["409"];
+        let catalog_parameters = catalog_route["parameters"]
+            .as_sequence()
+            .expect("catalog parameters");
         let top_parameters = spec["paths"]["/v1/metrics/events/top"]["get"]["parameters"]
             .as_sequence()
             .expect("top-events parameters");
+        let top_409 = &spec["paths"]["/v1/metrics/events/top"]["get"]["responses"]["409"];
         let usage_route = &spec["paths"]["/v1/usage/events"]["get"];
         let usage_200 = &usage_route["responses"]["200"];
         let usage_security = usage_route["security"]
@@ -3437,15 +3549,24 @@ mod tests {
             .expect("project route security");
         let live_installs_route = &spec["paths"]["/v1/metrics/live_installs"]["get"];
         let live_installs_200 = &live_installs_route["responses"]["200"];
+        let live_installs_409 = &live_installs_route["responses"]["409"];
         let session_metrics_route = &spec["paths"]["/v1/metrics/sessions"]["get"];
         let session_metrics_200 = &session_metrics_route["responses"]["200"]["content"]["application/json"]
             ["schema"]["oneOf"];
+        let session_metrics_409 = &session_metrics_route["responses"]["409"];
+        let session_metrics_422 = &session_metrics_route["responses"]["422"];
         let session_metrics_500 = &spec["paths"]["/v1/metrics/sessions"]["get"]["responses"]["500"];
         let session_metrics_parameters = session_metrics_route["parameters"]
             .as_sequence()
             .expect("session metrics parameters");
         let platform_filter_schema = &spec["components"]["parameters"]["PlatformFilter"]["schema"];
+        let event_name_schema = &spec["components"]["parameters"]["EventName"]["schema"];
+        let app_version_filter_schema =
+            &spec["components"]["parameters"]["AppVersionFilter"]["schema"];
+        let os_version_filter_schema =
+            &spec["components"]["parameters"]["OsVersionFilter"]["schema"];
         let locale_filter_schema = &spec["components"]["parameters"]["LocaleFilter"]["schema"];
+        let event_payload = &spec["components"]["schemas"]["EventPayload"]["properties"];
         let operator_auth = &spec["components"]["securitySchemes"]["OperatorBearerAuth"];
         let project_key_auth = &spec["components"]["securitySchemes"]["ProjectKeyHeader"];
         let usage_response_schema = &spec["components"]["schemas"]["UsageEventsResponse"];
@@ -3487,9 +3608,28 @@ mod tests {
                 .any(|schema| schema["$ref"] == "#/components/schemas/EventValidationResponse"),
             "ingest 422 must include indexed validation errors in the published envelope"
         );
+        assert_eq!(ingest_batch_max_items, 200);
+        assert!(
+            ingest_description
+                .as_str()
+                .expect("ingest description")
+                .contains("up to 200 events per batch"),
+            "ingest route description must stay aligned with the 200-event cap"
+        );
         assert!(
             event_metrics_500.is_mapping(),
             "event metrics route must document internal_server_error"
+        );
+        assert!(
+            event_metrics_409.is_mapping(),
+            "event metrics route must document lifecycle conflicts"
+        );
+        assert!(
+            event_metrics_422["description"]
+                .as_str()
+                .expect("event metrics 422 description")
+                .contains("group_limit_exceeded"),
+            "event metrics route must document group_limit_exceeded"
         );
         assert!(
             usage_route.is_mapping(),
@@ -3512,8 +3652,16 @@ mod tests {
             "openapi must publish the event catalog route"
         );
         assert!(
+            catalog_409.is_mapping(),
+            "event catalog route must document lifecycle conflicts"
+        );
+        assert!(
             spec["paths"]["/v1/metrics/events/top"]["get"].is_mapping(),
             "openapi must publish the top-events route"
+        );
+        assert!(
+            top_409.is_mapping(),
+            "top-events route must document lifecycle conflicts"
         );
         assert!(
             live_installs_route.is_mapping(),
@@ -3524,8 +3672,27 @@ mod tests {
             "live-installs route must document a success response"
         );
         assert!(
+            live_installs_409.is_mapping(),
+            "live-installs route must document lifecycle conflicts"
+        );
+        assert!(
             session_metrics_500.is_mapping(),
             "session metrics route must document internal_server_error"
+        );
+        assert!(
+            session_metrics_409.is_mapping(),
+            "session metrics route must document lifecycle conflicts"
+        );
+        let session_metrics_422_description = session_metrics_422["description"]
+            .as_str()
+            .expect("session metrics 422 description");
+        assert!(
+            session_metrics_422_description.contains("invalid_request"),
+            "session metrics route must document parser invalid_request errors"
+        );
+        assert!(
+            session_metrics_422_description.contains("group_limit_exceeded"),
+            "session metrics route must document group_limit_exceeded"
         );
         assert!(
             session_metrics_200
@@ -3599,7 +3766,17 @@ mod tests {
                 .contains("total_count"),
             "the event query parameter description must not mention removed total_count support"
         );
+        assert_eq!(event_name_schema["pattern"], "^\\S(?:[\\s\\S]*\\S)?$");
         assert_eq!(platform_filter_schema["type"], "string");
+        assert_eq!(
+            app_version_filter_schema["pattern"],
+            "^\\S(?:[\\s\\S]*\\S)?$"
+        );
+        assert_eq!(
+            os_version_filter_schema["pattern"],
+            "^\\S(?:[\\s\\S]*\\S)?$"
+        );
+        assert_eq!(locale_filter_schema["pattern"], "^\\S(?:[\\s\\S]*\\S)?$");
         assert_eq!(operator_auth["type"], "http");
         assert_eq!(operator_auth["scheme"], "bearer");
         assert!(
@@ -3631,6 +3808,20 @@ mod tests {
             live_installs_schema["properties"]["window_seconds"]["const"],
             120
         );
+        assert_eq!(event_payload["event"]["pattern"], "^\\S(?:[\\s\\S]*\\S)?$");
+        assert_eq!(
+            event_payload["install_id"]["pattern"],
+            "^\\S(?:[\\s\\S]*\\S)?$"
+        );
+        assert_eq!(
+            event_payload["app_version"]["pattern"],
+            "^\\S(?:[\\s\\S]*\\S)?$"
+        );
+        assert_eq!(
+            event_payload["os_version"]["pattern"],
+            "^\\S(?:[\\s\\S]*\\S)?$"
+        );
+        assert_eq!(event_payload["locale"]["pattern"], "^\\S(?:[\\s\\S]*\\S)?$");
         assert!(
             event_metrics_parameters
                 .iter()
@@ -3666,6 +3857,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry["ProjectKeyHeader"].is_sequence()),
             "event catalog must document project-key auth"
+        );
+        assert!(
+            catalog_parameters
+                .iter()
+                .any(|parameter| parameter["$ref"] == "#/components/parameters/TopEventsLimit"),
+            "event catalog must document the limit parameter"
         );
         assert!(
             top_parameters

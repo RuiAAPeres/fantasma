@@ -11,7 +11,7 @@
     "events": {
       "type": "array",
       "minItems": 1,
-      "maxItems": 100,
+      "maxItems": 200,
       "items": {
         "$ref": "./mobile-event.schema.json"
       }

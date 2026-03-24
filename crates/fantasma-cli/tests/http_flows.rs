@@ -2243,7 +2243,50 @@ async fn metrics_events_catalog_text_renders_last_seen_rows() {
         .expect("event catalog request");
     assert_eq!(
         request.query.as_deref(),
-        Some("start=2026-03-01&end=2026-03-02&platform=ios")
+        Some("start=2026-03-01&end=2026-03-02&limit=10&platform=ios")
+    );
+}
+
+#[tokio::test]
+async fn metrics_events_catalog_limit_serializes_into_request_query() {
+    let server = TestServer::spawn().await;
+    let mut config = server.read_config();
+    let profile = config.instances.get_mut("prod").unwrap();
+    profile.active_project_id = Some(server.project_id);
+    profile.store_read_key(
+        server.project_id,
+        fantasma_cli::config::StoredReadKey {
+            key_id: server.read_key_id,
+            name: "cli-read".to_owned(),
+            secret: server.read_key_secret.clone(),
+            created_at: "2026-03-13T12:00:00Z".to_owned(),
+        },
+    );
+    save_config(&server.config_path, &config).expect("save config");
+
+    server
+        .app
+        .run(server.parse(&[
+            "metrics",
+            "events-catalog",
+            "--start",
+            "2026-03-01",
+            "--end",
+            "2026-03-02",
+            "--limit",
+            "5",
+        ]))
+        .await
+        .expect("event catalog succeeds");
+
+    let records = server.records();
+    let request = records
+        .iter()
+        .find(|record| record.path == "/v1/metrics/events/catalog")
+        .expect("event catalog request");
+    assert_eq!(
+        request.query.as_deref(),
+        Some("start=2026-03-01&end=2026-03-02&limit=5")
     );
 }
 

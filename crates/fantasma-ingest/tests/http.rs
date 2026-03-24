@@ -235,6 +235,82 @@ async fn ingest_accepts_valid_batches(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn ingest_allows_interior_newlines_but_rejects_outer_whitespace(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let provisioned = provision_project(&pool).await;
+    let app = fantasma_ingest::app(pool);
+
+    let accepts_interior_newline = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "line1\nline2",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-1",
+                                "platform": "ios"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(accepts_interior_newline.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        response_json(accepts_interior_newline).await,
+        serde_json::json!({ "accepted": 1 })
+    );
+
+    let rejects_outer_whitespace = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": " line1\nline2 ",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-2",
+                                "platform": "ios"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(
+        rejects_outer_whitespace.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        response_json(rejects_outer_whitespace).await,
+        serde_json::json!({
+            "errors": [
+                {
+                    "index": 0,
+                    "message": "event must not have leading or trailing whitespace"
+                }
+            ]
+        })
+    );
+}
+
+#[sqlx::test]
 async fn ingest_rejects_legacy_properties_payloads(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
     let provisioned = provision_project(&pool).await;

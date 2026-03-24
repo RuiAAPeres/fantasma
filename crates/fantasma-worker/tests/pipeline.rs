@@ -995,7 +995,7 @@ async fn event_discovery_routes_return_catalog_and_top_events_for_real_ingest(po
 }
 
 #[sqlx::test]
-async fn event_catalog_uses_limit_as_reserved_parameter(pool: PgPool) {
+async fn event_catalog_accepts_limit_parameter(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
     let ingest = fantasma_ingest::app(pool.clone());
@@ -1046,10 +1046,14 @@ async fn event_catalog_uses_limit_as_reserved_parameter(pool: PgPool) {
         )
         .await
         .expect("catalog request succeeds");
-    assert_eq!(catalog_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(catalog_response.status(), StatusCode::OK);
     assert_eq!(
         response_json(catalog_response).await,
-        serde_json::json!({ "error": "invalid_query_key" })
+        serde_json::json!({
+            "events": [
+                { "name": "trial_blocked", "last_seen_at": "2026-01-01T00:05:00Z" }
+            ]
+        })
     );
 }
 
