@@ -37,6 +37,7 @@ The rejected March 25 Session D4 experiment already showed that moving append wo
   - repair and rebuild paths keep their current design
 - Do not move session metrics behind the rebuild finalizer again.
 - Do not add schema changes in this slice unless profiling proves they are necessary.
+- Preserve the existing Postgres bind-budget guard instead of building unbounded fused statements.
 - Preserve existing invariant checks:
   - inserted session count must still match `plan.new_sessions.len()`
   - tail update must still affect exactly one existing row
@@ -103,7 +104,7 @@ Keep `IncrementalSessionPlan` and `SessionMetricAccumulator` behavior unchanged.
 2. update the tail session if present
 3. insert new session rows
 4. upsert active-install slices
-5. build daily deltas and metric deltas exactly as it does today
+5. prepare the same raw daily inputs and metric deltas it already derives today
 6. enqueue active-install bitmap rebuild days
 7. upsert `install_session_state`
 
@@ -118,22 +119,28 @@ Add a store helper, for example:
 where `write_set` packages:
 
 - `SessionDailyInstallDelta`
-- `SessionDailyDelta`
-- `SessionDailyDurationDelta`
+- `daily_session_counts_by_day`
+- `daily_duration_deltas_by_day`
 
-This helper should execute the current three-step daily write set in one round trip using one SQL statement with staged inputs:
+This helper should own the current `upsert_session_daily_install_deltas_in_tx() + build_session_daily_deltas() + upsert_session_daily_deltas_in_tx() + add_session_daily_duration_deltas_in_tx()` sequence internally, using the raw per-day maps that `IncrementalSessionPlan` already carries today.
+
+This keeps worker planning unchanged while moving the daily write-set assembly boundary into the store helper, where the returned active-install deltas are already available.
+
+This helper should execute the current daily write set in one fused chunk at a time using staged inputs:
 
 1. upsert `session_daily_installs`
 2. aggregate returned active-install deltas by day
-3. upsert `session_daily`
-4. apply duration-only updates for days that must already exist
-5. return counts the worker can still use for invariant checks
+3. derive the same logical `session_daily` upserts and duration-only updates that `build_session_daily_deltas()` produces today
+4. upsert `session_daily`
+5. apply duration-only updates for days that must already exist
+6. return counts the worker can still use for invariant checks
 
 Important:
 
 - duration-only updates must remain update-only, not silent inserts
 - days with session-count or active-install changes may still be handled through the existing upsert semantics
 - the helper must preserve today’s exact arithmetic for `sessions_count`, `active_installs`, and `total_duration_seconds`
+- the helper must preserve the existing bind-budget guard by chunking fused statements when needed instead of assuming one unbounded statement is always safe
 
 ### New metric write-set helper
 
@@ -143,7 +150,7 @@ Add a store helper, for example:
 
 where `write_set` packages the five delta vectors currently emitted by `SessionMetricAccumulator::into_store_deltas()`.
 
-This helper should execute one SQL statement with staged inputs and one `INSERT ... ON CONFLICT DO UPDATE` CTE per cuboid table:
+This helper should execute one fused chunk at a time with staged inputs and one `INSERT ... ON CONFLICT DO UPDATE` CTE per cuboid table:
 
 - `session_metric_buckets_total`
 - `session_metric_buckets_dim1`
@@ -155,7 +162,8 @@ Why this shape:
 
 - the tables are different enough that one generic table-target abstraction is not helpful
 - the expensive part on the hot path is the repeated statement boundary, not Rust-side tuple sorting
-- a single multi-CTE statement keeps table-specific SQL explicit while removing four extra round trips
+- a fused multi-CTE chunk keeps table-specific SQL explicit while removing extra round trips
+- preserving the existing bind-budget guard matters more than forcing the entire write set through one literal statement
 
 ### Explicit non-changes
 
@@ -199,7 +207,9 @@ Add coverage for:
 
 - fused daily helper preserves active-install delta math across repeated same-day inserts
 - fused daily helper still treats duration-only updates as update-only
+- fused daily helper preserves the current `build_session_daily_deltas()` arithmetic when active-install deltas and duration-only days mix
 - fused metric helper produces the same stored rows as the old five-helper sequence for a mixed delta set
+- fused metric helper still chunks safely under the existing bind-budget ceiling
 - empty write sets stay no-op
 
 ### Worker behavior
