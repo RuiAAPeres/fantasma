@@ -1089,6 +1089,7 @@ async fn process_session_batch_with_hooks(
 struct RepairClaimBlocker {
     claimed: tokio::sync::Notify,
     resume: tokio::sync::Notify,
+    blocked_once: AtomicBool,
 }
 
 #[cfg(test)]
@@ -1165,6 +1166,9 @@ impl SessionRepairBatchHooks {
                 .as_deref()
                 .is_some_and(|blocked_install_id| blocked_install_id != install_id)
             {
+                return;
+            }
+            if claim_blocker.blocked_once.swap(true, Ordering::SeqCst) {
                 return;
             }
             claim_blocker.claimed.notify_one();
@@ -5872,6 +5876,7 @@ mod tests {
         let claim_blocker = Arc::new(RepairClaimBlocker {
             claimed: Notify::new(),
             resume: Notify::new(),
+            blocked_once: AtomicBool::new(false),
         });
         let repair_pool = pool.clone();
         let repair_claim_blocker = claim_blocker.clone();
@@ -5969,6 +5974,7 @@ mod tests {
         let claim_blocker = Arc::new(RepairClaimBlocker {
             claimed: Notify::new(),
             resume: Notify::new(),
+            blocked_once: AtomicBool::new(false),
         });
         let repair_pool = pool.clone();
         let repair_claim_blocker = claim_blocker.clone();
@@ -6911,6 +6917,7 @@ mod tests {
         let claim_blocker = Arc::new(RepairClaimBlocker {
             claimed: Notify::new(),
             resume: Notify::new(),
+            blocked_once: AtomicBool::new(false),
         });
         let repair_pool = pool.clone();
         let repair_claim_blocker = claim_blocker.clone();
@@ -6976,7 +6983,10 @@ mod tests {
             .expect("repair task succeeds");
         let apply_result = apply_task.await.expect("apply task joins");
 
-        assert_eq!(repair_processed, 1);
+        assert_eq!(
+            repair_processed, 2,
+            "repair drain should finish the initially claimed frontier and the widened follow-up frontier"
+        );
         assert!(
             !saw_offset_lock_timeout,
             "apply lane should not keep the raw offset lock while a claimed repair frontier is blocked"
