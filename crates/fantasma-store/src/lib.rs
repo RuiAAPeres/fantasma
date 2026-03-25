@@ -1175,16 +1175,16 @@ pub async fn insert_events_with_authenticated_ingest(
     events: &[EventPayload],
 ) -> Result<u64, StoreError> {
     let actor_id = Uuid::new_v4().to_string();
+    let lease = claim_project_processing_lease(
+        pool,
+        authenticated.project_id,
+        ProjectProcessingActorKind::Ingest,
+        &actor_id,
+    )
+    .await?;
 
     let result = async {
         let mut tx = pool.begin().await?;
-        let lease = claim_project_processing_lease_in_tx(
-            &mut tx,
-            authenticated.project_id,
-            ProjectProcessingActorKind::Ingest,
-            &actor_id,
-        )
-        .await?;
 
         let mut builder = QueryBuilder::<sqlx::Postgres>::new(
             "INSERT INTO events_raw (project_id, event_name, timestamp, install_id, platform, app_version, os_version, locale) ",
@@ -1208,16 +1208,15 @@ pub async fn insert_events_with_authenticated_ingest(
         verify_project_processing_lease_in_tx(&mut tx, &lease).await?;
         tx.commit().await?;
 
-        Ok::<_, StoreError>((lease, inserted.rows_affected()))
+        Ok::<_, StoreError>(inserted.rows_affected())
     }
     .await;
+    let release_result = release_project_processing_lease(pool, &lease).await;
 
-    match result {
-        Ok((lease, inserted)) => {
-            release_project_processing_lease(pool, &lease).await?;
-            Ok(inserted)
-        }
-        Err(error) => Err(error),
+    match (result, release_result) {
+        (Ok(inserted), Ok(())) => Ok(inserted),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
     }
 }
 
@@ -11808,6 +11807,27 @@ mod tests {
         assert!(
             source.contains("rebuild_session_daily_installs_for_pending_rebuilds_in_tx"),
             "Stage B should gain a queue-driven install-day session_daily_installs rewrite helper"
+        );
+    }
+
+    #[test]
+    fn insert_events_with_authenticated_ingest_keeps_lease_claim_outside_insert_transaction() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("pub async fn insert_events_with_authenticated_ingest")
+            .expect("find insert_events_with_authenticated_ingest");
+        let end = source
+            .find("pub async fn insert_events(")
+            .expect("find insert_events");
+        let helper = &source[start..end];
+
+        assert!(
+            helper.contains("let lease = claim_project_processing_lease("),
+            "authenticated ingest should claim the ingest lease before opening the insert transaction"
+        );
+        assert!(
+            !helper.contains("claim_project_processing_lease_in_tx"),
+            "authenticated ingest should not widen the hot insert transaction with an in-transaction lease claim"
         );
     }
 
