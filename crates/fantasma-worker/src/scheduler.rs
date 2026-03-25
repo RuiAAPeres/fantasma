@@ -8,8 +8,8 @@ use tracing::{debug, error, info};
 
 use crate::worker::{
     EVENT_METRICS_WORKER_NAME, SESSION_WORKER_NAME, SessionBatchConfig,
-    process_event_metrics_batch, process_project_deletion_batch, process_session_batch_with_config,
-    process_session_repair_batch_with_config,
+    drain_session_repair_queue_with_config, process_event_metrics_batch,
+    process_project_deletion_batch, process_session_batch_with_config,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,7 +221,7 @@ async fn session_repair_lane_tick(
     config: &WorkerConfig,
 ) -> Result<LaneTickResult, StoreError> {
     let processed_jobs =
-        process_session_repair_batch_with_config(pool, config.session_repair_concurrency).await?;
+        drain_session_repair_queue_with_config(pool, config.session_repair_concurrency).await?;
 
     Ok(LaneTickResult {
         processed_events: processed_jobs,

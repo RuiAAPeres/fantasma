@@ -728,7 +728,7 @@ pub async fn process_session_batch(pool: &PgPool, batch_size: i64) -> Result<usi
         repair_concurrency: DEFAULT_SESSION_REPAIR_CONCURRENCY,
     };
     let outcome = process_session_batch_with_config(pool, config).await?;
-    drain_session_repair_jobs(pool, config.repair_concurrency).await?;
+    drain_session_repair_queue_with_config(pool, config.repair_concurrency).await?;
 
     Ok(outcome.processed_events)
 }
@@ -1255,21 +1255,22 @@ impl SessionRepairTaskContext {
     }
 }
 
-pub async fn process_session_repair_batch(
+pub async fn drain_session_repair_queue(
     pool: &PgPool,
     concurrency: usize,
 ) -> Result<usize, StoreError> {
-    process_session_repair_batch_with_config(pool, concurrency).await
+    drain_session_repair_queue_with_config(pool, concurrency).await
 }
 
-pub(crate) async fn process_session_repair_batch_with_config(
+pub(crate) async fn drain_session_repair_queue_with_config(
     pool: &PgPool,
     concurrency: usize,
 ) -> Result<usize, StoreError> {
-    process_session_repair_batch_inner(pool, concurrency, SessionRepairBatchHooks::disabled()).await
+    drain_session_repair_queue_with_hooks(pool, concurrency, SessionRepairBatchHooks::disabled())
+        .await
 }
 
-async fn process_session_repair_batch_inner(
+async fn process_session_repair_slice_inner(
     pool: &PgPool,
     concurrency: usize,
     hooks: SessionRepairBatchHooks,
@@ -1376,10 +1377,46 @@ async fn process_session_repair_batch_inner(
         return Err(cleanup_error);
     }
 
+    if let Some(batch_error) = batch_error {
+        return Err(batch_error);
+    }
+
+    Ok(processed)
+}
+
+#[cfg(test)]
+async fn drain_session_repair_queue_with_test_hooks(
+    pool: &PgPool,
+    concurrency: usize,
+    hooks: SessionRepairBatchHooks,
+) -> Result<usize, StoreError> {
+    drain_session_repair_queue_with_hooks(pool, concurrency, hooks).await
+}
+
+async fn drain_session_repair_queue_with_hooks(
+    pool: &PgPool,
+    concurrency: usize,
+    hooks: SessionRepairBatchHooks,
+) -> Result<usize, StoreError> {
+    let mut processed = 0_usize;
+    let mut batch_error = None;
+    loop {
+        match process_session_repair_slice_inner(pool, concurrency, hooks.clone()).await {
+            Ok(0) => break,
+            Ok(batch_processed) => {
+                processed += batch_processed;
+            }
+            Err(error) => {
+                batch_error = Some(error);
+                break;
+            }
+        }
+    }
+
     if let Err(drain_error) = drain_pending_session_rebuild_buckets(pool).await {
         if let Some(batch_error) = batch_error {
             return Err(StoreError::InvariantViolation(format!(
-                "session repair batch failed with {batch_error}; draining queued rebuilds also failed with {drain_error}"
+                "session repair drain failed with {batch_error}; draining queued rebuilds also failed with {drain_error}"
             )));
         }
 
@@ -1388,7 +1425,7 @@ async fn process_session_repair_batch_inner(
     if let Err(drain_error) = drain_pending_active_install_bitmap_rebuilds(pool).await {
         if let Some(batch_error) = batch_error {
             return Err(StoreError::InvariantViolation(format!(
-                "session repair batch failed with {batch_error}; draining active-install bitmap rebuilds also failed with {drain_error}"
+                "session repair drain failed with {batch_error}; draining active-install bitmap rebuilds also failed with {drain_error}"
             )));
         }
 
@@ -1400,21 +1437,6 @@ async fn process_session_repair_batch_inner(
     }
 
     Ok(processed)
-}
-
-#[cfg(test)]
-async fn process_session_repair_batch_with_hooks(
-    pool: &PgPool,
-    concurrency: usize,
-    hooks: SessionRepairBatchHooks,
-) -> Result<usize, StoreError> {
-    process_session_repair_batch_inner(pool, concurrency, hooks).await
-}
-
-async fn drain_session_repair_jobs(pool: &PgPool, concurrency: usize) -> Result<(), StoreError> {
-    while process_session_repair_batch_with_config(pool, concurrency).await? > 0 {}
-
-    Ok(())
 }
 
 async fn process_next_session_repair_job(
@@ -2241,234 +2263,13 @@ async fn rebuild_event_metric_buckets_in_tx(
         .await?;
     }
 
-    let bucket_expr = bucket_sql(granularity, "scope.timestamp");
-    let event_dims = event_dimension_sql("scoped_events");
-
-    sqlx::query(&format!(
-        r#"
-        WITH scoped_events AS MATERIALIZED (
-            SELECT project_id, event_name, {bucket_expr} AS bucket_start
-            FROM events_raw AS scope
-            WHERE scope.project_id = $1
-              AND scope.event_name = ANY($3)
-              AND {bucket_expr} = ANY($4)
-        )
-        INSERT INTO event_metric_buckets_total (
-            project_id, granularity, bucket_start, event_name, event_count
-        )
-        SELECT project_id, $2, bucket_start, event_name, COUNT(*)::BIGINT
-        FROM scoped_events
-        GROUP BY project_id, bucket_start, event_name
-        "#
-    ))
-    .bind(project_id)
-    .bind(granularity.as_str())
-    .bind(&event_names)
-    .bind(&bucket_starts)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(&format!(
-        r#"
-        WITH scoped_events AS MATERIALIZED (
-            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, locale
-            FROM events_raw AS scope
-            WHERE scope.project_id = $1
-              AND scope.event_name = ANY($3)
-              AND {bucket_expr} = ANY($4)
-        )
-        INSERT INTO event_metric_buckets_dim1 (
-            project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, event_count
-        )
-        SELECT
-            scoped_events.project_id,
-            $2,
-            scoped_events.bucket_start,
-            scoped_events.event_name,
-            dims.dim_key,
-            dims.dim_value,
-            COUNT(*)::BIGINT
-        FROM scoped_events
-        CROSS JOIN LATERAL ({event_dims}) AS dims(dim_key, dim_value)
-        GROUP BY
-            scoped_events.project_id,
-            scoped_events.bucket_start,
-            scoped_events.event_name,
-            dims.dim_key,
-            dims.dim_value
-        "#
-    ))
-    .bind(project_id)
-    .bind(granularity.as_str())
-    .bind(&event_names)
-    .bind(&bucket_starts)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(&format!(
-        r#"
-        WITH scoped_events AS MATERIALIZED (
-            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, locale
-            FROM events_raw AS scope
-            WHERE scope.project_id = $1
-              AND scope.event_name = ANY($3)
-              AND {bucket_expr} = ANY($4)
-        ),
-        event_dim_source AS MATERIALIZED (
-            SELECT scoped_events.id, scoped_events.project_id, scoped_events.bucket_start, scoped_events.event_name, dims.dim_key, dims.dim_value
-            FROM scoped_events
-            CROSS JOIN LATERAL ({event_dims}) AS dims(dim_key, dim_value)
-        )
-        INSERT INTO event_metric_buckets_dim2 (
-            project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, event_count
-        )
-        SELECT
-            left_dims.project_id,
-            $2,
-            left_dims.bucket_start,
-            left_dims.event_name,
-            left_dims.dim_key,
-            left_dims.dim_value,
-            right_dims.dim_key,
-            right_dims.dim_value,
-            COUNT(*)::BIGINT
-        FROM event_dim_source left_dims
-        INNER JOIN event_dim_source right_dims
-          ON right_dims.id = left_dims.id
-         AND right_dims.dim_key > left_dims.dim_key
-        GROUP BY
-            left_dims.project_id,
-            left_dims.bucket_start,
-            left_dims.event_name,
-            left_dims.dim_key,
-            left_dims.dim_value,
-            right_dims.dim_key,
-            right_dims.dim_value
-        "#
-    ))
-    .bind(project_id)
-    .bind(granularity.as_str())
-    .bind(&event_names)
-    .bind(&bucket_starts)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(&format!(
-        r#"
-        WITH scoped_events AS MATERIALIZED (
-            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, locale
-            FROM events_raw AS scope
-            WHERE scope.project_id = $1
-              AND scope.event_name = ANY($3)
-              AND {bucket_expr} = ANY($4)
-        ),
-        event_dim_source AS MATERIALIZED (
-            SELECT scoped_events.id, scoped_events.project_id, scoped_events.bucket_start, scoped_events.event_name, dims.dim_key, dims.dim_value
-            FROM scoped_events
-            CROSS JOIN LATERAL ({event_dims}) AS dims(dim_key, dim_value)
-        )
-        INSERT INTO event_metric_buckets_dim3 (
-            project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count
-        )
-        SELECT
-            first_dims.project_id,
-            $2,
-            first_dims.bucket_start,
-            first_dims.event_name,
-            first_dims.dim_key,
-            first_dims.dim_value,
-            second_dims.dim_key,
-            second_dims.dim_value,
-            third_dims.dim_key,
-            third_dims.dim_value,
-            COUNT(*)::BIGINT
-        FROM event_dim_source AS first_dims
-        JOIN event_dim_source AS second_dims
-          ON second_dims.id = first_dims.id
-         AND second_dims.dim_key > first_dims.dim_key
-        JOIN event_dim_source AS third_dims
-          ON third_dims.id = first_dims.id
-         AND third_dims.dim_key > second_dims.dim_key
-        GROUP BY
-            first_dims.project_id,
-            first_dims.bucket_start,
-            first_dims.event_name,
-            first_dims.dim_key,
-            first_dims.dim_value,
-            second_dims.dim_key,
-            second_dims.dim_value,
-            third_dims.dim_key,
-            third_dims.dim_value
-        "#
-    ))
-    .bind(project_id)
-    .bind(granularity.as_str())
-    .bind(&event_names)
-    .bind(&bucket_starts)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(&format!(
-        r#"
-        WITH scoped_events AS MATERIALIZED (
-            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, locale
-            FROM events_raw AS scope
-            WHERE scope.project_id = $1
-              AND scope.event_name = ANY($3)
-              AND {bucket_expr} = ANY($4)
-        ),
-        event_dim_source AS MATERIALIZED (
-            SELECT scoped_events.id, scoped_events.project_id, scoped_events.bucket_start, scoped_events.event_name, dims.dim_key, dims.dim_value
-            FROM scoped_events
-            CROSS JOIN LATERAL ({event_dims}) AS dims(dim_key, dim_value)
-        )
-        INSERT INTO event_metric_buckets_dim4 (
-            project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, event_count
-        )
-        SELECT
-            first_dims.project_id,
-            $2,
-            first_dims.bucket_start,
-            first_dims.event_name,
-            first_dims.dim_key,
-            first_dims.dim_value,
-            second_dims.dim_key,
-            second_dims.dim_value,
-            third_dims.dim_key,
-            third_dims.dim_value,
-            fourth_dims.dim_key,
-            fourth_dims.dim_value,
-            COUNT(*)::BIGINT
-        FROM event_dim_source AS first_dims
-        JOIN event_dim_source AS second_dims
-          ON second_dims.id = first_dims.id
-         AND second_dims.dim_key > first_dims.dim_key
-        JOIN event_dim_source AS third_dims
-          ON third_dims.id = first_dims.id
-         AND third_dims.dim_key > second_dims.dim_key
-        JOIN event_dim_source AS fourth_dims
-          ON fourth_dims.id = first_dims.id
-         AND fourth_dims.dim_key > third_dims.dim_key
-        GROUP BY
-            first_dims.project_id,
-            first_dims.bucket_start,
-            first_dims.event_name,
-            first_dims.dim_key,
-            first_dims.dim_value,
-            second_dims.dim_key,
-            second_dims.dim_value,
-            third_dims.dim_key,
-            third_dims.dim_value,
-            fourth_dims.dim_key,
-            fourth_dims.dim_value
-        "#
-    ))
-    .bind(project_id)
-    .bind(granularity.as_str())
-    .bind(&event_names)
-    .bind(&bucket_starts)
-    .execute(&mut **tx)
-    .await?;
+    sqlx::query(&event_metric_rebuild_sql(granularity))
+        .bind(project_id)
+        .bind(granularity.as_str())
+        .bind(&event_names)
+        .bind(&bucket_starts)
+        .fetch_optional(&mut **tx)
+        .await?;
 
     Ok(())
 }
@@ -3945,6 +3746,479 @@ fn event_dimension_sql(source_alias: &str) -> String {
     )
 }
 
+fn event_metric_rebuild_sql(granularity: MetricGranularity) -> String {
+    let bucket_expr = bucket_sql(granularity, "scope.timestamp");
+    let event_dims = event_dimension_sql("scoped_events");
+
+    format!(
+        r#"
+        WITH scoped_events AS MATERIALIZED (
+            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, locale
+            FROM events_raw AS scope
+            WHERE scope.project_id = $1
+              AND scope.event_name = ANY($3)
+              AND {bucket_expr} = ANY($4)
+        ),
+        event_dim_source AS MATERIALIZED (
+            SELECT scoped_events.id, scoped_events.project_id, scoped_events.bucket_start, scoped_events.event_name, dims.dim_key, dims.dim_value
+            FROM scoped_events
+            CROSS JOIN LATERAL ({event_dims}) AS dims(dim_key, dim_value)
+        ),
+        insert_total AS (
+            INSERT INTO event_metric_buckets_total (
+                project_id, granularity, bucket_start, event_name, event_count
+            )
+            SELECT project_id, $2, bucket_start, event_name, COUNT(*)::BIGINT
+            FROM scoped_events
+            GROUP BY project_id, bucket_start, event_name
+            RETURNING 1
+        ),
+        insert_dim1 AS (
+            INSERT INTO event_metric_buckets_dim1 (
+                project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, event_count
+            )
+            SELECT
+                project_id,
+                $2,
+                bucket_start,
+                event_name,
+                dim_key,
+                dim_value,
+                COUNT(*)::BIGINT
+            FROM event_dim_source
+            GROUP BY project_id, bucket_start, event_name, dim_key, dim_value
+            RETURNING 1
+        ),
+        insert_dim2 AS (
+            INSERT INTO event_metric_buckets_dim2 (
+                project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, event_count
+            )
+            SELECT
+                left_dims.project_id,
+                $2,
+                left_dims.bucket_start,
+                left_dims.event_name,
+                left_dims.dim_key,
+                left_dims.dim_value,
+                right_dims.dim_key,
+                right_dims.dim_value,
+                COUNT(*)::BIGINT
+            FROM event_dim_source AS left_dims
+            JOIN event_dim_source AS right_dims
+              ON right_dims.id = left_dims.id
+             AND right_dims.dim_key > left_dims.dim_key
+            GROUP BY
+                left_dims.project_id,
+                left_dims.bucket_start,
+                left_dims.event_name,
+                left_dims.dim_key,
+                left_dims.dim_value,
+                right_dims.dim_key,
+                right_dims.dim_value
+            RETURNING 1
+        ),
+        insert_dim3 AS (
+            INSERT INTO event_metric_buckets_dim3 (
+                project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, event_count
+            )
+            SELECT
+                first_dims.project_id,
+                $2,
+                first_dims.bucket_start,
+                first_dims.event_name,
+                first_dims.dim_key,
+                first_dims.dim_value,
+                second_dims.dim_key,
+                second_dims.dim_value,
+                third_dims.dim_key,
+                third_dims.dim_value,
+                COUNT(*)::BIGINT
+            FROM event_dim_source AS first_dims
+            JOIN event_dim_source AS second_dims
+              ON second_dims.id = first_dims.id
+             AND second_dims.dim_key > first_dims.dim_key
+            JOIN event_dim_source AS third_dims
+              ON third_dims.id = first_dims.id
+             AND third_dims.dim_key > second_dims.dim_key
+            GROUP BY
+                first_dims.project_id,
+                first_dims.bucket_start,
+                first_dims.event_name,
+                first_dims.dim_key,
+                first_dims.dim_value,
+                second_dims.dim_key,
+                second_dims.dim_value,
+                third_dims.dim_key,
+                third_dims.dim_value
+            RETURNING 1
+        ),
+        insert_dim4 AS (
+            INSERT INTO event_metric_buckets_dim4 (
+                project_id, granularity, bucket_start, event_name, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, event_count
+            )
+            SELECT
+                first_dims.project_id,
+                $2,
+                first_dims.bucket_start,
+                first_dims.event_name,
+                first_dims.dim_key,
+                first_dims.dim_value,
+                second_dims.dim_key,
+                second_dims.dim_value,
+                third_dims.dim_key,
+                third_dims.dim_value,
+                fourth_dims.dim_key,
+                fourth_dims.dim_value,
+                COUNT(*)::BIGINT
+            FROM event_dim_source AS first_dims
+            JOIN event_dim_source AS second_dims
+              ON second_dims.id = first_dims.id
+             AND second_dims.dim_key > first_dims.dim_key
+            JOIN event_dim_source AS third_dims
+              ON third_dims.id = first_dims.id
+             AND third_dims.dim_key > second_dims.dim_key
+            JOIN event_dim_source AS fourth_dims
+              ON fourth_dims.id = first_dims.id
+             AND fourth_dims.dim_key > third_dims.dim_key
+            GROUP BY
+                first_dims.project_id,
+                first_dims.bucket_start,
+                first_dims.event_name,
+                first_dims.dim_key,
+                first_dims.dim_value,
+                second_dims.dim_key,
+                second_dims.dim_value,
+                third_dims.dim_key,
+                third_dims.dim_value,
+                fourth_dims.dim_key,
+                fourth_dims.dim_value
+            RETURNING 1
+        )
+        SELECT 1
+        "#
+    )
+}
+
+fn session_metric_rebuild_sql(granularity: MetricGranularity) -> String {
+    let bucket_expr = bucket_sql(granularity, "scope.session_start");
+    let first_seen_bucket_expr = bucket_sql(granularity, "scope.first_seen_at");
+    let session_dims = session_dimension_sql("scoped_sessions");
+    let install_dims = session_dimension_sql("scoped_installs");
+
+    format!(
+        r#"
+        WITH scoped_sessions AS MATERIALIZED (
+            SELECT project_id, session_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, locale
+            FROM sessions AS scope
+            WHERE scope.project_id = $1
+              AND {bucket_expr} = ANY($3)
+        ),
+        scoped_installs AS MATERIALIZED (
+            SELECT project_id, install_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, locale
+            FROM install_first_seen AS scope
+            WHERE scope.project_id = $1
+              AND {first_seen_bucket_expr} = ANY($3)
+        ),
+        session_dim_source AS MATERIALIZED (
+            SELECT scoped_sessions.project_id, scoped_sessions.session_id, scoped_sessions.bucket_start, scoped_sessions.duration_seconds, dims.dim_key, dims.dim_value
+            FROM scoped_sessions
+            CROSS JOIN LATERAL ({session_dims}) AS dims(dim_key, dim_value)
+        ),
+        install_dim_source AS MATERIALIZED (
+            SELECT scoped_installs.project_id, scoped_installs.install_id, scoped_installs.bucket_start, dims.dim_key, dims.dim_value
+            FROM scoped_installs
+            CROSS JOIN LATERAL ({install_dims}) AS dims(dim_key, dim_value)
+        ),
+        insert_total AS (
+            INSERT INTO session_metric_buckets_total (
+                project_id, granularity, bucket_start, session_count, duration_total_seconds, new_installs
+            )
+            SELECT
+                project_id,
+                $2,
+                bucket_start,
+                SUM(session_count)::BIGINT,
+                SUM(duration_total_seconds)::BIGINT,
+                SUM(new_installs)::BIGINT
+            FROM (
+                SELECT
+                    project_id,
+                    bucket_start,
+                    COUNT(*)::BIGINT AS session_count,
+                    COALESCE(SUM(duration_seconds), 0)::BIGINT AS duration_total_seconds,
+                    0::BIGINT AS new_installs
+                FROM scoped_sessions
+                GROUP BY project_id, bucket_start
+                UNION ALL
+                SELECT
+                    project_id,
+                    bucket_start,
+                    0::BIGINT,
+                    0::BIGINT,
+                    COUNT(*)::BIGINT
+                FROM scoped_installs
+                GROUP BY project_id, bucket_start
+            ) AS combined
+            GROUP BY project_id, bucket_start
+            RETURNING 1
+        ),
+        insert_dim1 AS (
+            INSERT INTO session_metric_buckets_dim1 (
+                project_id, granularity, bucket_start, dim1_key, dim1_value, session_count, duration_total_seconds, new_installs
+            )
+            SELECT
+                project_id,
+                $2,
+                bucket_start,
+                dim1_key,
+                dim1_value,
+                SUM(session_count)::BIGINT,
+                SUM(duration_total_seconds)::BIGINT,
+                SUM(new_installs)::BIGINT
+            FROM (
+                SELECT
+                    session_dim_source.project_id,
+                    session_dim_source.bucket_start,
+                    session_dim_source.dim_key AS dim1_key,
+                    session_dim_source.dim_value AS dim1_value,
+                    COUNT(*)::BIGINT AS session_count,
+                    COALESCE(SUM(session_dim_source.duration_seconds), 0)::BIGINT AS duration_total_seconds,
+                    0::BIGINT AS new_installs
+                FROM session_dim_source
+                GROUP BY project_id, bucket_start, dim_key, dim_value
+                UNION ALL
+                SELECT
+                    install_dim_source.project_id,
+                    install_dim_source.bucket_start,
+                    install_dim_source.dim_key,
+                    install_dim_source.dim_value,
+                    0::BIGINT,
+                    0::BIGINT,
+                    COUNT(*)::BIGINT
+                FROM install_dim_source
+                GROUP BY project_id, bucket_start, dim_key, dim_value
+            ) AS combined
+            GROUP BY project_id, bucket_start, dim1_key, dim1_value
+            RETURNING 1
+        ),
+        insert_dim2 AS (
+            INSERT INTO session_metric_buckets_dim2 (
+                project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, session_count, duration_total_seconds, new_installs
+            )
+            SELECT
+                project_id,
+                $2,
+                bucket_start,
+                dim1_key,
+                dim1_value,
+                dim2_key,
+                dim2_value,
+                SUM(session_count)::BIGINT,
+                SUM(duration_total_seconds)::BIGINT,
+                SUM(new_installs)::BIGINT
+            FROM (
+                SELECT
+                    left_dims.project_id,
+                    left_dims.bucket_start,
+                    left_dims.dim_key AS dim1_key,
+                    left_dims.dim_value AS dim1_value,
+                    right_dims.dim_key AS dim2_key,
+                    right_dims.dim_value AS dim2_value,
+                    COUNT(*)::BIGINT AS session_count,
+                    COALESCE(SUM(left_dims.duration_seconds), 0)::BIGINT AS duration_total_seconds,
+                    0::BIGINT AS new_installs
+                FROM session_dim_source AS left_dims
+                JOIN session_dim_source AS right_dims
+                  ON left_dims.project_id = right_dims.project_id
+                 AND left_dims.session_id = right_dims.session_id
+                 AND left_dims.bucket_start = right_dims.bucket_start
+                 AND left_dims.dim_key < right_dims.dim_key
+                GROUP BY left_dims.project_id, left_dims.bucket_start, left_dims.dim_key, left_dims.dim_value, right_dims.dim_key, right_dims.dim_value
+                UNION ALL
+                SELECT
+                    left_dims.project_id,
+                    left_dims.bucket_start,
+                    left_dims.dim_key,
+                    left_dims.dim_value,
+                    right_dims.dim_key,
+                    right_dims.dim_value,
+                    0::BIGINT,
+                    0::BIGINT,
+                    COUNT(*)::BIGINT
+                FROM install_dim_source AS left_dims
+                JOIN install_dim_source AS right_dims
+                  ON left_dims.project_id = right_dims.project_id
+                 AND left_dims.install_id = right_dims.install_id
+                 AND left_dims.bucket_start = right_dims.bucket_start
+                 AND left_dims.dim_key < right_dims.dim_key
+                GROUP BY left_dims.project_id, left_dims.bucket_start, left_dims.dim_key, left_dims.dim_value, right_dims.dim_key, right_dims.dim_value
+            ) AS combined
+            GROUP BY project_id, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value
+            RETURNING 1
+        ),
+        insert_dim3 AS (
+            INSERT INTO session_metric_buckets_dim3 (
+                project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, session_count, duration_total_seconds, new_installs
+            )
+            SELECT
+                project_id,
+                $2,
+                bucket_start,
+                dim1_key,
+                dim1_value,
+                dim2_key,
+                dim2_value,
+                dim3_key,
+                dim3_value,
+                SUM(session_count)::BIGINT,
+                SUM(duration_total_seconds)::BIGINT,
+                SUM(new_installs)::BIGINT
+            FROM (
+                SELECT
+                    first_dims.project_id,
+                    first_dims.bucket_start,
+                    first_dims.dim_key AS dim1_key,
+                    first_dims.dim_value AS dim1_value,
+                    second_dims.dim_key AS dim2_key,
+                    second_dims.dim_value AS dim2_value,
+                    third_dims.dim_key AS dim3_key,
+                    third_dims.dim_value AS dim3_value,
+                    COUNT(*)::BIGINT AS session_count,
+                    COALESCE(SUM(first_dims.duration_seconds), 0)::BIGINT AS duration_total_seconds,
+                    0::BIGINT AS new_installs
+                FROM session_dim_source AS first_dims
+                JOIN session_dim_source AS second_dims
+                  ON first_dims.project_id = second_dims.project_id
+                 AND first_dims.session_id = second_dims.session_id
+                 AND first_dims.bucket_start = second_dims.bucket_start
+                 AND first_dims.dim_key < second_dims.dim_key
+                JOIN session_dim_source AS third_dims
+                  ON first_dims.project_id = third_dims.project_id
+                 AND first_dims.session_id = third_dims.session_id
+                 AND first_dims.bucket_start = third_dims.bucket_start
+                 AND second_dims.dim_key < third_dims.dim_key
+                GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value
+                UNION ALL
+                SELECT
+                    first_dims.project_id,
+                    first_dims.bucket_start,
+                    first_dims.dim_key,
+                    first_dims.dim_value,
+                    second_dims.dim_key,
+                    second_dims.dim_value,
+                    third_dims.dim_key,
+                    third_dims.dim_value,
+                    0::BIGINT,
+                    0::BIGINT,
+                    COUNT(*)::BIGINT
+                FROM install_dim_source AS first_dims
+                JOIN install_dim_source AS second_dims
+                  ON first_dims.project_id = second_dims.project_id
+                 AND first_dims.install_id = second_dims.install_id
+                 AND first_dims.bucket_start = second_dims.bucket_start
+                 AND first_dims.dim_key < second_dims.dim_key
+                JOIN install_dim_source AS third_dims
+                  ON first_dims.project_id = third_dims.project_id
+                 AND first_dims.install_id = third_dims.install_id
+                 AND first_dims.bucket_start = third_dims.bucket_start
+                 AND second_dims.dim_key < third_dims.dim_key
+                GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value
+            ) AS combined
+            GROUP BY project_id, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value
+            RETURNING 1
+        ),
+        insert_dim4 AS (
+            INSERT INTO session_metric_buckets_dim4 (
+                project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, session_count, duration_total_seconds, new_installs
+            )
+            SELECT
+                project_id,
+                $2,
+                bucket_start,
+                dim1_key,
+                dim1_value,
+                dim2_key,
+                dim2_value,
+                dim3_key,
+                dim3_value,
+                dim4_key,
+                dim4_value,
+                SUM(session_count)::BIGINT,
+                SUM(duration_total_seconds)::BIGINT,
+                SUM(new_installs)::BIGINT
+            FROM (
+                SELECT
+                    first_dims.project_id,
+                    first_dims.bucket_start,
+                    first_dims.dim_key AS dim1_key,
+                    first_dims.dim_value AS dim1_value,
+                    second_dims.dim_key AS dim2_key,
+                    second_dims.dim_value AS dim2_value,
+                    third_dims.dim_key AS dim3_key,
+                    third_dims.dim_value AS dim3_value,
+                    fourth_dims.dim_key AS dim4_key,
+                    fourth_dims.dim_value AS dim4_value,
+                    COUNT(*)::BIGINT AS session_count,
+                    COALESCE(SUM(first_dims.duration_seconds), 0)::BIGINT AS duration_total_seconds,
+                    0::BIGINT AS new_installs
+                FROM session_dim_source AS first_dims
+                JOIN session_dim_source AS second_dims
+                  ON first_dims.project_id = second_dims.project_id
+                 AND first_dims.session_id = second_dims.session_id
+                 AND first_dims.bucket_start = second_dims.bucket_start
+                 AND first_dims.dim_key < second_dims.dim_key
+                JOIN session_dim_source AS third_dims
+                  ON first_dims.project_id = third_dims.project_id
+                 AND first_dims.session_id = third_dims.session_id
+                 AND first_dims.bucket_start = third_dims.bucket_start
+                 AND second_dims.dim_key < third_dims.dim_key
+                JOIN session_dim_source AS fourth_dims
+                  ON first_dims.project_id = fourth_dims.project_id
+                 AND first_dims.session_id = fourth_dims.session_id
+                 AND first_dims.bucket_start = fourth_dims.bucket_start
+                 AND third_dims.dim_key < fourth_dims.dim_key
+                GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value, fourth_dims.dim_key, fourth_dims.dim_value
+                UNION ALL
+                SELECT
+                    first_dims.project_id,
+                    first_dims.bucket_start,
+                    first_dims.dim_key,
+                    first_dims.dim_value,
+                    second_dims.dim_key,
+                    second_dims.dim_value,
+                    third_dims.dim_key,
+                    third_dims.dim_value,
+                    fourth_dims.dim_key,
+                    fourth_dims.dim_value,
+                    0::BIGINT,
+                    0::BIGINT,
+                    COUNT(*)::BIGINT
+                FROM install_dim_source AS first_dims
+                JOIN install_dim_source AS second_dims
+                  ON first_dims.project_id = second_dims.project_id
+                 AND first_dims.install_id = second_dims.install_id
+                 AND first_dims.bucket_start = second_dims.bucket_start
+                 AND first_dims.dim_key < second_dims.dim_key
+                JOIN install_dim_source AS third_dims
+                  ON first_dims.project_id = third_dims.project_id
+                 AND first_dims.install_id = third_dims.install_id
+                 AND first_dims.bucket_start = third_dims.bucket_start
+                 AND second_dims.dim_key < third_dims.dim_key
+                JOIN install_dim_source AS fourth_dims
+                  ON first_dims.project_id = fourth_dims.project_id
+                 AND first_dims.install_id = fourth_dims.install_id
+                 AND first_dims.bucket_start = fourth_dims.bucket_start
+                 AND third_dims.dim_key < fourth_dims.dim_key
+                GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value, fourth_dims.dim_key, fourth_dims.dim_value
+            ) AS combined
+            GROUP BY project_id, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value
+            RETURNING 1
+        )
+        SELECT 1
+        "#
+    )
+}
+
 async fn rebuild_session_metric_buckets_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
@@ -3960,11 +4234,6 @@ async fn rebuild_session_metric_buckets_in_tx(
     if bucket_starts.is_empty() {
         return Ok(());
     }
-
-    let bucket_expr = bucket_sql(granularity, "scope.session_start");
-    let first_seen_bucket_expr = bucket_sql(granularity, "scope.first_seen_at");
-    let session_dims = session_dimension_sql("scoped_sessions");
-    let install_dims = session_dimension_sql("scoped_installs");
 
     for table in [
         "session_metric_buckets_total",
@@ -3983,414 +4252,12 @@ async fn rebuild_session_metric_buckets_in_tx(
         .await?;
     }
 
-    sqlx::query(&format!(
-        r#"
-        WITH scoped_sessions AS MATERIALIZED (
-            SELECT project_id, {bucket_expr} AS bucket_start, duration_seconds
-            FROM sessions AS scope
-            WHERE scope.project_id = $1
-              AND {bucket_expr} = ANY($3)
-        ),
-        scoped_installs AS MATERIALIZED (
-            SELECT project_id, {first_seen_bucket_expr} AS bucket_start
-            FROM install_first_seen AS scope
-            WHERE scope.project_id = $1
-              AND {first_seen_bucket_expr} = ANY($3)
-        ),
-        combined AS (
-            SELECT project_id, bucket_start, COUNT(*)::BIGINT AS session_count,
-                   COALESCE(SUM(duration_seconds), 0)::BIGINT AS duration_total_seconds,
-                   0::BIGINT AS new_installs
-            FROM scoped_sessions
-            GROUP BY project_id, bucket_start
-            UNION ALL
-            SELECT project_id, bucket_start, 0::BIGINT, 0::BIGINT, COUNT(*)::BIGINT
-            FROM scoped_installs
-            GROUP BY project_id, bucket_start
-        )
-        INSERT INTO session_metric_buckets_total (
-            project_id, granularity, bucket_start, session_count, duration_total_seconds, new_installs
-        )
-        SELECT
-            project_id,
-            $2,
-            bucket_start,
-            SUM(session_count)::BIGINT,
-            SUM(duration_total_seconds)::BIGINT,
-            SUM(new_installs)::BIGINT
-        FROM combined
-        GROUP BY project_id, bucket_start
-        "#
-    ))
-    .bind(project_id)
-    .bind(granularity.as_str())
-    .bind(&bucket_starts)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(&format!(
-        r#"
-        WITH scoped_sessions AS MATERIALIZED (
-            SELECT project_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, locale
-            FROM sessions AS scope
-            WHERE scope.project_id = $1
-              AND {bucket_expr} = ANY($3)
-        ),
-        scoped_installs AS MATERIALIZED (
-            SELECT project_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, locale
-            FROM install_first_seen AS scope
-            WHERE scope.project_id = $1
-              AND {first_seen_bucket_expr} = ANY($3)
-        ),
-        combined AS (
-            SELECT
-                scoped_sessions.project_id,
-                scoped_sessions.bucket_start,
-                dims.dim_key AS dim1_key,
-                dims.dim_value AS dim1_value,
-                COUNT(*)::BIGINT AS session_count,
-                COALESCE(SUM(scoped_sessions.duration_seconds), 0)::BIGINT AS duration_total_seconds,
-                0::BIGINT AS new_installs
-            FROM scoped_sessions
-            CROSS JOIN LATERAL ({session_dims}) AS dims(dim_key, dim_value)
-            GROUP BY scoped_sessions.project_id, scoped_sessions.bucket_start, dims.dim_key, dims.dim_value
-            UNION ALL
-            SELECT
-                scoped_installs.project_id,
-                scoped_installs.bucket_start,
-                dims.dim_key,
-                dims.dim_value,
-                0::BIGINT,
-                0::BIGINT,
-                COUNT(*)::BIGINT
-            FROM scoped_installs
-            CROSS JOIN LATERAL ({install_dims}) AS dims(dim_key, dim_value)
-            GROUP BY scoped_installs.project_id, scoped_installs.bucket_start, dims.dim_key, dims.dim_value
-        )
-        INSERT INTO session_metric_buckets_dim1 (
-            project_id, granularity, bucket_start, dim1_key, dim1_value, session_count, duration_total_seconds, new_installs
-        )
-        SELECT
-            project_id,
-            $2,
-            bucket_start,
-            dim1_key,
-            dim1_value,
-            SUM(session_count)::BIGINT,
-            SUM(duration_total_seconds)::BIGINT,
-            SUM(new_installs)::BIGINT
-        FROM combined
-        GROUP BY project_id, bucket_start, dim1_key, dim1_value
-        "#
-    ))
-    .bind(project_id)
-    .bind(granularity.as_str())
-    .bind(&bucket_starts)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(&format!(
-        r#"
-        WITH scoped_sessions AS MATERIALIZED (
-            SELECT project_id, session_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, locale
-            FROM sessions AS scope
-            WHERE scope.project_id = $1
-              AND {bucket_expr} = ANY($3)
-        ),
-        scoped_installs AS MATERIALIZED (
-            SELECT project_id, install_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, locale
-            FROM install_first_seen AS scope
-            WHERE scope.project_id = $1
-              AND {first_seen_bucket_expr} = ANY($3)
-        ),
-        session_dim_source AS MATERIALIZED (
-            SELECT scoped_sessions.project_id, scoped_sessions.session_id, scoped_sessions.bucket_start, scoped_sessions.duration_seconds, dims.dim_key, dims.dim_value
-            FROM scoped_sessions
-            CROSS JOIN LATERAL ({session_dims}) AS dims(dim_key, dim_value)
-        ),
-        install_dim_source AS MATERIALIZED (
-            SELECT scoped_installs.project_id, scoped_installs.install_id, scoped_installs.bucket_start, dims.dim_key, dims.dim_value
-            FROM scoped_installs
-            CROSS JOIN LATERAL ({install_dims}) AS dims(dim_key, dim_value)
-        ),
-        combined AS (
-            SELECT
-                left_dims.project_id,
-                left_dims.bucket_start,
-                left_dims.dim_key AS dim1_key,
-                left_dims.dim_value AS dim1_value,
-                right_dims.dim_key AS dim2_key,
-                right_dims.dim_value AS dim2_value,
-                COUNT(*)::BIGINT AS session_count,
-                COALESCE(SUM(left_dims.duration_seconds), 0)::BIGINT AS duration_total_seconds,
-                0::BIGINT AS new_installs
-            FROM session_dim_source AS left_dims
-            JOIN session_dim_source AS right_dims
-              ON left_dims.project_id = right_dims.project_id
-             AND left_dims.session_id = right_dims.session_id
-             AND left_dims.bucket_start = right_dims.bucket_start
-             AND left_dims.dim_key < right_dims.dim_key
-            GROUP BY left_dims.project_id, left_dims.bucket_start, left_dims.dim_key, left_dims.dim_value, right_dims.dim_key, right_dims.dim_value
-            UNION ALL
-            SELECT
-                left_dims.project_id,
-                left_dims.bucket_start,
-                left_dims.dim_key,
-                left_dims.dim_value,
-                right_dims.dim_key,
-                right_dims.dim_value,
-                0::BIGINT,
-                0::BIGINT,
-                COUNT(*)::BIGINT
-            FROM install_dim_source AS left_dims
-            JOIN install_dim_source AS right_dims
-              ON left_dims.project_id = right_dims.project_id
-             AND left_dims.install_id = right_dims.install_id
-             AND left_dims.bucket_start = right_dims.bucket_start
-             AND left_dims.dim_key < right_dims.dim_key
-            GROUP BY left_dims.project_id, left_dims.bucket_start, left_dims.dim_key, left_dims.dim_value, right_dims.dim_key, right_dims.dim_value
-        )
-        INSERT INTO session_metric_buckets_dim2 (
-            project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, session_count, duration_total_seconds, new_installs
-        )
-        SELECT
-            project_id,
-            $2,
-            bucket_start,
-            dim1_key,
-            dim1_value,
-            dim2_key,
-            dim2_value,
-            SUM(session_count)::BIGINT,
-            SUM(duration_total_seconds)::BIGINT,
-            SUM(new_installs)::BIGINT
-        FROM combined
-        GROUP BY project_id, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value
-        "#
-    ))
-    .bind(project_id)
-    .bind(granularity.as_str())
-    .bind(&bucket_starts)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(&format!(
-        r#"
-        WITH scoped_sessions AS MATERIALIZED (
-            SELECT project_id, session_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, locale
-            FROM sessions AS scope
-            WHERE scope.project_id = $1
-              AND {bucket_expr} = ANY($3)
-        ),
-        scoped_installs AS MATERIALIZED (
-            SELECT project_id, install_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, locale
-            FROM install_first_seen AS scope
-            WHERE scope.project_id = $1
-              AND {first_seen_bucket_expr} = ANY($3)
-        ),
-        session_dim_source AS MATERIALIZED (
-            SELECT scoped_sessions.project_id, scoped_sessions.session_id, scoped_sessions.bucket_start, scoped_sessions.duration_seconds, dims.dim_key, dims.dim_value
-            FROM scoped_sessions
-            CROSS JOIN LATERAL ({session_dims}) AS dims(dim_key, dim_value)
-        ),
-        install_dim_source AS MATERIALIZED (
-            SELECT scoped_installs.project_id, scoped_installs.install_id, scoped_installs.bucket_start, dims.dim_key, dims.dim_value
-            FROM scoped_installs
-            CROSS JOIN LATERAL ({install_dims}) AS dims(dim_key, dim_value)
-        ),
-        combined AS (
-            SELECT
-                first_dims.project_id,
-                first_dims.bucket_start,
-                first_dims.dim_key AS dim1_key,
-                first_dims.dim_value AS dim1_value,
-                second_dims.dim_key AS dim2_key,
-                second_dims.dim_value AS dim2_value,
-                third_dims.dim_key AS dim3_key,
-                third_dims.dim_value AS dim3_value,
-                COUNT(*)::BIGINT AS session_count,
-                COALESCE(SUM(first_dims.duration_seconds), 0)::BIGINT AS duration_total_seconds,
-                0::BIGINT AS new_installs
-            FROM session_dim_source AS first_dims
-            JOIN session_dim_source AS second_dims
-              ON first_dims.project_id = second_dims.project_id
-             AND first_dims.session_id = second_dims.session_id
-             AND first_dims.bucket_start = second_dims.bucket_start
-             AND first_dims.dim_key < second_dims.dim_key
-            JOIN session_dim_source AS third_dims
-              ON first_dims.project_id = third_dims.project_id
-             AND first_dims.session_id = third_dims.session_id
-             AND first_dims.bucket_start = third_dims.bucket_start
-             AND second_dims.dim_key < third_dims.dim_key
-            GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value
-            UNION ALL
-            SELECT
-                first_dims.project_id,
-                first_dims.bucket_start,
-                first_dims.dim_key,
-                first_dims.dim_value,
-                second_dims.dim_key,
-                second_dims.dim_value,
-                third_dims.dim_key,
-                third_dims.dim_value,
-                0::BIGINT,
-                0::BIGINT,
-                COUNT(*)::BIGINT
-            FROM install_dim_source AS first_dims
-            JOIN install_dim_source AS second_dims
-              ON first_dims.project_id = second_dims.project_id
-             AND first_dims.install_id = second_dims.install_id
-             AND first_dims.bucket_start = second_dims.bucket_start
-             AND first_dims.dim_key < second_dims.dim_key
-            JOIN install_dim_source AS third_dims
-              ON first_dims.project_id = third_dims.project_id
-             AND first_dims.install_id = third_dims.install_id
-             AND first_dims.bucket_start = third_dims.bucket_start
-             AND second_dims.dim_key < third_dims.dim_key
-            GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value
-        )
-        INSERT INTO session_metric_buckets_dim3 (
-            project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, session_count, duration_total_seconds, new_installs
-        )
-        SELECT
-            project_id,
-            $2,
-            bucket_start,
-            dim1_key,
-            dim1_value,
-            dim2_key,
-            dim2_value,
-            dim3_key,
-            dim3_value,
-            SUM(session_count)::BIGINT,
-            SUM(duration_total_seconds)::BIGINT,
-            SUM(new_installs)::BIGINT
-        FROM combined
-        GROUP BY project_id, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value
-        "#
-    ))
-    .bind(project_id)
-    .bind(granularity.as_str())
-    .bind(&bucket_starts)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(&format!(
-        r#"
-        WITH scoped_sessions AS MATERIALIZED (
-            SELECT project_id, session_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, locale
-            FROM sessions AS scope
-            WHERE scope.project_id = $1
-              AND {bucket_expr} = ANY($3)
-        ),
-        scoped_installs AS MATERIALIZED (
-            SELECT project_id, install_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, locale
-            FROM install_first_seen AS scope
-            WHERE scope.project_id = $1
-              AND {first_seen_bucket_expr} = ANY($3)
-        ),
-        session_dim_source AS MATERIALIZED (
-            SELECT scoped_sessions.project_id, scoped_sessions.session_id, scoped_sessions.bucket_start, scoped_sessions.duration_seconds, dims.dim_key, dims.dim_value
-            FROM scoped_sessions
-            CROSS JOIN LATERAL ({session_dims}) AS dims(dim_key, dim_value)
-        ),
-        install_dim_source AS MATERIALIZED (
-            SELECT scoped_installs.project_id, scoped_installs.install_id, scoped_installs.bucket_start, dims.dim_key, dims.dim_value
-            FROM scoped_installs
-            CROSS JOIN LATERAL ({install_dims}) AS dims(dim_key, dim_value)
-        ),
-        combined AS (
-            SELECT
-                first_dims.project_id,
-                first_dims.bucket_start,
-                first_dims.dim_key AS dim1_key,
-                first_dims.dim_value AS dim1_value,
-                second_dims.dim_key AS dim2_key,
-                second_dims.dim_value AS dim2_value,
-                third_dims.dim_key AS dim3_key,
-                third_dims.dim_value AS dim3_value,
-                fourth_dims.dim_key AS dim4_key,
-                fourth_dims.dim_value AS dim4_value,
-                COUNT(*)::BIGINT AS session_count,
-                COALESCE(SUM(first_dims.duration_seconds), 0)::BIGINT AS duration_total_seconds,
-                0::BIGINT AS new_installs
-            FROM session_dim_source AS first_dims
-            JOIN session_dim_source AS second_dims
-              ON first_dims.project_id = second_dims.project_id
-             AND first_dims.session_id = second_dims.session_id
-             AND first_dims.bucket_start = second_dims.bucket_start
-             AND first_dims.dim_key < second_dims.dim_key
-            JOIN session_dim_source AS third_dims
-              ON first_dims.project_id = third_dims.project_id
-             AND first_dims.session_id = third_dims.session_id
-             AND first_dims.bucket_start = third_dims.bucket_start
-             AND second_dims.dim_key < third_dims.dim_key
-            JOIN session_dim_source AS fourth_dims
-              ON first_dims.project_id = fourth_dims.project_id
-             AND first_dims.session_id = fourth_dims.session_id
-             AND first_dims.bucket_start = fourth_dims.bucket_start
-             AND third_dims.dim_key < fourth_dims.dim_key
-            GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value, fourth_dims.dim_key, fourth_dims.dim_value
-            UNION ALL
-            SELECT
-                first_dims.project_id,
-                first_dims.bucket_start,
-                first_dims.dim_key,
-                first_dims.dim_value,
-                second_dims.dim_key,
-                second_dims.dim_value,
-                third_dims.dim_key,
-                third_dims.dim_value,
-                fourth_dims.dim_key,
-                fourth_dims.dim_value,
-                0::BIGINT,
-                0::BIGINT,
-                COUNT(*)::BIGINT
-            FROM install_dim_source AS first_dims
-            JOIN install_dim_source AS second_dims
-              ON first_dims.project_id = second_dims.project_id
-             AND first_dims.install_id = second_dims.install_id
-             AND first_dims.bucket_start = second_dims.bucket_start
-             AND first_dims.dim_key < second_dims.dim_key
-            JOIN install_dim_source AS third_dims
-              ON first_dims.project_id = third_dims.project_id
-             AND first_dims.install_id = third_dims.install_id
-             AND first_dims.bucket_start = third_dims.bucket_start
-             AND second_dims.dim_key < third_dims.dim_key
-            JOIN install_dim_source AS fourth_dims
-              ON first_dims.project_id = fourth_dims.project_id
-             AND first_dims.install_id = fourth_dims.install_id
-             AND first_dims.bucket_start = fourth_dims.bucket_start
-             AND third_dims.dim_key < fourth_dims.dim_key
-            GROUP BY first_dims.project_id, first_dims.bucket_start, first_dims.dim_key, first_dims.dim_value, second_dims.dim_key, second_dims.dim_value, third_dims.dim_key, third_dims.dim_value, fourth_dims.dim_key, fourth_dims.dim_value
-        )
-        INSERT INTO session_metric_buckets_dim4 (
-            project_id, granularity, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value, session_count, duration_total_seconds, new_installs
-        )
-        SELECT
-            project_id,
-            $2,
-            bucket_start,
-            dim1_key,
-            dim1_value,
-            dim2_key,
-            dim2_value,
-            dim3_key,
-            dim3_value,
-            dim4_key,
-            dim4_value,
-            SUM(session_count)::BIGINT,
-            SUM(duration_total_seconds)::BIGINT,
-            SUM(new_installs)::BIGINT
-        FROM combined
-        GROUP BY project_id, bucket_start, dim1_key, dim1_value, dim2_key, dim2_value, dim3_key, dim3_value, dim4_key, dim4_value
-        "#
-    ))
-    .bind(project_id)
-    .bind(granularity.as_str())
-    .bind(&bucket_starts)
-    .execute(&mut **tx)
-    .await?;
+    sqlx::query(&session_metric_rebuild_sql(granularity))
+        .bind(project_id)
+        .bind(granularity.as_str())
+        .bind(&bucket_starts)
+        .fetch_optional(&mut **tx)
+        .await?;
 
     Ok(())
 }
@@ -4471,6 +4338,41 @@ mod tests {
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),
         }
+    }
+
+    #[test]
+    fn event_metric_rebuild_sql_reuses_one_staged_scope_for_all_cuboids() {
+        let sql = event_metric_rebuild_sql(MetricGranularity::Hour);
+
+        assert_eq!(sql.matches("WITH scoped_events AS MATERIALIZED").count(), 1);
+        assert_eq!(sql.matches("event_dim_source AS MATERIALIZED").count(), 1);
+        assert_eq!(sql.matches("INSERT INTO event_metric_buckets_").count(), 5);
+        assert!(!sql.contains("event_dim_pairs AS MATERIALIZED"));
+        assert!(!sql.contains("event_dim_triples AS MATERIALIZED"));
+        assert!(!sql.contains("event_dim_quads AS MATERIALIZED"));
+    }
+
+    #[test]
+    fn session_metric_rebuild_sql_reuses_one_staged_scope_for_all_cuboids() {
+        let sql = session_metric_rebuild_sql(MetricGranularity::Hour);
+
+        assert_eq!(
+            sql.matches("WITH scoped_sessions AS MATERIALIZED").count(),
+            1
+        );
+        assert_eq!(sql.matches("scoped_installs AS MATERIALIZED").count(), 1);
+        assert_eq!(sql.matches("session_dim_source AS MATERIALIZED").count(), 1);
+        assert_eq!(sql.matches("install_dim_source AS MATERIALIZED").count(), 1);
+        assert_eq!(
+            sql.matches("INSERT INTO session_metric_buckets_").count(),
+            5
+        );
+        assert!(!sql.contains("session_dim_pairs AS MATERIALIZED"));
+        assert!(!sql.contains("session_dim_triples AS MATERIALIZED"));
+        assert!(!sql.contains("session_dim_quads AS MATERIALIZED"));
+        assert!(!sql.contains("install_dim_pairs AS MATERIALIZED"));
+        assert!(!sql.contains("install_dim_triples AS MATERIALIZED"));
+        assert!(!sql.contains("install_dim_quads AS MATERIALIZED"));
     }
 
     async fn session_daily_row(pool: &PgPool, day: NaiveDate) -> Option<(i64, i64, i64)> {
@@ -4580,10 +4482,10 @@ mod tests {
         .expect("fetch pending repair frontier")
     }
 
-    async fn run_session_repair_batch(pool: &PgPool, concurrency: usize) -> usize {
-        process_session_repair_batch(pool, concurrency)
+    async fn run_session_repair_queue(pool: &PgPool, concurrency: usize) -> usize {
+        drain_session_repair_queue(pool, concurrency)
             .await
-            .expect("run session repair batch")
+            .expect("drain session repair queue")
     }
 
     fn sample_stage_b_trace_record() -> StageBTraceRecord {
@@ -5660,7 +5562,7 @@ mod tests {
         )
         .await
         .expect("enqueue older event repair");
-        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
+        assert_eq!(run_session_repair_queue(&pool, 1).await, 1);
 
         assert_eq!(
             count_sessions(
@@ -5750,7 +5652,7 @@ mod tests {
         )
         .await
         .expect("enqueue late repair batch");
-        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
+        assert_eq!(run_session_repair_queue(&pool, 1).await, 1);
 
         let repaired_session = fetch_latest_session_for_install(&pool, project_id(), "install-1")
             .await
@@ -5796,7 +5698,7 @@ mod tests {
         )
         .await
         .expect("enqueue late repair batch");
-        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
+        assert_eq!(run_session_repair_queue(&pool, 1).await, 1);
 
         let sessions = sqlx::query(
             r#"
@@ -5974,7 +5876,7 @@ mod tests {
         let repair_pool = pool.clone();
         let repair_claim_blocker = claim_blocker.clone();
         let repair_task = tokio::spawn(async move {
-            process_session_repair_batch_with_hooks(
+            drain_session_repair_queue_with_test_hooks(
                 &repair_pool,
                 2,
                 SessionRepairBatchHooks::block_after_claim_for_install(
@@ -6071,7 +5973,7 @@ mod tests {
         let repair_pool = pool.clone();
         let repair_claim_blocker = claim_blocker.clone();
         let repair_task = tokio::spawn(async move {
-            process_session_repair_batch_with_hooks(
+            drain_session_repair_queue_with_test_hooks(
                 &repair_pool,
                 2,
                 SessionRepairBatchHooks::block_after_claim_for_install(
@@ -6187,7 +6089,7 @@ mod tests {
         .await
         .expect("enqueue repair frontier");
 
-        let error = process_session_repair_batch_with_hooks(
+        let error = drain_session_repair_queue_with_test_hooks(
             &pool,
             1,
             SessionRepairBatchHooks::panic_after_claim_for_install("install-1"),
@@ -6257,7 +6159,7 @@ mod tests {
         .await
         .expect("enqueue repair frontier");
 
-        let error = process_session_repair_batch_with_hooks(
+        let error = drain_session_repair_queue_with_test_hooks(
             &pool,
             1,
             SessionRepairBatchHooks::panic_after_claim_and_fail_join_error_release_once_for_install(
@@ -6338,7 +6240,7 @@ mod tests {
         )
         .await
         .expect("enqueue repair batch");
-        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
+        assert_eq!(run_session_repair_queue(&pool, 1).await, 1);
 
         let tail = load_install_session_state(&pool, project_id(), "install-1")
             .await
@@ -6399,7 +6301,7 @@ mod tests {
         )
         .await
         .expect("enqueue repair batch");
-        assert_eq!(run_session_repair_batch(&pool, 2).await, 2);
+        assert_eq!(run_session_repair_queue(&pool, 2).await, 2);
 
         assert_eq!(
             session_daily_row(&pool, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await,
@@ -6622,7 +6524,7 @@ mod tests {
         .await
         .expect("enqueue repair frontier");
 
-        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
+        assert_eq!(run_session_repair_queue(&pool, 1).await, 1);
         assert!(
             pending_session_daily_install_rebuild_rows(&pool)
                 .await
@@ -7013,7 +6915,7 @@ mod tests {
         let repair_pool = pool.clone();
         let repair_claim_blocker = claim_blocker.clone();
         let repair_task = tokio::spawn(async move {
-            process_session_repair_batch_with_hooks(
+            drain_session_repair_queue_with_test_hooks(
                 &repair_pool,
                 1,
                 SessionRepairBatchHooks::block_after_claim(repair_claim_blocker),
@@ -7104,7 +7006,7 @@ mod tests {
         .await
         .expect("insert repair frontier without install state");
 
-        let error = process_session_repair_batch_with_config(&pool, 1)
+        let error = drain_session_repair_queue_with_config(&pool, 1)
             .await
             .expect_err("repair batch should fail");
         assert!(matches!(error, StoreError::InvariantViolation(_)));
@@ -7231,7 +7133,7 @@ mod tests {
         .await
         .expect("enqueue repair frontier");
 
-        let processed = process_session_repair_batch(&pool, 1)
+        let processed = drain_session_repair_queue(&pool, 1)
             .await
             .expect("run repair lane");
 
@@ -7261,6 +7163,110 @@ mod tests {
             .expect("session exists");
         assert_eq!(repaired_session.event_count, 3);
         assert_eq!(repaired_session.duration_seconds, 45 * 60);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[sqlx::test]
+    async fn repair_queue_with_config_coalesces_same_bucket_rebuilds_across_multiple_jobs(
+        pool: PgPool,
+    ) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+
+        let install_ids = ["install-1", "install-2", "install-3", "install-4"];
+        let initial_events = install_ids
+            .into_iter()
+            .flat_map(|install_id| [event(install_id, 1, 0, 0), event(install_id, 1, 0, 45)])
+            .collect::<Vec<_>>();
+        insert_events(&pool, project_id(), &initial_events)
+            .await
+            .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        let late_events = install_ids
+            .into_iter()
+            .map(|install_id| event(install_id, 1, 0, 20))
+            .collect::<Vec<_>>();
+        insert_events(&pool, project_id(), &late_events)
+            .await
+            .expect("insert late repair events");
+        process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 1,
+                repair_concurrency: 2,
+            },
+        )
+        .await
+        .expect("enqueue repair frontiers without draining them");
+
+        for install_id in install_ids {
+            assert!(
+                pending_session_repair_frontier(&pool, install_id)
+                    .await
+                    .is_some(),
+                "repair frontier should be queued for {install_id}"
+            );
+        }
+
+        let _guard = lock_trace_env();
+        let path = std::env::temp_dir().join(format!("stage-b-trace-{}.jsonl", Uuid::new_v4()));
+        unsafe {
+            std::env::set_var(STAGE_B_TRACE_PATH_ENV, &path);
+        }
+
+        let processed = drain_session_repair_queue_with_config(&pool, 2)
+            .await
+            .expect("drain configured repair queue");
+
+        let contents = fs::read_to_string(&path).expect("read repair queue trace");
+        let rebuild_records = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse trace"))
+            .filter(|record| {
+                record["record_type"] == serde_json::json!(STAGE_B_TRACE_REBUILD_FINALIZE)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            processed, 4,
+            "configured repair queue should drain the full queued repair set"
+        );
+        assert_eq!(
+            rebuild_records.len(),
+            1,
+            "configured repair queue should coalesce same-bucket rebuild work across the full queued repair set"
+        );
+        assert_eq!(
+            rebuild_records[0]["counts"]["claimed_rebuild_bucket_rows"],
+            serde_json::json!(2),
+            "all four repairs touch the same shared day/hour buckets, so the queue should collapse to one day row plus one hour row"
+        );
+        assert_eq!(
+            rebuild_records[0]["counts"]["touched_day_buckets"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            rebuild_records[0]["counts"]["touched_hour_buckets"],
+            serde_json::json!(1)
+        );
+        for install_id in install_ids {
+            assert_eq!(
+                pending_session_repair_frontier(&pool, install_id).await,
+                None,
+                "configured repair queue should clear the repair frontier for {install_id}"
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var(STAGE_B_TRACE_PATH_ENV);
+        }
     }
 
     #[sqlx::test]
@@ -7705,7 +7711,7 @@ mod tests {
         )
         .await
         .expect("enqueue late repair batch");
-        assert_eq!(run_session_repair_batch(&pool, 1).await, 1);
+        assert_eq!(run_session_repair_queue(&pool, 1).await, 1);
 
         let first_seen_bucket = sqlx::query_scalar::<_, DateTime<Utc>>(
             r#"
