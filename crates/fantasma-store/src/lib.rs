@@ -249,6 +249,11 @@ pub struct ResolvedApiKey {
     pub kind: ApiKeyKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedIngestProject {
+    pub project_id: Uuid,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -1126,28 +1131,67 @@ pub async fn resolve_project_id_for_ingest_key(
         .map(|record| record.project_id))
 }
 
-pub async fn insert_events(
+pub async fn authenticate_ingest_request(
     pool: &PgPool,
-    project_id: Uuid,
+    ingest_key: &str,
+) -> Result<AuthenticatedIngestProject, StoreError> {
+    let row = sqlx::query(
+        r#"
+        SELECT api_keys.project_id, api_keys.kind, projects.state
+        FROM api_keys
+        INNER JOIN projects
+          ON projects.id = api_keys.project_id
+        WHERE api_keys.key_hash = $1
+          AND api_keys.revoked_at IS NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(hash_ingest_key(ingest_key))
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Err(StoreError::ProjectNotFound);
+    };
+
+    let kind = api_key_kind_from_str(row.try_get::<&str, _>("kind")?)?;
+    if kind != ApiKeyKind::Ingest {
+        return Err(StoreError::ProjectNotFound);
+    }
+
+    let state = project_state_from_str(row.try_get::<&str, _>("state")?)?;
+    if state != ProjectState::Active {
+        return Err(StoreError::ProjectNotActive(state));
+    }
+
+    Ok(AuthenticatedIngestProject {
+        project_id: row.try_get("project_id")?,
+    })
+}
+
+pub async fn insert_events_with_authenticated_ingest(
+    pool: &PgPool,
+    authenticated: &AuthenticatedIngestProject,
     events: &[EventPayload],
 ) -> Result<u64, StoreError> {
     let actor_id = Uuid::new_v4().to_string();
-    let lease = claim_project_processing_lease(
-        pool,
-        project_id,
-        ProjectProcessingActorKind::Ingest,
-        &actor_id,
-    )
-    .await?;
 
     let result = async {
         let mut tx = pool.begin().await?;
+        let lease = claim_project_processing_lease_in_tx(
+            &mut tx,
+            authenticated.project_id,
+            ProjectProcessingActorKind::Ingest,
+            &actor_id,
+        )
+        .await?;
+
         let mut builder = QueryBuilder::<sqlx::Postgres>::new(
             "INSERT INTO events_raw (project_id, event_name, timestamp, install_id, platform, app_version, os_version, locale) ",
         );
 
         builder.push_values(events, |mut separated, event| {
-            separated.push_bind(project_id);
+            separated.push_bind(authenticated.project_id);
             separated.push_bind(&event.event);
             separated.push_bind(event.timestamp);
             separated.push_bind(&event.install_id);
@@ -1164,16 +1208,30 @@ pub async fn insert_events(
         verify_project_processing_lease_in_tx(&mut tx, &lease).await?;
         tx.commit().await?;
 
-        Ok(inserted.rows_affected())
+        Ok::<_, StoreError>((lease, inserted.rows_affected()))
     }
     .await;
-    let release_result = release_project_processing_lease(pool, &lease).await;
 
-    match (result, release_result) {
-        (Ok(inserted), Ok(())) => Ok(inserted),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), _) => Err(error),
+    match result {
+        Ok((lease, inserted)) => {
+            release_project_processing_lease(pool, &lease).await?;
+            Ok(inserted)
+        }
+        Err(error) => Err(error),
     }
+}
+
+pub async fn insert_events(
+    pool: &PgPool,
+    project_id: Uuid,
+    events: &[EventPayload],
+) -> Result<u64, StoreError> {
+    insert_events_with_authenticated_ingest(
+        pool,
+        &AuthenticatedIngestProject { project_id },
+        events,
+    )
+    .await
 }
 
 pub async fn create_project_deletion_job(
@@ -9284,6 +9342,145 @@ mod tests {
                 .expect("list missing project")
                 .is_none()
         );
+    }
+
+    #[sqlx::test]
+    async fn authenticate_ingest_request_accepts_active_ingest_keys(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let project = create_project(&pool, "Authenticated Ingest Project")
+            .await
+            .expect("create project");
+        let ingest_secret = generate_api_key_secret(ApiKeyKind::Ingest);
+        create_api_key(
+            &pool,
+            project.id,
+            "ios-prod",
+            ApiKeyKind::Ingest,
+            &ingest_secret,
+        )
+        .await
+        .expect("create ingest key")
+        .expect("project exists");
+
+        let authenticated = authenticate_ingest_request(&pool, &ingest_secret)
+            .await
+            .expect("authenticate ingest request");
+
+        assert_eq!(authenticated.project_id, project.id);
+    }
+
+    #[sqlx::test]
+    async fn authenticate_ingest_request_rejects_invalid_revoked_and_wrong_kind_keys(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let project = create_project(&pool, "Reject Bad Ingest Keys")
+            .await
+            .expect("create project");
+        let revoked_secret = generate_api_key_secret(ApiKeyKind::Ingest);
+        let revoked_key = create_api_key(
+            &pool,
+            project.id,
+            "revoked",
+            ApiKeyKind::Ingest,
+            &revoked_secret,
+        )
+        .await
+        .expect("create revoked ingest key")
+        .expect("project exists");
+        let read_secret = generate_api_key_secret(ApiKeyKind::Read);
+        create_api_key(&pool, project.id, "read", ApiKeyKind::Read, &read_secret)
+            .await
+            .expect("create read key")
+            .expect("project exists");
+        assert!(
+            revoke_api_key(&pool, project.id, revoked_key.id)
+                .await
+                .expect("revoke ingest key"),
+            "revoked key should exist"
+        );
+
+        for secret in ["fg_ing_missing_key".to_owned(), revoked_secret, read_secret] {
+            let error = authenticate_ingest_request(&pool, &secret)
+                .await
+                .expect_err("non-active ingest auth should fail");
+            assert!(
+                matches!(error, StoreError::ProjectNotFound),
+                "expected unauthorized-like store error for {secret}, got {error:?}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn authenticate_ingest_request_rejects_non_active_projects(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        for (state, expected_state) in [
+            ("range_deleting", ProjectState::RangeDeleting),
+            ("pending_deletion", ProjectState::PendingDeletion),
+        ] {
+            let project = create_project(&pool, &format!("Auth Gate {state}"))
+                .await
+                .expect("create project");
+            let ingest_secret = generate_api_key_secret(ApiKeyKind::Ingest);
+            create_api_key(
+                &pool,
+                project.id,
+                "ingest",
+                ApiKeyKind::Ingest,
+                &ingest_secret,
+            )
+            .await
+            .expect("create ingest key")
+            .expect("project exists");
+            sqlx::query("UPDATE projects SET state = $2 WHERE id = $1")
+                .bind(project.id)
+                .bind(state)
+                .execute(&pool)
+                .await
+                .expect("update project state");
+
+            let error = authenticate_ingest_request(&pool, &ingest_secret)
+                .await
+                .expect_err("non-active project should fail auth gate");
+            assert!(matches!(
+                error,
+                StoreError::ProjectNotActive(actual) if actual == expected_state
+            ));
+        }
+    }
+
+    #[sqlx::test]
+    async fn insert_events_with_authenticated_ingest_inserts_rows(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let project = create_project(&pool, "Authenticated Insert Project")
+            .await
+            .expect("create project");
+        let ingest_secret = generate_api_key_secret(ApiKeyKind::Ingest);
+        create_api_key(
+            &pool,
+            project.id,
+            "ingest",
+            ApiKeyKind::Ingest,
+            &ingest_secret,
+        )
+        .await
+        .expect("create ingest key")
+        .expect("project exists");
+        let authenticated = authenticate_ingest_request(&pool, &ingest_secret)
+            .await
+            .expect("authenticate ingest request");
+
+        let inserted = insert_events_with_authenticated_ingest(
+            &pool,
+            &authenticated,
+            &[event("install-1", 0), event("install-2", 1)],
+        )
+        .await
+        .expect("insert events with authenticated ingest");
+
+        assert_eq!(inserted, 2);
     }
 
     #[sqlx::test]

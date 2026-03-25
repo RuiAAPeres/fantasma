@@ -1,12 +1,14 @@
 use axum::{
     body::{Body, to_bytes},
-    http::{Request, StatusCode, header::CONTENT_TYPE},
+    http::{HeaderValue, Request, StatusCode, header::CONTENT_TYPE},
     response::Response,
 };
 use fantasma_store::{
-    ApiKeyKind, PgPool, create_api_key, create_project, generate_api_key_secret, run_migrations,
+    ApiKeyKind, PgPool, create_api_key, create_project, generate_api_key_secret, revoke_api_key,
+    run_migrations,
 };
 use tower::util::ServiceExt;
+use uuid::Uuid;
 
 async fn response_json(response: Response) -> serde_json::Value {
     serde_json::from_slice(
@@ -32,6 +34,8 @@ fn event_batch_body(count: usize) -> String {
 }
 
 struct ProvisionedProject {
+    project_id: Uuid,
+    ingest_key_id: Uuid,
     ingest_key: String,
     read_key: String,
 }
@@ -42,7 +46,7 @@ async fn provision_project(pool: &PgPool) -> ProvisionedProject {
         .expect("create project");
 
     let ingest_key = generate_api_key_secret(ApiKeyKind::Ingest);
-    create_api_key(
+    let ingest_key_record = create_api_key(
         pool,
         project.id,
         "ingest-test",
@@ -60,9 +64,15 @@ async fn provision_project(pool: &PgPool) -> ProvisionedProject {
         .expect("project exists");
 
     ProvisionedProject {
+        project_id: project.id,
+        ingest_key_id: ingest_key_record.id,
         ingest_key,
         read_key,
     }
+}
+
+fn oversized_body() -> String {
+    "x".repeat(513 * 1024)
 }
 
 #[sqlx::test]
@@ -99,6 +109,85 @@ async fn ingest_rejects_non_ingest_project_keys(pool: PgPool) {
                 .header(CONTENT_TYPE, "application/json")
                 .header("x-fantasma-key", provisioned.read_key)
                 .body(Body::from("{\"events\":[]}"))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({ "error": "unauthorized" })
+    );
+}
+
+#[sqlx::test]
+async fn ingest_rejects_malformed_ingest_key_header(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header(
+                    "x-fantasma-key",
+                    HeaderValue::from_bytes(b"\xff\xfe").expect("header value"),
+                )
+                .body(Body::from("{\"events\":[]}"))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({ "error": "unauthorized" })
+    );
+}
+
+#[sqlx::test]
+async fn ingest_rejects_invalid_keys_before_reading_body(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", "fg_ing_invalid")
+                .body(Body::from(oversized_body()))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({ "error": "unauthorized" })
+    );
+}
+
+#[sqlx::test]
+async fn ingest_rejects_revoked_keys_before_reading_body(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let provisioned = provision_project(&pool).await;
+    assert!(
+        revoke_api_key(&pool, provisioned.project_id, provisioned.ingest_key_id)
+            .await
+            .expect("revoke ingest key"),
+        "provisioned ingest key should be revocable"
+    );
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", provisioned.ingest_key)
+                .body(Body::from(oversized_body()))
                 .expect("request"),
         )
         .await
@@ -177,14 +266,12 @@ async fn ingest_rejects_payloads_above_limit(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
     let provisioned = provision_project(&pool).await;
     let app = fantasma_ingest::app(pool);
-    let oversized = "x".repeat(513 * 1024);
-
     let response = app
         .oneshot(
             Request::post("/v1/events")
                 .header(CONTENT_TYPE, "application/json")
                 .header("x-fantasma-key", provisioned.ingest_key)
-                .body(Body::from(oversized))
+                .body(Body::from(oversized_body()))
                 .expect("request"),
         )
         .await
@@ -394,7 +481,8 @@ async fn ingest_rejects_legacy_properties_null_payloads(pool: PgPool) {
 async fn ingest_returns_project_busy_for_range_deleting_projects(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
     let provisioned = provision_project(&pool).await;
-    sqlx::query("UPDATE projects SET state = 'range_deleting' WHERE name = 'Ingest Test Project'")
+    sqlx::query("UPDATE projects SET state = 'range_deleting' WHERE id = $1")
+        .bind(provisioned.project_id)
         .execute(&pool)
         .await
         .expect("update project state");
@@ -419,15 +507,43 @@ async fn ingest_returns_project_busy_for_range_deleting_projects(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn ingest_returns_project_busy_before_reading_body_for_range_deleting_projects(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let provisioned = provision_project(&pool).await;
+    sqlx::query("UPDATE projects SET state = 'range_deleting' WHERE id = $1")
+        .bind(provisioned.project_id)
+        .execute(&pool)
+        .await
+        .expect("update project state");
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", provisioned.ingest_key)
+                .body(Body::from(oversized_body()))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({ "error": "project_busy" })
+    );
+}
+
+#[sqlx::test]
 async fn ingest_returns_project_pending_deletion_for_pending_projects(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
     let provisioned = provision_project(&pool).await;
-    sqlx::query(
-        "UPDATE projects SET state = 'pending_deletion' WHERE name = 'Ingest Test Project'",
-    )
-    .execute(&pool)
-    .await
-    .expect("update project state");
+    sqlx::query("UPDATE projects SET state = 'pending_deletion' WHERE id = $1")
+        .bind(provisioned.project_id)
+        .execute(&pool)
+        .await
+        .expect("update project state");
     let app = fantasma_ingest::app(pool);
 
     let response = app
@@ -436,6 +552,37 @@ async fn ingest_returns_project_pending_deletion_for_pending_projects(pool: PgPo
                 .header(CONTENT_TYPE, "application/json")
                 .header("x-fantasma-key", provisioned.ingest_key)
                 .body(Body::from(event_batch_body(1)))
+                .expect("request"),
+        )
+        .await
+        .expect("response succeeds");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({ "error": "project_pending_deletion" })
+    );
+}
+
+#[sqlx::test]
+async fn ingest_returns_project_pending_deletion_before_reading_body_for_pending_projects(
+    pool: PgPool,
+) {
+    run_migrations(&pool).await.expect("migrations succeed");
+    let provisioned = provision_project(&pool).await;
+    sqlx::query("UPDATE projects SET state = 'pending_deletion' WHERE id = $1")
+        .bind(provisioned.project_id)
+        .execute(&pool)
+        .await
+        .expect("update project state");
+    let app = fantasma_ingest::app(pool);
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", provisioned.ingest_key)
+                .body(Body::from(oversized_body()))
                 .expect("request"),
         )
         .await
