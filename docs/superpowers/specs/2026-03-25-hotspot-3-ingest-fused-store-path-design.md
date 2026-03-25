@@ -1,6 +1,6 @@
 # Hotspot 3 Ingest Fused Store Path Design
 
-**Goal:** Reduce fixed ingest-path database round trips for `POST /v1/events` without changing the public API, auth ordering, validation behavior, or project-fencing correctness.
+**Goal:** Reduce fixed ingest-path database round trips for `POST /v1/events` without changing the public API, auth-before-body-read behavior, validation behavior, or project-fencing correctness.
 
 ## Problem
 
@@ -16,7 +16,7 @@ This shape preserves correctness, but it pays repeated lookup and transaction ov
 ## Constraints
 
 - Keep the public `/v1/events` contract exactly the same.
-- Preserve current auth-before-body-parse ordering.
+- Preserve the current auth-and-project-state gate before the request body is read.
 - Preserve current response behavior for:
   - missing key -> `401 unauthorized`
   - invalid key -> `401 unauthorized`
@@ -62,25 +62,54 @@ This means one successful ingest batch pays:
 
 ## Recommended Design
 
-### New fused store entrypoint
+### Revised fused-path shape
 
-Add one new store function for accepted ingest batches, for example:
+Because the current handler fully authenticates the ingest key and gates on project state before it reads the body, a single store call that only runs after body parse is not compatible with the current public behavior.
 
-- `authenticate_and_insert_events(pool, ingest_key, events) -> Result<u64, StoreError>`
+For this slice, preserve the current ordering and use two store-side phases:
+
+1. a pre-body-read auth/state gate that fuses:
+   - ingest key lookup
+   - revoked / wrong-kind / missing-key rejection
+   - project lifecycle gating
+2. a post-parse insert path that fuses:
+   - ingest lease claim
+   - raw-event batch insert
+   - fence verification
+
+This is the maximum safe fusion that keeps the externally observable request ordering unchanged.
+
+### New pre-parse store entrypoint
+
+Add a store function for the auth/state gate, for example:
+
+- `authenticate_ingest_request(pool, ingest_key) -> Result<AuthenticatedIngestProject, StoreError>`
 
 This function should:
 
 1. resolve the supplied key from `api_keys`
 2. reject revoked, missing, or wrong-kind keys as unauthorized
-3. lock/load the target project row in the same transaction
-4. gate on project lifecycle state before any insert work
-5. claim the ingest project-processing lease in that same transaction
-6. batch insert the accepted rows into `events_raw`
-7. verify the lease fence before commit
-8. commit
-9. release the lease after the transactional work finishes
+3. load the target project row in the same query or transaction
+4. gate on project lifecycle state before the handler reads the body
+5. return a small authenticated ingest context containing at least `project_id`
 
-The HTTP handler should no longer call `resolve_project_id_for_ingest_key()` or `load_project()` directly on the hot success path.
+The HTTP handler should no longer call `resolve_project_id_for_ingest_key()` and `load_project()` separately on the hot path.
+
+### New post-parse fused insert entrypoint
+
+Add a second store function for accepted ingest batches, for example:
+
+- `insert_events_with_authenticated_ingest(pool, auth, events) -> Result<u64, StoreError>`
+
+This function should:
+
+1. start one transaction
+2. load current project state and fence in that transaction
+3. claim the ingest project-processing lease in that same transaction
+4. batch insert the accepted rows into `events_raw`
+5. verify the lease fence before commit
+6. commit
+7. release the lease after the transactional work finishes
 
 ### Handler behavior
 
@@ -88,25 +117,22 @@ The HTTP handler should no longer call `resolve_project_id_for_ingest_key()` or 
 
 1. read `x-fantasma-key`
 2. reject missing or malformed header as `401 unauthorized`
-3. read and normalize the body only after the header is present and syntactically usable
-4. call the fused store entrypoint with the normalized events
-5. map typed store errors back to the exact current HTTP responses
+3. call the new pre-parse auth/state gate
+4. only if that succeeds, read and normalize the body
+5. call the post-parse fused insert entrypoint with the authenticated ingest context and normalized events
+6. map typed store errors back to the exact current HTTP responses
 
-Important: body parsing still must not run for callers that fail the header-presence / header-string gate.
+Important: body parsing must not run for callers that fail either the header-presence check or the auth/state gate.
 
 ### Store implementation shape
 
-Prefer a transaction-local helper structure rather than stacking old public helpers:
+Prefer transaction-local helpers rather than stacking old public helpers:
 
 - keep `resolve_api_key()` as a lower-level reusable primitive if still useful
-- do not build the fused path by composing `resolve_project_id_for_ingest_key()` + `load_project()` + `insert_events()` unchanged
-- instead, use one transaction that:
-  - selects the key row
-  - validates `kind = ingest`
-  - joins or separately loads `projects ... FOR UPDATE`
-  - inserts/refreshes the ingest lease row
-  - performs the raw event insert
-  - checks `fence_epoch`
+- do not build the new path by composing `resolve_project_id_for_ingest_key()` + `load_project()` + `insert_events()` unchanged
+- the pre-parse auth/state gate should collapse the current key lookup plus lifecycle read into one store entrypoint
+- the post-parse insert path should collapse lease claim, insert, and fence verification into one transaction
+- do not require `FOR UPDATE` on the project row in the success path unless profiling or a concrete race demonstrates it is necessary
 
 This keeps the optimization real instead of hiding the same number of trips behind a new wrapper.
 
@@ -159,16 +185,20 @@ Add or extend tests covering:
 - invalid JSON -> `422 invalid_request`
 - validation errors -> structured validation response
 - success -> `202 accepted`
-- auth-before-body-parse ordering on unauthorized requests
+- body-read ordering proof for all pre-parse gate failures:
+  - unauthorized requests
+  - `range_deleting` projects
+  - `pending_deletion` projects
 
 ### Store coverage
 
 Add tests for the fused store path covering:
 
-- active ingest key inserts rows successfully
+- active ingest key authenticates successfully
 - wrong-kind key is rejected
 - revoked key is rejected
 - missing key is rejected
+- active authenticated ingest context inserts rows successfully
 - lifecycle gating returns the expected `StoreError`
 - fence change during ingest returns the expected `StoreError`
 - insert count matches accepted event count
