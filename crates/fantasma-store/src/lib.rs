@@ -11820,9 +11820,15 @@ mod tests {
             .find("pub async fn insert_events(")
             .expect("find insert_events");
         let helper = &source[start..end];
+        let lease_claim = helper
+            .find("let lease = claim_project_processing_lease(")
+            .expect("find out-of-transaction lease claim");
+        let begin_tx = helper
+            .find("let mut tx = pool.begin().await?")
+            .expect("find insert transaction start");
 
         assert!(
-            helper.contains("let lease = claim_project_processing_lease("),
+            lease_claim < begin_tx,
             "authenticated ingest should claim the ingest lease before opening the insert transaction"
         );
         assert!(
