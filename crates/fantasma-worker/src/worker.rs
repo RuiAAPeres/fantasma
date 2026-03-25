@@ -385,11 +385,11 @@ struct IncrementalSessionPlan {
 
 #[derive(Debug, Default)]
 struct SessionMetricAccumulator {
-    totals: BTreeMap<(MetricGranularity, DateTime<Utc>), SessionMetricDeltaValue>,
-    dim1: BTreeMap<(MetricGranularity, DateTime<Utc>, String, String), SessionMetricDeltaValue>,
-    dim2: BTreeMap<SessionMetricDim2Key, SessionMetricDeltaValue>,
-    dim3: BTreeMap<SessionMetricDim3Key, SessionMetricDeltaValue>,
-    dim4: BTreeMap<SessionMetricDim4Key, SessionMetricDeltaValue>,
+    totals: HashMap<(MetricGranularity, DateTime<Utc>), SessionMetricDeltaValue>,
+    dim1: HashMap<SessionMetricDim1Key, SessionMetricDeltaValue>,
+    dim2: HashMap<SessionMetricDim2Key, SessionMetricDeltaValue>,
+    dim3: HashMap<SessionMetricDim3Key, SessionMetricDeltaValue>,
+    dim4: HashMap<SessionMetricDim4Key, SessionMetricDeltaValue>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -399,36 +399,62 @@ struct SessionMetricDeltaValue {
     new_installs: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum BuiltinDimensionSlot {
+    AppVersion,
+    Locale,
+    OsVersion,
+    Platform,
+}
+
+impl BuiltinDimensionSlot {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AppVersion => "app_version",
+            Self::Locale => "locale",
+            Self::OsVersion => "os_version",
+            Self::Platform => "platform",
+        }
+    }
+}
+
+type SessionMetricDim1Key = (
+    MetricGranularity,
+    DateTime<Utc>,
+    BuiltinDimensionSlot,
+    String,
+);
+
 type SessionMetricDim2Key = (
     MetricGranularity,
     DateTime<Utc>,
+    BuiltinDimensionSlot,
     String,
-    String,
-    String,
+    BuiltinDimensionSlot,
     String,
 );
 
 type SessionMetricDim3Key = (
     MetricGranularity,
     DateTime<Utc>,
+    BuiltinDimensionSlot,
     String,
+    BuiltinDimensionSlot,
     String,
-    String,
-    String,
-    String,
+    BuiltinDimensionSlot,
     String,
 );
 
 type SessionMetricDim4Key = (
     MetricGranularity,
     DateTime<Utc>,
+    BuiltinDimensionSlot,
     String,
+    BuiltinDimensionSlot,
     String,
+    BuiltinDimensionSlot,
     String,
-    String,
-    String,
-    String,
-    String,
+    BuiltinDimensionSlot,
     String,
 );
 
@@ -447,7 +473,7 @@ impl SessionMetricAccumulator {
         session_count_delta: i64,
         duration_delta: i64,
     ) {
-        let dimensions = session_metric_dimensions(
+        let dimensions = session_metric_dimension_values(
             &session.platform,
             session.app_version.as_ref(),
             session.os_version.as_ref(),
@@ -463,7 +489,7 @@ impl SessionMetricAccumulator {
     }
 
     fn add_new_install_delta(&mut self, first_seen: &InstallFirstSeenRecord) {
-        let dimensions = session_metric_dimensions(
+        let dimensions = session_metric_dimension_values(
             &first_seen.platform,
             first_seen.app_version.as_ref(),
             first_seen.os_version.as_ref(),
@@ -475,7 +501,7 @@ impl SessionMetricAccumulator {
     fn add_deltas_for_dimensions(
         &mut self,
         timestamp: DateTime<Utc>,
-        dimensions: &[(String, String)],
+        dimensions: &[(BuiltinDimensionSlot, String)],
         session_count_delta: i64,
         duration_delta: i64,
         new_installs_delta: i64,
@@ -487,14 +513,9 @@ impl SessionMetricAccumulator {
                 .or_default()
                 .add(session_count_delta, duration_delta, new_installs_delta);
 
-            for (dim1_key, dim1_value) in dimensions {
+            for &(dim1_key, ref dim1_value) in dimensions {
                 self.dim1
-                    .entry((
-                        granularity,
-                        bucket_start,
-                        dim1_key.clone(),
-                        dim1_value.clone(),
-                    ))
+                    .entry((granularity, bucket_start, dim1_key, dim1_value.clone()))
                     .or_default()
                     .add(session_count_delta, duration_delta, new_installs_delta);
             }
@@ -507,9 +528,9 @@ impl SessionMetricAccumulator {
                         .entry((
                             granularity,
                             bucket_start,
-                            dim1_key.clone(),
+                            *dim1_key,
                             dim1_value.clone(),
-                            dim2_key.clone(),
+                            *dim2_key,
                             dim2_value.clone(),
                         ))
                         .or_default()
@@ -527,11 +548,11 @@ impl SessionMetricAccumulator {
                             .entry((
                                 granularity,
                                 bucket_start,
-                                dim1_key.clone(),
+                                *dim1_key,
                                 dim1_value.clone(),
-                                dim2_key.clone(),
+                                *dim2_key,
                                 dim2_value.clone(),
-                                dim3_key.clone(),
+                                *dim3_key,
                                 dim3_value.clone(),
                             ))
                             .or_default()
@@ -545,13 +566,13 @@ impl SessionMetricAccumulator {
                     .entry((
                         granularity,
                         bucket_start,
-                        dimensions[0].0.clone(),
+                        dimensions[0].0,
                         dimensions[0].1.clone(),
-                        dimensions[1].0.clone(),
+                        dimensions[1].0,
                         dimensions[1].1.clone(),
-                        dimensions[2].0.clone(),
+                        dimensions[2].0,
                         dimensions[2].1.clone(),
-                        dimensions[3].0.clone(),
+                        dimensions[3].0,
                         dimensions[3].1.clone(),
                     ))
                     .or_default()
@@ -561,8 +582,9 @@ impl SessionMetricAccumulator {
     }
 
     fn into_store_deltas(self, project_id: Uuid) -> SessionMetricStoreDeltas {
-        let totals = self
-            .totals
+        let mut totals = self.totals.into_iter().collect::<Vec<_>>();
+        totals.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let totals = totals
             .into_iter()
             .map(
                 |((granularity, bucket_start), value)| SessionMetricTotalDelta {
@@ -575,8 +597,9 @@ impl SessionMetricAccumulator {
                 },
             )
             .collect::<Vec<_>>();
-        let dim1 = self
-            .dim1
+        let mut dim1 = self.dim1.into_iter().collect::<Vec<_>>();
+        dim1.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let dim1 = dim1
             .into_iter()
             .map(
                 |((granularity, bucket_start, dim1_key, dim1_value), value)| {
@@ -584,7 +607,7 @@ impl SessionMetricAccumulator {
                         project_id,
                         granularity,
                         bucket_start,
-                        dim1_key,
+                        dim1_key: dim1_key.as_str().to_owned(),
                         dim1_value,
                         session_count: value.session_count,
                         duration_total_seconds: value.duration_total_seconds,
@@ -593,8 +616,9 @@ impl SessionMetricAccumulator {
                 },
             )
             .collect::<Vec<_>>();
-        let dim2 = self
-            .dim2
+        let mut dim2 = self.dim2.into_iter().collect::<Vec<_>>();
+        dim2.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let dim2 = dim2
             .into_iter()
             .map(
                 |(
@@ -604,9 +628,9 @@ impl SessionMetricAccumulator {
                     project_id,
                     granularity,
                     bucket_start,
-                    dim1_key,
+                    dim1_key: dim1_key.as_str().to_owned(),
                     dim1_value,
-                    dim2_key,
+                    dim2_key: dim2_key.as_str().to_owned(),
                     dim2_value,
                     session_count: value.session_count,
                     duration_total_seconds: value.duration_total_seconds,
@@ -614,8 +638,9 @@ impl SessionMetricAccumulator {
                 },
             )
             .collect::<Vec<_>>();
-        let dim3 = self
-            .dim3
+        let mut dim3 = self.dim3.into_iter().collect::<Vec<_>>();
+        dim3.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let dim3 = dim3
             .into_iter()
             .map(
                 |(
@@ -634,11 +659,11 @@ impl SessionMetricAccumulator {
                     project_id,
                     granularity,
                     bucket_start,
-                    dim1_key,
+                    dim1_key: dim1_key.as_str().to_owned(),
                     dim1_value,
-                    dim2_key,
+                    dim2_key: dim2_key.as_str().to_owned(),
                     dim2_value,
-                    dim3_key,
+                    dim3_key: dim3_key.as_str().to_owned(),
                     dim3_value,
                     session_count: value.session_count,
                     duration_total_seconds: value.duration_total_seconds,
@@ -646,8 +671,9 @@ impl SessionMetricAccumulator {
                 },
             )
             .collect::<Vec<_>>();
-        let dim4 = self
-            .dim4
+        let mut dim4 = self.dim4.into_iter().collect::<Vec<_>>();
+        dim4.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let dim4 = dim4
             .into_iter()
             .map(
                 |(
@@ -668,13 +694,13 @@ impl SessionMetricAccumulator {
                     project_id,
                     granularity,
                     bucket_start,
-                    dim1_key,
+                    dim1_key: dim1_key.as_str().to_owned(),
                     dim1_value,
-                    dim2_key,
+                    dim2_key: dim2_key.as_str().to_owned(),
                     dim2_value,
-                    dim3_key,
+                    dim3_key: dim3_key.as_str().to_owned(),
                     dim3_value,
-                    dim4_key,
+                    dim4_key: dim4_key.as_str().to_owned(),
                     dim4_value,
                     session_count: value.session_count,
                     duration_total_seconds: value.duration_total_seconds,
@@ -2456,67 +2482,63 @@ struct EventMetricRollups {
     dim4_deltas: Vec<EventMetricBucketDim4Delta>,
 }
 
+type EventMetricDim1Key = (
+    Uuid,
+    MetricGranularity,
+    DateTime<Utc>,
+    String,
+    BuiltinDimensionSlot,
+    String,
+);
+
+type EventMetricDim2Key = (
+    Uuid,
+    MetricGranularity,
+    DateTime<Utc>,
+    String,
+    BuiltinDimensionSlot,
+    String,
+    BuiltinDimensionSlot,
+    String,
+);
+
+type EventMetricDim3Key = (
+    Uuid,
+    MetricGranularity,
+    DateTime<Utc>,
+    String,
+    BuiltinDimensionSlot,
+    String,
+    BuiltinDimensionSlot,
+    String,
+    BuiltinDimensionSlot,
+    String,
+);
+
+type EventMetricDim4Key = (
+    Uuid,
+    MetricGranularity,
+    DateTime<Utc>,
+    String,
+    BuiltinDimensionSlot,
+    String,
+    BuiltinDimensionSlot,
+    String,
+    BuiltinDimensionSlot,
+    String,
+    BuiltinDimensionSlot,
+    String,
+);
+
 fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
-    let mut totals = BTreeMap::<(Uuid, MetricGranularity, DateTime<Utc>, String), i64>::new();
-    let mut dim1 = BTreeMap::<
-        (
-            Uuid,
-            MetricGranularity,
-            DateTime<Utc>,
-            String,
-            String,
-            String,
-        ),
-        i64,
-    >::new();
-    let mut dim2 = BTreeMap::<
-        (
-            Uuid,
-            MetricGranularity,
-            DateTime<Utc>,
-            String,
-            String,
-            String,
-            String,
-            String,
-        ),
-        i64,
-    >::new();
-    let mut dim3 = BTreeMap::<
-        (
-            Uuid,
-            MetricGranularity,
-            DateTime<Utc>,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        ),
-        i64,
-    >::new();
-    let mut dim4 = BTreeMap::<
-        (
-            Uuid,
-            MetricGranularity,
-            DateTime<Utc>,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        ),
-        i64,
-    >::new();
+    let mut totals = HashMap::<(Uuid, MetricGranularity, DateTime<Utc>, String), i64>::new();
+    let mut dim1 = HashMap::<EventMetricDim1Key, i64>::new();
+    let mut dim2 = HashMap::<EventMetricDim2Key, i64>::new();
+    let mut dim3 = HashMap::<EventMetricDim3Key, i64>::new();
+    let mut dim4 = HashMap::<EventMetricDim4Key, i64>::new();
     for event in batch {
         let event_name = event.event_name.clone();
-        let dimensions = event_metric_dimensions(event);
+        let dimensions = event_metric_dimension_values(event);
         for granularity in [MetricGranularity::Day, MetricGranularity::Hour] {
             let bucket_start = bucket_start_for_granularity(event.timestamp, granularity);
 
@@ -2529,15 +2551,15 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                 ))
                 .or_default() += 1;
 
-            for dimension in &dimensions {
+            for &(dim1_key, ref dim1_value) in &dimensions {
                 *dim1
                     .entry((
                         event.project_id,
                         granularity,
                         bucket_start,
                         event_name.clone(),
-                        dimension.0.clone(),
-                        dimension.1.clone(),
+                        dim1_key,
+                        dim1_value.clone(),
                     ))
                     .or_default() += 1;
             }
@@ -2552,9 +2574,9 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                             granularity,
                             bucket_start,
                             event_name.clone(),
-                            left.0.clone(),
+                            left.0,
                             left.1.clone(),
-                            right.0.clone(),
+                            right.0,
                             right.1.clone(),
                         ))
                         .or_default() += 1;
@@ -2573,11 +2595,11 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                                 granularity,
                                 bucket_start,
                                 event_name.clone(),
-                                first.0.clone(),
+                                first.0,
                                 first.1.clone(),
-                                second.0.clone(),
+                                second.0,
                                 second.1.clone(),
-                                third.0.clone(),
+                                third.0,
                                 third.1.clone(),
                             ))
                             .or_default() += 1;
@@ -2592,13 +2614,13 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                         granularity,
                         bucket_start,
                         event_name.clone(),
-                        dimensions[0].0.clone(),
+                        dimensions[0].0,
                         dimensions[0].1.clone(),
-                        dimensions[1].0.clone(),
+                        dimensions[1].0,
                         dimensions[1].1.clone(),
-                        dimensions[2].0.clone(),
+                        dimensions[2].0,
                         dimensions[2].1.clone(),
-                        dimensions[3].0.clone(),
+                        dimensions[3].0,
                         dimensions[3].1.clone(),
                     ))
                     .or_default() += 1;
@@ -2606,8 +2628,19 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
         }
     }
 
+    let mut total_deltas = totals.into_iter().collect::<Vec<_>>();
+    total_deltas.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    let mut dim1_deltas = dim1.into_iter().collect::<Vec<_>>();
+    dim1_deltas.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    let mut dim2_deltas = dim2.into_iter().collect::<Vec<_>>();
+    dim2_deltas.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    let mut dim3_deltas = dim3.into_iter().collect::<Vec<_>>();
+    dim3_deltas.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    let mut dim4_deltas = dim4.into_iter().collect::<Vec<_>>();
+    dim4_deltas.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+
     EventMetricRollups {
-        total_deltas: totals
+        total_deltas: total_deltas
             .into_iter()
             .map(
                 |((project_id, granularity, bucket_start, event_name), event_count)| {
@@ -2621,7 +2654,7 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                 },
             )
             .collect(),
-        dim1_deltas: dim1
+        dim1_deltas: dim1_deltas
             .into_iter()
             .map(
                 |(
@@ -2633,14 +2666,14 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                         granularity,
                         bucket_start,
                         event_name,
-                        dim1_key,
+                        dim1_key: dim1_key.as_str().to_owned(),
                         dim1_value,
                         event_count,
                     }
                 },
             )
             .collect(),
-        dim2_deltas: dim2
+        dim2_deltas: dim2_deltas
             .into_iter()
             .map(
                 |(
@@ -2660,15 +2693,15 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                     granularity,
                     bucket_start,
                     event_name,
-                    dim1_key,
+                    dim1_key: dim1_key.as_str().to_owned(),
                     dim1_value,
-                    dim2_key,
+                    dim2_key: dim2_key.as_str().to_owned(),
                     dim2_value,
                     event_count,
                 },
             )
             .collect(),
-        dim3_deltas: dim3
+        dim3_deltas: dim3_deltas
             .into_iter()
             .map(
                 |(
@@ -2690,17 +2723,17 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                     granularity,
                     bucket_start,
                     event_name,
-                    dim1_key,
+                    dim1_key: dim1_key.as_str().to_owned(),
                     dim1_value,
-                    dim2_key,
+                    dim2_key: dim2_key.as_str().to_owned(),
                     dim2_value,
-                    dim3_key,
+                    dim3_key: dim3_key.as_str().to_owned(),
                     dim3_value,
                     event_count,
                 },
             )
             .collect(),
-        dim4_deltas: dim4
+        dim4_deltas: dim4_deltas
             .into_iter()
             .map(
                 |(
@@ -2724,13 +2757,13 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                     granularity,
                     bucket_start,
                     event_name,
-                    dim1_key,
+                    dim1_key: dim1_key.as_str().to_owned(),
                     dim1_value,
-                    dim2_key,
+                    dim2_key: dim2_key.as_str().to_owned(),
                     dim2_value,
-                    dim3_key,
+                    dim3_key: dim3_key.as_str().to_owned(),
                     dim3_value,
-                    dim4_key,
+                    dim4_key: dim4_key.as_str().to_owned(),
                     dim4_value,
                     event_count,
                 },
@@ -2766,51 +2799,52 @@ fn build_live_install_state_upserts(batch: &[RawEventRecord]) -> Vec<LiveInstall
         .collect()
 }
 
-fn event_metric_dimensions(event: &RawEventRecord) -> Vec<(String, String)> {
-    let mut dimensions = Vec::with_capacity(4);
-
-    dimensions.push((
-        "platform".to_owned(),
-        platform_dimension_value(&event.platform),
-    ));
-
-    if let Some(app_version) = event.app_version.as_ref() {
-        dimensions.push(("app_version".to_owned(), app_version.clone()));
-    }
-
-    if let Some(os_version) = event.os_version.as_ref() {
-        dimensions.push(("os_version".to_owned(), os_version.clone()));
-    }
-
-    if let Some(locale) = event.locale.as_ref() {
-        dimensions.push(("locale".to_owned(), locale.clone()));
-    }
-    dimensions.sort_by(|left, right| left.0.cmp(&right.0));
-
-    dimensions
+fn event_metric_dimension_values(event: &RawEventRecord) -> Vec<(BuiltinDimensionSlot, String)> {
+    builtin_metric_dimension_values(
+        &event.platform,
+        event.app_version.as_deref(),
+        event.os_version.as_deref(),
+        event.locale.as_deref(),
+    )
 }
 
-fn session_metric_dimensions(
+fn session_metric_dimension_values(
     platform: &fantasma_core::Platform,
     app_version: Option<&String>,
     os_version: Option<&String>,
     locale: Option<&String>,
-) -> Vec<(String, String)> {
+) -> Vec<(BuiltinDimensionSlot, String)> {
+    builtin_metric_dimension_values(
+        platform,
+        app_version.map(String::as_str),
+        os_version.map(String::as_str),
+        locale.map(String::as_str),
+    )
+}
+
+fn builtin_metric_dimension_values(
+    platform: &fantasma_core::Platform,
+    app_version: Option<&str>,
+    os_version: Option<&str>,
+    locale: Option<&str>,
+) -> Vec<(BuiltinDimensionSlot, String)> {
     let mut dimensions = Vec::with_capacity(4);
-    dimensions.push(("platform".to_owned(), platform_dimension_value(platform)));
 
     if let Some(app_version) = app_version {
-        dimensions.push(("app_version".to_owned(), app_version.clone()));
-    }
-
-    if let Some(os_version) = os_version {
-        dimensions.push(("os_version".to_owned(), os_version.clone()));
+        dimensions.push((BuiltinDimensionSlot::AppVersion, app_version.to_owned()));
     }
 
     if let Some(locale) = locale {
-        dimensions.push(("locale".to_owned(), locale.clone()));
+        dimensions.push((BuiltinDimensionSlot::Locale, locale.to_owned()));
     }
-    dimensions.sort_by(|left, right| left.0.cmp(&right.0));
+
+    if let Some(os_version) = os_version {
+        dimensions.push((BuiltinDimensionSlot::OsVersion, os_version.to_owned()));
+    }
+    dimensions.push((
+        BuiltinDimensionSlot::Platform,
+        platform_dimension_value(platform),
+    ));
 
     dimensions
 }
@@ -4860,6 +4894,440 @@ mod tests {
                 .iter()
                 .all(|delta| delta.event_count == 1),
             "single events must increment each bounded cube exactly once"
+        );
+    }
+
+    #[test]
+    fn accumulator_dimension_helpers_preserve_existing_canonical_key_order() {
+        let raw_dimensions = event_metric_dimension_values(&raw_event_with_max_dimensions());
+        assert_eq!(
+            raw_dimensions,
+            vec![
+                (BuiltinDimensionSlot::AppVersion, "1.0.0".to_owned()),
+                (BuiltinDimensionSlot::Locale, "en-GB".to_owned()),
+                (BuiltinDimensionSlot::OsVersion, "18.3".to_owned()),
+                (BuiltinDimensionSlot::Platform, "ios".to_owned()),
+            ]
+        );
+
+        let session_dimensions = session_metric_dimension_values(
+            &Platform::Ios,
+            Some(&"1.0.0".to_owned()),
+            Some(&"18.3".to_owned()),
+            Some(&"en-GB".to_owned()),
+        );
+        assert_eq!(session_dimensions, raw_dimensions);
+    }
+
+    #[test]
+    fn event_metric_rollups_keep_tuple_key_order_after_accumulation() {
+        let mut z_event = raw_event_with_max_dimensions();
+        z_event.event_name = "z_open".to_owned();
+        z_event.timestamp = timestamp(1, 2, 3);
+
+        let mut a_event = raw_event_with_max_dimensions();
+        a_event.id = 2;
+        a_event.event_name = "a_open".to_owned();
+        a_event.timestamp = timestamp(1, 2, 3);
+        a_event.received_at = timestamp(1, 2, 4);
+
+        let rollups = build_event_metric_rollups(&[z_event, a_event]);
+
+        let total_keys = rollups
+            .total_deltas
+            .iter()
+            .map(|delta| (delta.event_name.as_str(), delta.granularity))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            total_keys,
+            vec![
+                ("a_open", MetricGranularity::Hour),
+                ("z_open", MetricGranularity::Hour),
+                ("a_open", MetricGranularity::Day),
+                ("z_open", MetricGranularity::Day),
+            ]
+        );
+
+        let dim1_keys = rollups
+            .dim1_deltas
+            .iter()
+            .map(|delta| {
+                (
+                    delta.event_name.as_str(),
+                    delta.dim1_key.as_str(),
+                    delta.granularity,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dim1_keys,
+            vec![
+                ("a_open", "app_version", MetricGranularity::Hour),
+                ("a_open", "locale", MetricGranularity::Hour),
+                ("a_open", "os_version", MetricGranularity::Hour),
+                ("a_open", "platform", MetricGranularity::Hour),
+                ("z_open", "app_version", MetricGranularity::Hour),
+                ("z_open", "locale", MetricGranularity::Hour),
+                ("z_open", "os_version", MetricGranularity::Hour),
+                ("z_open", "platform", MetricGranularity::Hour),
+                ("a_open", "app_version", MetricGranularity::Day),
+                ("a_open", "locale", MetricGranularity::Day),
+                ("a_open", "os_version", MetricGranularity::Day),
+                ("a_open", "platform", MetricGranularity::Day),
+                ("z_open", "app_version", MetricGranularity::Day),
+                ("z_open", "locale", MetricGranularity::Day),
+                ("z_open", "os_version", MetricGranularity::Day),
+                ("z_open", "platform", MetricGranularity::Day),
+            ]
+        );
+
+        let dim2_keys = rollups
+            .dim2_deltas
+            .iter()
+            .map(|delta| {
+                (
+                    delta.event_name.as_str(),
+                    delta.dim1_key.as_str(),
+                    delta.dim2_key.as_str(),
+                    delta.granularity,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dim2_keys,
+            vec![
+                ("a_open", "app_version", "locale", MetricGranularity::Hour),
+                (
+                    "a_open",
+                    "app_version",
+                    "os_version",
+                    MetricGranularity::Hour
+                ),
+                ("a_open", "app_version", "platform", MetricGranularity::Hour),
+                ("a_open", "locale", "os_version", MetricGranularity::Hour),
+                ("a_open", "locale", "platform", MetricGranularity::Hour),
+                ("a_open", "os_version", "platform", MetricGranularity::Hour),
+                ("z_open", "app_version", "locale", MetricGranularity::Hour),
+                (
+                    "z_open",
+                    "app_version",
+                    "os_version",
+                    MetricGranularity::Hour
+                ),
+                ("z_open", "app_version", "platform", MetricGranularity::Hour),
+                ("z_open", "locale", "os_version", MetricGranularity::Hour),
+                ("z_open", "locale", "platform", MetricGranularity::Hour),
+                ("z_open", "os_version", "platform", MetricGranularity::Hour),
+                ("a_open", "app_version", "locale", MetricGranularity::Day),
+                (
+                    "a_open",
+                    "app_version",
+                    "os_version",
+                    MetricGranularity::Day
+                ),
+                ("a_open", "app_version", "platform", MetricGranularity::Day),
+                ("a_open", "locale", "os_version", MetricGranularity::Day),
+                ("a_open", "locale", "platform", MetricGranularity::Day),
+                ("a_open", "os_version", "platform", MetricGranularity::Day),
+                ("z_open", "app_version", "locale", MetricGranularity::Day),
+                (
+                    "z_open",
+                    "app_version",
+                    "os_version",
+                    MetricGranularity::Day
+                ),
+                ("z_open", "app_version", "platform", MetricGranularity::Day),
+                ("z_open", "locale", "os_version", MetricGranularity::Day),
+                ("z_open", "locale", "platform", MetricGranularity::Day),
+                ("z_open", "os_version", "platform", MetricGranularity::Day),
+            ]
+        );
+
+        let dim3_keys = rollups
+            .dim3_deltas
+            .iter()
+            .map(|delta| {
+                (
+                    delta.event_name.as_str(),
+                    delta.dim1_key.as_str(),
+                    delta.dim2_key.as_str(),
+                    delta.dim3_key.as_str(),
+                    delta.granularity,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dim3_keys,
+            vec![
+                (
+                    "a_open",
+                    "app_version",
+                    "locale",
+                    "os_version",
+                    MetricGranularity::Hour,
+                ),
+                (
+                    "a_open",
+                    "app_version",
+                    "locale",
+                    "platform",
+                    MetricGranularity::Hour,
+                ),
+                (
+                    "a_open",
+                    "app_version",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Hour,
+                ),
+                (
+                    "a_open",
+                    "locale",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Hour,
+                ),
+                (
+                    "z_open",
+                    "app_version",
+                    "locale",
+                    "os_version",
+                    MetricGranularity::Hour,
+                ),
+                (
+                    "z_open",
+                    "app_version",
+                    "locale",
+                    "platform",
+                    MetricGranularity::Hour,
+                ),
+                (
+                    "z_open",
+                    "app_version",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Hour,
+                ),
+                (
+                    "z_open",
+                    "locale",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Hour,
+                ),
+                (
+                    "a_open",
+                    "app_version",
+                    "locale",
+                    "os_version",
+                    MetricGranularity::Day,
+                ),
+                (
+                    "a_open",
+                    "app_version",
+                    "locale",
+                    "platform",
+                    MetricGranularity::Day,
+                ),
+                (
+                    "a_open",
+                    "app_version",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Day,
+                ),
+                (
+                    "a_open",
+                    "locale",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Day,
+                ),
+                (
+                    "z_open",
+                    "app_version",
+                    "locale",
+                    "os_version",
+                    MetricGranularity::Day,
+                ),
+                (
+                    "z_open",
+                    "app_version",
+                    "locale",
+                    "platform",
+                    MetricGranularity::Day,
+                ),
+                (
+                    "z_open",
+                    "app_version",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Day,
+                ),
+                (
+                    "z_open",
+                    "locale",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Day,
+                ),
+            ]
+        );
+
+        let dim4_keys = rollups
+            .dim4_deltas
+            .iter()
+            .map(|delta| {
+                (
+                    delta.event_name.as_str(),
+                    delta.dim1_key.as_str(),
+                    delta.dim2_key.as_str(),
+                    delta.dim3_key.as_str(),
+                    delta.dim4_key.as_str(),
+                    delta.granularity,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dim4_keys,
+            vec![
+                (
+                    "a_open",
+                    "app_version",
+                    "locale",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Hour,
+                ),
+                (
+                    "z_open",
+                    "app_version",
+                    "locale",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Hour,
+                ),
+                (
+                    "a_open",
+                    "app_version",
+                    "locale",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Day,
+                ),
+                (
+                    "z_open",
+                    "app_version",
+                    "locale",
+                    "os_version",
+                    "platform",
+                    MetricGranularity::Day,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_metric_store_deltas_keep_tuple_key_order_after_accumulation() {
+        let mut accumulator = SessionMetricAccumulator::default();
+        let session = SessionRecord {
+            project_id: project_id(),
+            install_id: "install-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            session_start: timestamp(1, 2, 3),
+            session_end: timestamp(1, 2, 33),
+            event_count: 2,
+            duration_seconds: 30,
+            platform: Platform::Ios,
+            app_version: Some("1.0.0".to_owned()),
+            os_version: Some("18.3".to_owned()),
+            locale: Some("en-GB".to_owned()),
+        };
+
+        accumulator.add_session_delta(&session, 1, 30);
+        let (_, dim1, dim2, dim3, dim4) = accumulator.into_store_deltas(session.project_id);
+
+        let dim1_keys = dim1
+            .iter()
+            .map(|delta| delta.dim1_key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dim1_keys,
+            vec![
+                "app_version",
+                "locale",
+                "os_version",
+                "platform",
+                "app_version",
+                "locale",
+                "os_version",
+                "platform",
+            ]
+        );
+
+        let dim2_keys = dim2
+            .iter()
+            .map(|delta| (delta.dim1_key.as_str(), delta.dim2_key.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dim2_keys,
+            vec![
+                ("app_version", "locale"),
+                ("app_version", "os_version"),
+                ("app_version", "platform"),
+                ("locale", "os_version"),
+                ("locale", "platform"),
+                ("os_version", "platform"),
+                ("app_version", "locale"),
+                ("app_version", "os_version"),
+                ("app_version", "platform"),
+                ("locale", "os_version"),
+                ("locale", "platform"),
+                ("os_version", "platform"),
+            ]
+        );
+
+        let dim3_keys = dim3
+            .iter()
+            .map(|delta| {
+                (
+                    delta.dim1_key.as_str(),
+                    delta.dim2_key.as_str(),
+                    delta.dim3_key.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dim3_keys,
+            vec![
+                ("app_version", "locale", "os_version"),
+                ("app_version", "locale", "platform"),
+                ("app_version", "os_version", "platform"),
+                ("locale", "os_version", "platform"),
+                ("app_version", "locale", "os_version"),
+                ("app_version", "locale", "platform"),
+                ("app_version", "os_version", "platform"),
+                ("locale", "os_version", "platform"),
+            ]
+        );
+
+        let dim4_keys = dim4
+            .iter()
+            .map(|delta| {
+                (
+                    delta.dim1_key.as_str(),
+                    delta.dim2_key.as_str(),
+                    delta.dim3_key.as_str(),
+                    delta.dim4_key.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dim4_keys,
+            vec![
+                ("app_version", "locale", "os_version", "platform"),
+                ("app_version", "locale", "os_version", "platform"),
+            ]
         );
     }
 
