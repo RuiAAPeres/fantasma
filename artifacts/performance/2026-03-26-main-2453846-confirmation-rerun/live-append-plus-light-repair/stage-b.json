@@ -1,0 +1,607 @@
+{
+  "scenario": "live-append-plus-light-repair",
+  "run_config": {
+    "mode": "iterative",
+    "publication_repetitions": 1,
+    "worker_config": {
+      "session_batch_size": 2000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2,
+      "idle_poll_interval_ms": 250
+    }
+  },
+  "record_count": 99,
+  "measured_stage_b_ms": 4117,
+  "record_type_counts": {
+    "rebuild_finalize": 9,
+    "repair_job": 90
+  },
+  "phases": [
+    {
+      "name": "shared_bucket_finalize",
+      "total_ms": 4076,
+      "share": 0.9900412922030605,
+      "distribution": {
+        "count": 9,
+        "min_ms": 315,
+        "p50_ms": 447,
+        "p95_ms": 641,
+        "max_ms": 641
+      }
+    },
+    {
+      "name": "recompute_window_load",
+      "total_ms": 19,
+      "share": 0.004615010930289046,
+      "distribution": {
+        "count": 90,
+        "min_ms": 0,
+        "p50_ms": 0,
+        "p95_ms": 1,
+        "max_ms": 2
+      }
+    },
+    {
+      "name": "session_rewrite",
+      "total_ms": 16,
+      "share": 0.0038863249939276173,
+      "distribution": {
+        "count": 90,
+        "min_ms": 0,
+        "p50_ms": 0,
+        "p95_ms": 1,
+        "max_ms": 1
+      }
+    },
+    {
+      "name": "touched_bucket_enqueue",
+      "total_ms": 5,
+      "share": 0.0012144765606023804,
+      "distribution": {
+        "count": 90,
+        "min_ms": 0,
+        "p50_ms": 0,
+        "p95_ms": 1,
+        "max_ms": 1
+      }
+    },
+    {
+      "name": "frontier_fetch",
+      "total_ms": 1,
+      "share": 0.00024289531212047608,
+      "distribution": {
+        "count": 90,
+        "min_ms": 0,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "max_ms": 1
+      }
+    }
+  ],
+  "finalization_subphases": [
+    {
+      "name": "finalization_metric_rebuild",
+      "total_ms": 3389,
+      "share": 0.8357583230579532,
+      "distribution": {
+        "count": 9,
+        "min_ms": 258,
+        "p50_ms": 372,
+        "p95_ms": 551,
+        "max_ms": 551
+      }
+    },
+    {
+      "name": "finalization_active_install_slice_rebuild",
+      "total_ms": 481,
+      "share": 0.1186189889025894,
+      "distribution": {
+        "count": 9,
+        "min_ms": 38,
+        "p50_ms": 51,
+        "p95_ms": 76,
+        "max_ms": 76
+      }
+    },
+    {
+      "name": "finalization_session_daily_rebuild",
+      "total_ms": 174,
+      "share": 0.04290998766954377,
+      "distribution": {
+        "count": 9,
+        "min_ms": 14,
+        "p50_ms": 18,
+        "p95_ms": 33,
+        "max_ms": 33
+      }
+    },
+    {
+      "name": "finalization_drain_setup",
+      "total_ms": 11,
+      "share": 0.0027127003699136867,
+      "distribution": {
+        "count": 9,
+        "min_ms": 1,
+        "p50_ms": 1,
+        "p95_ms": 2,
+        "max_ms": 2
+      }
+    }
+  ],
+  "session_daily_subphases": [
+    {
+      "name": "session_daily_installs_write",
+      "total_ms": 106,
+      "share": 0.6347305389221557,
+      "distribution": {
+        "count": 9,
+        "min_ms": 8,
+        "p50_ms": 10,
+        "p95_ms": 21,
+        "max_ms": 21
+      }
+    },
+    {
+      "name": "session_daily_aggregate_write",
+      "total_ms": 61,
+      "share": 0.3652694610778443,
+      "distribution": {
+        "count": 9,
+        "min_ms": 5,
+        "p50_ms": 6,
+        "p95_ms": 11,
+        "max_ms": 11
+      }
+    }
+  ],
+  "backlog_context": [
+    {
+      "name": "row_mutation_lag_before_claim",
+      "total_ms": 10206,
+      "distribution": {
+        "count": 90,
+        "min_ms": 8,
+        "p50_ms": 98,
+        "p95_ms": 276,
+        "max_ms": 284
+      }
+    }
+  ],
+  "total_counts": {
+    "claimed_rebuild_bucket_rows": 72,
+    "drain_projects": 9,
+    "overlapping_sessions": 90,
+    "pending_frontier_events": 180,
+    "repaired_sessions_written": 90,
+    "touched_day_buckets": 126,
+    "touched_hour_buckets": 126,
+    "window_raw_events": 630
+  },
+  "slowest_records_by_type": {
+    "rebuild_finalize": [
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 641,
+        "phases_ms": {
+          "shared_bucket_finalize": 641
+        },
+        "finalization_subphases_ms": {
+          "finalization_active_install_slice_rebuild": 63,
+          "finalization_drain_setup": 2,
+          "finalization_metric_rebuild": 551,
+          "finalization_session_daily_rebuild": 24
+        },
+        "session_daily_subphases_ms": {
+          "session_daily_aggregate_write": 8,
+          "session_daily_installs_write": 15
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 10,
+          "drain_projects": 1,
+          "touched_day_buckets": 5,
+          "touched_hour_buckets": 5
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 542,
+        "phases_ms": {
+          "shared_bucket_finalize": 542
+        },
+        "finalization_subphases_ms": {
+          "finalization_active_install_slice_rebuild": 60,
+          "finalization_drain_setup": 1,
+          "finalization_metric_rebuild": 461,
+          "finalization_session_daily_rebuild": 18
+        },
+        "session_daily_subphases_ms": {
+          "session_daily_aggregate_write": 7,
+          "session_daily_installs_write": 10
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 10,
+          "drain_projects": 1,
+          "touched_day_buckets": 5,
+          "touched_hour_buckets": 5
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 489,
+        "phases_ms": {
+          "shared_bucket_finalize": 489
+        },
+        "finalization_subphases_ms": {
+          "finalization_active_install_slice_rebuild": 76,
+          "finalization_drain_setup": 1,
+          "finalization_metric_rebuild": 395,
+          "finalization_session_daily_rebuild": 14
+        },
+        "session_daily_subphases_ms": {
+          "session_daily_aggregate_write": 6,
+          "session_daily_installs_write": 8
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 8,
+          "drain_projects": 1,
+          "touched_day_buckets": 4,
+          "touched_hour_buckets": 4
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 462,
+        "phases_ms": {
+          "shared_bucket_finalize": 462
+        },
+        "finalization_subphases_ms": {
+          "finalization_active_install_slice_rebuild": 51,
+          "finalization_drain_setup": 1,
+          "finalization_metric_rebuild": 372,
+          "finalization_session_daily_rebuild": 33
+        },
+        "session_daily_subphases_ms": {
+          "session_daily_aggregate_write": 11,
+          "session_daily_installs_write": 21
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 8,
+          "drain_projects": 1,
+          "touched_day_buckets": 4,
+          "touched_hour_buckets": 4
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 447,
+        "phases_ms": {
+          "shared_bucket_finalize": 447
+        },
+        "finalization_subphases_ms": {
+          "finalization_active_install_slice_rebuild": 50,
+          "finalization_drain_setup": 1,
+          "finalization_metric_rebuild": 373,
+          "finalization_session_daily_rebuild": 21
+        },
+        "session_daily_subphases_ms": {
+          "session_daily_aggregate_write": 6,
+          "session_daily_installs_write": 14
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 8,
+          "drain_projects": 1,
+          "touched_day_buckets": 4,
+          "touched_hour_buckets": 4
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 433,
+        "phases_ms": {
+          "shared_bucket_finalize": 433
+        },
+        "finalization_subphases_ms": {
+          "finalization_active_install_slice_rebuild": 54,
+          "finalization_drain_setup": 1,
+          "finalization_metric_rebuild": 359,
+          "finalization_session_daily_rebuild": 16
+        },
+        "session_daily_subphases_ms": {
+          "session_daily_aggregate_write": 6,
+          "session_daily_installs_write": 10
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 8,
+          "drain_projects": 1,
+          "touched_day_buckets": 4,
+          "touched_hour_buckets": 4
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 428,
+        "phases_ms": {
+          "shared_bucket_finalize": 428
+        },
+        "finalization_subphases_ms": {
+          "finalization_active_install_slice_rebuild": 51,
+          "finalization_drain_setup": 1,
+          "finalization_metric_rebuild": 360,
+          "finalization_session_daily_rebuild": 14
+        },
+        "session_daily_subphases_ms": {
+          "session_daily_aggregate_write": 5,
+          "session_daily_installs_write": 8
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 8,
+          "drain_projects": 1,
+          "touched_day_buckets": 4,
+          "touched_hour_buckets": 4
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 319,
+        "phases_ms": {
+          "shared_bucket_finalize": 319
+        },
+        "finalization_subphases_ms": {
+          "finalization_active_install_slice_rebuild": 38,
+          "finalization_drain_setup": 2,
+          "finalization_metric_rebuild": 258,
+          "finalization_session_daily_rebuild": 19
+        },
+        "session_daily_subphases_ms": {
+          "session_daily_aggregate_write": 6,
+          "session_daily_installs_write": 12
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 6,
+          "drain_projects": 1,
+          "touched_day_buckets": 3,
+          "touched_hour_buckets": 3
+        }
+      },
+      {
+        "record_type": "rebuild_finalize",
+        "total_ms": 315,
+        "phases_ms": {
+          "shared_bucket_finalize": 315
+        },
+        "finalization_subphases_ms": {
+          "finalization_active_install_slice_rebuild": 38,
+          "finalization_drain_setup": 1,
+          "finalization_metric_rebuild": 260,
+          "finalization_session_daily_rebuild": 15
+        },
+        "session_daily_subphases_ms": {
+          "session_daily_aggregate_write": 6,
+          "session_daily_installs_write": 8
+        },
+        "counts": {
+          "claimed_rebuild_bucket_rows": 6,
+          "drain_projects": 1,
+          "touched_day_buckets": 3,
+          "touched_hour_buckets": 3
+        }
+      }
+    ],
+    "repair_job": [
+      {
+        "record_type": "repair_job",
+        "install_id": "live-install-0213",
+        "target_event_id": 225080,
+        "total_ms": 284,
+        "phases_ms": {
+          "frontier_fetch": 0,
+          "recompute_window_load": 0,
+          "row_mutation_lag_before_claim": 284,
+          "session_rewrite": 0,
+          "touched_bucket_enqueue": 0
+        },
+        "counts": {
+          "overlapping_sessions": 1,
+          "pending_frontier_events": 2,
+          "repaired_sessions_written": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1,
+          "window_raw_events": 7
+        }
+      },
+      {
+        "record_type": "repair_job",
+        "install_id": "live-install-0211",
+        "target_event_id": 225068,
+        "total_ms": 280,
+        "phases_ms": {
+          "frontier_fetch": 0,
+          "recompute_window_load": 0,
+          "row_mutation_lag_before_claim": 280,
+          "session_rewrite": 0,
+          "touched_bucket_enqueue": 0
+        },
+        "counts": {
+          "overlapping_sessions": 1,
+          "pending_frontier_events": 2,
+          "repaired_sessions_written": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1,
+          "window_raw_events": 7
+        }
+      },
+      {
+        "record_type": "repair_job",
+        "install_id": "live-install-0212",
+        "target_event_id": 225074,
+        "total_ms": 280,
+        "phases_ms": {
+          "frontier_fetch": 0,
+          "recompute_window_load": 0,
+          "row_mutation_lag_before_claim": 280,
+          "session_rewrite": 0,
+          "touched_bucket_enqueue": 0
+        },
+        "counts": {
+          "overlapping_sessions": 1,
+          "pending_frontier_events": 2,
+          "repaired_sessions_written": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1,
+          "window_raw_events": 7
+        }
+      },
+      {
+        "record_type": "repair_job",
+        "install_id": "live-install-0112",
+        "target_event_id": 225078,
+        "total_ms": 276,
+        "phases_ms": {
+          "frontier_fetch": 0,
+          "recompute_window_load": 0,
+          "row_mutation_lag_before_claim": 276,
+          "session_rewrite": 0,
+          "touched_bucket_enqueue": 0
+        },
+        "counts": {
+          "overlapping_sessions": 1,
+          "pending_frontier_events": 2,
+          "repaired_sessions_written": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1,
+          "window_raw_events": 7
+        }
+      },
+      {
+        "record_type": "repair_job",
+        "install_id": "live-install-0210",
+        "target_event_id": 225062,
+        "total_ms": 276,
+        "phases_ms": {
+          "frontier_fetch": 0,
+          "recompute_window_load": 0,
+          "row_mutation_lag_before_claim": 276,
+          "session_rewrite": 0,
+          "touched_bucket_enqueue": 0
+        },
+        "counts": {
+          "overlapping_sessions": 1,
+          "pending_frontier_events": 2,
+          "repaired_sessions_written": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1,
+          "window_raw_events": 7
+        }
+      },
+      {
+        "record_type": "repair_job",
+        "install_id": "live-install-0110",
+        "target_event_id": 225066,
+        "total_ms": 271,
+        "phases_ms": {
+          "frontier_fetch": 0,
+          "recompute_window_load": 0,
+          "row_mutation_lag_before_claim": 271,
+          "session_rewrite": 0,
+          "touched_bucket_enqueue": 0
+        },
+        "counts": {
+          "overlapping_sessions": 1,
+          "pending_frontier_events": 2,
+          "repaired_sessions_written": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1,
+          "window_raw_events": 7
+        }
+      },
+      {
+        "record_type": "repair_job",
+        "install_id": "live-install-0111",
+        "target_event_id": 225072,
+        "total_ms": 271,
+        "phases_ms": {
+          "frontier_fetch": 0,
+          "recompute_window_load": 0,
+          "row_mutation_lag_before_claim": 271,
+          "session_rewrite": 0,
+          "touched_bucket_enqueue": 0
+        },
+        "counts": {
+          "overlapping_sessions": 1,
+          "pending_frontier_events": 2,
+          "repaired_sessions_written": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1,
+          "window_raw_events": 7
+        }
+      },
+      {
+        "record_type": "repair_job",
+        "install_id": "live-install-0013",
+        "target_event_id": 225082,
+        "total_ms": 264,
+        "phases_ms": {
+          "frontier_fetch": 0,
+          "recompute_window_load": 2,
+          "row_mutation_lag_before_claim": 261,
+          "session_rewrite": 1,
+          "touched_bucket_enqueue": 0
+        },
+        "counts": {
+          "overlapping_sessions": 1,
+          "pending_frontier_events": 2,
+          "repaired_sessions_written": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1,
+          "window_raw_events": 7
+        }
+      },
+      {
+        "record_type": "repair_job",
+        "install_id": "live-install-0109",
+        "target_event_id": 225060,
+        "total_ms": 264,
+        "phases_ms": {
+          "frontier_fetch": 0,
+          "recompute_window_load": 2,
+          "row_mutation_lag_before_claim": 261,
+          "session_rewrite": 1,
+          "touched_bucket_enqueue": 0
+        },
+        "counts": {
+          "overlapping_sessions": 1,
+          "pending_frontier_events": 2,
+          "repaired_sessions_written": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1,
+          "window_raw_events": 7
+        }
+      },
+      {
+        "record_type": "repair_job",
+        "install_id": "live-install-0011",
+        "target_event_id": 225070,
+        "total_ms": 233,
+        "phases_ms": {
+          "frontier_fetch": 0,
+          "recompute_window_load": 1,
+          "row_mutation_lag_before_claim": 231,
+          "session_rewrite": 1,
+          "touched_bucket_enqueue": 0
+        },
+        "counts": {
+          "overlapping_sessions": 1,
+          "pending_frontier_events": 2,
+          "repaired_sessions_written": 1,
+          "touched_day_buckets": 1,
+          "touched_hour_buckets": 1,
+          "window_raw_events": 7
+        }
+      }
+    ]
+  },
+  "dominant_phase": "shared_bucket_finalize",
+  "dominant_finalization_subphase": "finalization_metric_rebuild",
+  "dominant_session_daily_subphase": "session_daily_installs_write"
+}
