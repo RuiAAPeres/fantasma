@@ -1,0 +1,2027 @@
+[
+  {
+    "sequence": 1,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 1420,
+    "event_metrics_ready_ms": 11,
+    "session_metrics_ready_ms": 118,
+    "derived_metrics_ready_ms": 118
+  },
+  {
+    "sequence": 2,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 1920,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 3,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 2420,
+    "event_metrics_ready_ms": 115,
+    "session_metrics_ready_ms": 122,
+    "derived_metrics_ready_ms": 122
+  },
+  {
+    "sequence": 4,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 4085,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 5,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 4585,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 6,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 6750,
+    "event_metrics_ready_ms": 109,
+    "session_metrics_ready_ms": 113,
+    "derived_metrics_ready_ms": 113
+  },
+  {
+    "sequence": 7,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 7250,
+    "event_metrics_ready_ms": 109,
+    "session_metrics_ready_ms": 114,
+    "derived_metrics_ready_ms": 114
+  },
+  {
+    "sequence": 8,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 9170,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 9,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 9670,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 112,
+    "derived_metrics_ready_ms": 112
+  },
+  {
+    "sequence": 10,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 11335,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 11,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 11835,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 12,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 12335,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 112,
+    "derived_metrics_ready_ms": 112
+  },
+  {
+    "sequence": 13,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 14000,
+    "event_metrics_ready_ms": 110,
+    "session_metrics_ready_ms": 113,
+    "derived_metrics_ready_ms": 113
+  },
+  {
+    "sequence": 14,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 14500,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 15,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 15000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 16,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 16420,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 17,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 16920,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 18,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 17420,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 19,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 19085,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 112,
+    "derived_metrics_ready_ms": 112
+  },
+  {
+    "sequence": 20,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 19585,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 21,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 21750,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 22,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 22250,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 23,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 24170,
+    "event_metrics_ready_ms": 113,
+    "session_metrics_ready_ms": 119,
+    "derived_metrics_ready_ms": 119
+  },
+  {
+    "sequence": 24,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 24670,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 112,
+    "derived_metrics_ready_ms": 112
+  },
+  {
+    "sequence": 25,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 26335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 26,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 26835,
+    "event_metrics_ready_ms": 109,
+    "session_metrics_ready_ms": 113,
+    "derived_metrics_ready_ms": 113
+  },
+  {
+    "sequence": 27,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 27335,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 113,
+    "derived_metrics_ready_ms": 113
+  },
+  {
+    "sequence": 28,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 29000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 29,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 29500,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 30,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 30000,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 31,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 31420,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 32,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 31920,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 33,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 32420,
+    "event_metrics_ready_ms": 111,
+    "session_metrics_ready_ms": 114,
+    "derived_metrics_ready_ms": 114
+  },
+  {
+    "sequence": 34,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 34085,
+    "event_metrics_ready_ms": 5,
+    "session_metrics_ready_ms": 114,
+    "derived_metrics_ready_ms": 114
+  },
+  {
+    "sequence": 35,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 34585,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 36,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 36750,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 37,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 37250,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 38,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 39170,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 39,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 39670,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 40,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 41335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 41,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 41835,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 42,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 42335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 43,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 44000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 44,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 44500,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 213,
+    "derived_metrics_ready_ms": 213
+  },
+  {
+    "sequence": 45,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 45000,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 46,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 46420,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 47,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 46920,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 212,
+    "derived_metrics_ready_ms": 212
+  },
+  {
+    "sequence": 48,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 47420,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 211,
+    "derived_metrics_ready_ms": 211
+  },
+  {
+    "sequence": 49,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 49085,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 50,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 49585,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 213,
+    "derived_metrics_ready_ms": 213
+  },
+  {
+    "sequence": 51,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 51750,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 52,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 52250,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 211,
+    "derived_metrics_ready_ms": 211
+  },
+  {
+    "sequence": 53,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 54170,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 54,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 54670,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 55,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 56335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 56,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 56835,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 213,
+    "derived_metrics_ready_ms": 213
+  },
+  {
+    "sequence": 57,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 57335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 212,
+    "derived_metrics_ready_ms": 212
+  },
+  {
+    "sequence": 58,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 59000,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 59,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 59500,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 212,
+    "derived_metrics_ready_ms": 212
+  },
+  {
+    "sequence": 60,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 60000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 212,
+    "derived_metrics_ready_ms": 212
+  },
+  {
+    "sequence": 61,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 61420,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 62,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 61920,
+    "event_metrics_ready_ms": 104,
+    "session_metrics_ready_ms": 314,
+    "derived_metrics_ready_ms": 314
+  },
+  {
+    "sequence": 63,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 62420,
+    "event_metrics_ready_ms": 104,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 64,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 64085,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 65,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 64585,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 66,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 66750,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 67,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 67250,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 212,
+    "derived_metrics_ready_ms": 212
+  },
+  {
+    "sequence": 68,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 69170,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 212,
+    "derived_metrics_ready_ms": 212
+  },
+  {
+    "sequence": 69,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 69670,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 214,
+    "derived_metrics_ready_ms": 214
+  },
+  {
+    "sequence": 70,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 71335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 213,
+    "derived_metrics_ready_ms": 213
+  },
+  {
+    "sequence": 71,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 71835,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 214,
+    "derived_metrics_ready_ms": 214
+  },
+  {
+    "sequence": 72,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 72335,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 212,
+    "derived_metrics_ready_ms": 212
+  },
+  {
+    "sequence": 73,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 74000,
+    "event_metrics_ready_ms": 111,
+    "session_metrics_ready_ms": 217,
+    "derived_metrics_ready_ms": 217
+  },
+  {
+    "sequence": 74,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 74500,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 211,
+    "derived_metrics_ready_ms": 211
+  },
+  {
+    "sequence": 75,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 75000,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 315,
+    "derived_metrics_ready_ms": 315
+  },
+  {
+    "sequence": 76,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 76420,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 315,
+    "derived_metrics_ready_ms": 315
+  },
+  {
+    "sequence": 77,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 76920,
+    "event_metrics_ready_ms": 114,
+    "session_metrics_ready_ms": 317,
+    "derived_metrics_ready_ms": 317
+  },
+  {
+    "sequence": 78,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 77420,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 211,
+    "derived_metrics_ready_ms": 211
+  },
+  {
+    "sequence": 79,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 79085,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 319,
+    "derived_metrics_ready_ms": 319
+  },
+  {
+    "sequence": 80,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 79585,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 213,
+    "derived_metrics_ready_ms": 213
+  },
+  {
+    "sequence": 81,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 81750,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 317,
+    "derived_metrics_ready_ms": 317
+  },
+  {
+    "sequence": 82,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 82250,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 316,
+    "derived_metrics_ready_ms": 316
+  },
+  {
+    "sequence": 83,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 84170,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 318,
+    "derived_metrics_ready_ms": 318
+  },
+  {
+    "sequence": 84,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 84670,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 215,
+    "derived_metrics_ready_ms": 215
+  },
+  {
+    "sequence": 85,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 86335,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 213,
+    "derived_metrics_ready_ms": 213
+  },
+  {
+    "sequence": 86,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 86835,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 315,
+    "derived_metrics_ready_ms": 315
+  },
+  {
+    "sequence": 87,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 87335,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 317,
+    "derived_metrics_ready_ms": 317
+  },
+  {
+    "sequence": 88,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 89000,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 317,
+    "derived_metrics_ready_ms": 317
+  },
+  {
+    "sequence": 89,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 89500,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 316,
+    "derived_metrics_ready_ms": 316
+  },
+  {
+    "sequence": 90,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 90000,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 214,
+    "derived_metrics_ready_ms": 214
+  },
+  {
+    "sequence": 91,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 91420,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 212,
+    "derived_metrics_ready_ms": 212
+  },
+  {
+    "sequence": 92,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 91920,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 318,
+    "derived_metrics_ready_ms": 318
+  },
+  {
+    "sequence": 93,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 92420,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 213,
+    "derived_metrics_ready_ms": 213
+  },
+  {
+    "sequence": 94,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 94085,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 213,
+    "derived_metrics_ready_ms": 213
+  },
+  {
+    "sequence": 95,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 94585,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 214,
+    "derived_metrics_ready_ms": 214
+  },
+  {
+    "sequence": 96,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 96750,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 97,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 97250,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 98,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 99170,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 99,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 99670,
+    "event_metrics_ready_ms": 104,
+    "session_metrics_ready_ms": 106,
+    "derived_metrics_ready_ms": 106
+  },
+  {
+    "sequence": 100,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 101335,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 101,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 101835,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 102,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 102335,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 103,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 104000,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 104,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 104500,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 105,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 105000,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 106,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 106420,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 107,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 106920,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 108,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 107420,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 109,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 109085,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 110,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 109585,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 111,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 111750,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 112,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 112250,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 113,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 114170,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 114,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 114670,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 115,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 116335,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 116,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 116835,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 117,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 117335,
+    "event_metrics_ready_ms": 104,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 118,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 119000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 119,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 119500,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 120,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 120000,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 121,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 121420,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 122,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 121920,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 123,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 122420,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 211,
+    "derived_metrics_ready_ms": 211
+  },
+  {
+    "sequence": 124,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 124085,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 125,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 124585,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 126,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 126750,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 127,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 127250,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 128,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 129170,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 113,
+    "derived_metrics_ready_ms": 113
+  },
+  {
+    "sequence": 129,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 129670,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 130,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 131335,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 131,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 131835,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 132,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 132335,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 133,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 134000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 134,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 134500,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 135,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 135000,
+    "event_metrics_ready_ms": 109,
+    "session_metrics_ready_ms": 112,
+    "derived_metrics_ready_ms": 112
+  },
+  {
+    "sequence": 136,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 136420,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 137,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 136920,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 138,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 137420,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 139,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 139085,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 140,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 139585,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 141,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 141750,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 142,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 142250,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 143,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 144170,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 144,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 144670,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 145,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 146335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 146,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 146835,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 147,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 147335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 148,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 149000,
+    "event_metrics_ready_ms": 112,
+    "session_metrics_ready_ms": 130,
+    "derived_metrics_ready_ms": 130
+  },
+  {
+    "sequence": 149,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 149500,
+    "event_metrics_ready_ms": 116,
+    "session_metrics_ready_ms": 127,
+    "derived_metrics_ready_ms": 127
+  },
+  {
+    "sequence": 150,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 150000,
+    "event_metrics_ready_ms": 112,
+    "session_metrics_ready_ms": 120,
+    "derived_metrics_ready_ms": 120
+  },
+  {
+    "sequence": 151,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 151420,
+    "event_metrics_ready_ms": 109,
+    "session_metrics_ready_ms": 113,
+    "derived_metrics_ready_ms": 113
+  },
+  {
+    "sequence": 152,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 151920,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 153,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 152420,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 154,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 154085,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 155,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 154585,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 156,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 156750,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 157,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 157250,
+    "event_metrics_ready_ms": 104,
+    "session_metrics_ready_ms": 106,
+    "derived_metrics_ready_ms": 106
+  },
+  {
+    "sequence": 158,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 159170,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 159,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 159670,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 160,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 161335,
+    "event_metrics_ready_ms": 208,
+    "session_metrics_ready_ms": 211,
+    "derived_metrics_ready_ms": 211
+  },
+  {
+    "sequence": 161,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 161835,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 162,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 162335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 163,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 164000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 164,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 164500,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 165,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 165000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 166,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 166420,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 167,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 166920,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 168,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 167420,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 169,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 169085,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 170,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 169585,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 171,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 171750,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 172,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 172250,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 173,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 174170,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 174,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 174670,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 175,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 176335,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 176,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 176835,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 177,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 177335,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 178,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 179000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 179,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 179500,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 180,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 180000,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 181,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 181420,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 182,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 181920,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 183,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 182420,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 184,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 184085,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 185,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 184585,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 186,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 186750,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 187,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 187250,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 106,
+    "derived_metrics_ready_ms": 106
+  },
+  {
+    "sequence": 188,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 189170,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 189,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 189670,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 190,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 191335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 191,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 191835,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 192,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 192335,
+    "event_metrics_ready_ms": 104,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 193,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 194000,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 194,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 194500,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 195,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 195000,
+    "event_metrics_ready_ms": 104,
+    "session_metrics_ready_ms": 106,
+    "derived_metrics_ready_ms": 106
+  },
+  {
+    "sequence": 196,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 196420,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 197,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 196920,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 198,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 197420,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 199,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 199085,
+    "event_metrics_ready_ms": 104,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 200,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 199585,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 107,
+    "derived_metrics_ready_ms": 107
+  },
+  {
+    "sequence": 201,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 201750,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 202,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 202250,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 203,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 204170,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 204,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 204670,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 205,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 206335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 206,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 206835,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 207,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 207335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 208,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 209000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 209,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 209500,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 210,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 210000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 211,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 211420,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 212,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 211920,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 213,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 212420,
+    "event_metrics_ready_ms": 316,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 316
+  },
+  {
+    "sequence": 214,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 214085,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 215,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 214585,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 110,
+    "derived_metrics_ready_ms": 110
+  },
+  {
+    "sequence": 216,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 216750,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 217,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 217250,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 218,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 219170,
+    "event_metrics_ready_ms": 105,
+    "session_metrics_ready_ms": 108,
+    "derived_metrics_ready_ms": 108
+  },
+  {
+    "sequence": 219,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 219670,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 220,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 221335,
+    "event_metrics_ready_ms": 108,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 221,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 221835,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 222,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 222335,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 223,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 224000,
+    "event_metrics_ready_ms": 107,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  },
+  {
+    "sequence": 224,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 224500,
+    "event_metrics_ready_ms": 3,
+    "session_metrics_ready_ms": 111,
+    "derived_metrics_ready_ms": 111
+  },
+  {
+    "sequence": 225,
+    "blob_kind": "append",
+    "events_in_blob": 5,
+    "cumulative_events": 225000,
+    "event_metrics_ready_ms": 106,
+    "session_metrics_ready_ms": 109,
+    "derived_metrics_ready_ms": 109
+  }
+]

@@ -28,24 +28,26 @@ use fantasma_store::{
     fetch_all_events_for_install_in_tx, fetch_events_after_in_tx,
     fetch_events_for_install_after_id_through_in_tx, fetch_events_for_install_between_in_tx,
     fetch_latest_session_for_install_in_tx, fetch_sessions_overlapping_window_in_tx,
-    insert_install_first_seen_in_tx, insert_session_in_tx, insert_sessions_in_tx,
-    load_install_session_states_in_tx, load_pending_session_daily_install_rebuilds_in_tx,
-    load_project, load_session_repair_jobs_for_installs_in_tx,
-    load_tail_sessions_for_installs_in_tx, lock_worker_offset,
-    mark_project_deletion_job_succeeded_in_tx, rebuild_session_active_install_slices_days_in_tx,
+    insert_install_first_seen_in_tx, insert_install_first_seen_many_in_tx, insert_session_in_tx,
+    insert_sessions_in_tx, load_install_session_states_in_tx,
+    load_pending_session_daily_install_rebuilds_in_tx, load_project,
+    load_session_repair_jobs_for_installs_in_tx, load_tail_sessions_for_installs_in_tx,
+    lock_worker_offset, mark_project_deletion_job_succeeded_in_tx,
+    rebuild_session_active_install_slices_days_in_tx,
     rebuild_session_daily_days_from_pending_install_rebuilds_with_telemetry_in_tx,
     rebuild_session_daily_days_in_tx, refresh_project_processing_lease,
     release_project_processing_lease, release_session_repair_job_claim_in_tx,
     replace_active_install_day_bitmaps_in_tx, save_worker_offset_in_tx, set_project_state_in_tx,
-    update_session_tail_in_tx, upsert_event_metric_buckets_dim1_in_tx,
+    update_session_tails_in_tx, upsert_event_metric_buckets_dim1_in_tx,
     upsert_event_metric_buckets_dim2_in_tx, upsert_event_metric_buckets_dim3_in_tx,
     upsert_event_metric_buckets_dim4_in_tx, upsert_event_metric_buckets_total_in_tx,
-    upsert_install_session_state_in_tx, upsert_live_install_state_in_tx,
-    upsert_session_active_install_slices_in_tx, upsert_session_daily_deltas_in_tx,
-    upsert_session_daily_install_deltas_in_tx, upsert_session_metric_dim1_in_tx,
-    upsert_session_metric_dim2_in_tx, upsert_session_metric_dim3_in_tx,
-    upsert_session_metric_dim4_in_tx, upsert_session_metric_totals_in_tx,
-    upsert_session_repair_jobs_in_tx, verify_project_processing_lease_in_tx,
+    upsert_install_session_state_in_tx, upsert_install_session_states_in_tx,
+    upsert_live_install_state_in_tx, upsert_session_active_install_slices_in_tx,
+    upsert_session_daily_deltas_in_tx, upsert_session_daily_install_deltas_in_tx,
+    upsert_session_metric_dim1_in_tx, upsert_session_metric_dim2_in_tx,
+    upsert_session_metric_dim3_in_tx, upsert_session_metric_dim4_in_tx,
+    upsert_session_metric_totals_in_tx, upsert_session_repair_jobs_in_tx,
+    verify_project_processing_lease_in_tx,
 };
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -467,6 +469,44 @@ type SessionMetricStoreDeltas = (
 );
 
 impl SessionMetricAccumulator {
+    fn merge(&mut self, other: Self) {
+        for (key, value) in other.totals {
+            self.totals.entry(key).or_default().add(
+                value.session_count,
+                value.duration_total_seconds,
+                value.new_installs,
+            );
+        }
+        for (key, value) in other.dim1 {
+            self.dim1.entry(key).or_default().add(
+                value.session_count,
+                value.duration_total_seconds,
+                value.new_installs,
+            );
+        }
+        for (key, value) in other.dim2 {
+            self.dim2.entry(key).or_default().add(
+                value.session_count,
+                value.duration_total_seconds,
+                value.new_installs,
+            );
+        }
+        for (key, value) in other.dim3 {
+            self.dim3.entry(key).or_default().add(
+                value.session_count,
+                value.duration_total_seconds,
+                value.new_installs,
+            );
+        }
+        for (key, value) in other.dim4 {
+            self.dim4.entry(key).or_default().add(
+                value.session_count,
+                value.duration_total_seconds,
+                value.new_installs,
+            );
+        }
+    }
+
     fn add_session_delta(
         &mut self,
         session: &SessionRecord,
@@ -886,16 +926,24 @@ async fn process_session_batch_inner(
             }
         }
 
-        let incremental_queue = run_session_incremental_queue(
-            pool.clone(),
+        // The coordinator still derives install-local plans with plan_incremental_session_batch(...)
+        // before batching the append commit, so replay filtering and per-install sessionization stay unchanged.
+        let SessionWorkQueueResult { plans, error } = run_session_incremental_queue(
             incremental_items,
             config.incremental_concurrency,
+            hooks.clone(),
         )
         .await?;
-        if let Some(error) = incremental_queue.error {
+        refresh_worker_project_leases(pool, &project_leases).await?;
+        let mut append_tx = pool.begin().await.map_err(StoreError::from)?;
+        apply_incremental_session_plans_in_tx(&mut append_tx, plans).await?;
+        for lease in &project_leases {
+            verify_project_processing_lease_in_tx(&mut append_tx, lease).await?;
+        }
+        append_tx.commit().await.map_err(StoreError::from)?;
+        if let Some(error) = error {
             return Err(error);
         }
-        refresh_worker_project_leases(pool, &project_leases).await?;
 
         enqueue_session_repair_items_in_tx(&mut tx, repair_items).await?;
         drain_pending_session_rebuild_buckets(pool).await?;
@@ -929,46 +977,62 @@ async fn process_session_batch_inner(
 }
 
 struct SessionWorkQueueResult {
+    plans: Vec<IncrementalSessionPlan>,
     error: Option<StoreError>,
 }
 
 async fn run_session_incremental_queue(
-    pool: PgPool,
     items: Vec<IncrementalSessionWorkItem>,
     concurrency: usize,
+    hooks: SessionBatchHooks,
 ) -> Result<SessionWorkQueueResult, StoreError> {
     if items.is_empty() {
-        return Ok(SessionWorkQueueResult { error: None });
+        return Ok(SessionWorkQueueResult {
+            plans: Vec::new(),
+            error: None,
+        });
     }
 
-    let mut work_items = items.into_iter();
+    let mut work_items = items.into_iter().enumerate();
     let mut work_set = JoinSet::new();
     let concurrency = concurrency.max(1);
+    let mut completed_plans = Vec::new();
     let mut error = None;
+    let mut successful_prefix_len = usize::MAX;
 
     for _ in 0..concurrency {
-        let Some(item) = work_items.next() else {
+        let Some((work_index, item)) = work_items.next() else {
             break;
         };
-        let pool = pool.clone();
-        work_set.spawn(async move { process_incremental_session_work_item(&pool, item).await });
+        let hooks = hooks.clone();
+        work_set.spawn(async move {
+            (
+                work_index,
+                plan_incremental_session_work_item(item, hooks).await,
+            )
+        });
     }
 
     while let Some(join_result) = work_set.join_next().await {
         match join_result {
-            Ok(Ok(())) => {
+            Ok((work_index, Ok(plan))) => {
+                completed_plans.push((work_index, plan));
                 if error.is_none()
-                    && let Some(item) = work_items.next()
+                    && let Some((next_work_index, item)) = work_items.next()
                 {
-                    let pool = pool.clone();
+                    let hooks = hooks.clone();
                     work_set.spawn(async move {
-                        process_incremental_session_work_item(&pool, item).await
+                        (
+                            next_work_index,
+                            plan_incremental_session_work_item(item, hooks).await,
+                        )
                     });
                 }
             }
-            Ok(Err(join_error)) => {
+            Ok((work_index, Err(join_error))) => {
                 if error.is_none() {
                     error = Some(join_error);
+                    successful_prefix_len = work_index;
                     work_set.abort_all();
                 }
             }
@@ -978,54 +1042,45 @@ async fn run_session_incremental_queue(
                     error = Some(StoreError::InvariantViolation(format!(
                         "session work item task failed: {join_error}"
                     )));
+                    successful_prefix_len = 0;
                     work_set.abort_all();
                 }
             }
         }
     }
 
-    Ok(SessionWorkQueueResult { error })
+    completed_plans.sort_by_key(|(work_index, _)| *work_index);
+
+    let mut prefix_plans = Vec::new();
+    for (expected_work_index, (work_index, plan)) in completed_plans.into_iter().enumerate() {
+        if work_index >= successful_prefix_len || work_index != expected_work_index {
+            break;
+        }
+        prefix_plans.push(plan);
+    }
+
+    Ok(SessionWorkQueueResult {
+        plans: prefix_plans,
+        error,
+    })
 }
 
-async fn process_incremental_session_work_item(
-    pool: &PgPool,
+async fn plan_incremental_session_work_item(
     item: IncrementalSessionWorkItem,
-) -> Result<(), StoreError> {
-    let actor_id = format!("session_apply:{}:{}", item.project_id, item.install_id);
-    let Some(lease) = claim_worker_project_lease(
-        pool,
+    hooks: SessionBatchHooks,
+) -> Result<IncrementalSessionPlan, StoreError> {
+    let install_id = item.install_id.clone();
+    hooks.before_plan(&install_id).await?;
+    let plan = plan_incremental_session_batch(
         item.project_id,
-        ProjectProcessingActorKind::SessionApply,
-        &actor_id,
-    )
-    .await?
-    else {
-        return Ok(());
-    };
-    let result = async {
-        let mut tx = pool.begin().await.map_err(StoreError::from)?;
-        process_install_batch_incremental(
-            &mut tx,
-            item.project_id,
-            &item.install_id,
-            item.events,
-            item.tail_state,
-            item.tail_session,
-        )
-        .await?;
-        verify_project_processing_lease_in_tx(&mut tx, &lease).await?;
-        tx.commit().await.map_err(StoreError::from)?;
+        &item.install_id,
+        item.events,
+        item.tail_state,
+        item.tail_session,
+    )?;
+    hooks.after_plan(&install_id);
 
-        Ok(())
-    }
-    .await;
-    let release_result = release_project_processing_lease(pool, &lease).await;
-
-    match (result, release_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(error), _) => Err(error),
-    }
+    Ok(plan)
 }
 
 async fn enqueue_session_repair_items_in_tx(
@@ -1045,9 +1100,13 @@ async fn enqueue_session_repair_items_in_tx(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct SessionBatchHooks {
     fail_before_coordinator_finalize: bool,
+    #[cfg(test)]
+    plan_gates: Vec<SessionPlanGateConfig>,
+    #[cfg(test)]
+    completed_plan_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl SessionBatchHooks {
@@ -1060,10 +1119,60 @@ impl SessionBatchHooks {
 
         Ok(())
     }
+
+    #[cfg(test)]
+    async fn before_plan(&self, install_id: &str) -> Result<(), StoreError> {
+        for plan_gate in &self.plan_gates {
+            if plan_gate.install_id == install_id
+                && !plan_gate.gate.blocked_once.swap(true, Ordering::SeqCst)
+            {
+                plan_gate.gate.planning_started.notify_one();
+                plan_gate.gate.resume.notified().await;
+                if plan_gate.fail_after_resume {
+                    return Err(StoreError::InvariantViolation(format!(
+                        "session batch hook forced planner failure for {install_id}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    async fn before_plan(&self, _install_id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn after_plan(&self, install_id: &str) {
+        if let Some(sender) = &self.completed_plan_sender {
+            let _ = sender.send(install_id.to_owned());
+        }
+    }
+
+    #[cfg(not(test))]
+    fn after_plan(&self, _install_id: &str) {}
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Default)]
+struct SessionPlanGate {
+    planning_started: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    blocked_once: AtomicBool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct SessionPlanGateConfig {
+    install_id: String,
+    gate: std::sync::Arc<SessionPlanGate>,
+    fail_after_resume: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
 struct SessionBatchTestHooks(SessionBatchHooks);
 
 #[cfg(test)]
@@ -1071,6 +1180,49 @@ impl SessionBatchTestHooks {
     fn fail_before_coordinator_finalize() -> Self {
         Self(SessionBatchHooks {
             fail_before_coordinator_finalize: true,
+            plan_gates: Vec::new(),
+            completed_plan_sender: None,
+        })
+    }
+
+    fn block_prefix_then_fail_later_install(
+        blocked_prefix_install_id: &str,
+        blocked_prefix_gate: std::sync::Arc<SessionPlanGate>,
+        delayed_failure_install_id: &str,
+        delayed_failure_gate: std::sync::Arc<SessionPlanGate>,
+        completed_plan_sender: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
+        Self(SessionBatchHooks {
+            fail_before_coordinator_finalize: false,
+            plan_gates: vec![
+                SessionPlanGateConfig {
+                    install_id: blocked_prefix_install_id.to_owned(),
+                    gate: blocked_prefix_gate,
+                    fail_after_resume: false,
+                },
+                SessionPlanGateConfig {
+                    install_id: delayed_failure_install_id.to_owned(),
+                    gate: delayed_failure_gate,
+                    fail_after_resume: true,
+                },
+            ],
+            completed_plan_sender: Some(completed_plan_sender),
+        })
+    }
+
+    fn fail_later_after_completed_prefix(
+        delayed_failure_install_id: &str,
+        delayed_failure_gate: std::sync::Arc<SessionPlanGate>,
+        completed_plan_sender: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
+        Self(SessionBatchHooks {
+            fail_before_coordinator_finalize: false,
+            plan_gates: vec![SessionPlanGateConfig {
+                install_id: delayed_failure_install_id.to_owned(),
+                gate: delayed_failure_gate,
+                fail_after_resume: true,
+            }],
+            completed_plan_sender: Some(completed_plan_sender),
         })
     }
 }
@@ -2724,21 +2876,6 @@ fn needs_exact_day_repair(
         .any(|event| event.timestamp < tail_state.tail_session_end)
 }
 
-async fn process_install_batch_incremental(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    project_id: Uuid,
-    install_id: &str,
-    events: Vec<RawEventRecord>,
-    tail_state: Option<InstallSessionStateRecord>,
-    tail_session: Option<SessionRecord>,
-) -> Result<SessionRepairBuckets, StoreError> {
-    let plan =
-        plan_incremental_session_batch(project_id, install_id, events, tail_state, tail_session)?;
-    apply_incremental_session_plan(tx, plan).await?;
-
-    Ok(SessionRepairBuckets::default())
-}
-
 fn plan_incremental_session_batch(
     project_id: Uuid,
     install_id: &str,
@@ -2865,71 +3002,118 @@ fn plan_incremental_session_batch(
     })
 }
 
-async fn apply_incremental_session_plan(
+async fn apply_incremental_session_plans_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    mut plan: IncrementalSessionPlan,
+    plans: Vec<IncrementalSessionPlan>,
 ) -> Result<(), StoreError> {
-    let first_seen_inserted = if let Some(first_seen) = plan.first_seen.as_ref() {
-        insert_install_first_seen_in_tx(tx, first_seen).await?
-    } else {
-        false
-    };
-    if first_seen_inserted {
-        let first_seen = plan
-            .first_seen
-            .as_ref()
-            .expect("inserted first_seen requires a record");
-        plan.session_metric_accumulator
-            .add_new_install_delta(first_seen);
+    if plans.is_empty() {
+        return Ok(());
     }
 
-    if let Some(tail_update) = plan.tail_update.as_ref() {
-        let updated_session_rows = update_session_tail_in_tx(
-            tx,
-            SessionTailUpdate {
-                project_id: tail_update.project_id,
-                session_id: &tail_update.session_id,
-                session_end: tail_update.session_end,
-                event_count: tail_update.event_count,
-                duration_seconds: tail_update.duration_seconds,
-            },
-        )
-        .await?;
-        ensure_rows_affected(
-            updated_session_rows,
-            1,
-            format!(
-                "tail session {} missing for project {} install {}",
-                tail_update.session_id, tail_update.project_id, tail_update.install_id
-            ),
-        )?;
+    let mut first_seen_by_project = BTreeMap::<Uuid, Vec<InstallFirstSeenRecord>>::new();
+    let mut tail_updates = Vec::<SessionRecord>::new();
+    let mut new_sessions = Vec::<SessionRecord>::new();
+    let mut daily_install_deltas = Vec::<SessionDailyInstallDelta>::new();
+    let mut daily_session_counts_by_project_day = BTreeMap::<(Uuid, NaiveDate), i64>::new();
+    let mut daily_duration_deltas_by_project_day = BTreeMap::<(Uuid, NaiveDate), i64>::new();
+    let mut active_install_bitmap_days_by_project = BTreeMap::<Uuid, BTreeSet<NaiveDate>>::new();
+    let mut session_metric_accumulators_by_project =
+        BTreeMap::<Uuid, SessionMetricAccumulator>::new();
+    let mut next_states = Vec::<InstallSessionStateRecord>::new();
+
+    for plan in plans {
+        let project_id = plan.next_state.project_id;
+        if let Some(first_seen) = plan.first_seen {
+            first_seen_by_project
+                .entry(project_id)
+                .or_default()
+                .push(first_seen);
+        }
+        if let Some(tail_update) = plan.tail_update {
+            tail_updates.push(tail_update);
+        }
+        new_sessions.extend(plan.new_sessions);
+        daily_install_deltas.extend(plan.daily_install_deltas);
+        for (day, session_count) in plan.daily_session_counts_by_day {
+            *daily_session_counts_by_project_day
+                .entry((project_id, day))
+                .or_default() += session_count;
+        }
+        for (day, duration_delta) in plan.daily_duration_deltas_by_day {
+            *daily_duration_deltas_by_project_day
+                .entry((project_id, day))
+                .or_default() += duration_delta;
+        }
+        active_install_bitmap_days_by_project
+            .entry(project_id)
+            .or_default()
+            .extend(plan.active_install_bitmap_days);
+        session_metric_accumulators_by_project
+            .entry(project_id)
+            .or_default()
+            .merge(plan.session_metric_accumulator);
+        next_states.push(plan.next_state);
     }
 
-    let inserted_sessions = insert_sessions_in_tx(tx, &plan.new_sessions).await?;
+    for (project_id, first_seen_records) in &first_seen_by_project {
+        let inserted_install_ids = insert_install_first_seen_many_in_tx(tx, first_seen_records)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if inserted_install_ids.is_empty() {
+            continue;
+        }
+        let accumulator = session_metric_accumulators_by_project
+            .entry(*project_id)
+            .or_default();
+        for first_seen in first_seen_records {
+            if inserted_install_ids.contains(&first_seen.install_id) {
+                accumulator.add_new_install_delta(first_seen);
+            }
+        }
+    }
+
+    let tail_updates = tail_updates
+        .iter()
+        .map(|tail_update| SessionTailUpdate {
+            project_id: tail_update.project_id,
+            session_id: &tail_update.session_id,
+            session_end: tail_update.session_end,
+            event_count: tail_update.event_count,
+            duration_seconds: tail_update.duration_seconds,
+        })
+        .collect::<Vec<_>>();
+    let updated_session_rows = update_session_tails_in_tx(tx, &tail_updates).await?;
     ensure_rows_affected(
-        inserted_sessions,
-        plan.new_sessions.len() as u64,
+        updated_session_rows,
+        tail_updates.len() as u64,
         format!(
-            "expected to insert {} sessions for project {} install {}",
-            plan.new_sessions.len(),
-            plan.next_state.project_id,
-            plan.next_state.install_id
+            "expected to update {} tail sessions during batched session apply",
+            tail_updates.len()
         ),
     )?;
 
-    let active_install_slices = plan
-        .new_sessions
+    let inserted_sessions = insert_sessions_in_tx(tx, &new_sessions).await?;
+    ensure_rows_affected(
+        inserted_sessions,
+        new_sessions.len() as u64,
+        format!(
+            "expected to insert {} sessions during batched session apply",
+            new_sessions.len()
+        ),
+    )?;
+
+    let active_install_slices = new_sessions
         .iter()
         .map(active_install_slice_delta)
         .collect::<Vec<_>>();
     upsert_session_active_install_slices_in_tx(tx, &active_install_slices).await?;
 
     let active_install_deltas =
-        upsert_session_daily_install_deltas_in_tx(tx, &plan.daily_install_deltas).await?;
-    let (daily_upserts, duration_updates) = build_session_daily_deltas(
-        plan.next_state.project_id,
-        plan.daily_session_counts_by_day,
-        plan.daily_duration_deltas_by_day,
+        upsert_session_daily_install_deltas_in_tx(tx, &daily_install_deltas).await?;
+    let (daily_upserts, duration_updates) = build_session_daily_batch_deltas(
+        daily_session_counts_by_project_day,
+        daily_duration_deltas_by_project_day,
         active_install_deltas,
     );
     let upserted_daily_rows = upsert_session_daily_deltas_in_tx(tx, &daily_upserts).await?;
@@ -2937,10 +3121,8 @@ async fn apply_incremental_session_plan(
         upserted_daily_rows,
         daily_upserts.len() as u64,
         format!(
-            "expected to upsert {} session_daily rows for project {} install {}",
-            daily_upserts.len(),
-            plan.next_state.project_id,
-            plan.next_state.install_id
+            "expected to upsert {} session_daily rows during batched session apply",
+            daily_upserts.len()
         ),
     )?;
     let updated_duration_rows =
@@ -2949,36 +3131,39 @@ async fn apply_incremental_session_plan(
         updated_duration_rows,
         duration_updates.len() as u64,
         format!(
-            "expected to update {} existing session_daily rows for project {} install {}",
-            duration_updates.len(),
-            plan.next_state.project_id,
-            plan.next_state.install_id
+            "expected to update {} existing session_daily rows during batched session apply",
+            duration_updates.len()
         ),
     )?;
 
-    let (
-        session_total_deltas,
-        session_dim1_deltas,
-        session_dim2_deltas,
-        session_dim3_deltas,
-        session_dim4_deltas,
-    ) = plan
-        .session_metric_accumulator
-        .into_store_deltas(plan.next_state.project_id);
-    upsert_session_metric_totals_in_tx(tx, &session_total_deltas).await?;
-    upsert_session_metric_dim1_in_tx(tx, &session_dim1_deltas).await?;
-    upsert_session_metric_dim2_in_tx(tx, &session_dim2_deltas).await?;
-    upsert_session_metric_dim3_in_tx(tx, &session_dim3_deltas).await?;
-    upsert_session_metric_dim4_in_tx(tx, &session_dim4_deltas).await?;
+    for (project_id, accumulator) in session_metric_accumulators_by_project {
+        let (
+            session_total_deltas,
+            session_dim1_deltas,
+            session_dim2_deltas,
+            session_dim3_deltas,
+            session_dim4_deltas,
+        ) = accumulator.into_store_deltas(project_id);
+        upsert_session_metric_totals_in_tx(tx, &session_total_deltas).await?;
+        upsert_session_metric_dim1_in_tx(tx, &session_dim1_deltas).await?;
+        upsert_session_metric_dim2_in_tx(tx, &session_dim2_deltas).await?;
+        upsert_session_metric_dim3_in_tx(tx, &session_dim3_deltas).await?;
+        upsert_session_metric_dim4_in_tx(tx, &session_dim4_deltas).await?;
+    }
 
-    enqueue_touched_active_install_bitmap_rebuilds_in_tx(
-        tx,
-        plan.next_state.project_id,
-        &plan.active_install_bitmap_days,
-    )
-    .await?;
+    for (project_id, touched_days) in active_install_bitmap_days_by_project {
+        enqueue_touched_active_install_bitmap_rebuilds_in_tx(tx, project_id, &touched_days).await?;
+    }
 
-    upsert_install_session_state_in_tx(tx, &plan.next_state).await?;
+    let upserted_state_rows = upsert_install_session_states_in_tx(tx, &next_states).await?;
+    ensure_rows_affected(
+        upserted_state_rows,
+        next_states.len() as u64,
+        format!(
+            "expected to upsert {} install session states during batched session apply",
+            next_states.len()
+        ),
+    )?;
 
     Ok(())
 }
@@ -3583,32 +3768,33 @@ fn tail_update_from_append_sessions(
     }
 }
 
-fn build_session_daily_deltas(
-    project_id: Uuid,
-    daily_session_counts_by_day: BTreeMap<NaiveDate, i64>,
-    mut daily_duration_deltas_by_day: BTreeMap<NaiveDate, i64>,
+fn build_session_daily_batch_deltas(
+    daily_session_counts_by_project_day: BTreeMap<(Uuid, NaiveDate), i64>,
+    mut daily_duration_deltas_by_project_day: BTreeMap<(Uuid, NaiveDate), i64>,
     active_install_deltas: Vec<SessionDailyActiveInstallDelta>,
 ) -> (Vec<SessionDailyDelta>, Vec<SessionDailyDurationDelta>) {
-    let mut active_by_day = active_install_deltas
+    let mut active_by_project_day = active_install_deltas
         .into_iter()
-        .map(|delta| (delta.day, delta.active_installs))
+        .map(|delta| ((delta.project_id, delta.day), delta.active_installs))
         .collect::<BTreeMap<_, _>>();
     let mut daily_upserts = Vec::new();
 
-    let days = daily_session_counts_by_day
+    let project_days = daily_session_counts_by_project_day
         .keys()
         .copied()
-        .chain(active_by_day.keys().copied())
+        .chain(active_by_project_day.keys().copied())
         .collect::<BTreeSet<_>>();
 
-    for day in days {
-        let sessions_count = daily_session_counts_by_day
-            .get(&day)
+    for (project_id, day) in project_days {
+        let sessions_count = daily_session_counts_by_project_day
+            .get(&(project_id, day))
             .copied()
             .unwrap_or_default();
-        let active_installs = active_by_day.remove(&day).unwrap_or_default();
-        let total_duration_seconds = daily_duration_deltas_by_day
-            .remove(&day)
+        let active_installs = active_by_project_day
+            .remove(&(project_id, day))
+            .unwrap_or_default();
+        let total_duration_seconds = daily_duration_deltas_by_project_day
+            .remove(&(project_id, day))
             .unwrap_or_default();
         daily_upserts.push(SessionDailyDelta {
             project_id,
@@ -3619,9 +3805,9 @@ fn build_session_daily_deltas(
         });
     }
 
-    let duration_updates = daily_duration_deltas_by_day
+    let duration_updates = daily_duration_deltas_by_project_day
         .into_iter()
-        .filter_map(|(day, duration_delta)| {
+        .filter_map(|((project_id, day), duration_delta)| {
             (duration_delta != 0).then_some(SessionDailyDurationDelta {
                 project_id,
                 day,
@@ -4377,6 +4563,46 @@ mod tests {
         assert!(!sql.contains("install_dim_pairs AS MATERIALIZED"));
         assert!(!sql.contains("install_dim_triples AS MATERIALIZED"));
         assert!(!sql.contains("install_dim_quads AS MATERIALIZED"));
+    }
+
+    #[test]
+    fn session_batch_uses_one_batched_incremental_apply() {
+        let source = include_str!("worker.rs");
+        let coordinator_start = source
+            .find("async fn process_session_batch_inner(")
+            .expect("find process_session_batch_inner");
+        let coordinator_end = source
+            .find("struct SessionWorkQueueResult")
+            .expect("find SessionWorkQueueResult");
+        let coordinator = &source[coordinator_start..coordinator_end];
+        let planner_start = source
+            .find("fn plan_incremental_session_work_item(")
+            .expect("find plan_incremental_session_work_item");
+        let planner_end = source
+            .find("async fn enqueue_session_repair_items_in_tx(")
+            .expect("find enqueue_session_repair_items_in_tx");
+        let planner = &source[planner_start..planner_end];
+
+        assert!(
+            coordinator.contains("apply_incremental_session_plans_in_tx"),
+            "session batch coordinator should apply incremental plans through one batched append helper"
+        );
+        assert!(
+            coordinator.contains("apply_incremental_session_plans_in_tx(&mut append_tx, plans)"),
+            "session batch coordinator should apply the whole ordered plan set in one append transaction"
+        );
+        assert!(
+            planner.contains("plan_incremental_session_batch("),
+            "incremental work items should still derive install-local session plans before writing"
+        );
+        assert!(
+            !coordinator.contains("process_install_batch_incremental("),
+            "session batch coordinator should not commit one child transaction per install"
+        );
+        assert!(
+            !coordinator.contains("plans_by_project"),
+            "session batch coordinator should not split the append commit back into per-project transactions"
+        );
     }
 
     async fn session_daily_row(pool: &PgPool, day: NaiveDate) -> Option<(i64, i64, i64)> {
@@ -6682,6 +6908,251 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn planner_failure_only_commits_successful_batch_prefix(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[
+                event("install-a", 1, 0, 0),
+                event("install-a", 1, 0, 10),
+                event("install-b", 1, 1, 0),
+                event("install-b", 1, 1, 10),
+                event("install-c", 1, 2, 0),
+                event("install-c", 1, 2, 10),
+            ],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(
+            &pool,
+            project_id(),
+            &[
+                event("install-a", 1, 0, 20),
+                event("install-b", 1, 1, 20),
+                event("install-c", 1, 2, 20),
+            ],
+        )
+        .await
+        .expect("insert mixed batch");
+
+        let blocked_prefix_gate = std::sync::Arc::new(SessionPlanGate::default());
+        let delayed_failure_gate = std::sync::Arc::new(SessionPlanGate::default());
+        let (completed_plan_tx, mut completed_plan_rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool_for_task = pool.clone();
+        let blocked_prefix_gate_for_task = blocked_prefix_gate.clone();
+        let delayed_failure_gate_for_task = delayed_failure_gate.clone();
+        let batch_handle = tokio::spawn(async move {
+            process_session_batch_with_hooks(
+                &pool_for_task,
+                SessionBatchConfig {
+                    batch_size: 100,
+                    incremental_concurrency: 3,
+                    repair_concurrency: 1,
+                },
+                SessionBatchTestHooks::block_prefix_then_fail_later_install(
+                    "install-a",
+                    blocked_prefix_gate_for_task,
+                    "install-c",
+                    delayed_failure_gate_for_task,
+                    completed_plan_tx,
+                ),
+            )
+            .await
+        });
+
+        blocked_prefix_gate.planning_started.notified().await;
+        delayed_failure_gate.planning_started.notified().await;
+        loop {
+            let install_id = completed_plan_rx
+                .recv()
+                .await
+                .expect("planner completion channel stays open");
+            if install_id == "install-b" {
+                break;
+            }
+        }
+        delayed_failure_gate.resume.notify_one();
+
+        let error = batch_handle
+            .await
+            .expect("join planner failure batch task")
+            .expect_err("planner failure should fail batch");
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+
+        let install_a = fetch_latest_session_for_install(&pool, project_id(), "install-a")
+            .await
+            .expect("fetch install-a session")
+            .expect("install-a session exists");
+        let install_b = fetch_latest_session_for_install(&pool, project_id(), "install-b")
+            .await
+            .expect("fetch install-b session")
+            .expect("install-b session exists");
+        let install_c = fetch_latest_session_for_install(&pool, project_id(), "install-c")
+            .await
+            .expect("fetch install-c session")
+            .expect("install-c session exists");
+        assert_eq!(
+            install_a.session_end,
+            timestamp(1, 0, 10),
+            "missing earlier plans must prevent later work from committing"
+        );
+        assert_eq!(
+            install_b.session_end,
+            timestamp(1, 1, 10),
+            "successful middle work must not commit unless every earlier work item also planned successfully"
+        );
+        assert_eq!(
+            install_c.session_end,
+            timestamp(1, 2, 10),
+            "later successful installs should not commit once an earlier planner work item fails"
+        );
+        assert_eq!(
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
+                .await
+                .expect("load session offset"),
+            6,
+            "offset should stay on the previously committed batch after planner failure",
+        );
+    }
+
+    #[sqlx::test]
+    async fn planner_failure_replays_only_remaining_prefix_work(pool: PgPool) {
+        fantasma_store::bootstrap(&pool, &bootstrap_config())
+            .await
+            .expect("bootstrap succeeds");
+        insert_events(
+            &pool,
+            project_id(),
+            &[
+                event("install-a", 1, 0, 0),
+                event("install-a", 1, 0, 10),
+                event("install-b", 1, 1, 0),
+                event("install-b", 1, 1, 10),
+                event("install-c", 1, 2, 0),
+                event("install-c", 1, 2, 10),
+            ],
+        )
+        .await
+        .expect("insert initial events");
+        process_session_batch(&pool, 100)
+            .await
+            .expect("process initial batch");
+
+        insert_events(
+            &pool,
+            project_id(),
+            &[
+                event("install-a", 1, 0, 20),
+                event("install-b", 1, 1, 20),
+                event("install-c", 1, 2, 20),
+            ],
+        )
+        .await
+        .expect("insert mixed batch");
+
+        let delayed_failure_gate = std::sync::Arc::new(SessionPlanGate::default());
+        let (completed_plan_tx, mut completed_plan_rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool_for_task = pool.clone();
+        let delayed_failure_gate_for_task = delayed_failure_gate.clone();
+        let batch_handle = tokio::spawn(async move {
+            process_session_batch_with_hooks(
+                &pool_for_task,
+                SessionBatchConfig {
+                    batch_size: 100,
+                    incremental_concurrency: 3,
+                    repair_concurrency: 1,
+                },
+                SessionBatchTestHooks::fail_later_after_completed_prefix(
+                    "install-c",
+                    delayed_failure_gate_for_task,
+                    completed_plan_tx,
+                ),
+            )
+            .await
+        });
+
+        delayed_failure_gate.planning_started.notified().await;
+        let mut completed_prefix = BTreeSet::new();
+        while completed_prefix.len() < 2 {
+            let install_id = completed_plan_rx
+                .recv()
+                .await
+                .expect("planner completion channel stays open");
+            if install_id == "install-a" || install_id == "install-b" {
+                completed_prefix.insert(install_id);
+            }
+        }
+        delayed_failure_gate.resume.notify_one();
+
+        let error = batch_handle
+            .await
+            .expect("join replay planner failure batch task")
+            .expect_err("planner failure should fail batch");
+        assert!(matches!(error, StoreError::InvariantViolation(_)));
+
+        let install_a = fetch_latest_session_for_install(&pool, project_id(), "install-a")
+            .await
+            .expect("fetch install-a session")
+            .expect("install-a session exists");
+        let install_b = fetch_latest_session_for_install(&pool, project_id(), "install-b")
+            .await
+            .expect("fetch install-b session")
+            .expect("install-b session exists");
+        let install_c = fetch_latest_session_for_install(&pool, project_id(), "install-c")
+            .await
+            .expect("fetch install-c session")
+            .expect("install-c session exists");
+        assert_eq!(install_a.session_end, timestamp(1, 0, 20));
+        assert_eq!(install_b.session_end, timestamp(1, 1, 20));
+        assert_eq!(install_c.session_end, timestamp(1, 2, 10));
+        assert_eq!(
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
+                .await
+                .expect("load session offset after planner failure"),
+            6,
+            "planner failure should keep the raw offset on the previous committed batch",
+        );
+
+        let replayed = process_session_batch_with_config(
+            &pool,
+            SessionBatchConfig {
+                batch_size: 100,
+                incremental_concurrency: 3,
+                repair_concurrency: 1,
+            },
+        )
+        .await
+        .expect("replay planner-failed batch");
+
+        assert_eq!(
+            replayed,
+            SessionBatchOutcome {
+                processed_events: 1,
+                advanced_offset: true,
+            }
+        );
+        let install_c = fetch_latest_session_for_install(&pool, project_id(), "install-c")
+            .await
+            .expect("fetch replayed install-c session")
+            .expect("install-c session exists after replay");
+        assert_eq!(install_c.session_end, timestamp(1, 2, 20));
+        assert_eq!(
+            fantasma_store::load_worker_offset(&pool, SESSION_WORKER_NAME)
+                .await
+                .expect("load replayed session offset"),
+            9,
+            "replay should advance the offset once the remaining install work succeeds",
+        );
+    }
+
+    #[sqlx::test]
     async fn replayed_append_batch_only_advances_offset_after_coordinator_failure(pool: PgPool) {
         fantasma_store::bootstrap(&pool, &bootstrap_config())
             .await
@@ -6883,7 +7354,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn apply_lane_does_not_hold_raw_offset_lock_while_waiting_on_claimed_repair(
+    async fn apply_lane_finishes_and_releases_raw_offset_lock_before_blocked_repair_resumes(
         pool: PgPool,
     ) {
         fantasma_store::bootstrap(&pool, &bootstrap_config())
@@ -6948,52 +7419,58 @@ mod tests {
             .await
         });
 
-        let mut saw_offset_lock_timeout = false;
-        for _ in 0..10 {
-            if apply_task.is_finished() {
-                break;
+        let apply_outcome = tokio::time::timeout(Duration::from_secs(5), apply_task)
+            .await
+            .expect("apply batch should finish while the claimed repair is still blocked")
+            .expect("apply task joins")
+            .expect("apply batch succeeds while the claimed repair is still blocked");
+        assert_eq!(
+            apply_outcome,
+            SessionBatchOutcome {
+                processed_events: 1,
+                advanced_offset: true,
             }
+        );
+        assert!(
+            !repair_task.is_finished(),
+            "blocked claimed repair should still be in flight when the follow-up apply batch finishes"
+        );
 
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let mut verify_tx = pool.begin().await.expect("begin offset verify tx");
-            sqlx::query("SET LOCAL lock_timeout = '50ms'")
-                .execute(&mut *verify_tx)
-                .await
-                .expect("set local lock timeout");
+        let mut verify_tx = pool.begin().await.expect("begin offset verify tx");
+        sqlx::query("SET LOCAL lock_timeout = '50ms'")
+            .execute(&mut *verify_tx)
+            .await
+            .expect("set local lock timeout");
+        let offset = lock_worker_offset(&mut verify_tx, SESSION_WORKER_NAME)
+            .await
+            .expect("raw offset lock should be available after apply finishes but before the blocked repair resumes");
+        verify_tx.rollback().await.expect("rollback verify tx");
 
-            if lock_worker_offset(&mut verify_tx, SESSION_WORKER_NAME)
-                .await
-                .is_err()
-            {
-                saw_offset_lock_timeout = true;
-                verify_tx
-                    .rollback()
-                    .await
-                    .expect("rollback timed out verify tx");
-                break;
-            }
-
-            verify_tx.rollback().await.expect("rollback verify tx");
-        }
+        assert_eq!(
+            offset, 4,
+            "apply lane should advance the raw offset before the blocked repair resumes"
+        );
+        assert_eq!(
+            pending_session_repair_frontier(&pool, "install-1").await,
+            Some(4),
+            "follow-up append should widen the queued repair frontier before the blocked repair resumes"
+        );
 
         claim_blocker.resume.notify_waiters();
         let repair_processed = repair_task
             .await
             .expect("repair task joins")
             .expect("repair task succeeds");
-        let apply_result = apply_task.await.expect("apply task joins");
 
         assert_eq!(
             repair_processed, 2,
             "repair drain should finish the initially claimed frontier and the widened follow-up frontier"
         );
         assert!(
-            !saw_offset_lock_timeout,
-            "apply lane should not keep the raw offset lock while a claimed repair frontier is blocked"
-        );
-        assert!(
-            apply_result.is_ok(),
-            "apply batch should finish after repair resumes"
+            pending_session_repair_frontier(&pool, "install-1")
+                .await
+                .is_none(),
+            "repair drain should clear the widened frontier after it resumes"
         );
     }
 
@@ -7187,7 +7664,13 @@ mod tests {
         let install_ids = ["install-1", "install-2", "install-3", "install-4"];
         let initial_events = install_ids
             .into_iter()
-            .flat_map(|install_id| [event(install_id, 1, 0, 0), event(install_id, 1, 0, 45)])
+            .flat_map(|install_id| {
+                [
+                    event(install_id, 1, 0, 0),
+                    event(install_id, 1, 0, 15),
+                    event(install_id, 1, 1, 0),
+                ]
+            })
             .collect::<Vec<_>>();
         insert_events(&pool, project_id(), &initial_events)
             .await
@@ -7198,7 +7681,7 @@ mod tests {
 
         let late_events = install_ids
             .into_iter()
-            .map(|install_id| event(install_id, 1, 0, 20))
+            .map(|install_id| event(install_id, 1, 0, 40))
             .collect::<Vec<_>>();
         insert_events(&pool, project_id(), &late_events)
             .await
@@ -7223,47 +7706,46 @@ mod tests {
             );
         }
 
-        let _guard = lock_trace_env();
-        let path = std::env::temp_dir().join(format!("stage-b-trace-{}.jsonl", Uuid::new_v4()));
-        unsafe {
-            std::env::set_var(STAGE_B_TRACE_PATH_ENV, &path);
+        let mut processed = 0;
+        loop {
+            let slice_processed =
+                process_session_repair_slice_inner(&pool, 2, SessionRepairBatchHooks::disabled())
+                    .await
+                    .expect("process repair slice");
+            if slice_processed == 0 {
+                break;
+            }
+            processed += slice_processed;
         }
 
-        let processed = drain_session_repair_queue_with_config(&pool, 2)
-            .await
-            .expect("drain configured repair queue");
-
-        let contents = fs::read_to_string(&path).expect("read repair queue trace");
-        let rebuild_records = contents
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse trace"))
-            .filter(|record| {
-                record["record_type"] == serde_json::json!(STAGE_B_TRACE_REBUILD_FINALIZE)
-            })
-            .collect::<Vec<_>>();
+        let pending_rebuild_buckets = pending_session_rebuild_buckets(&pool).await;
+        let day_buckets = pending_rebuild_buckets
+            .iter()
+            .filter(|bucket| bucket.granularity == MetricGranularity::Day)
+            .count();
+        let hour_buckets = pending_rebuild_buckets
+            .iter()
+            .filter(|bucket| bucket.granularity == MetricGranularity::Hour)
+            .count();
 
         assert_eq!(
             processed, 4,
             "configured repair queue should drain the full queued repair set"
         );
         assert_eq!(
-            rebuild_records.len(),
-            1,
-            "configured repair queue should coalesce same-bucket rebuild work across the full queued repair set"
+            pending_rebuild_buckets.len(),
+            3,
+            "all four repairs should collapse to one shared day bucket plus two shared hour buckets before finalization runs"
         );
-        assert_eq!(
-            rebuild_records[0]["counts"]["claimed_rebuild_bucket_rows"],
-            serde_json::json!(2),
-            "all four repairs touch the same shared day/hour buckets, so the queue should collapse to one day row plus one hour row"
-        );
-        assert_eq!(
-            rebuild_records[0]["counts"]["touched_day_buckets"],
-            serde_json::json!(1)
-        );
-        assert_eq!(
-            rebuild_records[0]["counts"]["touched_hour_buckets"],
-            serde_json::json!(1)
+        assert_eq!(day_buckets, 1);
+        assert_eq!(hour_buckets, 2);
+
+        drain_pending_session_rebuild_buckets(&pool)
+            .await
+            .expect("drain shared rebuild queue");
+        assert!(
+            pending_session_rebuild_buckets(&pool).await.is_empty(),
+            "shared rebuild queue should drain in one explicit pass"
         );
         for install_id in install_ids {
             assert_eq!(
@@ -7271,11 +7753,6 @@ mod tests {
                 None,
                 "configured repair queue should clear the repair frontier for {install_id}"
             );
-        }
-
-        let _ = fs::remove_file(&path);
-        unsafe {
-            std::env::remove_var(STAGE_B_TRACE_PATH_ENV);
         }
     }
 

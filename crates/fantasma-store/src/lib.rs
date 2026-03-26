@@ -2315,6 +2315,55 @@ pub async fn insert_install_first_seen_in_tx(
     Ok(result.rows_affected() == 1)
 }
 
+pub async fn insert_install_first_seen_many_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    records: &[InstallFirstSeenRecord],
+) -> Result<Vec<String>, StoreError> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut inserted_install_ids = Vec::new();
+    let mut unique_records = Vec::with_capacity(records.len());
+    let mut seen = BTreeSet::new();
+    for record in records {
+        if seen.insert((record.project_id, record.install_id.as_str())) {
+            unique_records.push(record);
+        }
+    }
+
+    for chunk in unique_records.chunks(max_rows_per_batched_statement(8)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO install_first_seen \
+             (project_id, install_id, first_seen_event_id, first_seen_at, platform, app_version, os_version, locale) ",
+        );
+        builder.push_values(chunk, |mut separated, record| {
+            separated
+                .push_bind(record.project_id)
+                .push_bind(&record.install_id)
+                .push_bind(record.first_seen_event_id)
+                .push_bind(record.first_seen_at)
+                .push_bind(platform_as_str(&record.platform))
+                .push_bind(&record.app_version)
+                .push_bind(&record.os_version)
+                .push_bind(&record.locale);
+        });
+        builder.push(
+            " ON CONFLICT (project_id, install_id) DO NOTHING \
+              RETURNING install_id",
+        );
+
+        let rows = builder.build().fetch_all(&mut **tx).await?;
+        inserted_install_ids.extend(
+            rows.into_iter()
+                .map(|row| row.try_get("install_id"))
+                .collect::<Result<Vec<String>, sqlx::Error>>()?,
+        );
+    }
+
+    Ok(inserted_install_ids)
+}
+
 pub async fn fetch_event_metrics_cube_rows_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Uuid,
@@ -3593,6 +3642,50 @@ pub async fn upsert_install_session_state_in_tx(
     upsert_install_session_state_in_executor(&mut **tx, state).await
 }
 
+pub async fn upsert_install_session_states_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    states: &[InstallSessionStateRecord],
+) -> Result<u64, StoreError> {
+    if states.is_empty() {
+        return Ok(0);
+    }
+
+    let mut affected_rows = 0;
+    for chunk in states.chunks(max_rows_per_batched_statement(9)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO install_session_state \
+             (project_id, install_id, tail_session_id, tail_session_start, tail_session_end, tail_event_count, tail_duration_seconds, tail_day, last_processed_event_id) ",
+        );
+        builder.push_values(chunk, |mut separated, state| {
+            separated
+                .push_bind(state.project_id)
+                .push_bind(&state.install_id)
+                .push_bind(&state.tail_session_id)
+                .push_bind(state.tail_session_start)
+                .push_bind(state.tail_session_end)
+                .push_bind(state.tail_event_count)
+                .push_bind(state.tail_duration_seconds)
+                .push_bind(state.tail_day)
+                .push_bind(state.last_processed_event_id);
+        });
+        builder.push(
+            " ON CONFLICT (project_id, install_id) DO UPDATE SET \
+              tail_session_id = EXCLUDED.tail_session_id, \
+              tail_session_start = EXCLUDED.tail_session_start, \
+              tail_session_end = EXCLUDED.tail_session_end, \
+              tail_event_count = EXCLUDED.tail_event_count, \
+              tail_duration_seconds = EXCLUDED.tail_duration_seconds, \
+              tail_day = EXCLUDED.tail_day, \
+              last_processed_event_id = EXCLUDED.last_processed_event_id, \
+              updated_at = now()",
+        );
+
+        affected_rows += builder.build().execute(&mut **tx).await?.rows_affected();
+    }
+
+    Ok(affected_rows)
+}
+
 async fn upsert_install_session_state_in_executor<'a, E>(
     executor: E,
     state: &InstallSessionStateRecord,
@@ -3993,27 +4086,30 @@ pub async fn insert_sessions_in_tx(
         return Ok(0);
     }
 
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO sessions \
-         (project_id, install_id, session_id, session_start, session_end, event_count, duration_seconds, platform, app_version, os_version, locale) ",
-    );
-    builder.push_values(sessions, |mut separated, session| {
-        separated
-            .push_bind(session.project_id)
-            .push_bind(&session.install_id)
-            .push_bind(&session.session_id)
-            .push_bind(session.session_start)
-            .push_bind(session.session_end)
-            .push_bind(session.event_count)
-            .push_bind(session.duration_seconds)
-            .push_bind(platform_as_str(&session.platform))
-            .push_bind(&session.app_version)
-            .push_bind(&session.os_version)
-            .push_bind(&session.locale);
-    });
-    let result = builder.build().execute(&mut **tx).await?;
+    let mut affected_rows = 0;
+    for chunk in sessions.chunks(max_rows_per_batched_statement(11)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO sessions \
+             (project_id, install_id, session_id, session_start, session_end, event_count, duration_seconds, platform, app_version, os_version, locale) ",
+        );
+        builder.push_values(chunk, |mut separated, session| {
+            separated
+                .push_bind(session.project_id)
+                .push_bind(&session.install_id)
+                .push_bind(&session.session_id)
+                .push_bind(session.session_start)
+                .push_bind(session.session_end)
+                .push_bind(session.event_count)
+                .push_bind(session.duration_seconds)
+                .push_bind(platform_as_str(&session.platform))
+                .push_bind(&session.app_version)
+                .push_bind(&session.os_version)
+                .push_bind(&session.locale);
+        });
+        affected_rows += builder.build().execute(&mut **tx).await?.rows_affected();
+    }
 
-    Ok(result.rows_affected())
+    Ok(affected_rows)
 }
 
 pub async fn update_session_tail_in_tx(
@@ -4039,6 +4135,42 @@ pub async fn update_session_tail_in_tx(
     .await?;
 
     Ok(result.rows_affected())
+}
+
+pub async fn update_session_tails_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    updates: &[SessionTailUpdate<'_>],
+) -> Result<u64, StoreError> {
+    if updates.is_empty() {
+        return Ok(0);
+    }
+
+    let mut affected_rows = 0;
+    for chunk in updates.chunks(max_rows_per_batched_statement(5)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "WITH input(project_id, session_id, session_end, event_count, duration_seconds) AS (",
+        );
+        builder.push_values(chunk, |mut row, update| {
+            row.push_bind(update.project_id)
+                .push_bind(update.session_id)
+                .push_bind(update.session_end)
+                .push_bind(update.event_count)
+                .push_bind(update.duration_seconds);
+        });
+        builder.push(
+            ") UPDATE sessions AS s \
+             SET session_end = input.session_end, \
+                 event_count = input.event_count, \
+                 duration_seconds = input.duration_seconds \
+             FROM input \
+             WHERE s.project_id = input.project_id \
+               AND s.session_id = input.session_id",
+        );
+
+        affected_rows += builder.build().execute(&mut **tx).await?.rows_affected();
+    }
+
+    Ok(affected_rows)
 }
 
 pub async fn delete_sessions_overlapping_window_in_tx(
@@ -4143,30 +4275,32 @@ pub async fn upsert_session_daily_install_deltas_in_tx(
         return Ok(Vec::new());
     }
 
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO session_daily_installs (project_id, day, install_id, session_count) ",
-    );
-    builder.push_values(deltas, |mut separated, delta| {
-        separated
-            .push_bind(delta.project_id)
-            .push_bind(delta.day)
-            .push_bind(&delta.install_id)
-            .push_bind(delta.session_count);
-    });
-    builder.push(
-        " ON CONFLICT (project_id, day, install_id) DO UPDATE SET \
-          session_count = session_daily_installs.session_count + EXCLUDED.session_count, \
-          updated_at = now() \
-          RETURNING project_id, day, (CASE WHEN xmax = 0 THEN 1 ELSE 0 END)::BIGINT AS active_install_delta",
-    );
-
-    let rows = builder.build().fetch_all(&mut **tx).await?;
     let mut active_by_day = BTreeMap::<(Uuid, NaiveDate), i64>::new();
-    for row in rows {
-        let project_id: Uuid = row.try_get("project_id")?;
-        let day: NaiveDate = row.try_get("day")?;
-        let active_install_delta: i64 = row.try_get("active_install_delta")?;
-        *active_by_day.entry((project_id, day)).or_default() += active_install_delta;
+    for chunk in deltas.chunks(max_rows_per_batched_statement(4)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_daily_installs (project_id, day, install_id, session_count) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated
+                .push_bind(delta.project_id)
+                .push_bind(delta.day)
+                .push_bind(&delta.install_id)
+                .push_bind(delta.session_count);
+        });
+        builder.push(
+            " ON CONFLICT (project_id, day, install_id) DO UPDATE SET \
+              session_count = session_daily_installs.session_count + EXCLUDED.session_count, \
+              updated_at = now() \
+              RETURNING project_id, day, (CASE WHEN xmax = 0 THEN 1 ELSE 0 END)::BIGINT AS active_install_delta",
+        );
+
+        let rows = builder.build().fetch_all(&mut **tx).await?;
+        for row in rows {
+            let project_id: Uuid = row.try_get("project_id")?;
+            let day: NaiveDate = row.try_get("day")?;
+            let active_install_delta: i64 = row.try_get("active_install_delta")?;
+            *active_by_day.entry((project_id, day)).or_default() += active_install_delta;
+        }
     }
 
     Ok(active_by_day
@@ -4299,29 +4433,32 @@ pub async fn upsert_session_daily_deltas_in_tx(
         return Ok(0);
     }
 
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO session_daily \
-         (project_id, day, sessions_count, active_installs, total_duration_seconds) ",
-    );
-    builder.push_values(deltas, |mut separated, delta| {
-        separated
-            .push_bind(delta.project_id)
-            .push_bind(delta.day)
-            .push_bind(delta.sessions_count)
-            .push_bind(delta.active_installs)
-            .push_bind(delta.total_duration_seconds);
-    });
-    builder.push(
-        " ON CONFLICT (project_id, day) DO UPDATE SET \
-          sessions_count = session_daily.sessions_count + EXCLUDED.sessions_count, \
-          active_installs = session_daily.active_installs + EXCLUDED.active_installs, \
-          total_duration_seconds = session_daily.total_duration_seconds + EXCLUDED.total_duration_seconds, \
-          updated_at = now()",
-    );
+    let mut affected_rows = 0;
+    for chunk in deltas.chunks(max_rows_per_batched_statement(5)) {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "INSERT INTO session_daily \
+             (project_id, day, sessions_count, active_installs, total_duration_seconds) ",
+        );
+        builder.push_values(chunk, |mut separated, delta| {
+            separated
+                .push_bind(delta.project_id)
+                .push_bind(delta.day)
+                .push_bind(delta.sessions_count)
+                .push_bind(delta.active_installs)
+                .push_bind(delta.total_duration_seconds);
+        });
+        builder.push(
+            " ON CONFLICT (project_id, day) DO UPDATE SET \
+              sessions_count = session_daily.sessions_count + EXCLUDED.sessions_count, \
+              active_installs = session_daily.active_installs + EXCLUDED.active_installs, \
+              total_duration_seconds = session_daily.total_duration_seconds + EXCLUDED.total_duration_seconds, \
+              updated_at = now()",
+        );
 
-    let result = builder.build().execute(&mut **tx).await?;
+        affected_rows += builder.build().execute(&mut **tx).await?.rows_affected();
+    }
 
-    Ok(result.rows_affected())
+    Ok(affected_rows)
 }
 
 pub async fn add_session_daily_duration_deltas_in_tx(
@@ -4332,25 +4469,28 @@ pub async fn add_session_daily_duration_deltas_in_tx(
         return Ok(0);
     }
 
-    let mut builder =
-        QueryBuilder::<Postgres>::new("WITH input(project_id, day, duration_delta) AS (");
-    builder.push_values(deltas, |mut row, delta| {
-        row.push_bind(delta.project_id)
-            .push_bind(delta.day)
-            .push_bind(delta.duration_delta);
-    });
-    builder.push(
-        ") UPDATE session_daily AS daily \
-         SET total_duration_seconds = daily.total_duration_seconds + input.duration_delta, \
-             updated_at = now() \
-         FROM input \
-         WHERE daily.project_id = input.project_id \
-           AND daily.day = input.day",
-    );
+    let mut affected_rows = 0;
+    for chunk in deltas.chunks(max_rows_per_batched_statement(3)) {
+        let mut builder =
+            QueryBuilder::<Postgres>::new("WITH input(project_id, day, duration_delta) AS (");
+        builder.push_values(chunk, |mut row, delta| {
+            row.push_bind(delta.project_id)
+                .push_bind(delta.day)
+                .push_bind(delta.duration_delta);
+        });
+        builder.push(
+            ") UPDATE session_daily AS daily \
+             SET total_duration_seconds = daily.total_duration_seconds + input.duration_delta, \
+                 updated_at = now() \
+             FROM input \
+             WHERE daily.project_id = input.project_id \
+               AND daily.day = input.day",
+        );
 
-    let result = builder.build().execute(&mut **tx).await?;
+        affected_rows += builder.build().execute(&mut **tx).await?.rows_affected();
+    }
 
-    Ok(result.rows_affected())
+    Ok(affected_rows)
 }
 
 pub async fn add_session_daily_duration_delta(
@@ -7390,6 +7530,38 @@ mod tests {
         }
     }
 
+    fn day(offset_days: i64) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date") + Duration::days(offset_days)
+    }
+
+    async fn insert_session_daily_rows_for_test(
+        tx: &mut Transaction<'_, Postgres>,
+        rows: &[SessionDailyRecord],
+    ) -> Result<u64, StoreError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut affected_rows = 0;
+        for chunk in rows.chunks(max_rows_per_batched_statement(5)) {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO session_daily \
+                 (project_id, day, sessions_count, active_installs, total_duration_seconds) ",
+            );
+            builder.push_values(chunk, |mut separated, row| {
+                separated
+                    .push_bind(row.project_id)
+                    .push_bind(row.day)
+                    .push_bind(row.sessions_count)
+                    .push_bind(row.active_installs)
+                    .push_bind(row.total_duration_seconds);
+            });
+            affected_rows += builder.build().execute(&mut **tx).await?.rows_affected();
+        }
+
+        Ok(affected_rows)
+    }
+
     fn explain_plan_root(plan: &Value) -> &Value {
         &plan.as_array().expect("EXPLAIN JSON is an array")[0]["Plan"]
     }
@@ -10304,6 +10476,489 @@ mod tests {
                 .expect("install-2 state")
                 .last_processed_event_id,
             77
+        );
+    }
+
+    #[sqlx::test]
+    async fn batch_insert_install_first_seen_inserts_only_new_rows(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let existing = InstallFirstSeenRecord {
+            project_id: project_id(),
+            install_id: "install-1".to_owned(),
+            first_seen_event_id: 1,
+            first_seen_at: timestamp(0),
+            platform: Platform::Ios,
+            app_version: Some("1.0.0".to_owned()),
+            os_version: Some("18.3".to_owned()),
+            locale: Some("en-GB".to_owned()),
+        };
+
+        let mut seed_tx = pool.begin().await.expect("begin seed tx");
+        assert!(
+            insert_install_first_seen_in_tx(&mut seed_tx, &existing)
+                .await
+                .expect("insert existing row"),
+            "seed insert should create the first row"
+        );
+        seed_tx.commit().await.expect("commit seed tx");
+
+        let new_record = InstallFirstSeenRecord {
+            install_id: "install-2".to_owned(),
+            first_seen_event_id: 2,
+            first_seen_at: timestamp(5),
+            ..existing.clone()
+        };
+
+        let mut tx = pool.begin().await.expect("begin batch tx");
+        let inserted = insert_install_first_seen_many_in_tx(
+            &mut tx,
+            &[existing.clone(), new_record.clone(), new_record.clone()],
+        )
+        .await
+        .expect("batch insert first-seen rows");
+        tx.commit().await.expect("commit batch tx");
+
+        assert_eq!(inserted, vec![new_record.install_id.clone()]);
+
+        let stored_installs = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT install_id
+            FROM install_first_seen
+            WHERE project_id = $1
+            ORDER BY install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .fetch_all(&pool)
+        .await
+        .expect("fetch stored installs");
+        assert_eq!(
+            stored_installs,
+            vec!["install-1".to_owned(), "install-2".to_owned()]
+        );
+    }
+
+    #[sqlx::test]
+    async fn batch_update_session_tails_updates_all_requested_rows(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let mut seed_tx = pool.begin().await.expect("begin seed tx");
+        insert_session_in_tx(&mut seed_tx, &session("install-1", 0, 10))
+            .await
+            .expect("insert install-1 session");
+        insert_session_in_tx(&mut seed_tx, &session("install-2", 15, 30))
+            .await
+            .expect("insert install-2 session");
+        seed_tx.commit().await.expect("commit seed tx");
+
+        let mut tx = pool.begin().await.expect("begin update tx");
+        let updated_rows = update_session_tails_in_tx(
+            &mut tx,
+            &[
+                SessionTailUpdate {
+                    project_id: project_id(),
+                    session_id: "install-1:2026-01-01T00:00:00+00:00",
+                    session_end: timestamp(20),
+                    event_count: 3,
+                    duration_seconds: 20 * 60,
+                },
+                SessionTailUpdate {
+                    project_id: project_id(),
+                    session_id: "install-2:2026-01-01T00:15:00+00:00",
+                    session_end: timestamp(45),
+                    event_count: 4,
+                    duration_seconds: 30 * 60,
+                },
+            ],
+        )
+        .await
+        .expect("batch update tails");
+        tx.commit().await.expect("commit update tx");
+
+        assert_eq!(updated_rows, 2);
+
+        let rows = sqlx::query(
+            r#"
+            SELECT session_id, session_end, event_count, duration_seconds
+            FROM sessions
+            WHERE project_id = $1
+            ORDER BY session_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .fetch_all(&pool)
+        .await
+        .expect("fetch updated sessions");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].try_get::<DateTime<Utc>, _>("session_end").unwrap(),
+            timestamp(20)
+        );
+        assert_eq!(rows[0].try_get::<i32, _>("event_count").unwrap(), 3);
+        assert_eq!(
+            rows[0].try_get::<i32, _>("duration_seconds").unwrap(),
+            20 * 60
+        );
+        assert_eq!(
+            rows[1].try_get::<DateTime<Utc>, _>("session_end").unwrap(),
+            timestamp(45)
+        );
+        assert_eq!(rows[1].try_get::<i32, _>("event_count").unwrap(), 4);
+        assert_eq!(
+            rows[1].try_get::<i32, _>("duration_seconds").unwrap(),
+            30 * 60
+        );
+    }
+
+    #[sqlx::test]
+    async fn batch_upsert_install_session_states_updates_existing_rows(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("ensure local project succeeds");
+
+        let mut tx = pool.begin().await.expect("begin first upsert tx");
+        upsert_install_session_states_in_tx(
+            &mut tx,
+            &[
+                tail_state(10, 2),
+                InstallSessionStateRecord {
+                    project_id: project_id(),
+                    install_id: "install-2".to_owned(),
+                    tail_session_id: "install-2:2026-01-01T00:00:00+00:00".to_owned(),
+                    tail_session_start: timestamp(0),
+                    tail_session_end: timestamp(15),
+                    tail_event_count: 2,
+                    tail_duration_seconds: 15 * 60,
+                    tail_day: NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+                    last_processed_event_id: 2,
+                },
+            ],
+        )
+        .await
+        .expect("initial batch upsert");
+        tx.commit().await.expect("commit first upsert tx");
+
+        let mut update_tx = pool.begin().await.expect("begin update upsert tx");
+        upsert_install_session_states_in_tx(
+            &mut update_tx,
+            &[
+                InstallSessionStateRecord {
+                    tail_session_end: timestamp(20),
+                    tail_event_count: 3,
+                    tail_duration_seconds: 20 * 60,
+                    last_processed_event_id: 3,
+                    ..tail_state(10, 2)
+                },
+                InstallSessionStateRecord {
+                    project_id: project_id(),
+                    install_id: "install-2".to_owned(),
+                    tail_session_id: "install-2:2026-01-01T00:00:00+00:00".to_owned(),
+                    tail_session_start: timestamp(0),
+                    tail_session_end: timestamp(25),
+                    tail_event_count: 4,
+                    tail_duration_seconds: 25 * 60,
+                    tail_day: NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+                    last_processed_event_id: 4,
+                },
+            ],
+        )
+        .await
+        .expect("update batch upsert");
+        update_tx.commit().await.expect("commit update upsert tx");
+
+        let states = sqlx::query(
+            r#"
+            SELECT install_id, tail_event_count, tail_duration_seconds, last_processed_event_id
+            FROM install_session_state
+            WHERE project_id = $1
+            ORDER BY install_id ASC
+            "#,
+        )
+        .bind(project_id())
+        .fetch_all(&pool)
+        .await
+        .expect("fetch stored states");
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(
+            states[0].try_get::<String, _>("install_id").unwrap(),
+            "install-1"
+        );
+        assert_eq!(states[0].try_get::<i32, _>("tail_event_count").unwrap(), 3);
+        assert_eq!(
+            states[0]
+                .try_get::<i32, _>("tail_duration_seconds")
+                .unwrap(),
+            20 * 60
+        );
+        assert_eq!(
+            states[0]
+                .try_get::<i64, _>("last_processed_event_id")
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            states[1].try_get::<String, _>("install_id").unwrap(),
+            "install-2"
+        );
+        assert_eq!(states[1].try_get::<i32, _>("tail_event_count").unwrap(), 4);
+        assert_eq!(
+            states[1]
+                .try_get::<i32, _>("tail_duration_seconds")
+                .unwrap(),
+            25 * 60
+        );
+        assert_eq!(
+            states[1]
+                .try_get::<i64, _>("last_processed_event_id")
+                .unwrap(),
+            4
+        );
+    }
+
+    #[sqlx::test]
+    async fn insert_sessions_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let sessions = (0..5_958)
+            .map(|index| {
+                session(
+                    &format!("install-{index}"),
+                    index as i64 * 2,
+                    index as i64 * 2 + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let inserted_rows = insert_sessions_in_tx(&mut tx, &sessions)
+            .await
+            .expect("large session insert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        assert_eq!(inserted_rows, sessions.len() as u64);
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS row_count,
+                COALESCE(SUM(event_count), 0)::BIGINT AS total_events,
+                COALESCE(SUM(duration_seconds), 0)::BIGINT AS total_duration
+            FROM sessions
+            WHERE project_id = $1
+            "#,
+        )
+        .bind(project_id())
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            5_958
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_events").expect("total_events"),
+            11_916
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_duration")
+                .expect("total_duration"),
+            357_480
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_daily_install_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let target_day = day(0);
+        let deltas = (0..16_384)
+            .map(|index| SessionDailyInstallDelta {
+                project_id: project_id(),
+                day: target_day,
+                install_id: format!("install-{index}"),
+                session_count: 1,
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let active_install_deltas = upsert_session_daily_install_deltas_in_tx(&mut tx, &deltas)
+            .await
+            .expect("large session daily install upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        assert_eq!(
+            active_install_deltas,
+            vec![SessionDailyActiveInstallDelta {
+                project_id: project_id(),
+                day: target_day,
+                active_installs: 16_384,
+            }]
+        );
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS row_count,
+                COALESCE(SUM(session_count), 0)::BIGINT AS total_sessions
+            FROM session_daily_installs
+            WHERE project_id = $1
+              AND day = $2
+            "#,
+        )
+        .bind(project_id())
+        .bind(target_day)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session daily install counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            16_384
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_sessions")
+                .expect("total_sessions"),
+            16_384
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_daily_upserts_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let deltas = (0..13_108)
+            .map(|index| SessionDailyDelta {
+                project_id: project_id(),
+                day: day(index as i64),
+                sessions_count: 1,
+                active_installs: 1,
+                total_duration_seconds: 60,
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let affected_rows = upsert_session_daily_deltas_in_tx(&mut tx, &deltas)
+            .await
+            .expect("large session daily upsert should succeed");
+        tx.commit().await.expect("commit tx");
+
+        assert_eq!(affected_rows, deltas.len() as u64);
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS row_count,
+                COALESCE(SUM(sessions_count), 0)::BIGINT AS total_sessions,
+                COALESCE(SUM(active_installs), 0)::BIGINT AS total_active_installs,
+                COALESCE(SUM(total_duration_seconds), 0)::BIGINT AS total_duration
+            FROM session_daily
+            WHERE project_id = $1
+            "#,
+        )
+        .bind(project_id())
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session daily counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            13_108
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_sessions")
+                .expect("total_sessions"),
+            13_108
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_active_installs")
+                .expect("total_active_installs"),
+            13_108
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_duration")
+                .expect("total_duration"),
+            786_480
+        );
+    }
+
+    #[sqlx::test]
+    async fn session_daily_duration_updates_handle_batches_above_postgres_bind_limit(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+        ensure_local_project(&pool, Some(&bootstrap_config()))
+            .await
+            .expect("seed project");
+
+        let existing_rows = (0..21_846)
+            .map(|index| SessionDailyRecord {
+                project_id: project_id(),
+                day: day(index as i64),
+                sessions_count: 1,
+                active_installs: 1,
+                total_duration_seconds: 10,
+            })
+            .collect::<Vec<_>>();
+        let deltas = (0..21_846)
+            .map(|index| SessionDailyDurationDelta {
+                project_id: project_id(),
+                day: day(index as i64),
+                duration_delta: 60,
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let seeded_rows = insert_session_daily_rows_for_test(&mut tx, &existing_rows)
+            .await
+            .expect("seed session daily rows");
+        assert_eq!(seeded_rows, existing_rows.len() as u64);
+        let updated_rows = add_session_daily_duration_deltas_in_tx(&mut tx, &deltas)
+            .await
+            .expect("large session daily duration update should succeed");
+        tx.commit().await.expect("commit tx");
+
+        assert_eq!(updated_rows, deltas.len() as u64);
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS row_count,
+                COALESCE(SUM(total_duration_seconds), 0)::BIGINT AS total_duration
+            FROM session_daily
+            WHERE project_id = $1
+            "#,
+        )
+        .bind(project_id())
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session daily duration counts");
+
+        assert_eq!(
+            row.try_get::<i64, _>("row_count").expect("row_count"),
+            21_846
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("total_duration")
+                .expect("total_duration"),
+            1_529_220
         );
     }
 

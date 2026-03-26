@@ -1,0 +1,53 @@
+{
+  "scenario": "live-append-small-blobs",
+  "run_config": {
+    "mode": "iterative",
+    "publication_repetitions": 1,
+    "worker_config": {
+      "session_batch_size": 2000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2,
+      "idle_poll_interval_ms": 250
+    }
+  },
+  "phases": [
+    {
+      "name": "append_uploads",
+      "events_sent": 225000,
+      "elapsed_ms": 117509,
+      "events_per_second": 1914.7409598902711
+    }
+  ],
+  "readiness": [
+    {
+      "name": "event_metrics_ready_ms",
+      "elapsed_ms": 1
+    },
+    {
+      "name": "session_metrics_ready_ms",
+      "elapsed_ms": 4
+    },
+    {
+      "name": "derived_metrics_ready_ms",
+      "elapsed_ms": 4
+    }
+  ],
+  "checkpoint_readiness": {
+    "sample_count": 225,
+    "event_metrics_ready_p50_ms": 107,
+    "event_metrics_ready_p95_ms": 109,
+    "event_metrics_ready_max_ms": 112,
+    "session_metrics_ready_p50_ms": 111,
+    "session_metrics_ready_p95_ms": 216,
+    "session_metrics_ready_max_ms": 325,
+    "derived_metrics_ready_p50_ms": 111,
+    "derived_metrics_ready_p95_ms": 216,
+    "derived_metrics_ready_max_ms": 325
+  },
+  "queries": [],
+  "budget": {
+    "passed": true,
+    "failures": []
+  }
+}

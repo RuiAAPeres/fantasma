@@ -1,0 +1,151 @@
+{
+  "host": {
+    "environment": "local"
+  },
+  "suites": [
+    "representative",
+    "mixed-repair"
+  ],
+  "run_config": {
+    "mode": "iterative",
+    "publication_repetitions": 1,
+    "worker_config": {
+      "session_batch_size": 2000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2,
+      "idle_poll_interval_ms": 250
+    }
+  },
+  "verdict": {
+    "baseline_source": "docs/STATUS.md benchmark usability reset entry (2026-03-15 representative + mixed-repair iterative smokes)",
+    "representative_append": {
+      "overall": "flat",
+      "checkpoint_sample_count_matches": true,
+      "checkpoint_derived": "flat",
+      "final_derived": "flat"
+    },
+    "mixed_repair": {
+      "overall": "flat",
+      "checkpoint_sample_count_matches": true,
+      "checkpoint_derived": "flat",
+      "final_derived": "flat"
+    },
+    "dominant_stage_b_phase": "unchanged",
+    "overall": "flat"
+  },
+  "scenarios": [
+    {
+      "scenario": "live-append-small-blobs",
+      "run_config": {
+        "mode": "iterative",
+        "publication_repetitions": 1,
+        "worker_config": {
+          "session_batch_size": 2000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2,
+          "idle_poll_interval_ms": 250
+        }
+      },
+      "phases": [
+        {
+          "name": "append_uploads",
+          "events_sent": 225000,
+          "elapsed_ms": 106229,
+          "events_per_second": 2118.0580800444664
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 0
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 2
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 2
+        }
+      ],
+      "checkpoint_readiness": {
+        "sample_count": 225,
+        "event_metrics_ready_p50_ms": 106,
+        "event_metrics_ready_p95_ms": 108,
+        "event_metrics_ready_max_ms": 209,
+        "session_metrics_ready_p50_ms": 109,
+        "session_metrics_ready_p95_ms": 314,
+        "session_metrics_ready_max_ms": 318,
+        "derived_metrics_ready_p50_ms": 109,
+        "derived_metrics_ready_p95_ms": 314,
+        "derived_metrics_ready_max_ms": 318
+      },
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    },
+    {
+      "scenario": "live-append-plus-light-repair",
+      "run_config": {
+        "mode": "iterative",
+        "publication_repetitions": 1,
+        "worker_config": {
+          "session_batch_size": 2000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2,
+          "idle_poll_interval_ms": 250
+        }
+      },
+      "phases": [
+        {
+          "name": "append_uploads",
+          "events_sent": 225000,
+          "elapsed_ms": 246638,
+          "events_per_second": 912.2657349863069
+        },
+        {
+          "name": "repair_uploads",
+          "events_sent": 180,
+          "elapsed_ms": 6998,
+          "events_per_second": 25.72022892432644
+        }
+      ],
+      "readiness": [
+        {
+          "name": "event_metrics_ready_ms",
+          "elapsed_ms": 0
+        },
+        {
+          "name": "session_metrics_ready_ms",
+          "elapsed_ms": 2
+        },
+        {
+          "name": "derived_metrics_ready_ms",
+          "elapsed_ms": 2
+        }
+      ],
+      "checkpoint_readiness": {
+        "sample_count": 234,
+        "event_metrics_ready_p50_ms": 105,
+        "event_metrics_ready_p95_ms": 147,
+        "event_metrics_ready_max_ms": 319,
+        "session_metrics_ready_p50_ms": 108,
+        "session_metrics_ready_p95_ms": 253,
+        "session_metrics_ready_max_ms": 956,
+        "derived_metrics_ready_p50_ms": 108,
+        "derived_metrics_ready_p95_ms": 253,
+        "derived_metrics_ready_max_ms": 956
+      },
+      "queries": [],
+      "budget": {
+        "passed": true,
+        "failures": []
+      }
+    }
+  ]
+}

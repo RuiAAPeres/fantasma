@@ -1,0 +1,24 @@
+{
+  "scenario": "live-append-small-blobs",
+  "run_config": {
+    "mode": "iterative",
+    "publication_repetitions": 1,
+    "worker_config": {
+      "session_batch_size": 2000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2,
+      "idle_poll_interval_ms": 250
+    }
+  },
+  "phases": [],
+  "readiness": [],
+  "queries": [],
+  "budget": {
+    "passed": false,
+    "failures": [
+      "scenario execution failed: POST /v1/events: error sending request for url (http://127.0.0.1:18081/v1/events): client error (SendRequest): connection closed before message completed"
+    ]
+  },
+  "failure": "scenario execution failed: POST /v1/events: error sending request for url (http://127.0.0.1:18081/v1/events): client error (SendRequest): connection closed before message completed"
+}
