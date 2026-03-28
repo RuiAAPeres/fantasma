@@ -233,6 +233,9 @@ The harness starts the benchmark stack in its own Compose project, renders a tem
 - one JSON and one Markdown file per scenario run
 - `summary.json`
 - `summary.md`
+- compact sidecars such as `checkpoint-readiness.json` or `stage-b.json` when a scenario emits them
+
+Heavy raw diagnostic sidecars such as `append-attribution.json`, `event-lane-trace.jsonl`, and `stage-b-trace.jsonl` are for local investigation only. Do not check them in as published benchmark artifacts; keep the retained repo artifact set compact and summary-oriented.
 
 ## Demo Stack Burst Workflow
 
@@ -251,7 +254,6 @@ That wrapper copies [demo-stack-burst-bench.py](/Users/ruiperes/Code/fantasma/sc
 - `burst-readiness-100-installs-x3`
 
 This is the benchmark path to use for real demo-stack freshness checks. Keep the isolated `fantasma-bench slo` Compose path for local benchmark-stack runs and for the larger stress suites.
-- checkpoint sidecars for representative and mixed-repair scenarios
 - Stage B sidecars for representative, mixed-repair, and stress scenarios when trace data is present
 
 If a scenario fails operationally, the suite still writes the failed run artifact plus the top-level summary before exiting non-zero.

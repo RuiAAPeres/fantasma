@@ -24,3 +24,7 @@
 /node_modules
 /sdks/react-native/**/node_modules
 /sdks/react-native/**/dist
+/artifacts/performance/**/checkpoint-readiness.json
+/artifacts/performance/**/append-attribution.json
+/artifacts/performance/**/event-lane-trace.jsonl
+/artifacts/performance/**/stage-b-trace.jsonl
