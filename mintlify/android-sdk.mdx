@@ -82,6 +82,8 @@ class DemoApplication : Application() {
 ## Android-Specific Notes
 
 - Android uses an instance-based `FantasmaClient` API rather than a static facade.
+- The SDK auto-populates `platform = "android"`, `device`, `app_version`, `os_version`, and `locale`.
+- `device` emits `phone`, `tablet`, or `unknown` from the Android runtime form-factor snapshot.
 - `track()` and `flush()` are suspend functions and throw typed `FantasmaException` failures.
 - `close()` is idempotent, and any later `track()`, `flush()`, or `clear()` call on that closed client throws `FantasmaException.ClosedClient`.
 - In addition to the shared upload triggers, the SDK also attempts uploads when the app enters background.

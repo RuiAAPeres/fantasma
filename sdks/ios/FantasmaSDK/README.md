@@ -34,7 +34,7 @@ Task {
 }
 ```
 
-The SDK adds `platform`, `app_version`, `os_version`, and `locale`
+The SDK adds `platform`, `device`, `app_version`, `os_version`, and `locale`
 automatically.
 
 ## Behavior
@@ -52,6 +52,9 @@ automatically.
 - `track(_:)` throws when the SDK has not been configured.
 - `flush()` throws when the SDK has not been configured.
 - The SDK also attempts a periodic flush every 30 seconds when configured.
-- The SDK auto-populates `platform`, `app_version`, `os_version`, and `locale` on each event.
+- The SDK auto-populates `platform`, `device`, `app_version`, `os_version`, and `locale` on each event.
+- iPhone emits `platform = "ios"`, `device = "phone"`.
+- iPad emits `platform = "ios"`, `device = "tablet"`.
+- Native macOS, Mac Catalyst, and iOS-on-Mac desktop-class runs emit `platform = "macos"`, `device = "desktop"`.
 - The SDK persists one local install identifier, reuses it on every event, and rotates it on `clear()` without mutating already queued rows.
 - Reconfiguring to a different server URL or write key discards any still-queued rows after the current upload boundary, even across app relaunches, then switches future uploads to the new destination.

@@ -7,7 +7,7 @@ use std::{
 };
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Timelike, Utc};
-use fantasma_core::MetricGranularity;
+use fantasma_core::{Device, MetricGranularity};
 use fantasma_store::{
     ActiveInstallBitmapDim1Input, ActiveInstallBitmapDim2Input, EventMetricBucketDim1Delta,
     EventMetricBucketDim2Delta, EventMetricBucketDim3Delta, EventMetricBucketDim4Delta,
@@ -404,6 +404,7 @@ struct SessionMetricDeltaValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum BuiltinDimensionSlot {
     AppVersion,
+    Device,
     Locale,
     OsVersion,
     Platform,
@@ -413,6 +414,7 @@ impl BuiltinDimensionSlot {
     fn as_str(self) -> &'static str {
         match self {
             Self::AppVersion => "app_version",
+            Self::Device => "device",
             Self::Locale => "locale",
             Self::OsVersion => "os_version",
             Self::Platform => "platform",
@@ -515,6 +517,7 @@ impl SessionMetricAccumulator {
     ) {
         let dimensions = session_metric_dimension_values(
             &session.platform,
+            &session.device,
             session.app_version.as_ref(),
             session.os_version.as_ref(),
             session.locale.as_ref(),
@@ -531,6 +534,7 @@ impl SessionMetricAccumulator {
     fn add_new_install_delta(&mut self, first_seen: &InstallFirstSeenRecord) {
         let dimensions = session_metric_dimension_values(
             &first_seen.platform,
+            &first_seen.device,
             first_seen.app_version.as_ref(),
             first_seen.os_version.as_ref(),
             first_seen.locale.as_ref(),
@@ -601,22 +605,28 @@ impl SessionMetricAccumulator {
                 }
             }
 
-            if dimensions.len() == 4 {
-                self.dim4
-                    .entry((
-                        granularity,
-                        bucket_start,
-                        dimensions[0].0,
-                        dimensions[0].1.clone(),
-                        dimensions[1].0,
-                        dimensions[1].1.clone(),
-                        dimensions[2].0,
-                        dimensions[2].1.clone(),
-                        dimensions[3].0,
-                        dimensions[3].1.clone(),
-                    ))
-                    .or_default()
-                    .add(session_count_delta, duration_delta, new_installs_delta);
+            for first in 0..dimensions.len() {
+                for second in (first + 1)..dimensions.len() {
+                    for third in (second + 1)..dimensions.len() {
+                        for fourth in (third + 1)..dimensions.len() {
+                            self.dim4
+                                .entry((
+                                    granularity,
+                                    bucket_start,
+                                    dimensions[first].0,
+                                    dimensions[first].1.clone(),
+                                    dimensions[second].0,
+                                    dimensions[second].1.clone(),
+                                    dimensions[third].0,
+                                    dimensions[third].1.clone(),
+                                    dimensions[fourth].0,
+                                    dimensions[fourth].1.clone(),
+                                ))
+                                .or_default()
+                                .add(session_count_delta, duration_delta, new_installs_delta);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2335,6 +2345,7 @@ async fn rebuild_range_deleted_install_in_tx(
             first_seen_event_id: first_raw_event.id,
             first_seen_at: first_raw_event.timestamp,
             platform: first_raw_event.platform.clone(),
+            device: first_raw_event.device.clone(),
             app_version: first_raw_event.app_version.clone(),
             os_version: first_raw_event.os_version.clone(),
             locale: first_raw_event.locale.clone(),
@@ -2564,23 +2575,29 @@ fn build_event_metric_rollups(batch: &[RawEventRecord]) -> EventMetricRollups {
                 }
             }
 
-            if dimensions.len() == 4 {
-                *dim4
-                    .entry((
-                        event.project_id,
-                        granularity,
-                        bucket_start,
-                        event_name.clone(),
-                        dimensions[0].0,
-                        dimensions[0].1.clone(),
-                        dimensions[1].0,
-                        dimensions[1].1.clone(),
-                        dimensions[2].0,
-                        dimensions[2].1.clone(),
-                        dimensions[3].0,
-                        dimensions[3].1.clone(),
-                    ))
-                    .or_default() += 1;
+            for first_index in 0..dimensions.len() {
+                for second_index in first_index + 1..dimensions.len() {
+                    for third_index in second_index + 1..dimensions.len() {
+                        for fourth_index in third_index + 1..dimensions.len() {
+                            *dim4
+                                .entry((
+                                    event.project_id,
+                                    granularity,
+                                    bucket_start,
+                                    event_name.clone(),
+                                    dimensions[first_index].0,
+                                    dimensions[first_index].1.clone(),
+                                    dimensions[second_index].0,
+                                    dimensions[second_index].1.clone(),
+                                    dimensions[third_index].0,
+                                    dimensions[third_index].1.clone(),
+                                    dimensions[fourth_index].0,
+                                    dimensions[fourth_index].1.clone(),
+                                ))
+                                .or_default() += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2759,6 +2776,7 @@ fn build_live_install_state_upserts(batch: &[RawEventRecord]) -> Vec<LiveInstall
 fn event_metric_dimension_values(event: &RawEventRecord) -> Vec<(BuiltinDimensionSlot, String)> {
     builtin_metric_dimension_values(
         &event.platform,
+        &event.device,
         event.app_version.as_deref(),
         event.os_version.as_deref(),
         event.locale.as_deref(),
@@ -2767,12 +2785,14 @@ fn event_metric_dimension_values(event: &RawEventRecord) -> Vec<(BuiltinDimensio
 
 fn session_metric_dimension_values(
     platform: &fantasma_core::Platform,
+    device: &Device,
     app_version: Option<&String>,
     os_version: Option<&String>,
     locale: Option<&String>,
 ) -> Vec<(BuiltinDimensionSlot, String)> {
     builtin_metric_dimension_values(
         platform,
+        device,
         app_version.map(String::as_str),
         os_version.map(String::as_str),
         locale.map(String::as_str),
@@ -2781,15 +2801,18 @@ fn session_metric_dimension_values(
 
 fn builtin_metric_dimension_values(
     platform: &fantasma_core::Platform,
+    device: &Device,
     app_version: Option<&str>,
     os_version: Option<&str>,
     locale: Option<&str>,
 ) -> Vec<(BuiltinDimensionSlot, String)> {
-    let mut dimensions = Vec::with_capacity(4);
+    let mut dimensions = Vec::with_capacity(5);
 
     if let Some(app_version) = app_version {
         dimensions.push((BuiltinDimensionSlot::AppVersion, app_version.to_owned()));
     }
+
+    dimensions.push((BuiltinDimensionSlot::Device, device_dimension_value(device)));
 
     if let Some(locale) = locale {
         dimensions.push((BuiltinDimensionSlot::Locale, locale.to_owned()));
@@ -2812,6 +2835,7 @@ fn active_install_slice_delta(session: &SessionRecord) -> SessionActiveInstallSl
         day: session.session_start.date_naive(),
         install_id: session.install_id.clone(),
         platform: platform_dimension_value(&session.platform),
+        device: device_dimension_value(&session.device),
         app_version: session.app_version.clone(),
         app_version_is_null: session.app_version.is_none(),
         os_version: session.os_version.clone(),
@@ -2825,6 +2849,16 @@ fn platform_dimension_value(platform: &fantasma_core::Platform) -> String {
     match platform {
         fantasma_core::Platform::Ios => "ios".to_owned(),
         fantasma_core::Platform::Android => "android".to_owned(),
+        fantasma_core::Platform::Macos => "macos".to_owned(),
+    }
+}
+
+fn device_dimension_value(device: &Device) -> String {
+    match device {
+        Device::Phone => "phone".to_owned(),
+        Device::Tablet => "tablet".to_owned(),
+        Device::Desktop => "desktop".to_owned(),
+        Device::Unknown => "unknown".to_owned(),
     }
 }
 
@@ -2908,6 +2942,7 @@ fn plan_incremental_session_batch(
                 first_seen_event_id: event.id,
                 first_seen_at: event.timestamp,
                 platform: event.platform.clone(),
+                device: event.device.clone(),
                 app_version: event.app_version.clone(),
                 os_version: event.os_version.clone(),
                 locale: event.locale.clone(),
@@ -2927,6 +2962,7 @@ fn plan_incremental_session_batch(
                 timestamp: event.timestamp,
                 install_id: event.install_id.clone(),
                 platform: event.platform.clone(),
+                device: event.device.clone(),
                 app_version: event.app_version.clone(),
                 os_version: event.os_version.clone(),
                 locale: event.locale.clone(),
@@ -3558,6 +3594,7 @@ async fn rebuild_active_install_day_bitmaps_in_tx(
         SELECT
             install_id,
             platform,
+            device,
             app_version,
             app_version_is_null,
             os_version,
@@ -3653,6 +3690,7 @@ fn active_install_dimensions_for_slice_row(
 ) -> Result<Vec<(String, Option<String>)>, StoreError> {
     let mut dims = BTreeMap::<String, Option<String>>::new();
     dims.insert("platform".to_owned(), Some(row.try_get("platform")?));
+    dims.insert("device".to_owned(), Some(row.try_get("device")?));
 
     let app_version: String = row.try_get("app_version")?;
     let app_version_is_null: bool = row.try_get("app_version_is_null")?;
@@ -3743,6 +3781,7 @@ fn derive_sessions_for_window(raw_events: &[RawEventRecord]) -> Vec<SessionRecor
             timestamp: event.timestamp,
             install_id: event.install_id.clone(),
             platform: event.platform.clone(),
+            device: event.device.clone(),
             app_version: event.app_version.clone(),
             os_version: event.os_version.clone(),
             locale: event.locale.clone(),
@@ -3907,6 +3946,8 @@ fn session_dimension_sql(source_alias: &str) -> String {
         r#"
         SELECT 'platform'::text AS dim_key, {source_alias}.platform::text AS dim_value
         UNION ALL
+        SELECT 'device'::text, {source_alias}.device::text
+        UNION ALL
         SELECT 'app_version'::text, {source_alias}.app_version
         WHERE {source_alias}.app_version IS NOT NULL
         UNION ALL
@@ -3923,6 +3964,8 @@ fn event_dimension_sql(source_alias: &str) -> String {
     format!(
         r#"
         SELECT 'platform'::text AS dim_key, {source_alias}.platform::text AS dim_value
+        UNION ALL
+        SELECT 'device'::text, {source_alias}.device::text
         UNION ALL
         SELECT 'app_version'::text, {source_alias}.app_version
         WHERE {source_alias}.app_version IS NOT NULL
@@ -3943,7 +3986,7 @@ fn event_metric_rebuild_sql(granularity: MetricGranularity) -> String {
     format!(
         r#"
         WITH scoped_events AS MATERIALIZED (
-            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, app_version, os_version, locale
+            SELECT id, project_id, event_name, {bucket_expr} AS bucket_start, platform, device, app_version, os_version, locale
             FROM events_raw AS scope
             WHERE scope.project_id = $1
               AND scope.event_name = ANY($3)
@@ -4098,13 +4141,13 @@ fn session_metric_rebuild_sql(granularity: MetricGranularity) -> String {
     format!(
         r#"
         WITH scoped_sessions AS MATERIALIZED (
-            SELECT project_id, session_id, {bucket_expr} AS bucket_start, duration_seconds, platform, app_version, os_version, locale
+            SELECT project_id, session_id, {bucket_expr} AS bucket_start, duration_seconds, platform, device, app_version, os_version, locale
             FROM sessions AS scope
             WHERE scope.project_id = $1
               AND {bucket_expr} = ANY($3)
         ),
         scoped_installs AS MATERIALIZED (
-            SELECT project_id, install_id, {first_seen_bucket_expr} AS bucket_start, platform, app_version, os_version, locale
+            SELECT project_id, install_id, {first_seen_bucket_expr} AS bucket_start, platform, device, app_version, os_version, locale
             FROM install_first_seen AS scope
             WHERE scope.project_id = $1
               AND {first_seen_bucket_expr} = ANY($3)
@@ -4458,7 +4501,7 @@ mod tests {
     use std::{collections::BTreeMap, fs, sync::Arc, sync::LazyLock, sync::Mutex, time::Duration};
 
     use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
-    use fantasma_core::{EventPayload, Platform};
+    use fantasma_core::{Device, EventPayload, Platform};
     use fantasma_store::{
         BootstrapConfig, RawEventRecord, average_session_duration_seconds, count_active_installs,
         count_sessions, fetch_latest_session_for_install, insert_events,
@@ -4509,6 +4552,7 @@ mod tests {
             timestamp: timestamp(day, hour, minute),
             install_id: install_id.to_owned(),
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: app_version.map(str::to_owned),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),
@@ -4524,10 +4568,54 @@ mod tests {
             received_at: timestamp(1, 0, 1),
             install_id: "install-1".to_owned(),
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),
         }
+    }
+
+    fn builtin_dimension_keys() -> [&'static str; 5] {
+        ["app_version", "device", "locale", "os_version", "platform"]
+    }
+
+    fn builtin_dimension_pairs() -> Vec<(&'static str, &'static str)> {
+        let keys = builtin_dimension_keys();
+        let mut pairs = Vec::new();
+        for left in 0..keys.len() {
+            for right in (left + 1)..keys.len() {
+                pairs.push((keys[left], keys[right]));
+            }
+        }
+        pairs
+    }
+
+    fn builtin_dimension_triples() -> Vec<(&'static str, &'static str, &'static str)> {
+        let keys = builtin_dimension_keys();
+        let mut triples = Vec::new();
+        for first in 0..keys.len() {
+            for second in (first + 1)..keys.len() {
+                for third in (second + 1)..keys.len() {
+                    triples.push((keys[first], keys[second], keys[third]));
+                }
+            }
+        }
+        triples
+    }
+
+    fn builtin_dimension_quads() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+        let keys = builtin_dimension_keys();
+        let mut quads = Vec::new();
+        for first in 0..keys.len() {
+            for second in (first + 1)..keys.len() {
+                for third in (second + 1)..keys.len() {
+                    for fourth in (third + 1)..keys.len() {
+                        quads.push((keys[first], keys[second], keys[third], keys[fourth]));
+                    }
+                }
+            }
+        }
+        quads
     }
 
     #[test]
@@ -5015,11 +5103,11 @@ mod tests {
             + rollups.dim4_deltas.len();
 
         assert_eq!(rollups.total_deltas.len(), 2);
-        assert_eq!(rollups.dim1_deltas.len(), 8);
-        assert_eq!(rollups.dim2_deltas.len(), 12);
-        assert_eq!(rollups.dim3_deltas.len(), 8);
-        assert_eq!(rollups.dim4_deltas.len(), 2);
-        assert_eq!(total_fanout, 32);
+        assert_eq!(rollups.dim1_deltas.len(), 10);
+        assert_eq!(rollups.dim2_deltas.len(), 20);
+        assert_eq!(rollups.dim3_deltas.len(), 20);
+        assert_eq!(rollups.dim4_deltas.len(), 10);
+        assert_eq!(total_fanout, 62);
         assert!(
             rollups
                 .dim2_deltas
@@ -5036,6 +5124,7 @@ mod tests {
             raw_dimensions,
             vec![
                 (BuiltinDimensionSlot::AppVersion, "1.0.0".to_owned()),
+                (BuiltinDimensionSlot::Device, "phone".to_owned()),
                 (BuiltinDimensionSlot::Locale, "en-GB".to_owned()),
                 (BuiltinDimensionSlot::OsVersion, "18.3".to_owned()),
                 (BuiltinDimensionSlot::Platform, "ios".to_owned()),
@@ -5044,6 +5133,7 @@ mod tests {
 
         let session_dimensions = session_metric_dimension_values(
             &Platform::Ios,
+            &Device::Phone,
             Some(&"1.0.0".to_owned()),
             Some(&"18.3".to_owned()),
             Some(&"en-GB".to_owned()),
@@ -5070,15 +5160,15 @@ mod tests {
             .iter()
             .map(|delta| (delta.event_name.as_str(), delta.granularity))
             .collect::<Vec<_>>();
-        assert_eq!(
-            total_keys,
-            vec![
-                ("a_open", MetricGranularity::Hour),
-                ("z_open", MetricGranularity::Hour),
-                ("a_open", MetricGranularity::Day),
-                ("z_open", MetricGranularity::Day),
-            ]
-        );
+        let expected_total_keys = [MetricGranularity::Hour, MetricGranularity::Day]
+            .into_iter()
+            .flat_map(|granularity| {
+                ["a_open", "z_open"]
+                    .into_iter()
+                    .map(move |event_name| (event_name, granularity))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(total_keys, expected_total_keys);
 
         let dim1_keys = rollups
             .dim1_deltas
@@ -5091,27 +5181,19 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            dim1_keys,
-            vec![
-                ("a_open", "app_version", MetricGranularity::Hour),
-                ("a_open", "locale", MetricGranularity::Hour),
-                ("a_open", "os_version", MetricGranularity::Hour),
-                ("a_open", "platform", MetricGranularity::Hour),
-                ("z_open", "app_version", MetricGranularity::Hour),
-                ("z_open", "locale", MetricGranularity::Hour),
-                ("z_open", "os_version", MetricGranularity::Hour),
-                ("z_open", "platform", MetricGranularity::Hour),
-                ("a_open", "app_version", MetricGranularity::Day),
-                ("a_open", "locale", MetricGranularity::Day),
-                ("a_open", "os_version", MetricGranularity::Day),
-                ("a_open", "platform", MetricGranularity::Day),
-                ("z_open", "app_version", MetricGranularity::Day),
-                ("z_open", "locale", MetricGranularity::Day),
-                ("z_open", "os_version", MetricGranularity::Day),
-                ("z_open", "platform", MetricGranularity::Day),
-            ]
-        );
+        let expected_dim1_keys = [MetricGranularity::Hour, MetricGranularity::Day]
+            .into_iter()
+            .flat_map(|granularity| {
+                ["a_open", "z_open"]
+                    .into_iter()
+                    .flat_map(move |event_name| {
+                        builtin_dimension_keys()
+                            .into_iter()
+                            .map(move |dim1_key| (event_name, dim1_key, granularity))
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dim1_keys, expected_dim1_keys);
 
         let dim2_keys = rollups
             .dim2_deltas
@@ -5125,55 +5207,21 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            dim2_keys,
-            vec![
-                ("a_open", "app_version", "locale", MetricGranularity::Hour),
-                (
-                    "a_open",
-                    "app_version",
-                    "os_version",
-                    MetricGranularity::Hour
-                ),
-                ("a_open", "app_version", "platform", MetricGranularity::Hour),
-                ("a_open", "locale", "os_version", MetricGranularity::Hour),
-                ("a_open", "locale", "platform", MetricGranularity::Hour),
-                ("a_open", "os_version", "platform", MetricGranularity::Hour),
-                ("z_open", "app_version", "locale", MetricGranularity::Hour),
-                (
-                    "z_open",
-                    "app_version",
-                    "os_version",
-                    MetricGranularity::Hour
-                ),
-                ("z_open", "app_version", "platform", MetricGranularity::Hour),
-                ("z_open", "locale", "os_version", MetricGranularity::Hour),
-                ("z_open", "locale", "platform", MetricGranularity::Hour),
-                ("z_open", "os_version", "platform", MetricGranularity::Hour),
-                ("a_open", "app_version", "locale", MetricGranularity::Day),
-                (
-                    "a_open",
-                    "app_version",
-                    "os_version",
-                    MetricGranularity::Day
-                ),
-                ("a_open", "app_version", "platform", MetricGranularity::Day),
-                ("a_open", "locale", "os_version", MetricGranularity::Day),
-                ("a_open", "locale", "platform", MetricGranularity::Day),
-                ("a_open", "os_version", "platform", MetricGranularity::Day),
-                ("z_open", "app_version", "locale", MetricGranularity::Day),
-                (
-                    "z_open",
-                    "app_version",
-                    "os_version",
-                    MetricGranularity::Day
-                ),
-                ("z_open", "app_version", "platform", MetricGranularity::Day),
-                ("z_open", "locale", "os_version", MetricGranularity::Day),
-                ("z_open", "locale", "platform", MetricGranularity::Day),
-                ("z_open", "os_version", "platform", MetricGranularity::Day),
-            ]
-        );
+        let expected_dim2_keys = [MetricGranularity::Hour, MetricGranularity::Day]
+            .into_iter()
+            .flat_map(|granularity| {
+                ["a_open", "z_open"]
+                    .into_iter()
+                    .flat_map(move |event_name| {
+                        builtin_dimension_pairs()
+                            .into_iter()
+                            .map(move |(dim1_key, dim2_key)| {
+                                (event_name, dim1_key, dim2_key, granularity)
+                            })
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dim2_keys, expected_dim2_keys);
 
         let dim3_keys = rollups
             .dim3_deltas
@@ -5188,123 +5236,21 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            dim3_keys,
-            vec![
-                (
-                    "a_open",
-                    "app_version",
-                    "locale",
-                    "os_version",
-                    MetricGranularity::Hour,
-                ),
-                (
-                    "a_open",
-                    "app_version",
-                    "locale",
-                    "platform",
-                    MetricGranularity::Hour,
-                ),
-                (
-                    "a_open",
-                    "app_version",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Hour,
-                ),
-                (
-                    "a_open",
-                    "locale",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Hour,
-                ),
-                (
-                    "z_open",
-                    "app_version",
-                    "locale",
-                    "os_version",
-                    MetricGranularity::Hour,
-                ),
-                (
-                    "z_open",
-                    "app_version",
-                    "locale",
-                    "platform",
-                    MetricGranularity::Hour,
-                ),
-                (
-                    "z_open",
-                    "app_version",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Hour,
-                ),
-                (
-                    "z_open",
-                    "locale",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Hour,
-                ),
-                (
-                    "a_open",
-                    "app_version",
-                    "locale",
-                    "os_version",
-                    MetricGranularity::Day,
-                ),
-                (
-                    "a_open",
-                    "app_version",
-                    "locale",
-                    "platform",
-                    MetricGranularity::Day,
-                ),
-                (
-                    "a_open",
-                    "app_version",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Day,
-                ),
-                (
-                    "a_open",
-                    "locale",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Day,
-                ),
-                (
-                    "z_open",
-                    "app_version",
-                    "locale",
-                    "os_version",
-                    MetricGranularity::Day,
-                ),
-                (
-                    "z_open",
-                    "app_version",
-                    "locale",
-                    "platform",
-                    MetricGranularity::Day,
-                ),
-                (
-                    "z_open",
-                    "app_version",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Day,
-                ),
-                (
-                    "z_open",
-                    "locale",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Day,
-                ),
-            ]
-        );
+        let expected_dim3_keys = [MetricGranularity::Hour, MetricGranularity::Day]
+            .into_iter()
+            .flat_map(|granularity| {
+                ["a_open", "z_open"]
+                    .into_iter()
+                    .flat_map(move |event_name| {
+                        builtin_dimension_triples().into_iter().map(
+                            move |(dim1_key, dim2_key, dim3_key)| {
+                                (event_name, dim1_key, dim2_key, dim3_key, granularity)
+                            },
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dim3_keys, expected_dim3_keys);
 
         let dim4_keys = rollups
             .dim4_deltas
@@ -5320,43 +5266,28 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            dim4_keys,
-            vec![
-                (
-                    "a_open",
-                    "app_version",
-                    "locale",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Hour,
-                ),
-                (
-                    "z_open",
-                    "app_version",
-                    "locale",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Hour,
-                ),
-                (
-                    "a_open",
-                    "app_version",
-                    "locale",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Day,
-                ),
-                (
-                    "z_open",
-                    "app_version",
-                    "locale",
-                    "os_version",
-                    "platform",
-                    MetricGranularity::Day,
-                ),
-            ]
-        );
+        let expected_dim4_keys = [MetricGranularity::Hour, MetricGranularity::Day]
+            .into_iter()
+            .flat_map(|granularity| {
+                ["a_open", "z_open"]
+                    .into_iter()
+                    .flat_map(move |event_name| {
+                        builtin_dimension_quads().into_iter().map(
+                            move |(dim1_key, dim2_key, dim3_key, dim4_key)| {
+                                (
+                                    event_name,
+                                    dim1_key,
+                                    dim2_key,
+                                    dim3_key,
+                                    dim4_key,
+                                    granularity,
+                                )
+                            },
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dim4_keys, expected_dim4_keys);
     }
 
     #[test]
@@ -5371,6 +5302,7 @@ mod tests {
             event_count: 2,
             duration_seconds: 30,
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),
@@ -5383,41 +5315,21 @@ mod tests {
             .iter()
             .map(|delta| delta.dim1_key.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            dim1_keys,
-            vec![
-                "app_version",
-                "locale",
-                "os_version",
-                "platform",
-                "app_version",
-                "locale",
-                "os_version",
-                "platform",
-            ]
-        );
+        let expected_dim1_keys = [MetricGranularity::Hour, MetricGranularity::Day]
+            .into_iter()
+            .flat_map(|_| builtin_dimension_keys().into_iter())
+            .collect::<Vec<_>>();
+        assert_eq!(dim1_keys, expected_dim1_keys);
 
         let dim2_keys = dim2
             .iter()
             .map(|delta| (delta.dim1_key.as_str(), delta.dim2_key.as_str()))
             .collect::<Vec<_>>();
-        assert_eq!(
-            dim2_keys,
-            vec![
-                ("app_version", "locale"),
-                ("app_version", "os_version"),
-                ("app_version", "platform"),
-                ("locale", "os_version"),
-                ("locale", "platform"),
-                ("os_version", "platform"),
-                ("app_version", "locale"),
-                ("app_version", "os_version"),
-                ("app_version", "platform"),
-                ("locale", "os_version"),
-                ("locale", "platform"),
-                ("os_version", "platform"),
-            ]
-        );
+        let expected_dim2_keys = [MetricGranularity::Hour, MetricGranularity::Day]
+            .into_iter()
+            .flat_map(|_| builtin_dimension_pairs().into_iter())
+            .collect::<Vec<_>>();
+        assert_eq!(dim2_keys, expected_dim2_keys);
 
         let dim3_keys = dim3
             .iter()
@@ -5429,19 +5341,11 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            dim3_keys,
-            vec![
-                ("app_version", "locale", "os_version"),
-                ("app_version", "locale", "platform"),
-                ("app_version", "os_version", "platform"),
-                ("locale", "os_version", "platform"),
-                ("app_version", "locale", "os_version"),
-                ("app_version", "locale", "platform"),
-                ("app_version", "os_version", "platform"),
-                ("locale", "os_version", "platform"),
-            ]
-        );
+        let expected_dim3_keys = [MetricGranularity::Hour, MetricGranularity::Day]
+            .into_iter()
+            .flat_map(|_| builtin_dimension_triples().into_iter())
+            .collect::<Vec<_>>();
+        assert_eq!(dim3_keys, expected_dim3_keys);
 
         let dim4_keys = dim4
             .iter()
@@ -5454,13 +5358,11 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            dim4_keys,
-            vec![
-                ("app_version", "locale", "os_version", "platform"),
-                ("app_version", "locale", "os_version", "platform"),
-            ]
-        );
+        let expected_dim4_keys = [MetricGranularity::Hour, MetricGranularity::Day]
+            .into_iter()
+            .flat_map(|_| builtin_dimension_quads().into_iter())
+            .collect::<Vec<_>>();
+        assert_eq!(dim4_keys, expected_dim4_keys);
     }
 
     #[test]
@@ -5473,6 +5375,7 @@ mod tests {
             received_at: timestamp(1, 0, 1),
             install_id: "install-1".to_owned(),
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),
@@ -5485,6 +5388,7 @@ mod tests {
             received_at: timestamp(1, 0, 3),
             install_id: "install-1".to_owned(),
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),
@@ -5497,6 +5401,7 @@ mod tests {
             received_at: timestamp(1, 0, 2),
             install_id: "install-2".to_owned(),
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),

@@ -33,7 +33,21 @@
       "type": "string",
       "enum": [
         "ios",
-        "android"
+        "android",
+        "macos"
+      ]
+    },
+    "device": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "phone",
+        "tablet",
+        "desktop",
+        "unknown",
+        null
       ]
     },
     "app_version": {

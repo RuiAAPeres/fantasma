@@ -58,6 +58,9 @@ await fantasma.close();
 - `close()` closes the JS client immediately and allows a fresh client to be created right away; the native bridge retires or hands off the underlying destination state safely underneath.
 - Destination switching stays supported by closing the current client and constructing a new one with the new destination.
 - The native SDKs still own queue durability, built-in metadata population, blocked-destination handling, and identity rotation semantics.
+- React Native inherits native built-in metadata population, including `platform`, `device`, `app_version`, `os_version`, and `locale`.
+- Apple runs emit `platform = "ios"` with `device = "phone"` or `device = "tablet"` on iPhone and iPad, and emit `platform = "macos"`, `device = "desktop"` for native macOS, Mac Catalyst, and iOS-on-Mac desktop-class runs.
+- Android emits `platform = "android"` with `device = "phone"` or `device = "tablet"`.
 
 ## Error Codes
 

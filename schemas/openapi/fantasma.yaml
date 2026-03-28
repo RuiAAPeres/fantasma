@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Fantasma API
-  version: 0.3.0
+  version: 0.4.0
   description: |
     Fantasma is a privacy-first, self-hosted, install-scoped mobile analytics
     platform.
@@ -559,8 +559,8 @@ paths:
 
         `metric=count` is the only public event metric, and it requires `event`.
 
-        Use only the built-in dimensions `platform`, `app_version`,
-        `os_version`, and `locale`.
+        Use only the built-in dimensions `platform`, `device`,
+        `app_version`, `os_version`, and `locale`.
 
         Repeated `group_by` is supported on those same built-ins. Total
         referenced dimensions across filters plus `group_by` are capped at 4.
@@ -575,6 +575,7 @@ paths:
         - $ref: '#/components/parameters/MetricStart'
         - $ref: '#/components/parameters/MetricEnd'
         - $ref: '#/components/parameters/PlatformFilter'
+        - $ref: '#/components/parameters/DeviceFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
         - $ref: '#/components/parameters/LocaleFilter'
@@ -636,14 +637,16 @@ paths:
         read directly from accepted raw events. They are intended for event
         discovery, not bucketed chart series.
 
-        Use only the built-in equality filters `platform`, `app_version`,
-        `os_version`, and `locale`. Legacy public params such as `project_id`,
-        `start_date`, `end_date`, and `group_by` fail fast with `422`.
+        Use only the built-in equality filters `platform`, `device`,
+        `app_version`, `os_version`, and `locale`. Legacy public params such
+        as `project_id`, `start_date`, `end_date`, and `group_by` fail fast
+        with `422`.
       parameters:
         - $ref: '#/components/parameters/EventDiscoveryStart'
         - $ref: '#/components/parameters/EventDiscoveryEnd'
         - $ref: '#/components/parameters/TopEventsLimit'
         - $ref: '#/components/parameters/PlatformFilter'
+        - $ref: '#/components/parameters/DeviceFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
         - $ref: '#/components/parameters/LocaleFilter'
@@ -699,14 +702,16 @@ paths:
         read directly from accepted raw events. They are discovery helpers, not
         worker-derived bucketed metrics.
 
-        Use only the built-in equality filters `platform`, `app_version`,
-        `os_version`, and `locale`. Legacy public params such as `project_id`,
-        `start_date`, `end_date`, and `group_by` fail fast with `422`.
+        Use only the built-in equality filters `platform`, `device`,
+        `app_version`, `os_version`, and `locale`. Legacy public params such
+        as `project_id`, `start_date`, `end_date`, and `group_by` fail fast
+        with `422`.
       parameters:
         - $ref: '#/components/parameters/EventDiscoveryStart'
         - $ref: '#/components/parameters/EventDiscoveryEnd'
         - $ref: '#/components/parameters/TopEventsLimit'
         - $ref: '#/components/parameters/PlatformFilter'
+        - $ref: '#/components/parameters/DeviceFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
         - $ref: '#/components/parameters/LocaleFilter'
@@ -821,8 +826,8 @@ paths:
         calendar-shaped and clipped to the request edges; requests do not need
         aligned boundaries.
 
-        Built-in filter and grouping dimensions are `platform`, `app_version`,
-        `os_version`, and `locale`.
+        Built-in filter and grouping dimensions are `platform`, `device`,
+        `app_version`, `os_version`, and `locale`.
 
         `count`, `duration_total`, and `new_installs` allow up to 4 total
         referenced dimensions across filters plus repeated `group_by`.
@@ -846,6 +851,7 @@ paths:
         - $ref: '#/components/parameters/MetricStart'
         - $ref: '#/components/parameters/MetricEnd'
         - $ref: '#/components/parameters/PlatformFilter'
+        - $ref: '#/components/parameters/DeviceFilter'
         - $ref: '#/components/parameters/AppVersionFilter'
         - $ref: '#/components/parameters/OsVersionFilter'
         - $ref: '#/components/parameters/LocaleFilter'
@@ -1000,9 +1006,19 @@ components:
       schema:
         type: string
       description: |
-        Built-in platform equality filter. Supported SDKs currently emit
-        `ios` and `android`; other strings are treated as literal filter
-        values and normally yield empty results.
+        Built-in platform equality filter. `platform` is the OS family.
+        Supported SDKs currently emit `ios`, `android`, and `macos`; other
+        strings are treated as literal filter values and normally yield empty
+        results.
+    DeviceFilter:
+      in: query
+      name: device
+      required: false
+      schema:
+        type: string
+      description: |
+        Built-in device equality filter. `device` is the coarse form factor.
+        Supported values are `phone`, `tablet`, `desktop`, and `unknown`.
     AppVersionFilter:
       in: query
       name: app_version
@@ -1041,12 +1057,14 @@ components:
           type: string
           enum:
             - platform
+            - device
             - app_version
             - os_version
             - locale
       description: |
         Repeat to group by built-in dimensions in request order. Supported
-        keys are `platform`, `app_version`, `os_version`, and `locale`.
+        keys are `platform`, `device`, `app_version`, `os_version`, and
+        `locale`.
     MetricStart:
       in: query
       name: start
@@ -1459,12 +1477,20 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Allowed keys are `platform`, `app_version`, `os_version`, and `locale`.
+          description: Allowed keys are `platform`, `device`, `app_version`, `os_version`, and `locale`.
     Platform:
       type: string
       enum:
         - ios
         - android
+        - macos
+    Device:
+      type: string
+      enum:
+        - phone
+        - tablet
+        - desktop
+        - unknown
     EventPayload:
       type: object
       description: Install-scoped mobile event payload for Fantasma.
@@ -1491,6 +1517,17 @@ components:
           description: Stable install-scoped client identity used by ingest and backend sessionization. It is not a person identifier and it is not a public metrics query dimension.
         platform:
           $ref: '#/components/schemas/Platform'
+        device:
+          type:
+            - string
+            - 'null'
+          enum:
+            - phone
+            - tablet
+            - desktop
+            - unknown
+            - null
+          description: Optional built-in device form factor. Omitted or `null` values normalize to `unknown`.
         app_version:
           type:
             - string
@@ -1677,6 +1714,7 @@ components:
             type: string
             enum:
               - platform
+              - device
               - app_version
               - os_version
               - locale
@@ -1734,6 +1772,7 @@ components:
             type: string
             enum:
               - platform
+              - device
               - app_version
               - os_version
               - locale

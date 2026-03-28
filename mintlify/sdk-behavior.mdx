@@ -34,7 +34,10 @@ guarantee.
 - Accepted events are deleted from the durable queue.
 - Failed or retryable uploads keep rows in the queue for later replay.
 - `clear()` rotates the future install identity without rewriting already queued rows.
-- Each SDK auto-populates built-in metadata such as timestamp, install id, platform, app version, OS version, and locale.
+- Each SDK auto-populates built-in metadata such as timestamp, install id, platform, device, app version, OS version, and locale.
+- `platform` is the coarse OS family. `device` is the coarse form factor.
+- Apple SDKs emit `platform=macos`, `device=desktop` for native macOS, Mac Catalyst, and iOS-on-Mac desktop-class runs.
+- Android-class mobile SDKs emit `platform=android` with `device=phone` or `device=tablet`, and fall back to `device=unknown` when the runtime cannot classify device form factor.
 
 ## Blocked And Retryable Destinations
 

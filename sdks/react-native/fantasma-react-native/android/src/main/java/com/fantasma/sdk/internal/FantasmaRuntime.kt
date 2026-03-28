@@ -1,6 +1,7 @@
 package com.fantasma.sdk.internal
 
 import android.content.Context
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -146,6 +147,7 @@ internal class FantasmaRuntime private constructor(
                     timestamp = DateTimeFormatter.ISO_INSTANT.format(Instant.now()),
                     installId = identity,
                     platform = "android",
+                    device = currentDevice(),
                     appVersion = appVersion(),
                     osVersion = Build.VERSION.RELEASE,
                     locale = currentLocale(),
@@ -239,6 +241,15 @@ internal class FantasmaRuntime private constructor(
             .toLanguageTag()
             .takeIf { it.isNotBlank() }
 
+    private fun currentDevice(): String {
+        val smallestWidthDp = context.resources.configuration.smallestScreenWidthDp
+        return when {
+            smallestWidthDp == Configuration.SMALLEST_SCREEN_WIDTH_DP_UNDEFINED -> "unknown"
+            smallestWidthDp >= TABLET_MIN_SMALLEST_WIDTH_DP -> "tablet"
+            else -> "phone"
+        }
+    }
+
     private fun appLocale(): java.util.Locale {
         val configuration = context.resources.configuration
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -265,6 +276,7 @@ internal class FantasmaRuntime private constructor(
     companion object {
         private const val PERIODIC_FLUSH_INTERVAL_MS: Long = 30_000L
         private const val UPLOAD_BATCH_SIZE: Int = 100
+        private const val TABLET_MIN_SMALLEST_WIDTH_DP: Int = 600
 
         fun create(
             context: Context,

@@ -67,6 +67,36 @@ void main() {
       );
     });
 
+    test('persists metadata device snapshots in queued events', () async {
+      final store = InMemoryFantasmaStore();
+      final client = FantasmaClient.test(
+        config: FantasmaConfig(
+          serverUrl: 'https://example.com',
+          writeKey: 'write-key',
+          storageNamespace: 'device-snapshot',
+        ),
+        dependencies: FantasmaDependencies.test(
+          store: store,
+          clock: () => DateTime.parse('2026-03-22T12:00:00Z'),
+          metadataProvider: StaticMetadataProvider(
+            platform: 'ios',
+            device: 'tablet',
+            appVersion: '2.0.0',
+            osVersion: '18.0',
+            fallbackLocale: Locale('en', 'US'),
+          ),
+          transport: RecordingTransport(),
+          lifecycle: ManualLifecycleCallbacks(),
+          periodicFlushInterval: Duration.zero,
+        ),
+      );
+
+      await client.track('app_open');
+
+      expect(store.pendingEvents.single.platform, 'ios');
+      expect(store.pendingEvents.single.device, 'tablet');
+    });
+
     test('persists before explicit flush and clears uploaded rows on 202', () async {
       final store = InMemoryFantasmaStore();
       final transport = RecordingTransport(

@@ -111,7 +111,7 @@ Current worker behavior:
 - keep append and repair intentionally different maintenance paths in this slice: append commits direct deltas, repair/backfill recomputes exact touched windows from source tables
 - let `session_repair` own the install-scoped repair commit: rewritten sessions, `install_session_state`, exact touched-day rebuilds, queued touched hour/day bucket finalization, and repair-frontier completion all commit together
 - queue shared project hour/day session bucket rebuilds through `session_rebuild_queue` and drain that queue after repair claims finish, even if a later install in the same batch fails, so overlapping installs rebuild each bucket on one serialized path without stranding already-committed repairs behind a later error
-- preserve grouped session dimensions from the pre-repair session assignment so late events do not rebucket `platform` or `app_version`
+- preserve fixed built-in grouped dimensions from the pre-repair session assignment so late events do not rebucket `platform`, `device`, or version dimensions
 - keep the normal append path incremental and delta-based: direct session metric bucket deltas replace append-path delete-and-rescan maintenance
 - derive event-count cuboids incrementally from raw events into bounded hourly and daily totals, single-dimension rollups, two-dimension rollups, and three-dimension rollups
 - derive session metric rollups incrementally for `count`, `duration_total`, and `new_installs`
@@ -214,6 +214,7 @@ Event requirements:
 
 Optional event fields:
 
+- `device`
 - `app_version`
 - `os_version`
 - `locale`
@@ -225,7 +226,9 @@ Identity model:
 - Fantasma does not expose person-scoped identifiers in the public event contract
 - backend-derived session identifiers are internal implementation details, not public API
 - multi-device usage counts as multiple installs by design
-- built-in event dimensions stay minimal: `platform`, `app_version`, `os_version`, and `locale`
+- `platform` is the coarse OS family (`ios`, `android`, `macos`)
+- `device` is the coarse form factor (`phone`, `tablet`, `desktop`, `unknown`)
+- built-in event dimensions stay minimal: `platform`, `device`, `app_version`, `os_version`, and `locale`
 
 ## Metrics Query Model
 
@@ -269,16 +272,16 @@ Event metrics:
 
 - supported public metrics are `count`
 - `event` is required
-- built-in equality filters use `platform`, `app_version`, `os_version`, and `locale`
+- built-in equality filters use `platform`, `device`, `app_version`, `os_version`, and `locale`
 - only built-in filters and built-in `group_by` keys are accepted
-- `group_by` is supported on `platform`, `app_version`, `os_version`, and `locale`
+- `group_by` is supported on `platform`, `device`, `app_version`, `os_version`, and `locale`
 - total referenced dimensions across filters plus `group_by` are capped at 4
 - duplicate `group_by` keys and filter/group overlap are rejected
 
 Session metrics:
 
 - supported public metrics are `count`, `duration_total`, `new_installs`, and `active_installs`
-- built-in equality filters use `platform`, `app_version`, `os_version`, and `locale`
+- built-in equality filters use `platform`, `device`, `app_version`, `os_version`, and `locale`
 - only built-in filters and built-in `group_by` keys are accepted
 - `count`, `duration_total`, and `new_installs` allow built-in `group_by` through D4
 - `active_installs` allows built-in `group_by` through D2 only
@@ -352,7 +355,9 @@ Current first-party SDK shapes:
 Shared SDK behavior:
 
 - serialize each tracked event to JSON and store it as an immutable SQLite row
-- auto-populate `platform`, `app_version`, `os_version`, and `locale`
+- auto-populate `platform`, `device`, `app_version`, `os_version`, and `locale`
+- Apple SDKs emit `platform=macos`, `device=desktop` for native macOS, Mac Catalyst, and iOS-on-Mac desktop-class runs
+- Android emits `platform=android` with `device=phone` or `device=tablet`, and falls back to `device=unknown` when the runtime cannot classify device form factor
 - upload queued events asynchronously to `POST /v1/events` using an `ingest` key only
 - treat malformed `202 Accepted` envelopes as invalid responses and keep queued rows for later operator-visible handling
 - snapshot `locale` at enqueue time rather than re-resolving it during upload

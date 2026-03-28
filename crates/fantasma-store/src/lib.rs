@@ -9,7 +9,8 @@ use std::{
 use chrono::{DateTime, NaiveDate, Utc};
 use fantasma_auth::{derive_key_prefix, hash_ingest_key};
 use fantasma_core::{
-    EventPayload, MetricGranularity, Platform, ProjectSummary, SessionMetric, UsageProjectEvents,
+    Device, EventPayload, MetricGranularity, Platform, ProjectSummary, SessionMetric,
+    UsageProjectEvents,
 };
 use roaring::RoaringTreemap;
 use serde_json::Value;
@@ -262,6 +263,8 @@ pub enum StoreError {
     Migration(#[from] sqlx::migrate::MigrateError),
     #[error("invalid platform value: {0}")]
     InvalidPlatform(String),
+    #[error("invalid device value: {0}")]
+    InvalidDevice(String),
     #[error("project not found")]
     ProjectNotFound,
     #[error("project is not active: {0}")]
@@ -281,6 +284,7 @@ pub struct RawEventRecord {
     pub received_at: DateTime<Utc>,
     pub install_id: String,
     pub platform: Platform,
+    pub device: Device,
     pub app_version: Option<String>,
     pub os_version: Option<String>,
     pub locale: Option<String>,
@@ -296,6 +300,7 @@ pub struct SessionRecord {
     pub event_count: i32,
     pub duration_seconds: i32,
     pub platform: Platform,
+    pub device: Device,
     pub app_version: Option<String>,
     pub os_version: Option<String>,
     pub locale: Option<String>,
@@ -346,6 +351,7 @@ pub struct SessionActiveInstallSliceDelta {
     pub day: NaiveDate,
     pub install_id: String,
     pub platform: String,
+    pub device: String,
     pub app_version: Option<String>,
     pub app_version_is_null: bool,
     pub os_version: Option<String>,
@@ -552,6 +558,7 @@ pub struct InstallFirstSeenRecord {
     pub first_seen_event_id: i64,
     pub first_seen_at: DateTime<Utc>,
     pub platform: Platform,
+    pub device: Device,
     pub app_version: Option<String>,
     pub os_version: Option<String>,
     pub locale: Option<String>,
@@ -1187,7 +1194,7 @@ pub async fn insert_events_with_authenticated_ingest(
         let mut tx = pool.begin().await?;
 
         let mut builder = QueryBuilder::<sqlx::Postgres>::new(
-            "INSERT INTO events_raw (project_id, event_name, timestamp, install_id, platform, app_version, os_version, locale) ",
+            "INSERT INTO events_raw (project_id, event_name, timestamp, install_id, platform, device, app_version, os_version, locale) ",
         );
 
         builder.push_values(events, |mut separated, event| {
@@ -1195,10 +1202,8 @@ pub async fn insert_events_with_authenticated_ingest(
             separated.push_bind(&event.event);
             separated.push_bind(event.timestamp);
             separated.push_bind(&event.install_id);
-            separated.push_bind(match event.platform {
-                fantasma_core::Platform::Ios => "ios",
-                fantasma_core::Platform::Android => "android",
-            });
+            separated.push_bind(platform_as_str(&event.platform));
+            separated.push_bind(device_as_str(&event.device));
             separated.push_bind(&event.app_version);
             separated.push_bind(&event.os_version);
             separated.push_bind(&event.locale);
@@ -2293,11 +2298,12 @@ pub async fn insert_install_first_seen_in_tx(
             first_seen_event_id,
             first_seen_at,
             platform,
+            device,
             app_version,
             os_version,
             locale
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (project_id, install_id) DO NOTHING
         "#,
     )
@@ -2306,6 +2312,7 @@ pub async fn insert_install_first_seen_in_tx(
     .bind(record.first_seen_event_id)
     .bind(record.first_seen_at)
     .bind(platform_as_str(&record.platform))
+    .bind(device_as_str(&record.device))
     .bind(&record.app_version)
     .bind(&record.os_version)
     .bind(&record.locale)
@@ -2332,10 +2339,10 @@ pub async fn insert_install_first_seen_many_in_tx(
         }
     }
 
-    for chunk in unique_records.chunks(max_rows_per_batched_statement(8)) {
+    for chunk in unique_records.chunks(max_rows_per_batched_statement(9)) {
         let mut builder = QueryBuilder::<Postgres>::new(
             "INSERT INTO install_first_seen \
-             (project_id, install_id, first_seen_event_id, first_seen_at, platform, app_version, os_version, locale) ",
+             (project_id, install_id, first_seen_event_id, first_seen_at, platform, device, app_version, os_version, locale) ",
         );
         builder.push_values(chunk, |mut separated, record| {
             separated
@@ -2344,6 +2351,7 @@ pub async fn insert_install_first_seen_many_in_tx(
                 .push_bind(record.first_seen_event_id)
                 .push_bind(record.first_seen_at)
                 .push_bind(platform_as_str(&record.platform))
+                .push_bind(device_as_str(&record.device))
                 .push_bind(&record.app_version)
                 .push_bind(&record.os_version)
                 .push_bind(&record.locale);
@@ -2958,7 +2966,7 @@ where
 {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, locale
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, device, app_version, os_version, locale
         FROM events_raw
         WHERE id > $1
         ORDER BY id ASC
@@ -3001,7 +3009,7 @@ pub async fn fetch_all_events_for_install_in_tx(
 ) -> Result<Vec<RawEventRecord>, StoreError> {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, locale
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, device, app_version, os_version, locale
         FROM events_raw
         WHERE project_id = $1
           AND install_id = $2
@@ -3028,7 +3036,7 @@ where
 {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, locale
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, device, app_version, os_version, locale
         FROM events_raw
         WHERE project_id = $1
           AND install_id = $2
@@ -3229,7 +3237,7 @@ pub async fn fetch_events_for_install_after_id_through_in_tx(
 ) -> Result<Vec<RawEventRecord>, StoreError> {
     let rows = sqlx::query(
         r#"
-        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, app_version, os_version, locale
+        SELECT id, project_id, event_name, timestamp, received_at, install_id, platform, device, app_version, os_version, locale
         FROM events_raw
         WHERE project_id = $1
           AND install_id = $2
@@ -3275,7 +3283,7 @@ where
     let row = sqlx::query(
         r#"
         SELECT project_id, install_id, session_id, session_start, session_end,
-               event_count, duration_seconds, platform, app_version, os_version, locale
+               event_count, duration_seconds, platform, device, app_version, os_version, locale
         FROM sessions
         WHERE project_id = $1
           AND install_id = $2
@@ -3301,7 +3309,7 @@ pub async fn fetch_sessions_overlapping_window_in_tx(
     let rows = sqlx::query(
         r#"
         SELECT project_id, install_id, session_id, session_start, session_end,
-               event_count, duration_seconds, platform, app_version, os_version, locale
+               event_count, duration_seconds, platform, device, app_version, os_version, locale
         FROM sessions
         WHERE project_id = $1
           AND install_id = $2
@@ -3389,6 +3397,7 @@ pub async fn load_tail_sessions_for_installs_in_tx(
             s.event_count, \
             s.duration_seconds, \
             s.platform, \
+            s.device, \
             s.app_version, \
             s.os_version, \
             s.locale \
@@ -4054,11 +4063,12 @@ pub async fn insert_session_in_tx(
             event_count,
             duration_seconds,
             platform,
+            device,
             app_version,
             os_version,
             locale
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         "#,
     )
     .bind(session.project_id)
@@ -4069,6 +4079,7 @@ pub async fn insert_session_in_tx(
     .bind(session.event_count)
     .bind(session.duration_seconds)
     .bind(platform_as_str(&session.platform))
+    .bind(device_as_str(&session.device))
     .bind(&session.app_version)
     .bind(&session.os_version)
     .bind(&session.locale)
@@ -4087,10 +4098,10 @@ pub async fn insert_sessions_in_tx(
     }
 
     let mut affected_rows = 0;
-    for chunk in sessions.chunks(max_rows_per_batched_statement(11)) {
+    for chunk in sessions.chunks(max_rows_per_batched_statement(12)) {
         let mut builder = QueryBuilder::<Postgres>::new(
             "INSERT INTO sessions \
-             (project_id, install_id, session_id, session_start, session_end, event_count, duration_seconds, platform, app_version, os_version, locale) ",
+             (project_id, install_id, session_id, session_start, session_end, event_count, duration_seconds, platform, device, app_version, os_version, locale) ",
         );
         builder.push_values(chunk, |mut separated, session| {
             separated
@@ -4102,6 +4113,7 @@ pub async fn insert_sessions_in_tx(
                 .push_bind(session.event_count)
                 .push_bind(session.duration_seconds)
                 .push_bind(platform_as_str(&session.platform))
+                .push_bind(device_as_str(&session.device))
                 .push_bind(&session.app_version)
                 .push_bind(&session.os_version)
                 .push_bind(&session.locale);
@@ -4324,10 +4336,10 @@ pub async fn upsert_session_active_install_slices_in_tx(
     }
 
     let mut inserted_rows = 0;
-    for chunk in deltas.chunks(max_rows_per_batched_statement(10)) {
+    for chunk in deltas.chunks(max_rows_per_batched_statement(11)) {
         let mut builder = QueryBuilder::<Postgres>::new(
             "INSERT INTO session_active_install_slices \
-             (project_id, day, install_id, platform, app_version, app_version_is_null, os_version, os_version_is_null, locale, locale_is_null) ",
+             (project_id, day, install_id, platform, device, app_version, app_version_is_null, os_version, os_version_is_null, locale, locale_is_null) ",
         );
         builder.push_values(chunk, |mut separated, delta| {
             separated
@@ -4335,6 +4347,7 @@ pub async fn upsert_session_active_install_slices_in_tx(
                 .push_bind(delta.day)
                 .push_bind(&delta.install_id)
                 .push_bind(&delta.platform)
+                .push_bind(&delta.device)
                 .push_bind(delta.app_version.as_deref().unwrap_or(""))
                 .push_bind(delta.app_version_is_null)
                 .push_bind(delta.os_version.as_deref().unwrap_or(""))
@@ -4384,6 +4397,7 @@ pub async fn rebuild_session_active_install_slices_days_in_tx(
                 DATE(session_start AT TIME ZONE 'UTC') AS day,
                 install_id,
                 platform,
+                device,
                 app_version,
                 os_version,
                 locale
@@ -4396,6 +4410,7 @@ pub async fn rebuild_session_active_install_slices_days_in_tx(
             day,
             install_id,
             platform,
+            device,
             app_version,
             app_version_is_null,
             os_version,
@@ -4408,6 +4423,7 @@ pub async fn rebuild_session_active_install_slices_days_in_tx(
             day,
             install_id,
             platform::TEXT,
+            device::TEXT,
             COALESCE(app_version, ''),
             app_version IS NULL,
             COALESCE(os_version, ''),
@@ -6820,6 +6836,7 @@ fn raw_event_from_row(row: sqlx::postgres::PgRow) -> Result<RawEventRecord, Stor
         received_at: row.try_get("received_at")?,
         install_id: row.try_get("install_id")?,
         platform: platform_from_str(&row.try_get::<String, _>("platform")?)?,
+        device: device_from_str(&row.try_get::<String, _>("device")?)?,
         app_version: row.try_get("app_version")?,
         os_version: row.try_get("os_version")?,
         locale: row.try_get("locale")?,
@@ -6836,6 +6853,7 @@ fn session_from_row(row: sqlx::postgres::PgRow) -> Result<SessionRecord, StoreEr
         event_count: row.try_get("event_count")?,
         duration_seconds: row.try_get("duration_seconds")?,
         platform: platform_from_str(&row.try_get::<String, _>("platform")?)?,
+        device: device_from_str(&row.try_get::<String, _>("device")?)?,
         app_version: row.try_get("app_version")?,
         os_version: row.try_get("os_version")?,
         locale: row.try_get("locale")?,
@@ -6871,6 +6889,7 @@ fn platform_as_str(platform: &Platform) -> &'static str {
     match platform {
         Platform::Ios => "ios",
         Platform::Android => "android",
+        Platform::Macos => "macos",
     }
 }
 
@@ -6878,7 +6897,27 @@ fn platform_from_str(value: &str) -> Result<Platform, StoreError> {
     match value {
         "ios" => Ok(Platform::Ios),
         "android" => Ok(Platform::Android),
+        "macos" => Ok(Platform::Macos),
         other => Err(StoreError::InvalidPlatform(other.to_owned())),
+    }
+}
+
+fn device_as_str(device: &Device) -> &'static str {
+    match device {
+        Device::Phone => "phone",
+        Device::Tablet => "tablet",
+        Device::Desktop => "desktop",
+        Device::Unknown => "unknown",
+    }
+}
+
+fn device_from_str(value: &str) -> Result<Device, StoreError> {
+    match value {
+        "phone" => Ok(Device::Phone),
+        "tablet" => Ok(Device::Tablet),
+        "desktop" => Ok(Device::Desktop),
+        "unknown" => Ok(Device::Unknown),
+        other => Err(StoreError::InvalidDevice(other.to_owned())),
     }
 }
 
@@ -6888,7 +6927,7 @@ fn append_raw_event_filters(
 ) {
     for (key, value) in filters {
         match key.as_str() {
-            "platform" | "app_version" | "os_version" | "locale" => {
+            "platform" | "device" | "app_version" | "os_version" | "locale" => {
                 query.push(" AND ");
                 query.push(key.as_str());
                 query.push(" = ");
@@ -7489,6 +7528,7 @@ mod tests {
             timestamp: timestamp(minutes),
             install_id: install_id.to_owned(),
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),
@@ -7524,6 +7564,7 @@ mod tests {
                 .signed_duration_since(session_start)
                 .num_seconds() as i32,
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),
@@ -8748,6 +8789,30 @@ mod tests {
     }
 
     #[test]
+    fn forward_migration_adds_device_columns_and_slice_indexes() {
+        let migration = include_str!("../migrations/0022_device_dimension_and_macos_platform.sql");
+
+        assert!(
+            migration.contains("ALTER TABLE events_raw")
+                && migration.contains("ALTER TABLE sessions")
+                && migration.contains("ALTER TABLE install_first_seen")
+                && migration.contains("ALTER TABLE session_active_install_slices"),
+            "0022 must widen every backend-owned device snapshot table"
+        );
+        assert!(
+            migration.contains("UPDATE events_raw")
+                && migration.contains("UPDATE sessions")
+                && migration.contains("UPDATE install_first_seen"),
+            "0022 must canonicalize legacy device values to unknown"
+        );
+        assert!(
+            migration.contains("idx_events_device")
+                && migration.contains("idx_session_active_install_slices_project_day_device"),
+            "0022 must add device read indexes for raw events and active-install slices"
+        );
+    }
+
+    #[test]
     fn forward_migration_adds_live_install_state_storage() {
         let migration = include_str!("../migrations/0018_live_installs.sql");
 
@@ -9776,6 +9841,61 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn run_migrations_add_device_columns_and_slice_index(pool: PgPool) {
+        run_migrations(&pool).await.expect("migrations succeed");
+
+        let device_columns = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT table_name
+            FROM information_schema.columns
+            WHERE column_name = 'device'
+              AND table_name IN (
+                'events_raw',
+                'sessions',
+                'install_first_seen',
+                'session_active_install_slices'
+              )
+            ORDER BY table_name ASC
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch device columns");
+
+        let index_names = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE indexname IN (
+                'idx_events_device',
+                'idx_session_active_install_slices_project_day_device'
+            )
+            ORDER BY indexname ASC
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("fetch device indexes");
+
+        assert_eq!(
+            device_columns,
+            vec![
+                "events_raw".to_owned(),
+                "install_first_seen".to_owned(),
+                "session_active_install_slices".to_owned(),
+                "sessions".to_owned(),
+            ]
+        );
+        assert_eq!(
+            index_names,
+            vec![
+                "idx_events_device".to_owned(),
+                "idx_session_active_install_slices_project_day_device".to_owned(),
+            ]
+        );
+    }
+
+    #[sqlx::test]
     async fn run_migrations_creates_live_install_state_table_and_indexes(pool: PgPool) {
         run_migrations(&pool).await.expect("migrations succeed");
 
@@ -9999,18 +10119,32 @@ mod tests {
                 bitmap: RoaringTreemap::from_iter([0_u64, 2]),
             },
             ActiveInstallBitmapDim1Input {
+                dim1_key: "device".to_owned(),
+                dim1_value: Some("phone".to_owned()),
+                bitmap: RoaringTreemap::from_iter([0_u64, 2]),
+            },
+            ActiveInstallBitmapDim1Input {
                 dim1_key: "app_version".to_owned(),
                 dim1_value: None,
                 bitmap: RoaringTreemap::from_iter([1_u64]),
             },
         ];
-        let dim2_rows = vec![ActiveInstallBitmapDim2Input {
-            dim1_key: "app_version".to_owned(),
-            dim1_value: None,
-            dim2_key: "platform".to_owned(),
-            dim2_value: Some("ios".to_owned()),
-            bitmap: RoaringTreemap::from_iter([1_u64]),
-        }];
+        let dim2_rows = vec![
+            ActiveInstallBitmapDim2Input {
+                dim1_key: "app_version".to_owned(),
+                dim1_value: None,
+                dim2_key: "platform".to_owned(),
+                dim2_value: Some("ios".to_owned()),
+                bitmap: RoaringTreemap::from_iter([1_u64]),
+            },
+            ActiveInstallBitmapDim2Input {
+                dim1_key: "app_version".to_owned(),
+                dim1_value: None,
+                dim2_key: "device".to_owned(),
+                dim2_value: Some("phone".to_owned()),
+                bitmap: RoaringTreemap::from_iter([1_u64]),
+            },
+        ];
 
         let mut tx = pool.begin().await.expect("begin bitmap write tx");
         replace_active_install_day_bitmaps_in_tx(
@@ -10046,6 +10180,15 @@ mod tests {
         )
         .await
         .expect("load null app_version dim1 bitmaps");
+        let device_rows = load_active_install_bitmap_dim1_in_executor(
+            &pool,
+            project_id(),
+            "device",
+            Some("phone"),
+            &[day],
+        )
+        .await
+        .expect("load device dim1 bitmaps");
         let dim2 = load_active_install_bitmap_dim2_in_executor(
             &pool,
             project_id(),
@@ -10057,6 +10200,17 @@ mod tests {
         )
         .await
         .expect("load dim2 bitmaps");
+        let device_dim2 = load_active_install_bitmap_dim2_in_executor(
+            &pool,
+            project_id(),
+            "app_version",
+            None,
+            "device",
+            Some("phone"),
+            &[day],
+        )
+        .await
+        .expect("load device dim2 bitmaps");
 
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].bitmap, total);
@@ -10064,12 +10218,18 @@ mod tests {
         assert_eq!(platform_rows.len(), 1);
         assert_eq!(platform_rows[0].bitmap, dim1_rows[0].bitmap);
         assert_eq!(platform_rows[0].cardinality, 2);
+        assert_eq!(device_rows.len(), 1);
+        assert_eq!(device_rows[0].bitmap, dim1_rows[1].bitmap);
+        assert_eq!(device_rows[0].cardinality, 2);
         assert_eq!(null_app_version_rows.len(), 1);
-        assert_eq!(null_app_version_rows[0].bitmap, dim1_rows[1].bitmap);
+        assert_eq!(null_app_version_rows[0].bitmap, dim1_rows[2].bitmap);
         assert_eq!(null_app_version_rows[0].cardinality, 1);
         assert_eq!(dim2.len(), 1);
         assert_eq!(dim2[0].bitmap, dim2_rows[0].bitmap);
         assert_eq!(dim2[0].cardinality, 1);
+        assert_eq!(device_dim2.len(), 1);
+        assert_eq!(device_dim2[0].bitmap, dim2_rows[1].bitmap);
+        assert_eq!(device_dim2[0].cardinality, 1);
     }
 
     #[sqlx::test]
@@ -10082,19 +10242,39 @@ mod tests {
         let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid day");
         let total = RoaringTreemap::from_iter([0_u64]);
         let dim1_rows = (0..20_000)
-            .map(|offset| ActiveInstallBitmapDim1Input {
-                dim1_key: "platform".to_owned(),
-                dim1_value: Some(format!("platform-{offset}")),
-                bitmap: RoaringTreemap::from_iter([offset as u64]),
+            .flat_map(|offset| {
+                [
+                    ActiveInstallBitmapDim1Input {
+                        dim1_key: "platform".to_owned(),
+                        dim1_value: Some(format!("platform-{offset}")),
+                        bitmap: RoaringTreemap::from_iter([offset as u64]),
+                    },
+                    ActiveInstallBitmapDim1Input {
+                        dim1_key: "device".to_owned(),
+                        dim1_value: Some(format!("device-{offset}")),
+                        bitmap: RoaringTreemap::from_iter([offset as u64]),
+                    },
+                ]
             })
             .collect::<Vec<_>>();
         let dim2_rows = (0..20_000)
-            .map(|offset| ActiveInstallBitmapDim2Input {
-                dim1_key: "app_version".to_owned(),
-                dim1_value: Some(format!("app-{offset}")),
-                dim2_key: "platform".to_owned(),
-                dim2_value: Some(format!("platform-{offset}")),
-                bitmap: RoaringTreemap::from_iter([offset as u64]),
+            .flat_map(|offset| {
+                [
+                    ActiveInstallBitmapDim2Input {
+                        dim1_key: "app_version".to_owned(),
+                        dim1_value: Some(format!("app-{offset}")),
+                        dim2_key: "platform".to_owned(),
+                        dim2_value: Some(format!("platform-{offset}")),
+                        bitmap: RoaringTreemap::from_iter([offset as u64]),
+                    },
+                    ActiveInstallBitmapDim2Input {
+                        dim1_key: "app_version".to_owned(),
+                        dim1_value: Some(format!("app-{offset}")),
+                        dim2_key: "device".to_owned(),
+                        dim2_value: Some(format!("device-{offset}")),
+                        bitmap: RoaringTreemap::from_iter([offset as u64]),
+                    },
+                ]
             })
             .collect::<Vec<_>>();
 
@@ -10155,6 +10335,41 @@ mod tests {
             "dim1 bitmap read should use the value index, got {dim1_indexes:?} from {dim1_plan:#}"
         );
 
+        let device_dim1_plan_row = sqlx::query(
+            r#"
+            EXPLAIN (FORMAT JSON)
+            SELECT bitmap
+            FROM active_install_daily_bitmaps_dim1
+            WHERE project_id = $1
+              AND dim1_key = 'device'
+              AND dim1_value_is_null = FALSE
+              AND dim1_value = 'device-19999'
+              AND day = ANY($2)
+            "#,
+        )
+        .bind(project_id())
+        .bind(vec![day])
+        .fetch_one(&pool)
+        .await
+        .expect("explain device dim1 read");
+        let device_dim1_plan = device_dim1_plan_row
+            .try_get::<Value, _>(0)
+            .expect("device dim1 explain json");
+        let device_dim1_root = explain_plan_root(&device_dim1_plan);
+        let mut device_dim1_indexes = Vec::new();
+        collect_plan_index_names(device_dim1_root, &mut device_dim1_indexes);
+
+        assert!(
+            !plan_contains_node_type(device_dim1_root, "Seq Scan"),
+            "device dim1 bitmap read should avoid sequential scans: {device_dim1_plan:#}"
+        );
+        assert!(
+            device_dim1_indexes
+                .iter()
+                .any(|name| name == "idx_active_install_daily_bitmaps_dim1_value"),
+            "device dim1 bitmap read should use the value index, got {device_dim1_indexes:?} from {device_dim1_plan:#}"
+        );
+
         let dim2_plan_row = sqlx::query(
             r#"
             EXPLAIN (FORMAT JSON)
@@ -10189,6 +10404,42 @@ mod tests {
                 .iter()
                 .any(|name| name == "idx_active_install_daily_bitmaps_dim2_filter_dim2"),
             "dim2 bitmap read should use the later-dimension filter index, got {dim2_indexes:?} from {dim2_plan:#}"
+        );
+
+        let device_dim2_plan_row = sqlx::query(
+            r#"
+            EXPLAIN (FORMAT JSON)
+            SELECT bitmap
+            FROM active_install_daily_bitmaps_dim2
+            WHERE project_id = $1
+              AND dim1_key = 'app_version'
+              AND dim2_key = 'device'
+              AND dim2_value_is_null = FALSE
+              AND dim2_value = 'device-19999'
+              AND day = ANY($2)
+            "#,
+        )
+        .bind(project_id())
+        .bind(vec![day])
+        .fetch_one(&pool)
+        .await
+        .expect("explain device dim2 filtered read");
+        let device_dim2_plan = device_dim2_plan_row
+            .try_get::<Value, _>(0)
+            .expect("device dim2 explain json");
+        let device_dim2_root = explain_plan_root(&device_dim2_plan);
+        let mut device_dim2_indexes = Vec::new();
+        collect_plan_index_names(device_dim2_root, &mut device_dim2_indexes);
+
+        assert!(
+            !plan_contains_node_type(device_dim2_root, "Seq Scan"),
+            "device dim2 bitmap read should avoid sequential scans: {device_dim2_plan:#}"
+        );
+        assert!(
+            device_dim2_indexes
+                .iter()
+                .any(|name| name == "idx_active_install_daily_bitmaps_dim2_filter_dim2"),
+            "device dim2 bitmap read should use the later-dimension filter index, got {device_dim2_indexes:?} from {device_dim2_plan:#}"
         );
     }
 
@@ -10492,6 +10743,7 @@ mod tests {
             first_seen_event_id: 1,
             first_seen_at: timestamp(0),
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),

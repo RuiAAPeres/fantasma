@@ -60,6 +60,8 @@ to `pub.dev`.
 
 ## Flutter-Specific Notes
 
+- The package currently supports iOS and Android only.
+- Tracked events auto-populate `platform`, `device`, `app_version`, `os_version`, and `locale`.
 - `storageNamespace` is required and defines the client-local persistence boundary for the queue, install identity, and blocked-destination state.
 - Only one live `FantasmaClient` may use a given `storageNamespace` inside a process at a time. Reusing a namespace concurrently is rejected.
 - `localeProvider` is resolved when `track()` enqueues the event; queued rows keep that snapshot even if the app locale changes later.

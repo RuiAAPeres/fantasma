@@ -7,6 +7,7 @@ final class QueuedEvent {
     required this.timestamp,
     required this.installId,
     required this.platform,
+    required this.device,
     required this.appVersion,
     required this.osVersion,
     required this.locale,
@@ -17,6 +18,7 @@ final class QueuedEvent {
   final String timestamp;
   final String installId;
   final String platform;
+  final String device;
   final String? appVersion;
   final String? osVersion;
   final String? locale;
@@ -27,6 +29,7 @@ final class QueuedEvent {
       'timestamp': timestamp,
       'install_id': installId,
       'platform': platform,
+      'device': device,
       'app_version': appVersion,
       'os_version': osVersion,
       'locale': locale,
@@ -42,6 +45,7 @@ final class QueuedEvent {
       timestamp: timestamp,
       installId: installId,
       platform: platform,
+      device: device,
       appVersion: appVersion,
       osVersion: osVersion,
       locale: locale,
@@ -59,6 +63,7 @@ final class QueuedEvent {
       timestamp: decoded['timestamp'] as String,
       installId: decoded['install_id'] as String,
       platform: decoded['platform'] as String,
+      device: decoded['device'] as String? ?? 'unknown',
       appVersion: decoded['app_version'] as String?,
       osVersion: decoded['os_version'] as String?,
       locale: decoded['locale'] as String?,
@@ -69,12 +74,14 @@ final class QueuedEvent {
 final class MetadataSnapshot {
   const MetadataSnapshot({
     required this.platform,
+    this.device = 'unknown',
     required this.appVersion,
     required this.osVersion,
     required this.fallbackLocale,
   });
 
   final String platform;
+  final String device;
   final String? appVersion;
   final String? osVersion;
   final String? fallbackLocale;

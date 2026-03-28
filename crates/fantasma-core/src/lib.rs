@@ -2,7 +2,7 @@ pub mod events;
 pub mod metrics;
 
 pub use events::{
-    EventAcceptedResponse, EventBatchRequest, EventPayload, EventValidationIssue,
+    Device, EventAcceptedResponse, EventBatchRequest, EventPayload, EventValidationIssue,
     EventValidationResponse, MAX_APP_VERSION_CHARS, MAX_EVENT_NAME_CHARS, MAX_INSTALL_ID_CHARS,
     MAX_LOCALE_CHARS, MAX_OS_VERSION_CHARS, Platform, RawEventBatchRequest, RawEventPayload,
 };

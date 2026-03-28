@@ -184,9 +184,34 @@ internal class FantasmaRuntimeBehaviorTest {
                         .parseToJsonElement(row.payload.decodeToString())
                         .jsonObject
 
+                assertEquals("phone", payload["device"]?.jsonPrimitive?.content)
                 assertEquals("pt-PT", payload["locale"]?.jsonPrimitive?.content)
             } finally {
                 Locale.setDefault(originalDefault)
+                harness.close()
+            }
+        }
+
+    @Test
+    internal fun `event device uses tablet for large smallest width dp`() =
+        runTest {
+            val baseContext = ApplicationProvider.getApplicationContext<Context>()
+            val configuration = Configuration(baseContext.resources.configuration)
+            configuration.smallestScreenWidthDp = 720
+            val tabletContext = baseContext.createConfigurationContext(configuration)
+            val harness = RuntimeHarness.create(NoopTransport(), context = tabletContext)
+
+            try {
+                harness.runtime.track("app_open")
+
+                val row = harness.queue.peek(limit = 1).single()
+                val payload =
+                    kotlinx.serialization.json.Json
+                        .parseToJsonElement(row.payload.decodeToString())
+                        .jsonObject
+
+                assertEquals("tablet", payload["device"]?.jsonPrimitive?.content)
+            } finally {
                 harness.close()
             }
         }

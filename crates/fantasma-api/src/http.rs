@@ -254,7 +254,7 @@ fn parse_event_metrics_query(
                 }
                 group_by.push(value);
             }
-            "platform" | "app_version" | "os_version" | "locale" => {
+            "platform" | "device" | "app_version" | "os_version" | "locale" => {
                 validate_filter_query_value(&key, &value).map_err(EventMetricsQueryError)?;
                 if group_by.contains(&key) {
                     return Err(EventMetricsQueryError("duplicate_query_key"));
@@ -412,7 +412,7 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
                 }
                 group_by.push(value);
             }
-            "platform" | "app_version" | "os_version" | "locale" => {
+            "platform" | "device" | "app_version" | "os_version" | "locale" => {
                 validate_filter_query_value(&key, &value)?;
                 if group_by.contains(&key) {
                     return Err("duplicate_query_key");
@@ -472,7 +472,7 @@ fn parse_session_metric_query(raw_query: &str) -> Result<PublicSessionMetricsQue
 
 fn validate_group_by_key(key: &str) -> Result<(), &'static str> {
     match key {
-        "platform" | "app_version" | "os_version" | "locale" => Ok(()),
+        "platform" | "device" | "app_version" | "os_version" | "locale" => Ok(()),
         _ => Err("invalid_query_key"),
     }
 }
@@ -487,7 +487,18 @@ fn validate_query_text_value(value: &str, max_chars: usize) -> Result<(), &'stat
 
 fn validate_filter_query_value(key: &str, value: &str) -> Result<(), &'static str> {
     let max_chars = match key {
-        "platform" => return Ok(()),
+        "platform" => {
+            return match value {
+                "ios" | "android" | "macos" => Ok(()),
+                _ => Err("invalid_query_key"),
+            };
+        }
+        "device" => {
+            return match value {
+                "phone" | "tablet" | "desktop" | "unknown" => Ok(()),
+                _ => Err("invalid_query_key"),
+            };
+        }
         "app_version" => MAX_APP_VERSION_CHARS,
         "os_version" => MAX_OS_VERSION_CHARS,
         "locale" => MAX_LOCALE_CHARS,
@@ -569,7 +580,7 @@ fn parse_event_discovery_query(
 
                 limit = Some(parse_top_events_limit(&value)?);
             }
-            "platform" | "app_version" | "os_version" | "locale" => {
+            "platform" | "device" | "app_version" | "os_version" | "locale" => {
                 validate_filter_query_value(&key, &value)?;
                 if filters.insert(key, value).is_some() {
                     return Err("invalid_query_key");
@@ -1650,7 +1661,7 @@ fn validate_range_deletion_request(
     if payload.filters.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "platform" | "app_version" | "os_version" | "locale"
+            "platform" | "device" | "app_version" | "os_version" | "locale"
         )
     }) {
         return Err("invalid_request");
@@ -2875,6 +2886,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_event_metrics_query_accepts_device_and_macos_filters() {
+        let query = parse_event_metrics_query(
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=macos&device=desktop",
+        )
+        .expect("query parses");
+
+        assert_eq!(query.filters.get("platform"), Some(&"macos".to_owned()));
+        assert_eq!(query.filters.get("device"), Some(&"desktop".to_owned()));
+    }
+
+    #[test]
+    fn parse_event_metrics_query_rejects_invalid_device_filter_value() {
+        for raw_query in [
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&device=",
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&device=laptop",
+        ] {
+            let error = parse_event_metrics_query(raw_query).unwrap_err();
+
+            assert_eq!(error.error_code(), "invalid_query_key");
+        }
+    }
+
+    #[test]
+    fn parse_event_metrics_query_accepts_device_group_by() {
+        let query = parse_event_metrics_query(
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=device&group_by=platform",
+        )
+        .expect("query parses");
+
+        assert_eq!(
+            query.group_by,
+            vec!["device".to_owned(), "platform".to_owned()]
+        );
+    }
+
+    #[test]
     fn parse_event_metrics_query_accepts_four_group_by_dimensions() {
         let query = parse_event_metrics_query(
             "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=platform&group_by=app_version&group_by=os_version&group_by=locale",
@@ -3083,6 +3130,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_metric_query_accepts_device_and_macos_filters() {
+        let query = parse_session_metric_query(
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=macos&device=desktop",
+        )
+        .expect("query parses");
+
+        assert_eq!(query.filters.get("platform"), Some(&"macos".to_owned()));
+        assert_eq!(query.filters.get("device"), Some(&"desktop".to_owned()));
+    }
+
+    #[test]
+    fn parse_session_metric_query_rejects_invalid_device_filter_value() {
+        for raw_query in [
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&device=",
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&device=laptop",
+        ] {
+            let error = parse_session_metric_query(raw_query).unwrap_err();
+
+            assert_eq!(error, "invalid_query_key");
+        }
+    }
+
+    #[test]
     fn parse_session_metric_query_accepts_all_four_built_in_filters() {
         let query = parse_session_metric_query(
             "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.0.0&os_version=18.3&locale=en-GB",
@@ -3091,6 +3161,34 @@ mod tests {
 
         assert_eq!(query.filters.len(), 4);
         assert_eq!(query.filters.get("locale"), Some(&"en-GB".to_owned()));
+    }
+
+    #[test]
+    fn parse_event_catalog_query_accepts_device_and_macos_filters() {
+        let query = parse_event_catalog_query(
+            "start=2026-03-01&end=2026-03-02&platform=macos&device=desktop",
+        )
+        .expect("query parses");
+
+        assert_eq!(
+            query.window.filters,
+            BTreeMap::from([
+                ("device".to_owned(), "desktop".to_owned()),
+                ("platform".to_owned(), "macos".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_event_catalog_query_rejects_invalid_device_filter_value() {
+        for raw_query in [
+            "start=2026-03-01&end=2026-03-02&device=",
+            "start=2026-03-01&end=2026-03-02&device=laptop",
+        ] {
+            let error = parse_event_catalog_query(raw_query).unwrap_err();
+
+            assert_eq!(error, "invalid_query_key");
+        }
     }
 
     #[test]
@@ -3563,10 +3661,12 @@ mod tests {
         let event_name_schema = &spec["components"]["parameters"]["EventName"]["schema"];
         let app_version_filter_schema =
             &spec["components"]["parameters"]["AppVersionFilter"]["schema"];
+        let device_filter_schema = &spec["components"]["parameters"]["DeviceFilter"]["schema"];
         let os_version_filter_schema =
             &spec["components"]["parameters"]["OsVersionFilter"]["schema"];
         let locale_filter_schema = &spec["components"]["parameters"]["LocaleFilter"]["schema"];
         let event_payload = &spec["components"]["schemas"]["EventPayload"]["properties"];
+        let platform_schema = &spec["components"]["schemas"]["Platform"];
         let operator_auth = &spec["components"]["securitySchemes"]["OperatorBearerAuth"];
         let project_key_auth = &spec["components"]["securitySchemes"]["ProjectKeyHeader"];
         let usage_response_schema = &spec["components"]["schemas"]["UsageEventsResponse"];
@@ -3768,10 +3868,12 @@ mod tests {
         );
         assert_eq!(event_name_schema["pattern"], "^\\S(?:[\\s\\S]*\\S)?$");
         assert_eq!(platform_filter_schema["type"], "string");
+        assert_eq!(platform_schema["enum"][2], "macos");
         assert_eq!(
             app_version_filter_schema["pattern"],
             "^\\S(?:[\\s\\S]*\\S)?$"
         );
+        assert_eq!(device_filter_schema["type"], "string");
         assert_eq!(
             os_version_filter_schema["pattern"],
             "^\\S(?:[\\s\\S]*\\S)?$"
@@ -3817,6 +3919,10 @@ mod tests {
             event_payload["app_version"]["pattern"],
             "^\\S(?:[\\s\\S]*\\S)?$"
         );
+        assert_eq!(event_payload["device"]["enum"][0], "phone");
+        assert_eq!(event_payload["device"]["enum"][1], "tablet");
+        assert_eq!(event_payload["device"]["enum"][2], "desktop");
+        assert_eq!(event_payload["device"]["enum"][3], "unknown");
         assert_eq!(
             event_payload["os_version"]["pattern"],
             "^\\S(?:[\\s\\S]*\\S)?$"

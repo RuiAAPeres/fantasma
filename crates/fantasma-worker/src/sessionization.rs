@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use fantasma_core::Platform;
+use fantasma_core::{Device, Platform};
 use uuid::Uuid;
 
 const SESSION_TIMEOUT_SECS: i64 = 30 * 60;
@@ -10,6 +10,7 @@ pub(crate) struct SessionEvent {
     pub(crate) timestamp: DateTime<Utc>,
     pub(crate) install_id: String,
     pub(crate) platform: Platform,
+    pub(crate) device: Device,
     pub(crate) app_version: Option<String>,
     pub(crate) os_version: Option<String>,
     pub(crate) locale: Option<String>,
@@ -102,6 +103,7 @@ fn session_from_event(event: &SessionEvent) -> fantasma_store::SessionRecord {
         event_count: 1,
         duration_seconds: 0,
         platform: event.platform.clone(),
+        device: event.device.clone(),
         app_version: event.app_version.clone(),
         os_version: event.os_version.clone(),
         locale: event.locale.clone(),
@@ -151,6 +153,7 @@ mod tests {
             timestamp: timestamp(day, hour, minute),
             install_id: install_id.to_owned(),
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: app_version.map(str::to_owned),
             os_version: os_version.map(str::to_owned),
             locale: locale.map(str::to_owned),
@@ -228,6 +231,7 @@ mod tests {
             event_count: 2,
             duration_seconds: 10 * 60,
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: Some("1.0.0".to_owned()),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),

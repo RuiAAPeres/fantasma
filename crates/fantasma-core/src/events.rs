@@ -15,6 +15,16 @@ pub const MAX_LOCALE_CHARS: usize = 64;
 pub enum Platform {
     Ios,
     Android,
+    Macos,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Device {
+    Phone,
+    Tablet,
+    Desktop,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -24,6 +34,7 @@ pub struct EventPayload {
     pub timestamp: DateTime<Utc>,
     pub install_id: String,
     pub platform: Platform,
+    pub device: Device,
     pub app_version: Option<String>,
     pub os_version: Option<String>,
     pub locale: Option<String>,
@@ -36,6 +47,7 @@ pub struct RawEventPayload {
     pub timestamp: DateTime<Utc>,
     pub install_id: String,
     pub platform: Platform,
+    pub device: Option<Device>,
     pub app_version: Option<String>,
     pub os_version: Option<String>,
     pub locale: Option<String>,
@@ -221,6 +233,7 @@ impl RawEventPayload {
             timestamp: self.timestamp,
             install_id: self.install_id,
             platform: self.platform,
+            device: self.device.unwrap_or(Device::Unknown),
             app_version: self.app_version,
             os_version: self.os_version,
             locale: self.locale,
@@ -320,6 +333,7 @@ mod tests {
             timestamp: Utc::now(),
             install_id: "install_123".to_owned(),
             platform: Platform::Ios,
+            device: Device::Phone,
             app_version: Some("1.2.3".to_owned()),
             os_version: Some("18.3".to_owned()),
             locale: Some("en-GB".to_owned()),
@@ -508,6 +522,69 @@ mod tests {
         use super::*;
 
         #[test]
+        fn accepts_device_and_macos_platform() {
+            let request: RawEventBatchRequest = serde_json::from_value(serde_json::json!({
+                "events": [
+                    {
+                        "event": "app_open",
+                        "timestamp": "2026-03-01T00:00:00Z",
+                        "install_id": "install_123",
+                        "platform": "macos",
+                        "device": "desktop"
+                    }
+                ]
+            }))
+            .expect("raw request parses");
+
+            let normalized = request.normalize().expect("request normalizes");
+            let encoded = serde_json::to_value(&normalized.events[0]).expect("event encodes");
+
+            assert_eq!(encoded["platform"], serde_json::json!("macos"));
+            assert_eq!(encoded["device"], serde_json::json!("desktop"));
+        }
+
+        #[test]
+        fn normalizes_missing_device_to_unknown() {
+            let request: RawEventBatchRequest = serde_json::from_value(serde_json::json!({
+                "events": [
+                    {
+                        "event": "app_open",
+                        "timestamp": "2026-03-01T00:00:00Z",
+                        "install_id": "install_123",
+                        "platform": "ios"
+                    }
+                ]
+            }))
+            .expect("raw request parses");
+
+            let normalized = request.normalize().expect("request normalizes");
+            let encoded = serde_json::to_value(&normalized.events[0]).expect("event encodes");
+
+            assert_eq!(encoded["device"], serde_json::json!("unknown"));
+        }
+
+        #[test]
+        fn normalizes_null_device_to_unknown() {
+            let request: RawEventBatchRequest = serde_json::from_value(serde_json::json!({
+                "events": [
+                    {
+                        "event": "app_open",
+                        "timestamp": "2026-03-01T00:00:00Z",
+                        "install_id": "install_123",
+                        "platform": "ios",
+                        "device": null
+                    }
+                ]
+            }))
+            .expect("raw request parses");
+
+            let normalized = request.normalize().expect("request normalizes");
+            let encoded = serde_json::to_value(&normalized.events[0]).expect("event encodes");
+
+            assert_eq!(encoded["device"], serde_json::json!("unknown"));
+        }
+
+        #[test]
         fn accepts_top_level_locale() {
             let request: RawEventBatchRequest = serde_json::from_value(serde_json::json!({
                 "events": [
@@ -621,6 +698,13 @@ mod tests {
             .expect("schema parses");
             let properties = &schema["properties"];
 
+            assert_eq!(schema["properties"]["platform"]["enum"][2], "macos");
+            assert_eq!(properties["device"]["enum"][0], "phone");
+            assert_eq!(properties["device"]["enum"][1], "tablet");
+            assert_eq!(properties["device"]["enum"][2], "desktop");
+            assert_eq!(properties["device"]["enum"][3], "unknown");
+            assert_eq!(properties["device"]["type"][0], "string");
+            assert_eq!(properties["device"]["type"][1], "null");
             assert_eq!(properties["event"]["pattern"], "^\\S(?:[\\s\\S]*\\S)?$");
             assert_eq!(
                 properties["install_id"]["pattern"],

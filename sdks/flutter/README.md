@@ -38,7 +38,8 @@ Behavior notes:
 
 - Every tracked event is written to a local SQLite queue before upload.
 - `writeKey` must be a project-scoped `ingest` key.
-- The SDK adds `timestamp`, `install_id`, `platform`, `app_version`, `os_version`, and `locale`.
+- The SDK adds `timestamp`, `install_id`, `platform`, `device`, `app_version`, `os_version`, and `locale`.
+- Flutter currently supports iOS and Android only, inheriting the native mobile `platform` and `device` mapping.
 - `localeProvider` is resolved when `track()` enqueues the event; queued rows keep that snapshot even if the app locale changes later.
 - `storageNamespace` is required and defines the client-local persistence boundary for the queue, install identity, and blocked-destination state.
 - Only one live `FantasmaClient` may use a given `storageNamespace` inside a process at a time. Reusing a namespace concurrently is rejected.

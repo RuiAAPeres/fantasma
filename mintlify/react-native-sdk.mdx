@@ -55,3 +55,4 @@ Current packaging shape:
 - If first native acquire fails, that JS instance auto-closes and frees the slot immediately.
 - Destination switching remains supported by closing the current client and creating a new one with a different destination.
 - The native iOS and Android SDKs still own queue durability, built-in metadata, blocked-destination handling, and identity rotation.
+- React Native inherits the native `platform` and `device` mappings, including Apple desktop-class `platform = "macos"`, `device = "desktop"`.

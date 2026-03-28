@@ -45,6 +45,7 @@ final class FantasmaClient {
         timestamp: _timestamp(_dependencies.clock().toUtc()),
         installId: installId,
         platform: state.metadata.platform,
+        device: state.metadata.device,
         appVersion: state.metadata.appVersion,
         osVersion: state.metadata.osVersion,
         locale: localeTag,

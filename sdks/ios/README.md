@@ -34,8 +34,8 @@ Task {
 }
 ```
 
-The SDK auto-populates `platform`, `app_version`, `os_version`, and `locale`
-for each event.
+The SDK auto-populates `platform`, `device`, `app_version`, `os_version`, and
+`locale` for each event.
 
 ## Install
 
@@ -48,11 +48,11 @@ https://github.com/RuiAAPeres/fantasma.git
 Then use:
 
 - Package: `FantasmaSDK`
-- Minimum version: your tagged release (for example, `0.3.0`)
+- Minimum version: your tagged release (for example, `0.4.0`)
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/RuiAAPeres/fantasma.git", from: "0.3.0"),
+    .package(url: "https://github.com/RuiAAPeres/fantasma.git", from: "0.4.0"),
 ]
 ```
 
@@ -67,7 +67,10 @@ Behavior notes:
 
 - Every tracked event is written to a local SQLite queue before upload.
 - `writeKey` must be a project-scoped `ingest` key, not a metrics read key.
-- The SDK adds `timestamp`, `install_id`, `platform = "ios"`, `app_version`, `os_version`, and `locale`.
+- The SDK adds `timestamp`, `install_id`, `platform`, `device`, `app_version`, `os_version`, and `locale`.
+- iPhone emits `platform = "ios"`, `device = "phone"`.
+- iPad emits `platform = "ios"`, `device = "tablet"`.
+- Native macOS, Mac Catalyst, and iOS-on-Mac desktop-class runs emit `platform = "macos"`, `device = "desktop"`.
 - `clear()` rotates `install_id` and preserves already queued events.
 - `track(_:)` throws when the SDK has not been configured.
 - `flush()` throws when the SDK has not been configured.

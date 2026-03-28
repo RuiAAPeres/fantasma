@@ -10,6 +10,7 @@ internal data class EventEnvelope(
     @SerialName("install_id")
     val installId: String,
     val platform: String,
+    val device: String,
     @SerialName("app_version")
     val appVersion: String?,
     @SerialName("os_version")

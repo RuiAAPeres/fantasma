@@ -39,8 +39,8 @@ Task {
 }
 ```
 
-The SDK auto-populates `platform`, `app_version`, `os_version`, and `locale`
-for each event.
+The SDK auto-populates `platform`, `device`, `app_version`, `os_version`, and
+`locale` for each event.
 
 Shared ingest and queue behavior lives on the [SDK behavior](/mintlify/sdk-behavior)
 page.
@@ -56,11 +56,11 @@ https://github.com/RuiAAPeres/fantasma.git
 Then use:
 
 - Package: `FantasmaSDK`
-- Minimum version: your tagged release, for example `0.3.0`
+- Minimum version: your tagged release, for example `0.4.0`
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/RuiAAPeres/fantasma.git", from: "0.3.0"),
+    .package(url: "https://github.com/RuiAAPeres/fantasma.git", from: "0.4.0"),
 ]
 ```
 
@@ -79,6 +79,9 @@ Supported platforms:
 ## iOS-Specific Notes
 
 - The SDK exposes a static `Fantasma` facade instead of an instance-based client.
+- iPhone emits `platform = "ios"`, `device = "phone"`.
+- iPad emits `platform = "ios"`, `device = "tablet"`.
+- Native macOS, Mac Catalyst, and iOS-on-Mac desktop-class runs emit `platform = "macos"`, `device = "desktop"`.
 - `track(_:)` throws when the SDK has not been configured.
 - `flush()` throws when the SDK has not been configured.
 - Reconfiguring to a different server URL or write key discards any still-queued rows after the current upload boundary, even across app relaunches, then switches future uploads to the new destination.

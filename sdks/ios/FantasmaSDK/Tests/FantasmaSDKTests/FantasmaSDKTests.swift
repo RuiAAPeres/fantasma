@@ -109,9 +109,32 @@ struct FantasmaSDKBehaviorTests {
         #expect(event.event == "screen_view")
         #expect(event.installId == "install-a")
         #expect(event.platform == "ios")
+        #expect(event.device == "phone")
         #expect(event.appVersion == "1.2.3")
         #expect(event.osVersion == "18.3")
         #expect(event.locale != nil)
+    }
+
+    @Test("public API preserves injected macOS desktop device context in queued payloads")
+    func publicAPIQueuesMacOSDesktopSnapshot() async throws {
+        let harness = TestHarness()
+        defer { harness.cleanup() }
+
+        await Fantasma.resetSharedCoreForTesting()
+        try await harness.installSharedCore(
+            transport: RecordingTransport(),
+            deviceContext: DeviceContext(platform: "macos", device: "desktop")
+        )
+
+        try await Fantasma.configure(serverURL: localhostURL(), writeKey: "fg_ing_test")
+        try await Fantasma.track("app_open")
+
+        let queue = try harness.makeQueue()
+        let row = try requireValue(await queue.peek(limit: 1).first)
+        let event = try JSONDecoder().decode(EventEnvelope.self, from: row.payload)
+
+        #expect(event.platform == "macos")
+        #expect(event.device == "desktop")
     }
 
     @Test("clear rotates identity for future events without mutating queued rows")
@@ -1030,6 +1053,7 @@ struct FantasmaSDKBehaviorTests {
         #expect(event.event == "app_open")
         #expect(event.installId == "install-a")
         #expect(event.platform == "ios")
+        #expect(event.device == "phone")
         #expect(event.osVersion == "18.3")
         #expect(event.locale != nil)
 
@@ -1299,6 +1323,7 @@ private struct TestHarness {
     func installSharedCore(
         transport: FantasmaTransport,
         uploadBatchSize: Int = 100,
+        deviceContext: DeviceContext = DeviceContext(platform: "ios", device: "phone"),
         beforeEnqueue: @escaping @Sendable () async -> Void = {},
         afterBuildBatch: @escaping @Sendable () async -> Void = {},
         beforeUploadBoundary: @escaping @Sendable () async -> Void = {}
@@ -1308,6 +1333,7 @@ private struct TestHarness {
         let core = try makeCore(
             transport: transport,
             uploadBatchSize: uploadBatchSize,
+            deviceContext: deviceContext,
             beforeEnqueue: beforeEnqueue,
             afterBuildBatch: afterBuildBatch,
             beforeUploadBoundary: beforeUploadBoundary
@@ -1322,6 +1348,7 @@ private struct TestHarness {
                 timestamp: "2026-01-01T00:00:00.000Z",
                 installId: installId,
                 platform: "ios",
+                device: "phone",
                 appVersion: "1.2.3",
                 osVersion: "18.3",
                 locale: nil
@@ -1332,6 +1359,7 @@ private struct TestHarness {
     private func makeCore(
         transport: FantasmaTransport,
         uploadBatchSize: Int,
+        deviceContext: DeviceContext,
         beforeEnqueue: @escaping @Sendable () async -> Void,
         afterBuildBatch: @escaping @Sendable () async -> Void,
         beforeUploadBoundary: @escaping @Sendable () async -> Void
@@ -1340,6 +1368,7 @@ private struct TestHarness {
             databaseURL: databaseURL,
             transport: transport,
             now: { fixedDate },
+            deviceContext: { deviceContext },
             appVersion: { "1.2.3" },
             osVersion: { "18.3" },
             newIdentifier: { identifiers.next() },

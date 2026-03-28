@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const packageDir = fileURLToPath(new URL("..", import.meta.url));
@@ -94,7 +95,27 @@ try {
     },
   );
 } finally {
-  await rm(tempDir, { recursive: true, force: true });
+  await removeDirectoryWithRetries(tempDir);
 }
 
 console.log("Android bridge sources compile and the packed package includes the required files.");
+
+async function removeDirectoryWithRetries(targetDir) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(targetDir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (
+        error?.code !== "ENOTEMPTY" &&
+        error?.code !== "EBUSY" &&
+        error?.code !== "EPERM"
+      ) {
+        throw error;
+      }
+      await delay(200);
+    }
+  }
+
+  await rm(targetDir, { recursive: true, force: true });
+}

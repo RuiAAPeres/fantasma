@@ -80,8 +80,10 @@ failures. `close()` is idempotent, and any later `track()`, `flush()`, or
 - `500`, transport failures, and unrelated `409` responses remain retryable.
 - The SDK attempts a periodic flush every 30 seconds, when the queue reaches 100
   events, on explicit `flush()`, and when the app enters background.
-- The SDK auto-populates `platform = "android"`, `app_version`,
+- The SDK auto-populates `platform = "android"`, `device`, `app_version`,
   `os_version`, and `locale`.
+- `device` is derived from Android form factor and emits `phone`, `tablet`, or
+  `unknown` when the runtime cannot classify it.
 - The SDK persists one app-local install identifier, reuses it across
   destinations, and rotates it on `clear()` without mutating already queued
   rows.

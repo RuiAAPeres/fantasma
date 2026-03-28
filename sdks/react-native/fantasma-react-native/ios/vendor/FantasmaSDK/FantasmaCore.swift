@@ -61,6 +61,7 @@ struct EventEnvelope: Codable, Equatable, Sendable {
     let timestamp: String
     let installId: String
     let platform: String
+    let device: String
     let appVersion: String?
     let osVersion: String?
     let locale: String?
@@ -70,10 +71,16 @@ struct EventEnvelope: Codable, Equatable, Sendable {
         case timestamp
         case installId = "install_id"
         case platform
+        case device
         case appVersion = "app_version"
         case osVersion = "os_version"
         case locale
     }
+}
+
+struct DeviceContext: Equatable, Sendable {
+    let platform: String
+    let device: String
 }
 
 struct AcceptedResponse: Decodable, Equatable, Sendable {
@@ -90,6 +97,7 @@ struct FantasmaDependencies: Sendable {
     let databaseURL: URL
     let transport: FantasmaTransport
     let now: @Sendable () -> Date
+    let deviceContext: @Sendable () -> DeviceContext
     let appVersion: @Sendable () -> String?
     let osVersion: @Sendable () -> String?
     let newIdentifier: @Sendable () -> String
@@ -103,6 +111,7 @@ struct FantasmaDependencies: Sendable {
             databaseURL: defaultDatabaseURL(),
             transport: URLSessionTransport(session: .shared),
             now: { Date() },
+            deviceContext: { liveDeviceContext() },
             appVersion: {
                 let bundle = Bundle.main
                 return bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
@@ -130,6 +139,29 @@ struct FantasmaDependencies: Sendable {
         let directoryURL = baseURL.appendingPathComponent("FantasmaSDK", isDirectory: true)
         try? fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         return directoryURL.appendingPathComponent("events.sqlite3")
+    }
+
+    private static func liveDeviceContext() -> DeviceContext {
+        #if os(macOS)
+        DeviceContext(platform: "macos", device: "desktop")
+        #elseif targetEnvironment(macCatalyst)
+        DeviceContext(platform: "macos", device: "desktop")
+        #elseif canImport(UIKit)
+        if #available(iOS 14.0, *), ProcessInfo.processInfo.isiOSAppOnMac {
+            return DeviceContext(platform: "macos", device: "desktop")
+        }
+
+        switch UIDevice.current.userInterfaceIdiom {
+        case .phone:
+            return DeviceContext(platform: "ios", device: "phone")
+        case .pad:
+            return DeviceContext(platform: "ios", device: "tablet")
+        default:
+            return DeviceContext(platform: "ios", device: "unknown")
+        }
+        #else
+        DeviceContext(platform: "ios", device: "unknown")
+        #endif
     }
 }
 
@@ -242,11 +274,13 @@ actor FantasmaCore {
         do {
             let now = dependencies.now()
             let identity = await currentIdentity()
+            let deviceContext = dependencies.deviceContext()
             let event = EventEnvelope(
                 event: name,
                 timestamp: FantasmaJSON.timestamp(from: now),
                 installId: identity.installID,
-                platform: "ios",
+                platform: deviceContext.platform,
+                device: deviceContext.device,
                 appVersion: dependencies.appVersion(),
                 osVersion: dependencies.osVersion(),
                 locale: currentLocaleIdentifier()
