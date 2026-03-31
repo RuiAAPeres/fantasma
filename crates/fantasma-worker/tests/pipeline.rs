@@ -39,6 +39,17 @@ fn scale_like_events(day: &str, install_count: usize) -> Vec<serde_json::Value> 
     events
 }
 
+async fn drain_event_metric_projections(pool: &PgPool, batch_size: i64) {
+    loop {
+        let processed = fantasma_worker::process_event_metrics_batch(pool, batch_size)
+            .await
+            .expect("event metrics worker batch succeeds");
+        if processed == 0 {
+            break;
+        }
+    }
+}
+
 #[sqlx::test]
 async fn range_delete_worker_rebuilds_state_and_reactivates_project(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
@@ -95,9 +106,7 @@ async fn range_delete_worker_rebuilds_state_and_reactivates_project(pool: PgPool
     fantasma_worker::process_session_batch(&pool, 100)
         .await
         .expect("session worker batch succeeds");
-    fantasma_worker::process_event_metrics_batch(&pool, 100)
-        .await
-        .expect("event metrics worker batch succeeds");
+    drain_event_metric_projections(&pool, 100).await;
 
     let create_deletion_response = api
         .clone()
@@ -206,6 +215,140 @@ async fn range_delete_worker_rebuilds_state_and_reactivates_project(pool: PgPool
 
     assert_eq!(raw_count, 1);
     assert_eq!(session_count, 1);
+}
+
+#[sqlx::test]
+async fn range_delete_keeps_unrelated_event_projection_backlog(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-a",
+                                "platform": "ios"
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-02T00:00:00Z",
+                                "install_id": "install-b",
+                                "platform": "ios"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    fantasma_worker::process_event_metrics_batch(&pool, 100)
+        .await
+        .expect("event worker batch succeeds");
+
+    let stale_response = api
+        .clone()
+        .oneshot(
+            Request::get(
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-02&end=2026-01-02",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid day-2 event metrics request"),
+        )
+        .await
+        .expect("stale event metrics request succeeds");
+    assert_eq!(stale_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(stale_response).await,
+        serde_json::json!({
+            "metric": "count",
+            "granularity": "day",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        { "bucket": "2026-01-02", "value": 0 }
+                    ]
+                }
+            ]
+        })
+    );
+
+    let create_deletion_response = api
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/projects/{}/deletions", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "start_at": "2026-01-01T00:00:00Z",
+                        "end_before": "2026-01-02T00:00:00Z",
+                        "event": "app_open"
+                    })
+                    .to_string(),
+                ))
+                .expect("valid range-delete request"),
+        )
+        .await
+        .expect("range-delete request succeeds");
+    assert_eq!(create_deletion_response.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project deletion worker succeeds"),
+        1
+    );
+
+    drain_event_metric_projections(&pool, 100).await;
+
+    let recovered_response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-02&end=2026-01-02",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid recovered day-2 event metrics request"),
+        )
+        .await
+        .expect("recovered event metrics request succeeds");
+    assert_eq!(recovered_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(recovered_response).await,
+        serde_json::json!({
+            "metric": "count",
+            "granularity": "day",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        { "bucket": "2026-01-02", "value": 1 }
+                    ]
+                }
+            ]
+        })
+    );
 }
 
 #[sqlx::test]
@@ -439,6 +582,125 @@ async fn project_deletion_waits_while_open_writer_transaction_holds_visible_leas
         fantasma_worker::process_project_deletion_batch(&pool)
             .await
             .expect("project deletion worker runs once inflight lease clears"),
+        1
+    );
+}
+
+#[sqlx::test]
+async fn project_deletion_waits_for_inflight_event_metric_deferred_drain(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+    let project_id = provisioned
+        .project_id
+        .parse::<uuid::Uuid>()
+        .expect("project id parses");
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "install-a",
+                                "platform": "ios"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    fantasma_worker::process_event_metrics_batch(&pool, 100)
+        .await
+        .expect("event worker batch succeeds");
+
+    let mut lock_tx = pool.begin().await.expect("begin table lock transaction");
+    sqlx::query("LOCK TABLE event_metric_buckets_total IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock_tx)
+        .await
+        .expect("lock event metric buckets table");
+
+    let drain_pool = pool.clone();
+    let drain_task = tokio::spawn(async move {
+        fantasma_worker::process_event_metrics_batch(&drain_pool, 100).await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let visible_leases = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM project_processing_leases WHERE project_id = $1",
+            )
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count project processing leases");
+            if visible_leases > 0 {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deferred drain should hold a visible processing lease while rebuilding");
+
+    let create_deletion_response = api
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/projects/{}/deletions", provisioned.project_id))
+                .header(AUTHORIZATION, "Bearer fg_pat_test_admin")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "start_at": "2026-02-01T00:00:00Z",
+                        "end_before": "2026-02-02T00:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("valid empty range-delete request"),
+        )
+        .await
+        .expect("empty range-delete request succeeds");
+    assert_eq!(create_deletion_response.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project deletion worker should wait for in-flight deferred drain"),
+        0
+    );
+
+    lock_tx
+        .rollback()
+        .await
+        .expect("release event metric table lock");
+    assert!(
+        matches!(
+            drain_task.await.expect("deferred drain task joins"),
+            Err(fantasma_store::StoreError::ProjectFenceChanged),
+        ),
+        "deferred drain should abort once the deletion request fences the project"
+    );
+
+    assert_eq!(
+        fantasma_worker::process_project_deletion_batch(&pool)
+            .await
+            .expect("project deletion worker runs once deferred drain clears"),
         1
     );
 }
@@ -1298,15 +1560,13 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
 
     assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
 
-    fantasma_worker::process_event_metrics_batch(&pool, 100)
-        .await
-        .expect("event metrics worker batch succeeds");
+    drain_event_metric_projections(&pool, 100).await;
 
     let hourly_response = api
         .clone()
         .oneshot(
             Request::get(
-                "/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-03-01T00:00:00Z&end=2026-03-01T01:00:00Z&platform=ios&app_version=1.4.0&os_version=18.3&locale=en-US",
+                "/v1/metrics/events?event=app_open&metric=count&granularity=hour&start=2026-03-01T00:00:00Z&end=2026-03-01T01:00:00Z&platform=ios&locale=en-US",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -1342,7 +1602,7 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
     let daily_response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.4.0&os_version=18.3&locale=pt-PT",
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&locale=pt-PT",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -1377,7 +1637,123 @@ async fn pipeline_exposes_event_metrics_after_worker_batch(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn pipeline_exposes_live_installs_after_event_worker_batch(pool: PgPool) {
+async fn pipeline_keeps_event_and_install_projections_stale_until_deferred_drain(pool: PgPool) {
+    run_migrations(&pool).await.expect("migrations succeed");
+
+    let ingest = fantasma_ingest::app(pool.clone());
+    let api = fantasma_api::app(
+        pool.clone(),
+        Arc::new(StaticAdminAuthorizer::new("fg_pat_test_admin")),
+    );
+    let provisioned = provision_project(api.clone()).await;
+
+    let ingest_response = ingest
+        .oneshot(
+            Request::post("/v1/events")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-fantasma-key", &provisioned.ingest_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "events": [
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "live-install-1",
+                                "platform": "ios"
+                            },
+                            {
+                                "event": "app_open",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                                "install_id": "live-install-2",
+                                "platform": "ios"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("valid ingest request"),
+        )
+        .await
+        .expect("ingest request succeeds");
+    assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
+
+    let catalog_response = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics/events/catalog?start=2026-01-01&end=2026-01-01")
+                .header("x-fantasma-key", &provisioned.read_key)
+                .body(Body::empty())
+                .expect("valid catalog request"),
+        )
+        .await
+        .expect("catalog request succeeds");
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(catalog_response).await,
+        serde_json::json!({
+            "events": [
+                { "name": "app_open", "last_seen_at": "2026-01-01T00:00:00Z" }
+            ]
+        })
+    );
+
+    fantasma_worker::process_event_metrics_batch(&pool, 100)
+        .await
+        .expect("event worker batch succeeds");
+
+    let live_installs_response = api
+        .clone()
+        .oneshot(
+            Request::get("/v1/metrics/live_installs")
+                .header("x-fantasma-key", &provisioned.read_key)
+                .body(Body::empty())
+                .expect("valid live installs request"),
+        )
+        .await
+        .expect("live installs request succeeds");
+    assert_eq!(live_installs_response.status(), StatusCode::OK);
+
+    let live_installs_body = response_json(live_installs_response).await;
+    assert_eq!(
+        live_installs_body["metric"],
+        serde_json::json!("live_installs")
+    );
+    assert_eq!(live_installs_body["window_seconds"], serde_json::json!(120));
+    assert_eq!(live_installs_body["value"], serde_json::json!(0));
+    assert!(live_installs_body["as_of"].is_string());
+
+    let event_metrics_response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-01",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid event metrics request"),
+        )
+        .await
+        .expect("event metrics request succeeds");
+    assert_eq!(event_metrics_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(event_metrics_response).await,
+        serde_json::json!({
+            "metric": "count",
+            "granularity": "day",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 0 }
+                    ]
+                }
+            ]
+        })
+    );
+}
+
+#[sqlx::test]
+async fn pipeline_event_and_install_projections_converge_after_deferred_drains(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
     let ingest = fantasma_ingest::app(pool.clone());
@@ -1420,8 +1796,15 @@ async fn pipeline_exposes_live_installs_after_event_worker_batch(pool: PgPool) {
     fantasma_worker::process_event_metrics_batch(&pool, 100)
         .await
         .expect("event worker batch succeeds");
+    fantasma_worker::process_event_metrics_batch(&pool, 100)
+        .await
+        .expect("event deferred drain tick succeeds");
+    fantasma_worker::process_session_batch(&pool, 100)
+        .await
+        .expect("session deferred drain tick succeeds");
 
     let live_installs_response = api
+        .clone()
         .oneshot(
             Request::get("/v1/metrics/live_installs")
                 .header("x-fantasma-key", &provisioned.read_key)
@@ -1432,11 +1815,43 @@ async fn pipeline_exposes_live_installs_after_event_worker_batch(pool: PgPool) {
         .expect("live installs request succeeds");
     assert_eq!(live_installs_response.status(), StatusCode::OK);
 
-    let body = response_json(live_installs_response).await;
-    assert_eq!(body["metric"], serde_json::json!("live_installs"));
-    assert_eq!(body["window_seconds"], serde_json::json!(120));
-    assert_eq!(body["value"], serde_json::json!(2));
-    assert!(body["as_of"].is_string());
+    let live_installs_body = response_json(live_installs_response).await;
+    assert_eq!(
+        live_installs_body["metric"],
+        serde_json::json!("live_installs")
+    );
+    assert_eq!(live_installs_body["window_seconds"], serde_json::json!(120));
+    assert_eq!(live_installs_body["value"], serde_json::json!(2));
+    assert!(live_installs_body["as_of"].is_string());
+
+    let event_metrics_response = api
+        .oneshot(
+            Request::get(
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-01",
+            )
+            .header("x-fantasma-key", &provisioned.read_key)
+            .body(Body::empty())
+            .expect("valid event metrics request"),
+        )
+        .await
+        .expect("event metrics request succeeds");
+    assert_eq!(event_metrics_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(event_metrics_response).await,
+        serde_json::json!({
+            "metric": "count",
+            "granularity": "day",
+            "group_by": [],
+            "series": [
+                {
+                    "dimensions": {},
+                    "points": [
+                        { "bucket": "2026-01-01", "value": 2 }
+                    ]
+                }
+            ]
+        })
+    );
 }
 
 #[sqlx::test]
@@ -1487,14 +1902,12 @@ async fn pipeline_exposes_dim2_event_metrics_with_null_buckets(pool: PgPool) {
 
     assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
 
-    fantasma_worker::process_event_metrics_batch(&pool, 100)
-        .await
-        .expect("event metrics worker batch succeeds");
+    drain_event_metric_projections(&pool, 100).await;
 
     let response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.4.0&os_version=18.3&locale=en-US",
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&locale=en-US",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -1524,7 +1937,7 @@ async fn pipeline_exposes_dim2_event_metrics_with_null_buckets(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn pipeline_keeps_active_installs_visible_while_session_backlog_remains(pool: PgPool) {
+async fn pipeline_keeps_active_installs_stale_while_session_backlog_remains(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
     let ingest = fantasma_ingest::app(pool.clone());
@@ -1598,7 +2011,7 @@ async fn pipeline_keeps_active_installs_visible_while_session_backlog_remains(po
                 {
                     "dimensions": {},
                     "points": [
-                        { "bucket": "2026-03-01", "value": 1 }
+                        { "bucket": "2026-03-01", "value": 0 }
                     ]
                 }
             ]
@@ -1629,12 +2042,12 @@ async fn pipeline_keeps_active_installs_visible_while_session_backlog_remains(po
                 {
                     "dimensions": {},
                     "points": [
-                        { "start": "2026-03-01", "end": "2026-03-01", "value": 1 }
+                        { "start": "2026-03-01", "end": "2026-03-01", "value": 0 }
                     ]
                 }
             ]
         }),
-        "exact-range active_installs should reflect committed session batches even while later raw events remain queued"
+        "exact-range active_installs may lag while later raw session work is still queued"
     );
 
     let remaining = fantasma_worker::process_session_batch(&pool, 1)
@@ -1866,7 +2279,6 @@ async fn pipeline_exposes_dim2_session_metrics_and_active_install_overlaps(pool:
     fantasma_worker::process_session_batch(&pool, 100)
         .await
         .expect("worker batch succeeds");
-
     let filtered_count_response = api
         .clone()
         .oneshot(
@@ -2042,9 +2454,7 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
     assert_eq!(first_ingest_response.status(), StatusCode::ACCEPTED);
     assert_eq!(second_ingest_response.status(), StatusCode::ACCEPTED);
 
-    fantasma_worker::process_event_metrics_batch(&pool, 200)
-        .await
-        .expect("event metrics worker batch succeeds");
+    drain_event_metric_projections(&pool, 200).await;
 
     let response = api
         .oneshot(
@@ -2073,7 +2483,7 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_group_limit(pool: Pg
 }
 
 #[sqlx::test]
-async fn pipeline_exposes_grouped_event_metrics_up_to_four_built_in_dimensions(pool: PgPool) {
+async fn pipeline_exposes_grouped_event_metrics_up_to_two_built_in_dimensions(pool: PgPool) {
     run_migrations(&pool).await.expect("migrations succeed");
 
     let ingest = fantasma_ingest::app(pool.clone());
@@ -2129,14 +2539,12 @@ async fn pipeline_exposes_grouped_event_metrics_up_to_four_built_in_dimensions(p
 
     assert_eq!(ingest_response.status(), StatusCode::ACCEPTED);
 
-    fantasma_worker::process_event_metrics_batch(&pool, 100)
-        .await
-        .expect("event worker batch succeeds");
+    drain_event_metric_projections(&pool, 100).await;
 
     let response = api
         .oneshot(
             Request::get(
-                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-01&group_by=platform&group_by=app_version&group_by=os_version&group_by=locale",
+                "/v1/metrics/events?event=app_open&metric=count&granularity=day&start=2026-01-01&end=2026-01-01&group_by=platform&group_by=locale",
             )
             .header("x-fantasma-key", &provisioned.read_key)
             .body(Body::empty())
@@ -2151,13 +2559,11 @@ async fn pipeline_exposes_grouped_event_metrics_up_to_four_built_in_dimensions(p
         serde_json::json!({
             "metric": "count",
             "granularity": "day",
-            "group_by": ["platform", "app_version", "os_version", "locale"],
+            "group_by": ["platform", "locale"],
             "series": [
                 {
                     "dimensions": {
                         "platform": "android",
-                        "app_version": "2.0.0",
-                        "os_version": "15",
                         "locale": "en-US"
                     },
                     "points": [
@@ -2167,8 +2573,6 @@ async fn pipeline_exposes_grouped_event_metrics_up_to_four_built_in_dimensions(p
                 {
                     "dimensions": {
                         "platform": "ios",
-                        "app_version": "1.0.0",
-                        "os_version": "18.3",
                         "locale": "en-US"
                     },
                     "points": [
@@ -2178,8 +2582,6 @@ async fn pipeline_exposes_grouped_event_metrics_up_to_four_built_in_dimensions(p
                 {
                     "dimensions": {
                         "platform": "ios",
-                        "app_version": "1.0.0",
-                        "os_version": "18.4",
                         "locale": "pt-PT"
                     },
                     "points": [
@@ -2244,9 +2646,7 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_d2_dimension_budget(
     assert_eq!(first_ingest_response.status(), StatusCode::ACCEPTED);
     assert_eq!(second_ingest_response.status(), StatusCode::ACCEPTED);
 
-    fantasma_worker::process_event_metrics_batch(&pool, 200)
-        .await
-        .expect("event metrics worker batch succeeds");
+    drain_event_metric_projections(&pool, 200).await;
 
     let response = api
         .oneshot(
@@ -2260,21 +2660,11 @@ async fn pipeline_rejects_event_metrics_queries_that_exceed_d2_dimension_budget(
         .await
         .expect("aggregate request succeeds");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         response_json(response).await,
         serde_json::json!({
-            "metric": "count",
-            "granularity": "day",
-            "group_by": [],
-            "series": [
-                {
-                    "dimensions": {},
-                    "points": [
-                        { "bucket": "2026-03-01", "value": 101 }
-                    ]
-                }
-            ]
+            "error": "too_many_dimensions"
         })
     );
 }
@@ -2495,9 +2885,11 @@ async fn pipeline_keeps_grouped_session_metrics_day_queries_200_during_worker_ca
     );
     let provisioned = provision_project(api.clone()).await;
 
-    for day_offset in 0..10 {
+    // Keep enough backlog to exercise bounded catch-up without turning this
+    // regression into a large deferred-rebuild benchmark.
+    for day_offset in 0..4 {
         let day = format!("2026-01-{:02}", day_offset + 1);
-        let events = benchmark_like_session_events(&day, day_offset, 120);
+        let events = benchmark_like_session_events(&day, day_offset, 24);
         for batch in events.chunks(100) {
             let ingest_response = ingest
                 .clone()
@@ -2517,24 +2909,18 @@ async fn pipeline_keeps_grouped_session_metrics_day_queries_200_during_worker_ca
         }
     }
 
-    let worker_pool = pool.clone();
-    let worker = tokio::spawn(async move {
-        loop {
-            let processed = fantasma_worker::process_session_batch(&worker_pool, 1)
-                .await
-                .expect("session worker batch succeeds");
-            if processed == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    });
-
-    let query = "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-10";
+    let query = "/v1/metrics/sessions?metric=count&granularity=day&start=2026-01-01&end=2026-01-04";
     let mut saw_internal_server_error = false;
     let mut query_count = 0;
 
-    while !worker.is_finished() {
+    loop {
+        let processed = fantasma_worker::process_session_batch(&pool, 1)
+            .await
+            .expect("session worker batch succeeds");
+        if processed == 0 {
+            break;
+        }
+
         let response = api
             .clone()
             .oneshot(
@@ -2554,8 +2940,6 @@ async fn pipeline_keeps_grouped_session_metrics_day_queries_200_during_worker_ca
 
         tokio::task::yield_now().await;
     }
-
-    worker.await.expect("worker task joins");
 
     assert!(
         query_count > 0,

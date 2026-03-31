@@ -1,0 +1,60 @@
+{
+  "host": {
+    "environment": "local"
+  },
+  "suites": [
+    "representative"
+  ],
+  "run_config": {
+    "mode": "iterative",
+    "publication_repetitions": 1,
+    "worker_config": {
+      "session_batch_size": 2000,
+      "event_batch_size": 5000,
+      "session_incremental_concurrency": 8,
+      "session_repair_concurrency": 2,
+      "idle_poll_interval_ms": 250,
+      "enable_event_metric_deferred_drains": true,
+      "enable_session_projection_deferred_drains": false,
+      "enable_install_activity_deferred_drains": true
+    }
+  },
+  "verdict": {
+    "baseline_source": "docs/STATUS.md benchmark usability reset entry (2026-03-15 representative + mixed-repair iterative smokes)",
+    "representative_append": {
+      "overall": "worse",
+      "checkpoint_sample_count_matches": false,
+      "final_derived": "worse"
+    },
+    "overall": "worse"
+  },
+  "scenarios": [
+    {
+      "scenario": "live-append-small-blobs",
+      "run_config": {
+        "mode": "iterative",
+        "publication_repetitions": 1,
+        "worker_config": {
+          "session_batch_size": 2000,
+          "event_batch_size": 5000,
+          "session_incremental_concurrency": 8,
+          "session_repair_concurrency": 2,
+          "idle_poll_interval_ms": 250,
+          "enable_event_metric_deferred_drains": true,
+          "enable_session_projection_deferred_drains": false,
+          "enable_install_activity_deferred_drains": true
+        }
+      },
+      "phases": [],
+      "readiness": [],
+      "queries": [],
+      "budget": {
+        "passed": false,
+        "failures": [
+          "scenario execution failed: timed out waiting for checkpoint readiness (session metrics)"
+        ]
+      },
+      "failure": "scenario execution failed: timed out waiting for checkpoint readiness (session metrics)"
+    }
+  ]
+}

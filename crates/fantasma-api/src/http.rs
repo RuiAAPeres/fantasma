@@ -178,7 +178,7 @@ impl EventMetricsQueryError {
     }
 }
 
-const MAX_FILTER_DIMENSIONS: usize = 4;
+const MAX_FILTER_DIMENSIONS: usize = 2;
 const MAX_METRIC_GROUPS: usize = 100;
 const MAX_ACTIVE_INSTALL_POINTS: usize = 120;
 type GroupKey = Vec<Option<String>>;
@@ -2874,14 +2874,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_event_metrics_query_accepts_all_four_built_in_filters() {
+    fn parse_event_metrics_query_accepts_two_built_in_filters() {
         let query = parse_event_metrics_query(
-            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.0.0&os_version=18.3&locale=pt-PT",
+            "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&locale=pt-PT",
         )
         .expect("query parses");
 
         assert_eq!(query.metric, EventMetric::Count);
-        assert_eq!(query.filters.len(), 4);
+        assert_eq!(query.filters.len(), 2);
         assert_eq!(query.filters.get("locale"), Some(&"pt-PT".to_owned()));
     }
 
@@ -2922,21 +2922,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_event_metrics_query_accepts_four_group_by_dimensions() {
-        let query = parse_event_metrics_query(
+    fn parse_event_metrics_query_rejects_more_than_two_referenced_dimensions() {
+        let error = parse_event_metrics_query(
             "event=app_open&metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=platform&group_by=app_version&group_by=os_version&group_by=locale",
         )
-        .expect("query parses");
+        .unwrap_err();
 
-        assert_eq!(
-            query.group_by,
-            vec![
-                "platform".to_owned(),
-                "app_version".to_owned(),
-                "os_version".to_owned(),
-                "locale".to_owned()
-            ]
-        );
+        assert_eq!(error.error_code(), "too_many_dimensions");
     }
 
     #[test]
@@ -3153,13 +3145,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_metric_query_accepts_all_four_built_in_filters() {
+    fn parse_session_metric_query_accepts_two_built_in_filters() {
         let query = parse_session_metric_query(
-            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&app_version=1.0.0&os_version=18.3&locale=en-GB",
+            "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&platform=ios&locale=en-GB",
         )
         .expect("query parses");
 
-        assert_eq!(query.filters.len(), 4);
+        assert_eq!(query.filters.len(), 2);
         assert_eq!(query.filters.get("locale"), Some(&"en-GB".to_owned()));
     }
 
@@ -3192,21 +3184,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_metric_query_accepts_four_group_by_dimensions_for_bucket_metrics() {
-        let query = parse_session_metric_query(
+    fn parse_session_metric_query_rejects_more_than_two_referenced_dimensions_for_bucket_metrics() {
+        let error = parse_session_metric_query(
             "metric=count&granularity=day&start=2026-03-01&end=2026-03-02&group_by=platform&group_by=app_version&group_by=os_version&group_by=locale",
         )
-        .expect("query parses");
+        .unwrap_err();
 
-        assert_eq!(
-            query.group_by,
-            vec![
-                "platform".to_owned(),
-                "app_version".to_owned(),
-                "os_version".to_owned(),
-                "locale".to_owned()
-            ]
-        );
+        assert_eq!(error, "too_many_dimensions");
     }
 
     #[test]
@@ -3713,7 +3697,11 @@ mod tests {
             ingest_description
                 .as_str()
                 .expect("ingest description")
-                .contains("up to 200 events per batch"),
+                .contains("up to 200 events per")
+                && ingest_description
+                    .as_str()
+                    .expect("ingest description")
+                    .contains("batch"),
             "ingest route description must stay aligned with the 200-event cap"
         );
         assert!(

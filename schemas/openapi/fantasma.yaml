@@ -26,7 +26,14 @@ paths:
         - ingest
       summary: Ingest a batch of mobile events
       operationId: ingestEvents
-      description: Accepts only project-scoped `ingest` keys and up to 200 events per batch.
+      description: |
+        Accepts only project-scoped `ingest` keys and up to 200 events per
+        batch.
+
+        `202 Accepted` means authentication and validation succeeded and the
+        batch was durably appended to `events_raw`. Customer-facing derived
+        metrics are rebuilt asynchronously by worker-owned deferred drains and
+        may lag behind raw ingest.
       security:
         - ProjectKeyHeader: []
       requestBody:
@@ -37,7 +44,7 @@ paths:
               $ref: '#/components/schemas/EventBatchRequest'
       responses:
         '202':
-          description: Batch accepted and persisted to the raw event store.
+          description: Batch accepted and durably persisted to the raw event store.
           content:
             application/json:
               schema:
@@ -555,7 +562,8 @@ paths:
         - ProjectKeyHeader: []
       description: |
         Event metrics are eventually consistent because the API reads only from
-        worker-built hourly and daily rollups.
+        worker-built hourly and daily rollups. Accepted ingest does not wait
+        for those rollups to catch up.
 
         `metric=count` is the only public event metric, and it requires `event`.
 
@@ -563,7 +571,7 @@ paths:
         `app_version`, `os_version`, and `locale`.
 
         Repeated `group_by` is supported on those same built-ins. Total
-        referenced dimensions across filters plus `group_by` are capped at 4.
+        referenced dimensions across filters plus `group_by` are capped at 2.
         Duplicate group keys and filter/group overlap fail fast with `422`.
 
         Legacy public params such as `project_id`, `start_date`, and
@@ -634,7 +642,8 @@ paths:
         requested time window, ordered by most recent occurrence.
 
         These reads are project-scoped from the authenticated `read` key and
-        read directly from accepted raw events. They are intended for event
+        read directly from accepted raw events, so they remain append-visible
+        even while derived worker projections lag. They are intended for event
         discovery, not bucketed chart series.
 
         Use only the built-in equality filters `platform`, `device`,
@@ -699,8 +708,9 @@ paths:
         ascending as a deterministic tie-breaker.
 
         These reads are project-scoped from the authenticated `read` key and
-        read directly from accepted raw events. They are discovery helpers, not
-        worker-derived bucketed metrics.
+        read directly from accepted raw events, so they remain append-visible
+        even while derived worker projections lag. They are discovery helpers,
+        not worker-derived bucketed metrics.
 
         Use only the built-in equality filters `platform`, `device`,
         `app_version`, `os_version`, and `locale`. Legacy public params such
@@ -766,7 +776,8 @@ paths:
         This is a narrow current-state endpoint, not a bucketed metrics-family
         query. It accepts no public query parameters. Like the other metrics
         routes, it is eventually consistent because it reads from worker-owned
-        derived state rather than the ingest path.
+        derived state rather than the ingest path, and accepted ingest does not
+        wait for that state to catch up.
       responses:
         '200':
           description: Current live install count.
@@ -808,7 +819,8 @@ paths:
         - ProjectKeyHeader: []
       description: |
         Session metrics are eventually consistent because the API reads from
-        worker-maintained session-derived state.
+        worker-maintained session-derived state, and accepted ingest does not
+        wait for that state to catch up.
 
         Supported public metrics are:
 
@@ -829,7 +841,7 @@ paths:
         Built-in filter and grouping dimensions are `platform`, `device`,
         `app_version`, `os_version`, and `locale`.
 
-        `count`, `duration_total`, and `new_installs` allow up to 4 total
+        `count`, `duration_total`, and `new_installs` allow up to 2 total
         referenced dimensions across filters plus repeated `group_by`.
 
         `active_installs` allows up to 2 total referenced dimensions across

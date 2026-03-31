@@ -44,7 +44,7 @@ Responsibilities:
 - authenticate project-scoped ingest keys
 - validate incoming event batches up to 200 events per request
 - batch insert raw events into Postgres
-- acknowledge accepted events with `202 Accepted`
+- acknowledge accepted events with `202 Accepted` once raw rows are durably appended
 
 Non-responsibilities:
 
@@ -98,23 +98,17 @@ Current worker behavior:
 - let `session_repair` claim install-scoped repair work safely, fetch raw events by `(project_id, install_id, raw_event_id frontier)`, and no-op stale claims when `last_processed_event_id` already covers the claimed frontier
 - if one repair in a batch fails, let any already-claimed peer repairs finish their normal success or cleanup paths before surfacing the first error so those peer claims do not get stranded by coordinator-side cancellation
 - derive replacement sessions from raw events inside the overlapping repair window and rewrite only those derived rows
-- leave append-derived state final at child-transaction commit time: `sessions`, `install_first_seen`, `install_session_state`, `session_daily_installs`, `session_daily`, and the session metric bucket tables are already correct before the coordinator advances offsets
-- persist append outcomes with set-based helpers wherever practical so hot-path writes stay batched instead of reintroducing per-event SQL churn
-- update `install_first_seen` on append with one `INSERT ... ON CONFLICT DO NOTHING` attempt at most and derive `new_installs` from the insert result rather than a read-before-write precheck
-- update `session_daily_installs` once per touched `(project_id, install_id, day)` on append; `active_installs` contributes at most `0/1` per install-day even when `session_count` for that install-day is greater than `1`
-- update `session_daily` from net per-day append deltas only; append-only cross-midnight sessions still keep `duration_total` on the session-start bucket while daily counters remain correct for each affected UTC day
-- keep `session_active_install_slices` authoritative for public `active_installs`: each row represents one install with at least one session whose `session_start` falls on that UTC day under the session's fixed grouped/filterable dimensions
-- queue touched `(project_id, day)` rows for bitmap rebuild whenever append or repair changes `session_active_install_slices`
-- rebuild only the exact touched UTC days for `active_install_daily_bitmaps_total` / `dim1` / `dim2`, replacing each day's rows transactionally from `session_active_install_slices`
-- rebuild only the exact touched UTC days for `session_daily` and `session_daily_installs` after a repair
-- rebuild only the exact touched hourly and daily session metric buckets after repair/backfill session changes
-- keep append and repair intentionally different maintenance paths in this slice: append commits direct deltas, repair/backfill recomputes exact touched windows from source tables
+- keep append-path success scoped to foundational state only: `sessions`, `install_first_seen`, `install_session_state`, and worker-owned deferred queue rows are the only durable session-lane writes required before the coordinator advances
+- enqueue deferred scope atomically with the worker-owned state it depends on: the event lane saves offset progress in the same transaction as touched event rebuild scope, and the session lane queues touched session/install projection scope in the same transaction as foundational session state
+- treat all customer-facing derived tables as eventually consistent: `event_metric_buckets_*`, `session_metric_buckets_*`, `session_daily`, `session_active_install_slices`, `active_install_daily_bitmaps_*`, and `live_install_state` can lag until deferred drains catch up
+- keep bucketed event and session projections bounded at D2; there is no public or internal D3/D4 cuboid surface in the current product
+- keep deferred drains outside the raw-offset transactions and let reads serve the last committed derived rows while those drains catch up
+- keep repair/backfill conservative and exact: touched-day and touched-bucket rebuilds still recompute from source-of-truth tables instead of trying to preserve incremental deltas across rare correctness-heavy paths
 - let `session_repair` own the install-scoped repair commit: rewritten sessions, `install_session_state`, exact touched-day rebuilds, queued touched hour/day bucket finalization, and repair-frontier completion all commit together
 - queue shared project hour/day session bucket rebuilds through `session_rebuild_queue` and drain that queue after repair claims finish, even if a later install in the same batch fails, so overlapping installs rebuild each bucket on one serialized path without stranding already-committed repairs behind a later error
 - preserve fixed built-in grouped dimensions from the pre-repair session assignment so late events do not rebucket `platform`, `device`, or version dimensions
-- keep the normal append path incremental and delta-based: direct session metric bucket deltas replace append-path delete-and-rescan maintenance
-- derive event-count cuboids incrementally from raw events into bounded hourly and daily totals, single-dimension rollups, two-dimension rollups, and three-dimension rollups
-- derive session metric rollups incrementally for `count`, `duration_total`, and `new_installs`
+- keep the request path and append-adjacent worker hot lanes free of direct customer-facing projection writes
+- rebuild event metrics from `events_raw`, session metrics from foundational session state, and install activity views from raw events plus foundational session state
 - keep event-metrics rollups keyed only by canonical string dimensions, never by the full property bag
 - advance a `worker_offsets` checkpoint only after successful writes
 - treat project deletion as an explicit operator-owned job: the API flips project lifecycle state and records an independent `project_deletions` row, then the `project_deletions` lane waits for the existing worker queues to drain before it either rebuilds the narrowed project state for a range delete or explicitly purges every project-owned table before deleting the `projects` row
@@ -275,7 +269,7 @@ Event metrics:
 - built-in equality filters use `platform`, `device`, `app_version`, `os_version`, and `locale`
 - only built-in filters and built-in `group_by` keys are accepted
 - `group_by` is supported on `platform`, `device`, `app_version`, `os_version`, and `locale`
-- total referenced dimensions across filters plus `group_by` are capped at 4
+- total referenced dimensions across filters plus `group_by` are capped at 2
 - duplicate `group_by` keys and filter/group overlap are rejected
 
 Session metrics:
@@ -283,7 +277,7 @@ Session metrics:
 - supported public metrics are `count`, `duration_total`, `new_installs`, and `active_installs`
 - built-in equality filters use `platform`, `device`, `app_version`, `os_version`, and `locale`
 - only built-in filters and built-in `group_by` keys are accepted
-- `count`, `duration_total`, and `new_installs` allow built-in `group_by` through D4
+- `count`, `duration_total`, and `new_installs` allow built-in `group_by` through D2
 - `active_installs` allows built-in `group_by` through D2 only
 - duplicate `group_by` keys and filter/group overlap are rejected
 - `duration_total` is assigned to the bucket where the session starts
@@ -302,7 +296,7 @@ Current-state metrics:
 - `live_installs` accepts no public query parameters
 - `live_installs` counts installs whose latest worker-processed raw-event `received_at` is within the last 120 seconds
 - `live_installs` reads from worker-owned `live_install_state`, keyed by `(project_id, install_id)`
-- the existing `event_metrics` lane updates `live_install_state` in the same raw-event batch transaction and offset progression used for event rollups
+- `live_install_state` is rebuilt by deferred worker drains rather than by the append-adjacent event path
 - the API returns `as_of` and `value` from one SQL statement so the cutoff clock and the count share the same snapshot
 
 ## SDK Direction

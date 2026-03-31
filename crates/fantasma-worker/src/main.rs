@@ -29,6 +29,22 @@ async fn main() {
             2,
         )
         .max(1),
+        enable_event_metric_deferred_drains: parse_env_bool(
+            "FANTASMA_WORKER_ENABLE_EVENT_METRIC_DEFERRED_DRAINS",
+            true,
+        ),
+        enable_session_daily_deferred_drains: parse_env_bool(
+            "FANTASMA_WORKER_ENABLE_SESSION_DAILY_DEFERRED_REBUILDS",
+            true,
+        ),
+        enable_session_metric_deferred_drains: parse_env_bool(
+            "FANTASMA_WORKER_ENABLE_SESSION_METRIC_DEFERRED_REBUILDS",
+            true,
+        ),
+        enable_install_activity_deferred_drains: parse_env_bool(
+            "FANTASMA_WORKER_ENABLE_INSTALL_ACTIVITY_DEFERRED_DRAINS",
+            true,
+        ),
     };
     let mut database_config = DatabaseConfig::new(database_url);
     database_config.max_connections = database_config
@@ -43,6 +59,10 @@ async fn main() {
         event_batch_size = config.event_batch_size,
         session_incremental_concurrency = config.session_incremental_concurrency,
         session_repair_concurrency = config.session_repair_concurrency,
+        enable_event_metric_deferred_drains = config.enable_event_metric_deferred_drains,
+        enable_session_daily_deferred_drains = config.enable_session_daily_deferred_drains,
+        enable_session_metric_deferred_drains = config.enable_session_metric_deferred_drains,
+        enable_install_activity_deferred_drains = config.enable_install_activity_deferred_drains,
         max_db_connections = database_config.max_connections,
         "fantasma-worker started"
     );
@@ -70,5 +90,16 @@ fn parse_env_usize(name: &str, default: usize) -> usize {
     env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
         .unwrap_or(default)
 }

@@ -7,9 +7,9 @@ use fantasma_store::{PgPool, StoreError, load_raw_event_tail_id, load_worker_off
 use tracing::{debug, error, info};
 
 use crate::worker::{
-    EVENT_METRICS_WORKER_NAME, SESSION_WORKER_NAME, SessionBatchConfig,
-    drain_session_repair_queue_with_config, process_event_metrics_batch,
-    process_project_deletion_batch, process_session_batch_with_config,
+    DeferredDrainControl, EVENT_METRICS_WORKER_NAME, SESSION_WORKER_NAME, SessionBatchConfig,
+    drain_session_repair_queue_with_config, process_event_metrics_batch_with_drain_control,
+    process_project_deletion_batch, process_session_batch_with_drain_control,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +19,10 @@ pub struct WorkerConfig {
     pub event_batch_size: i64,
     pub session_incremental_concurrency: usize,
     pub session_repair_concurrency: usize,
+    pub enable_event_metric_deferred_drains: bool,
+    pub enable_session_daily_deferred_drains: bool,
+    pub enable_session_metric_deferred_drains: bool,
+    pub enable_install_activity_deferred_drains: bool,
 }
 
 impl Default for WorkerConfig {
@@ -29,6 +33,10 @@ impl Default for WorkerConfig {
             event_batch_size: 5_000,
             session_incremental_concurrency: 8,
             session_repair_concurrency: 2,
+            enable_event_metric_deferred_drains: true,
+            enable_session_daily_deferred_drains: true,
+            enable_session_metric_deferred_drains: true,
+            enable_install_activity_deferred_drains: true,
         }
     }
 }
@@ -40,6 +48,15 @@ impl WorkerConfig {
             .saturating_add(self.session_repair_concurrency)
             .saturating_add(6);
         required as u32
+    }
+
+    fn deferred_drain_control(&self) -> DeferredDrainControl {
+        DeferredDrainControl {
+            event_metrics: self.enable_event_metric_deferred_drains,
+            session_daily: self.enable_session_daily_deferred_drains,
+            session_metrics: self.enable_session_metric_deferred_drains,
+            install_activity: self.enable_install_activity_deferred_drains,
+        }
     }
 }
 
@@ -60,7 +77,7 @@ pub async fn run_worker(pool: PgPool, config: WorkerConfig) -> Result<(), StoreE
     let session_apply_pool = pool.clone();
     let session_repair_pool = pool.clone();
     let event_pool = pool.clone();
-    let deletion_pool = pool;
+    let deletion_pool = pool.clone();
     let session_apply_config = config.clone();
     let session_repair_config = config.clone();
     let event_config = config.clone();
@@ -191,13 +208,14 @@ async fn session_lane_tick(
     pool: &PgPool,
     config: &WorkerConfig,
 ) -> Result<LaneTickResult, StoreError> {
-    let processed_events = process_session_batch_with_config(
+    let processed_events = process_session_batch_with_drain_control(
         pool,
         SessionBatchConfig {
             batch_size: config.session_batch_size,
             incremental_concurrency: config.session_incremental_concurrency,
             repair_concurrency: config.session_repair_concurrency,
         },
+        config.deferred_drain_control(),
     )
     .await?;
     let backlog_events = lane_backlog(pool, SESSION_WORKER_NAME).await?;
@@ -234,7 +252,12 @@ async fn event_metrics_lane_tick(
     pool: &PgPool,
     config: &WorkerConfig,
 ) -> Result<LaneTickResult, StoreError> {
-    let processed_events = process_event_metrics_batch(pool, config.event_batch_size).await?;
+    let processed_events = process_event_metrics_batch_with_drain_control(
+        pool,
+        config.event_batch_size,
+        config.deferred_drain_control(),
+    )
+    .await?;
     let backlog_events = lane_backlog(pool, EVENT_METRICS_WORKER_NAME).await?;
 
     Ok(LaneTickResult {
@@ -317,6 +340,10 @@ mod tests {
         assert_eq!(config.event_batch_size, 5_000);
         assert_eq!(config.session_incremental_concurrency, 8);
         assert_eq!(config.session_repair_concurrency, 2);
+        assert!(config.enable_event_metric_deferred_drains);
+        assert!(config.enable_session_daily_deferred_drains);
+        assert!(config.enable_session_metric_deferred_drains);
+        assert!(config.enable_install_activity_deferred_drains);
         assert_eq!(config.required_db_connections(), 16);
     }
 

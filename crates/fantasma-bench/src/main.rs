@@ -201,6 +201,16 @@ enum CliCommand {
         worker_session_repair_concurrency: usize,
         #[arg(long, default_value_t = DEFAULT_SLO_IDLE_POLL_INTERVAL_MS)]
         worker_idle_poll_interval_ms: u64,
+        #[arg(long, default_value_t = false)]
+        disable_event_metric_deferred_drains: bool,
+        #[arg(long, default_value_t = false)]
+        disable_session_projection_deferred_drains: bool,
+        #[arg(long, default_value_t = false)]
+        disable_session_daily_deferred_rebuilds: bool,
+        #[arg(long, default_value_t = false)]
+        disable_session_metric_deferred_rebuilds: bool,
+        #[arg(long, default_value_t = false)]
+        disable_install_activity_deferred_drains: bool,
     },
 }
 
@@ -801,6 +811,10 @@ struct BenchWorkerConfig {
     session_incremental_concurrency: usize,
     session_repair_concurrency: usize,
     idle_poll_interval_ms: u64,
+    enable_event_metric_deferred_drains: bool,
+    enable_session_daily_deferred_rebuilds: bool,
+    enable_session_metric_deferred_rebuilds: bool,
+    enable_install_activity_deferred_drains: bool,
 }
 
 impl Default for BenchWorkerConfig {
@@ -811,6 +825,10 @@ impl Default for BenchWorkerConfig {
             session_incremental_concurrency: DEFAULT_SLO_SESSION_INCREMENTAL_CONCURRENCY,
             session_repair_concurrency: DEFAULT_SLO_SESSION_REPAIR_CONCURRENCY,
             idle_poll_interval_ms: DEFAULT_SLO_IDLE_POLL_INTERVAL_MS,
+            enable_event_metric_deferred_drains: true,
+            enable_session_daily_deferred_rebuilds: true,
+            enable_session_metric_deferred_rebuilds: true,
+            enable_install_activity_deferred_drains: true,
         }
     }
 }
@@ -1074,6 +1092,11 @@ where
             worker_session_incremental_concurrency,
             worker_session_repair_concurrency,
             worker_idle_poll_interval_ms,
+            disable_event_metric_deferred_drains,
+            disable_session_projection_deferred_drains,
+            disable_session_daily_deferred_rebuilds,
+            disable_session_metric_deferred_rebuilds,
+            disable_install_activity_deferred_drains,
         } => BenchCommand::Slo(SloArgs {
             output_dir,
             scenarios,
@@ -1087,6 +1110,15 @@ where
                     session_incremental_concurrency: worker_session_incremental_concurrency.max(1),
                     session_repair_concurrency: worker_session_repair_concurrency.max(1),
                     idle_poll_interval_ms: worker_idle_poll_interval_ms.max(1),
+                    enable_event_metric_deferred_drains: !disable_event_metric_deferred_drains,
+                    enable_session_daily_deferred_rebuilds:
+                        !(disable_session_projection_deferred_drains
+                            || disable_session_daily_deferred_rebuilds),
+                    enable_session_metric_deferred_rebuilds:
+                        !(disable_session_projection_deferred_drains
+                            || disable_session_metric_deferred_rebuilds),
+                    enable_install_activity_deferred_drains:
+                        !disable_install_activity_deferred_drains,
                 },
             },
         }),
@@ -3817,6 +3849,28 @@ fn render_slo_run_config_lines(run_config: &SloRunConfig) -> Vec<String> {
             "  - worker_idle_poll_interval_ms: {}",
             run_config.worker_config.idle_poll_interval_ms
         ),
+        format!(
+            "  - enable_event_metric_deferred_drains: {}",
+            run_config.worker_config.enable_event_metric_deferred_drains
+        ),
+        format!(
+            "  - enable_session_daily_deferred_rebuilds: {}",
+            run_config
+                .worker_config
+                .enable_session_daily_deferred_rebuilds
+        ),
+        format!(
+            "  - enable_session_metric_deferred_rebuilds: {}",
+            run_config
+                .worker_config
+                .enable_session_metric_deferred_rebuilds
+        ),
+        format!(
+            "  - enable_install_activity_deferred_drains: {}",
+            run_config
+                .worker_config
+                .enable_install_activity_deferred_drains
+        ),
     ]
 }
 
@@ -6065,6 +6119,22 @@ fn render_benchmark_compose_template(template: &str, worker_config: &BenchWorker
                 "      FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY: {}",
                 worker_config.session_repair_concurrency
             ));
+            rendered_lines.push(format!(
+                "      FANTASMA_WORKER_ENABLE_EVENT_METRIC_DEFERRED_DRAINS: {}",
+                worker_config.enable_event_metric_deferred_drains
+            ));
+            rendered_lines.push(format!(
+                "      FANTASMA_WORKER_ENABLE_SESSION_DAILY_DEFERRED_REBUILDS: {}",
+                worker_config.enable_session_daily_deferred_rebuilds
+            ));
+            rendered_lines.push(format!(
+                "      FANTASMA_WORKER_ENABLE_SESSION_METRIC_DEFERRED_REBUILDS: {}",
+                worker_config.enable_session_metric_deferred_rebuilds
+            ));
+            rendered_lines.push(format!(
+                "      FANTASMA_WORKER_ENABLE_INSTALL_ACTIVITY_DEFERRED_DRAINS: {}",
+                worker_config.enable_install_activity_deferred_drains
+            ));
             if !trace_path_rendered {
                 rendered_lines.push(format!(
                     "      {WORKER_STAGE_B_TRACE_ENV_VAR}: {WORKER_STAGE_B_TRACE_CONTAINER_PATH}"
@@ -6552,6 +6622,8 @@ mod tests {
             "4",
             "--worker-idle-poll-interval-ms",
             "75",
+            "--disable-session-daily-deferred-rebuilds",
+            "--disable-install-activity-deferred-drains",
         ])
         .expect("parse slo override command");
 
@@ -6572,6 +6644,28 @@ mod tests {
                 );
                 assert_eq!(args.run_config.worker_config.session_repair_concurrency, 4);
                 assert_eq!(args.run_config.worker_config.idle_poll_interval_ms, 75);
+                assert!(
+                    args.run_config
+                        .worker_config
+                        .enable_event_metric_deferred_drains
+                );
+                assert!(
+                    args.run_config
+                        .worker_config
+                        .enable_session_metric_deferred_rebuilds
+                );
+                assert!(
+                    !args
+                        .run_config
+                        .worker_config
+                        .enable_session_daily_deferred_rebuilds
+                );
+                assert!(
+                    !args
+                        .run_config
+                        .worker_config
+                        .enable_install_activity_deferred_drains
+                );
             }
             other => panic!("expected SLO command, got {other:?}"),
         }
@@ -8164,6 +8258,10 @@ mod tests {
                 session_incremental_concurrency: 12,
                 session_repair_concurrency: 4,
                 idle_poll_interval_ms: 75,
+                enable_event_metric_deferred_drains: true,
+                enable_session_daily_deferred_rebuilds: false,
+                enable_session_metric_deferred_rebuilds: true,
+                enable_install_activity_deferred_drains: true,
             },
         );
 
@@ -8172,6 +8270,10 @@ mod tests {
         assert!(rendered.contains("FANTASMA_WORKER_EVENT_BATCH_SIZE: 7000"));
         assert!(rendered.contains("FANTASMA_WORKER_SESSION_INCREMENTAL_CONCURRENCY: 12"));
         assert!(rendered.contains("FANTASMA_WORKER_SESSION_REPAIR_CONCURRENCY: 4"));
+        assert!(rendered.contains("FANTASMA_WORKER_ENABLE_EVENT_METRIC_DEFERRED_DRAINS: true"));
+        assert!(rendered.contains("FANTASMA_WORKER_ENABLE_SESSION_DAILY_DEFERRED_REBUILDS: false"));
+        assert!(rendered.contains("FANTASMA_WORKER_ENABLE_SESSION_METRIC_DEFERRED_REBUILDS: true"));
+        assert!(rendered.contains("FANTASMA_WORKER_ENABLE_INSTALL_ACTIVITY_DEFERRED_DRAINS: true"));
         assert!(rendered.contains("FANTASMA_WORKER_STAGE_B_TRACE_PATH: /tmp/stage-b-trace.jsonl"));
         assert!(
             rendered.contains("FANTASMA_WORKER_EVENT_LANE_TRACE_PATH: /tmp/event-lane-trace.jsonl")

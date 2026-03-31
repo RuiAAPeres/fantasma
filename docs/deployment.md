@@ -661,9 +661,9 @@ curl -fsS "http://localhost:8082/v1/metrics/events?event=app_open&metric=count&g
 
 Grouping rules:
 
-- `events`, `count`, `duration_total`, and `new_installs` allow built-in filters plus built-in `group_by` through D4
+- `events`, `count`, `duration_total`, and `new_installs` allow built-in filters plus built-in `group_by` through D2
 - `active_installs` allows built-in filters plus built-in `group_by` through D2
-- built-in dimensions are `platform`, `app_version`, `os_version`, and `locale`
+- built-in dimensions are `platform`, `device`, `app_version`, `os_version`, and `locale`
 - `live_installs` remains unfiltered and ungrouped
 
 ## Related Docs
