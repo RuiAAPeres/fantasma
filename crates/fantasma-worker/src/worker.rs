@@ -553,7 +553,7 @@ impl SessionMetricAccumulator {
 
     fn into_store_deltas(self, project_id: Uuid) -> SessionMetricStoreDeltas {
         let mut totals = self.totals.into_iter().collect::<Vec<_>>();
-        totals.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        totals.sort_by_key(|(key, _)| *key);
         let totals = totals
             .into_iter()
             .map(

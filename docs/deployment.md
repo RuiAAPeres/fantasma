@@ -688,3 +688,30 @@ Behavior:
 - removes the remote temp helper on exit
 
 This path exists because the normal isolated `fantasma-bench` Compose stack binds to the benchmark loopback ports and can collide with already-running services on the same host. For live freshness measurements against an existing demo stack, use the wrapper above instead of the isolated benchmark stack.
+
+## October 2026 runtime security baseline
+
+Production API, ingest and worker images now copy the committed `Cargo.lock`
+and compile with `cargo build --locked`. The lockfile used to be ignored and
+omitted from Docker contexts, so old deployed crate versions cannot be inferred
+from an old laptop lockfile. Rust 1.99.1 builds the services and Docker test
+runner; the workspace minimum remains Rust 1.92.
+
+The reviewed lockfile patches rustls to 0.23.46, rustls-webpki to 0.103.16 and
+webpki-roots to 1.0.10. These dependencies are selected by the normal Postgres TLS
+path. Keep Debian bookworm runtime images refreshed with `docker compose ...
+build --pull fantasma-api fantasma-ingest fantasma-worker`; the image's existing
+APT step refreshes CA certificates. Do not reuse old runtime images merely
+because application source is unchanged. Preserve prior image IDs for rollback
+and verify both production and demo stacks after replacement.
+
+Cargo audit also reports QUIC and RSA advisories in the full workspace lockfile.
+The affected QUIC dependency is not enabled in the services' normal runtime
+graph, and the RSA dependency is not selected by the API's Postgres runtime.
+The same-series anyhow 1.0.103, event-listener 5.4.2 and rand 0.8.6/0.9.3
+fixes also remove informational
+soundness warnings in selected runtime dependencies. The unmaintained
+unsafe-libyaml warning remains in a development-only dependency; the yanked
+spin package is also absent from the services' normal runtime graph. This change
+does not upgrade unrelated database backends or transport features to eliminate
+lockfile-only findings. Reassess reachability before enabling those features.

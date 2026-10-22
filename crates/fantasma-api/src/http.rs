@@ -604,7 +604,7 @@ fn parse_event_discovery_query(
             end_exclusive,
             filters,
         },
-        Some(limit.unwrap_or(DEFAULT_TOP_EVENTS_LIMIT)).filter(|_| allow_limit),
+        allow_limit.then_some(limit.unwrap_or(DEFAULT_TOP_EVENTS_LIMIT)),
     ))
 }
 
@@ -1206,6 +1206,8 @@ fn authorize_operator(
     })
 }
 
+// Preserve the concrete HTTP error response; boxing only to satisfy its target-dependent size adds allocation.
+#[allow(clippy::result_large_err)]
 async fn authorize_project_key(
     pool: &PgPool,
     headers: &HeaderMap,
@@ -1250,6 +1252,8 @@ fn project_mutation_error_response(error: &StoreError) -> Option<axum::response:
     }
 }
 
+// Preserve the concrete HTTP error response; boxing only to satisfy its target-dependent size adds allocation.
+#[allow(clippy::result_large_err)]
 async fn require_project_active_for_management_mutation(
     pool: &PgPool,
     project_id: Uuid,
@@ -1269,6 +1273,8 @@ async fn require_project_active_for_management_mutation(
     }
 }
 
+// Preserve the concrete HTTP error response; boxing only to satisfy its target-dependent size adds allocation.
+#[allow(clippy::result_large_err)]
 async fn require_project_active_for_read_key_route(
     pool: &PgPool,
     project_id: Uuid,
@@ -2592,7 +2598,7 @@ fn synthesize_group_counts(
             }
 
             let mut final_group_key = vec![None; group_by.len()];
-            for (position, subset_value) in positions.iter().zip(subset_group_key.into_iter()) {
+            for (position, subset_value) in positions.iter().zip(subset_group_key) {
                 final_group_key[*position] = subset_value;
             }
             *final_groups.entry(final_group_key).or_default() += remainder;

@@ -4,7 +4,6 @@
 /.DS_Store
 /.idea
 /.vscode
-/Cargo.lock
 /.env.production
 /.env.demo
 /.env.local
