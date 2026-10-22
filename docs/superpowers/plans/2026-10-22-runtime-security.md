@@ -12,3 +12,5 @@
 ## Scope and verification updates
 
 Cargo.lock was ignored rather than tracked, so remove its .gitignore entry and commit the reviewed lockfile. Include same-series anyhow 1.0.103, event-listener 5.4.2 and rand 0.8.6/0.9.3 soundness fixes. Native Rust 1.92 fmt/clippy, all 481 Docker workspace tests on Rust 1.99.1, all three release images and the CLI smoke passed. Additional Linux Rust 1.99 Clippy identified five existing http.rs lints; the coordinating agent approved two equivalent idiom edits and narrowly documented result_large_err allowances on three existing HTTP response boundaries, preserving their concrete Response error contract. Final verification passed on both toolchains; the final Docker suite passed all 481 tests and the CLI smoke passed. One further sort idiom was updated only inside a cfg(test) worker helper.
+
+- [x] Coordinator published `54b1fb5`, pulled the exact revision on Hetzner, built production amd64 images and activated demo then production. Both stacks, deployed image IDs/runtime packages, linked demo history and public ingest smoke/cleanup passed.
