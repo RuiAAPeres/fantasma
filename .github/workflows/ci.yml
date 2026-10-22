@@ -170,6 +170,9 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The action default includes the retired SDK package `tools`.
+          packages: platform-tools
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
